@@ -40,9 +40,11 @@ from rquant.runtime_service_entrypoint import (
 )
 
 if TYPE_CHECKING:
+    from rquant.paper_portfolio_runtime import PaperPortfolioRuntimeCatalog
     from rquant.runtime_artifact_terminal_lifecycle import (
         ProductionArtifactTerminalLifecycle,
     )
+    from rquant.runtime_health_authority import RuntimeHealthTrustedOpsProvider
     from rquant.runtime_schema_registry import RuntimeSchemaServiceBinding
     from rquant.runtime_service_control import RuntimeStepResult
     from rquant.runtime_shadow_validation import CompletionAttestationSigner
@@ -155,8 +157,17 @@ def build_builtin_registry(
     completion_attestation_active_key_id: str | None = None,
     startup_degraded_reasons: tuple[str, ...] = (),
     runtime_root: Path | None = None,
+    paper_portfolio_catalog: PaperPortfolioRuntimeCatalog | None = None,
+    ops_context_provider: RuntimeHealthTrustedOpsProvider | None = None,
 ) -> RuntimeServiceRegistry:
+    from rquant.paper_portfolio_runtime import PaperPortfolioRuntimeCatalog
     from rquant.runtime_service_builtin import build_builtin_registry as factory
+
+    if (
+        paper_portfolio_catalog is not None
+        and type(paper_portfolio_catalog) is not PaperPortfolioRuntimeCatalog
+    ):
+        raise TypeError("paper host requires its finite concrete portfolio catalog")
 
     kwargs: dict[str, object] = {
         "runtime_capabilities": runtime_capabilities,
@@ -164,6 +175,10 @@ def build_builtin_registry(
         "artifact_terminal_lifecycle_factory": artifact_terminal_lifecycle_factory,
         "runtime_root": runtime_root,
     }
+    if paper_portfolio_catalog is not None:
+        kwargs["paper_portfolio_catalog"] = paper_portfolio_catalog
+    if ops_context_provider is not None:
+        kwargs["ops_context_provider"] = ops_context_provider
     if completion_attestation_signer is not None:
         kwargs["completion_attestation_signer"] = completion_attestation_signer
         kwargs["completion_attestation_active_key_id"] = completion_attestation_active_key_id
@@ -171,6 +186,42 @@ def build_builtin_registry(
     if startup_degraded_reasons:
         registry = _StartupDegradedRegistry(registry, reasons=startup_degraded_reasons)
     return registry
+
+
+def build_runtime_health_ops_provider(
+    runtime_root: Path,
+    *,
+    manifest: RuntimeServiceManifest,
+) -> RuntimeHealthTrustedOpsProvider | None:
+    from rquant.runtime_builder_authority import RuntimeHealthPublisherSettings
+    from rquant.runtime_health_authority import RuntimeHealthTrustedOpsProvider
+    from rquant.runtime_schema_registry import RuntimeSchemaCompatibilityError
+
+    try:
+        profile = load_current_runtime_deployment_profile(runtime_root)
+    except (OSError, ValueError, RuntimeSchemaCompatibilityError):
+        # A legacy startup without this optional verified source gets no witness.
+        # Its existing manifest/schema/capability admission still runs unchanged.
+        return None
+    health_manifests = tuple(
+        item
+        for item in profile.manifests
+        if item.service_kind is RuntimeServiceKind.RUNTIME_HEALTH_PUBLISHER
+    )
+    if not health_manifests:
+        return None
+    if len(health_manifests) != 1:
+        raise ValueError("runtime profile has ambiguous health owner manifests")
+    settings = RuntimeHealthPublisherSettings.model_validate(dict(health_manifests[0].settings))
+    if settings.ops_binding is None:
+        return None
+    if profile.producer_commit != manifest.producer_commit or not any(
+        item.service_id == manifest.service_id
+        and item.manifest_fingerprint == manifest.manifest_fingerprint
+        for item in profile.manifests
+    ):
+        raise ValueError("runtime health Ops profile does not cover the exact service manifest")
+    return RuntimeHealthTrustedOpsProvider(settings.ops_binding)
 
 
 def runtime_root_from_control_root(control_root: Path) -> Path:
@@ -398,8 +449,7 @@ def resolve_legacy_schema_generation(
         raise ValueError(f"runtime legacy generation binding is invalid: {exc}") from exc
     if not binding.is_legacy:
         raise ValueError(
-            "runtime generation was staged from the checkout and cannot bind a legacy "
-            "deployment"
+            "runtime generation was staged from the checkout and cannot bind a legacy deployment"
         )
     declared_root = Path(os.path.abspath(str(binding.runtime_root)))
     if declared_root != Path(os.path.abspath(runtime_root)):
@@ -452,6 +502,10 @@ class _StartupDegradedRegistry(RuntimeServiceRegistry):
     @property
     def registered_kinds(self) -> tuple[RuntimeServiceKind, ...]:
         return self._inner.registered_kinds
+
+    @property
+    def ops_context_provider(self) -> RuntimeHealthTrustedOpsProvider | None:
+        return self._inner.ops_context_provider
 
     def open_artifact_terminal_lifecycle(self) -> ProductionArtifactTerminalLifecycle:
         return self._inner.open_artifact_terminal_lifecycle()
@@ -810,6 +864,12 @@ def run(args: argparse.Namespace) -> int:
                 # previous generation's durable state from a foreign one (#248).
                 "runtime_root": runtime_root,
             }
+            if runtime_root is not None:
+                ops_context_provider = build_runtime_health_ops_provider(
+                    runtime_root, manifest=manifest
+                )
+                if ops_context_provider is not None:
+                    registry_kwargs["ops_context_provider"] = ops_context_provider
             if startup_degraded_reasons:
                 registry_kwargs["startup_degraded_reasons"] = startup_degraded_reasons
             if retention_schema_resolver is not None:

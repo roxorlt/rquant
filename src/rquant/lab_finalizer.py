@@ -10,7 +10,7 @@ import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, Literal, TypeVar
+from typing import TYPE_CHECKING, BinaryIO, Literal, TypeVar
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 import pandas as pd
@@ -76,6 +76,10 @@ from rquant.strategy_job_adapters import (
     default_strategy_job_adapter_registry,
 )
 from rquant.strict_json import canonical_json_bytes, strict_model_validate_canonical_json
+if TYPE_CHECKING:
+    from rquant.paper_research_runtime import PaperResearchRuntimeDirectory
+    from rquant.strategy_template_runtime import StrategyTemplateRuntimeDirectory
+    from rquant.experiment_platform_templates import ExperimentTemplateRuntimeBinding
 
 
 class LabFinalizationError(RuntimeError):
@@ -1374,6 +1378,9 @@ class LabFinalizer:
             LabFinalizerAuthorityVerificationKeyProvider | None
         ) = None,
         adapter_registry: StrategyJobAdapterRegistry | None = None,
+        template_directory: StrategyTemplateRuntimeDirectory | None = None,
+        experiment_template_binding: ExperimentTemplateRuntimeBinding | None = None,
+        paper_directory: PaperResearchRuntimeDirectory | None = None,
         bundle_limits: LabShardBundleLimits | None = None,
         job_limits: LabFinalizerJobLimits | None = None,
         result_digest_policy: LabResultDigestPolicy | None = None,
@@ -1409,6 +1416,12 @@ class LabFinalizer:
                 finalizer_authority_verification_key_provider
             )
         self.adapter_registry = adapter_registry or default_strategy_job_adapter_registry()
+        from rquant.strategy_template_runtime import require_template_runtime_directory
+        self.template_directory = require_template_runtime_directory(template_directory)
+        from rquant.experiment_platform_templates import require_experiment_template_runtime_binding
+        self.experiment_template_binding = require_experiment_template_runtime_binding(experiment_template_binding)
+        from rquant.paper_research_runtime import require_paper_runtime_directory
+        self.paper_directory = require_paper_runtime_directory(paper_directory)
 
     @classmethod
     def for_formal_runtime(
@@ -2252,7 +2265,14 @@ class LabFinalizer:
                 maximum=self.job_limits.max_peak_resident_bytes,
                 label="aggregate preflight peak resident bytes",
             )
-            result = self.adapter_registry.aggregate_results(snapshot.job.spec, shard_results)
+            if self.paper_directory is not None and snapshot.job.spec.parameters.strategy_name in {"paper_reconcile", "paper_backtest_band"}:
+                registry = self.paper_directory.registry_for_spec(snapshot.job.spec)
+            else:
+                directory = self.template_directory
+                if self.experiment_template_binding is not None:
+                    directory = self.experiment_template_binding.directory_for_job(snapshot.job.job_id, snapshot.job.spec) or directory
+                registry = self.adapter_registry if directory is None else directory.registry_for_spec(snapshot.job.spec)
+            result = registry.aggregate_results(snapshot.job.spec, shard_results)
         except (LabFinalizationIntegrityError, BaseExceptionGroup):
             raise
         except Exception as exc:

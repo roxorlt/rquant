@@ -1,0 +1,16 @@
+{
+  "argv": [
+    "/opt/homebrew/bin/pnpm",
+    "exec",
+    "vitest",
+    "run",
+    "src/pages/query/query.test.tsx",
+    "-t",
+    "RQ-R"
+  ],
+  "started_utc": "2026-10-04T22:02:58.114161+00:00",
+  "elapsed_seconds": 3.211051416998089,
+  "exit_code": 1,
+  "starting_candidate": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb",
+  "phase": "red_before_corresponding_product_fixes"
+}

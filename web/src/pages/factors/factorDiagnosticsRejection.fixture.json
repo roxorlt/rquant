@@ -1,0 +1,175 @@
+{
+  "actor": "alice",
+  "request": {
+    "command_id": "bdcd0f72-bb27-4512-8a65-c629003fe066",
+    "requested_at": "2026-08-01T08:00:00Z",
+    "serving_generation_id": "7de31755f7e050ad1616b12ff7bb6d31a6f9b705d23e5748ced89cf61f949be1",
+    "parameters": {
+      "factor_id": "entry_test",
+      "expected_head": {
+        "version": 1,
+        "content_sha256": "b42eabaa7e31895211717bf07f29e73ff862fbeffa0cb1f76fb2ab5909e6a7a9"
+      },
+      "selection": "all",
+      "start_date": "2026-07-01",
+      "end_date": "2026-07-11",
+      "holding_sessions": 5,
+      "group_count": 5,
+      "ic_method": "rank",
+      "neutralization": "none",
+      "extended_statistics": true
+    }
+  },
+  "availability": {
+    "enabled": true,
+    "reason": null,
+    "pools": [
+      {
+        "selection": "all",
+        "label": "全市场（剔除北交所、ST）",
+        "available": true,
+        "reason": null
+      },
+      {
+        "selection": "hs300",
+        "label": "沪深300",
+        "available": false,
+        "reason": "缺少该股票池的历史归档"
+      },
+      {
+        "selection": "zz1000",
+        "label": "中证1000",
+        "available": false,
+        "reason": "缺少该股票池的历史归档"
+      },
+      {
+        "selection": "gem",
+        "label": "创业板 + 科创板",
+        "available": false,
+        "reason": "缺少该股票池的历史归档"
+      }
+    ],
+    "start_date": "2026-07-01",
+    "end_date": "2026-07-30",
+    "neutralizations": [
+      {
+        "neutralization": "none",
+        "label": "无",
+        "available": true,
+        "reason": null
+      },
+      {
+        "neutralization": "industry",
+        "label": "行业",
+        "available": false,
+        "reason": "缺少可核验的行业或市值来源"
+      },
+      {
+        "neutralization": "industry_size",
+        "label": "行业 + 市值",
+        "available": false,
+        "reason": "缺少可核验的行业或市值来源"
+      }
+    ]
+  },
+  "responses": {
+    "submit": {
+      "status": 200,
+      "body": {
+        "data": {
+          "original_request": {
+            "command_id": "bdcd0f72-bb27-4512-8a65-c629003fe066",
+            "requested_at": "2026-08-01T08:00:00Z",
+            "serving_generation_id": "7de31755f7e050ad1616b12ff7bb6d31a6f9b705d23e5748ced89cf61f949be1",
+            "parameters": {
+              "factor_id": "entry_test",
+              "expected_head": {
+                "version": 1,
+                "content_sha256": "b42eabaa7e31895211717bf07f29e73ff862fbeffa0cb1f76fb2ab5909e6a7a9"
+              },
+              "selection": "all",
+              "start_date": "2026-07-01",
+              "end_date": "2026-07-11",
+              "holding_sessions": 5,
+              "group_count": 5,
+              "ic_method": "rank",
+              "neutralization": "none",
+              "extended_statistics": true
+            }
+          },
+          "status": "rejected",
+          "reason": "开始日期前的历史数据不足，请调整开始日期。",
+          "job_id": null,
+          "spec_sha256": null
+        },
+        "serving": {
+          "generation_id": "7de31755f7e050ad1616b12ff7bb6d31a6f9b705d23e5748ced89cf61f949be1",
+          "built_at": "2026-09-24T07:31:00Z",
+          "age_seconds": 60.0,
+          "state": "ready",
+          "message": null,
+          "detail": "serving generation verified"
+        }
+      }
+    },
+    "resume": {
+      "status": 404,
+      "body": {
+        "detail": "原请求尚未确认，请重试原请求。"
+      }
+    },
+    "retry": {
+      "status": 200,
+      "body": {
+        "data": {
+          "original_request": {
+            "command_id": "bdcd0f72-bb27-4512-8a65-c629003fe066",
+            "requested_at": "2026-08-01T08:00:00Z",
+            "serving_generation_id": "7de31755f7e050ad1616b12ff7bb6d31a6f9b705d23e5748ced89cf61f949be1",
+            "parameters": {
+              "factor_id": "entry_test",
+              "expected_head": {
+                "version": 1,
+                "content_sha256": "b42eabaa7e31895211717bf07f29e73ff862fbeffa0cb1f76fb2ab5909e6a7a9"
+              },
+              "selection": "all",
+              "start_date": "2026-07-01",
+              "end_date": "2026-07-11",
+              "holding_sessions": 5,
+              "group_count": 5,
+              "ic_method": "rank",
+              "neutralization": "none",
+              "extended_statistics": true
+            }
+          },
+          "status": "rejected",
+          "reason": "开始日期前的历史数据不足，请调整开始日期。",
+          "job_id": null,
+          "spec_sha256": null
+        },
+        "serving": {
+          "generation_id": "7de31755f7e050ad1616b12ff7bb6d31a6f9b705d23e5748ced89cf61f949be1",
+          "built_at": "2026-09-24T07:31:00Z",
+          "age_seconds": 60.0,
+          "state": "ready",
+          "message": null,
+          "detail": "serving generation verified"
+        }
+      }
+    }
+  },
+  "context": "Synthetic real factory, PageControl, Unix transport and authenticated Web. Existing UID fixture seam; not installed dual-UID proof. MAD omitted; extended_statistics=true.",
+  "resources": {
+    "listener_joined": true,
+    "listener_name": "recapture-factorRunRejection.fixture.json",
+    "listener_socket_fileno": -1,
+    "socket_removed": true,
+    "socket_path": "/private/tmp/rquant-diagnostics-rejection-recapture-HiWxWfFn/tmp/uds-1zebf00i/run.sock",
+    "socket_directory_removed": true,
+    "proof_directory_removed": true,
+    "matching_proof_fds": [],
+    "execution_copies": 0,
+    "jobs": 0,
+    "outbox_receipt": null
+  }
+}

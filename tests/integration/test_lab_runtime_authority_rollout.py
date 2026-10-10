@@ -105,6 +105,7 @@ def _physical_test_venv(checkout: Path) -> Path:
         "typing_extensions.py",
         "typing_inspection",
         "six.py",
+        "ta",
     }
     dependency_names.update(
         entry.name for entry in source_site.iterdir() if entry.name.startswith("_duckdb.")

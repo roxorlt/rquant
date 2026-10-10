@@ -7,12 +7,13 @@ import binascii
 import re
 from collections.abc import Callable, Iterable, Mapping
 from datetime import UTC, date, datetime, time, timedelta
+from hashlib import sha256
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-from pydantic import Field, InstanceOf, StrictInt, field_validator, model_validator
+from pydantic import Field, InstanceOf, StrictBool, StrictInt, field_validator, model_validator
 
 from rquant.auction_match_gateway import AuctionMatchGateway, AuctionMatchGatewayConfig
 from rquant.auction_match_source_service import capture_auction_match_step
@@ -33,6 +34,7 @@ from rquant.live_spool import (
 )
 from rquant.market_minute_gateway import MarketMinuteGateway, MarketMinuteGatewayConfig
 from rquant.market_minute_source_service import capture_market_minute_step
+from rquant.monitor_builtin_runtime import MonitorBuiltinCaptureSettings
 from rquant.readside_replica_gate import (
     AUCTION_UNIVERSE_PUBLISHER_PROFILE,
     REFERENCE_SLOW_SOURCE_PROFILE,
@@ -71,10 +73,14 @@ from rquant.source_quota_transport import (
     QuotaBoundTransportObserver,
     SourceTransportUsageReceipt,
 )
+from rquant.strict_json import canonical_json_bytes
 from rquant.watchlist_quote_gateway import WatchlistQuoteGateway, WatchlistQuoteGatewayConfig
 from rquant.watchlist_quote_source_service import capture_watchlist_quote_step
 
 if TYPE_CHECKING:
+    from rquant.paper_research_runtime import NativeMinuteForwardViewSource
+    from rquant.strategy_runner import StrategyRunnerStore
+    from rquant.paper_portfolio_runtime import PaperPortfolioRuntimeCatalog
     from rquant.paper_signal_worker import QuoteResolver
     from rquant.reference_slow_publisher import ReferenceSlowSourceSnapshot
     from rquant.reference_slow_source import ReferenceSlowAdapter
@@ -90,6 +96,7 @@ if TYPE_CHECKING:
         SignalSourceLoader,
     )
     from rquant.runtime_builder_strategy import StrategyEvaluatorLoader
+    from rquant.runtime_health_authority import RuntimeHealthTrustedOpsProvider
     from rquant.runtime_shadow_validation import CompletionAttestationSigner
     from rquant.signal_router_runtime import TargetResolver
 
@@ -916,9 +923,7 @@ def auction_match_source_builder(
             try:
                 decision = decide_market_session(calendar, observed_at)
             except MarketSessionCalendarError as error:
-                return idle_result(
-                    (raise_or_label_calendar_refusal(calendar, observed_at, error),)
-                )
+                return idle_result((raise_or_label_calendar_refusal(calendar, observed_at, error),))
             if attempt_trade_date != decision.local_trade_date:
                 attempt_trade_date = decision.local_trade_date
                 attempts = 0
@@ -1000,6 +1005,7 @@ def auction_match_source_builder(
 
 
 class MarketMinuteSourceSettings(RuntimeContractModel):
+    health_metrics_enabled: StrictBool = False
     spool_root: Path
     quota_path: Path
     quota_units_per_window: StrictInt = Field(gt=0)
@@ -1153,6 +1159,8 @@ def market_minute_source_builder(
                 gateway,
                 received_at=observed_at,
                 quota_cost_units=call_count,
+                health_metrics_enabled=settings.health_metrics_enabled,
+                expected_codes=universe if settings.health_metrics_enabled else None,
             )
 
         last_result = RuntimeStepResult()
@@ -1224,8 +1232,19 @@ class WatchlistQuoteSourceSettings(RuntimeContractModel):
     calendar_expected_commit: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
     calendar_content_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     candidate_authorities: tuple[CandidateUniverseAuthority, ...] = ()
+    domain_mode: Literal["candidate", "price_rules", "builtin_watchlist"] = "candidate"
+    price_scope_serving_root: Path | None = None
+    price_request_root: Path | None = None
+    builtin_primary_path: Path | None = None
+    builtin_replica_path: Path | None = None
+    builtin_request_root: Path | None = None
+    monitor_builtin_capture_manifest_path: Path | None = None
+    monitor_builtin_capture: MonitorBuiltinCaptureSettings | None = None
+    units_contract_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    volume_unit: Literal["shares", "lot100"] | None = None
+    amount_unit: Literal["CNY"] | None = None
 
-    @field_validator("spool_root", "quota_path", "calendar_path")
+    @field_validator("spool_root", "quota_path", "calendar_path", "builtin_primary_path", "builtin_replica_path", "builtin_request_root", "monitor_builtin_capture_manifest_path")
     @classmethod
     def require_absolute_path(cls, value: Path | None) -> Path | None:
         if value is not None and not value.is_absolute():
@@ -1244,15 +1263,74 @@ def watchlist_quote_source_builder(
     provider_factory: Callable[[], WatchlistQuoteProvider],
     universe_loader: Callable[[], Iterable[str]] | None,
     clock: Callable[[], datetime],
+    runtime_root: Path | None = None,
 ) -> RuntimeServiceBuilder:
     def build(manifest: RuntimeServiceManifest) -> RuntimeServiceStep:
         if manifest.service_kind is not RuntimeServiceKind.WATCHLIST_QUOTE_SOURCE:
             raise ValueError("runtime service kind must be watchlist_quote_source")
         if manifest.plane is not RuntimeServicePlane.LIVE:
             raise ValueError("watchlist quote source must run on the live plane")
-        settings = WatchlistQuoteSourceSettings.model_validate(dict(manifest.settings))
+        settings = WatchlistQuoteSourceSettings.model_validate_json(canonical_json_bytes(manifest.model_dump(mode="json")["settings"]))
+        price_domain = settings.domain_mode == "price_rules"
+        builtin_domain = settings.domain_mode == "builtin_watchlist"
         authoritative_universe = universe_loader is None
-        if authoritative_universe:
+        builtin_authority, builtin_replica = None, None
+        if builtin_domain:
+            from rquant.monitor_builtin_runtime import verify_builtin_capture_authority
+            from rquant.price_alert_runtime_contracts import _activation_bytes
+            from rquant.price_alert_runtime_store import _private_parent
+            from rquant.screen.replica_source import VerifiedReplicaScreenSource
+            from rquant.runtime_service_entrypoint import load_runtime_service_manifest
+
+            if (universe_loader is not None or runtime_root is None or settings.rollout_mode != "published"
+                    or settings.schema_version != 3 or settings.minimum_cadence_seconds < 5
+                    or any(value is None for value in (settings.builtin_primary_path, settings.builtin_replica_path,
+                        settings.builtin_request_root, settings.monitor_builtin_capture_manifest_path,
+                        settings.monitor_builtin_capture, settings.calendar_path, settings.calendar_expected_commit,
+                        settings.calendar_content_sha256)) or settings.candidate_authorities
+                    or settings.price_scope_serving_root is not None or settings.price_request_root is not None):
+                raise ValueError("builtin quotes require their actual complete monitor replica and published source")
+            if not settings.builtin_request_root.is_relative_to(runtime_root):
+                raise ValueError("builtin quote requests must stay inside the actual private runtime root")
+            actual_path = settings.monitor_builtin_capture_manifest_path
+            actual = load_runtime_service_manifest(actual_path, expected_commit=manifest.producer_commit)
+            if actual != manifest:
+                raise ValueError("builtin quote source differs from its actual immutable role manifest")
+            builtin_authority = verify_builtin_capture_authority(actual_path, runtime_root=runtime_root,
+                expected_sha256=sha256(_activation_bytes(actual_path, runtime_root)).hexdigest(), expected_commit=manifest.producer_commit)
+            settings.builtin_request_root.mkdir(mode=0o700, parents=False, exist_ok=True)
+            _private_parent(settings.builtin_request_root / "binding.json")
+            builtin_replica = VerifiedReplicaScreenSource(primary_path=settings.builtin_primary_path, replica_path=settings.builtin_replica_path)
+            calendar = load_market_calendar_authority(settings.calendar_path, expected_commit=settings.calendar_expected_commit)
+            if calendar.content_sha256 != settings.calendar_content_sha256:
+                raise ValueError("builtin quote calendar changed")
+            candidate_loader = None
+        elif price_domain:
+            if (
+                universe_loader is not None
+                or settings.rollout_mode != "published"
+                or settings.schema_version != 2
+                or settings.minimum_cadence_seconds < 5
+                or settings.price_scope_serving_root is None
+                or settings.price_request_root is None
+                or settings.calendar_path is None
+                or settings.calendar_expected_commit is None
+                or settings.calendar_content_sha256 is None
+                or settings.candidate_authorities
+            ):
+                raise ValueError(
+                    "price quote domain requires the complete trusted scope and published gateway"
+                )
+            from rquant.price_alert_runtime_store import _private_parent
+
+            _private_parent(settings.price_request_root / "binding.json")
+            calendar = load_market_calendar_authority(
+                settings.calendar_path, expected_commit=settings.calendar_expected_commit
+            )
+            if calendar.content_sha256 != settings.calendar_content_sha256:
+                raise ValueError("price quote calendar content identity mismatch")
+            candidate_loader = None
+        elif authoritative_universe:
             if (
                 settings.calendar_path is None
                 or settings.calendar_expected_commit is None
@@ -1304,17 +1382,120 @@ def watchlist_quote_source_builder(
                 max_backoff_seconds=settings.max_backoff_seconds,
                 quota_units_per_window=settings.quota_units_per_window,
                 quota_cost_per_request=settings.quota_cost_per_request,
+                units_contract_id=settings.units_contract_id,
+                volume_unit=settings.volume_unit,
+                amount_unit=settings.amount_unit,
             ),
             quota_store=SourceQuotaStore(settings.quota_path),
             clock=clock,
         )
         last_result = RuntimeStepResult()
+        if builtin_domain and gateway.spool._source_generation(LiveChannel.WATCHLIST_QUOTE) != settings.monitor_builtin_capture.source_generation_id:
+            raise ValueError("builtin source generation differs from the actual original quote spool")
+
+        def builtin_step(scheduled_at: datetime) -> RuntimeStepResult:
+            from rquant.monitor_builtin_runtime import next_builtin_capture_sequence, publish_original_builtin_status, publish_original_quote_builtin_capture, read_original_monitor_watchlist, require_monitor_watchlist_read
+            from rquant.price_alert_runtime_source import BuiltinQuoteRequestBinding, freeze_builtin_quote_request, read_latest_price_quote_snapshot
+
+            watchlist = None
+            try:
+                decision = decide_market_session(calendar, scheduled_at)
+                if not decision.is_open_date or not _watchlist_quote_session_active(scheduled_at=scheduled_at):
+                    publish_original_builtin_status(builtin_authority, observed_at=scheduled_at, state="waiting", reason="outside_window",
+                        receipt_json=canonical_json_bytes({"state": "waiting", "evaluated_at": scheduled_at.isoformat(), "calendar_sha256": calendar.content_sha256}).decode())
+                    return RuntimeStepResult(batch_published=False)
+                watchlist = read_original_monitor_watchlist(builtin_replica, read_at=scheduled_at)
+                scope = require_monitor_watchlist_read(watchlist)
+                codes = tuple(item.ts_code for item in scope.watch)
+                if not codes:
+                    publish_original_builtin_status(builtin_authority, observed_at=scheduled_at, state="waiting", reason="empty_watchlist",
+                        receipt_json=canonical_json_bytes({"state": "empty_watchlist", "evaluated_at": scheduled_at.isoformat(), "replica_identity": scope.replica_identity}).decode(), watchlist=watchlist)
+                    return RuntimeStepResult(batch_published=False)
+                request = BuiltinQuoteRequestBinding.create(source=settings.source,
+                    quote_source_generation_id=settings.monitor_builtin_capture.source_generation_id,
+                    scope_generation_id=scope.replica_identity, scope_manifest_sha256=scope.sidecar_sha256,
+                    watch_basis_sha256=sha256(scope.basis_json.encode()).hexdigest(), codes=codes, scheduled_at=scheduled_at,
+                    universe_as_of=scope.synced_at, trade_date=decision.local_trade_date, schema_version=3)
+                freeze_builtin_quote_request(settings.builtin_request_root, request)
+                require_monitor_watchlist_read(watchlist)
+                result = capture_watchlist_quote_step(gateway, codes=codes, scheduled_at=scheduled_at, universe_as_of=scope.synced_at, trade_date=decision.local_trade_date)
+                if result.batch_published is not True or result.degraded_reasons:
+                    publish_original_builtin_status(builtin_authority, observed_at=clock(), state="disconnected", reason="quote_batch_unavailable",
+                        receipt_json=canonical_json_bytes({"original_step": result.model_dump(mode="json"), "request_sha256": sha256(request.wire_bytes()).hexdigest()}).decode(), watchlist=watchlist)
+                    return result
+                reads = []
+                read_latest_price_quote_snapshot(gateway.spool, request_root=settings.builtin_request_root, binding=request,
+                    evaluated_at=clock(), expected_producer_commit=manifest.producer_commit, owned_read_observer=reads.append)
+                publish_original_quote_builtin_capture(builtin_authority, watchlist=watchlist, quotes=reads[0], sequence=next_builtin_capture_sequence(builtin_authority))
+                return result
+            except Exception as exc:
+                publish_original_builtin_status(builtin_authority, observed_at=clock(), state="disconnected", reason="source_unavailable",
+                    receipt_json=canonical_json_bytes({"actual_error_type": type(exc).__name__, "evaluated_at": scheduled_at.isoformat()}).decode())
+                return RuntimeStepResult(batch_published=False, degraded_reasons=("monitor_builtin:source_unavailable",))
 
         def step() -> RuntimeStepResult:
             nonlocal last_result
             scheduled_at = clock()
+            if builtin_domain:
+                last_result = _never_below(builtin_step(scheduled_at), last_result)
+                return last_result
             evidence: dict[str, str] = {}
-            if candidate_loader is not None and calendar is not None:
+            if price_domain:
+                from rquant.price_alert_runtime_source import (
+                    PriceAlertScopeSnapshot,
+                    PriceQuoteRequestBinding,
+                    freeze_price_quote_request,
+                    read_price_alert_scope,
+                )
+                from rquant.serving_publisher import ServingReader
+
+                with ServingReader(settings.price_scope_serving_root).acquire_generation() as lease:
+                    scope = read_price_alert_scope(lease, evaluated_at=scheduled_at)
+                    if type(scope) is not PriceAlertScopeSnapshot:
+                        return RuntimeStepResult(
+                            batch_published=False, degraded_reasons=(f"price_alert:{scope.reason}",)
+                        )
+                    decision = decide_market_session(calendar, scheduled_at)
+                    if not decision.is_open_date or not _watchlist_quote_session_active(
+                        scheduled_at=scheduled_at
+                    ):
+                        return RuntimeStepResult(
+                            batch_published=False,
+                            source_generations={"market_calendar": calendar.content_sha256},
+                        )
+                    if not scope.codes:
+                        return RuntimeStepResult(
+                            batch_published=False,
+                            source_generations={"price_alert_scope": scope.generation_id},
+                        )
+                    codes, universe_as_of, trade_date = (
+                        scope.codes,
+                        scope.available_at,
+                        decision.local_trade_date,
+                    )
+                    request = PriceQuoteRequestBinding.create(
+                        source=settings.source,
+                        quote_source_generation_id=gateway.spool._source_generation(
+                            LiveChannel.WATCHLIST_QUOTE
+                        ),
+                        scope_generation_id=scope.generation_id,
+                        scope_manifest_sha256=scope.manifest_sha256,
+                        codes=codes,
+                        scheduled_at=scheduled_at,
+                        universe_as_of=universe_as_of,
+                        trade_date=trade_date,
+                        schema_version=2,
+                    )
+                    freeze_price_quote_request(settings.price_request_root, request)
+                    if (
+                        ServingReader(settings.price_scope_serving_root).current_pointer()
+                        != lease.pointer
+                    ):
+                        raise ValueError(
+                            "price quote scope changed before the original gateway call"
+                        )
+                    evidence["price_alert_scope"] = scope.generation_id
+            elif candidate_loader is not None and calendar is not None:
                 decision = decide_market_session(calendar, scheduled_at)
                 evidence["market_calendar"] = calendar.content_sha256
                 if not decision.is_open_date or not _watchlist_quote_session_active(
@@ -1398,11 +1579,15 @@ def build_builtin_registry(
     universe_loader: Callable[[], Iterable[str]] | None = None,
     clock: Callable[[], datetime] | None = None,
     evaluator_loader: StrategyEvaluatorLoader | None = None,
+    native_forward_source_factory: Callable[
+        [StrategyRunnerStore, RuntimeServiceManifest], NativeMinuteForwardViewSource
+    ] | None = None,
     signal_source_loader: SignalSourceLoader | None = None,
     target_resolver: TargetResolver | None = None,
     provider_loader: ProviderLoader | None = None,
     paper_quote_resolver: QuoteResolver | None = None,
     trade_date_resolver: TradeDateResolver | None = None,
+    paper_portfolio_catalog: PaperPortfolioRuntimeCatalog | None = None,
     serving_snapshot_loader: ServingSnapshotLoader | None = None,
     daily_close_fetcher: Callable[[object], object] | None = None,
     shadow_input_loader: object | None = None,
@@ -1416,13 +1601,15 @@ def build_builtin_registry(
     completion_attestation_signer: CompletionAttestationSigner | None = None,
     completion_attestation_active_key_id: str | None = None,
     runtime_root: Path | None = None,
+    ops_context_provider: RuntimeHealthTrustedOpsProvider | None = None,
 ) -> RuntimeServiceRegistry:
-    from rquant.runtime_builder_authority import (
-        lab_jobs_publisher_builder,
-        paper_execution_constraint_publisher_builder,
-        promotions_publisher_builder,
-        runtime_health_publisher_builder,
-    )
+    from rquant.paper_portfolio_runtime import PaperPortfolioRuntimeCatalog
+
+    if (
+        paper_portfolio_catalog is not None
+        and type(paper_portfolio_catalog) is not PaperPortfolioRuntimeCatalog
+    ):
+        raise TypeError("paper runtime requires its finite concrete portfolio catalog")
     from rquant.runtime_builder_candidate import candidate_publisher_builder
     from rquant.runtime_builder_daily import daily_close_source_builder
     from rquant.runtime_builder_daily_orchestrator import (
@@ -1443,6 +1630,7 @@ def build_builtin_registry(
         raise ValueError("completion attestation signer and active key id must be paired")
     registry = RuntimeServiceRegistry(
         artifact_terminal_lifecycle_factory=artifact_terminal_lifecycle_factory,
+        ops_context_provider=ops_context_provider,
     )
     registry.register(
         RuntimeServiceKind.REFERENCE_SLOW_SOURCE,
@@ -1488,6 +1676,7 @@ def build_builtin_registry(
             ),
             universe_loader=universe_loader,
             clock=resolved_clock,
+            runtime_root=runtime_root,
         ),
     )
     registry.register(
@@ -1527,6 +1716,7 @@ def build_builtin_registry(
         "evaluator_loader": evaluator_loader,
         "clock": resolved_clock,
         "runtime_root": runtime_root,
+        "native_forward_source_factory": native_forward_source_factory,
     }
     if completion_attestation_signer is not None:
         strategy_builder_kwargs["completion_attestation_signer"] = completion_attestation_signer
@@ -1561,29 +1751,44 @@ def build_builtin_registry(
         )(manifest)
 
     registry.register(RuntimeServiceKind.NOTIFIER, build_notifier)
-    registry.register(
-        RuntimeServiceKind.PAPER_CONSTRAINT_PUBLISHER,
-        paper_execution_constraint_publisher_builder(clock=resolved_clock),
-    )
+
+    def build_price_alert(manifest: RuntimeServiceManifest) -> RuntimeServiceStep:
+        from rquant.runtime_builder_price_alert import price_alert_runtime_builder
+
+        return price_alert_runtime_builder(clock=resolved_clock, runtime_root=runtime_root)(manifest)
+
+    registry.register(RuntimeServiceKind.PRICE_ALERT_RUNTIME, build_price_alert)
+    def build_paper_constraint_publisher(manifest: RuntimeServiceManifest) -> RuntimeServiceStep:
+        from rquant.runtime_builder_authority import paper_execution_constraint_publisher_builder
+
+        return paper_execution_constraint_publisher_builder(clock=resolved_clock)(manifest)
+
+    registry.register(RuntimeServiceKind.PAPER_CONSTRAINT_PUBLISHER, build_paper_constraint_publisher)
     registry.register(
         RuntimeServiceKind.PAPER_BROKER,
         paper_broker_builder(
             clock=resolved_clock,
             quote_resolver=paper_quote_resolver,
             trade_date_resolver=trade_date_resolver,
+            portfolio_catalog=paper_portfolio_catalog,
         ),
     )
-    registry.register(
-        RuntimeServiceKind.RUNTIME_HEALTH_PUBLISHER,
-        runtime_health_publisher_builder(clock=resolved_clock, runtime_root=runtime_root),
-    )
-    registry.register(
-        RuntimeServiceKind.LAB_JOBS_PUBLISHER,
-        lab_jobs_publisher_builder(
+    def build_runtime_health_publisher(manifest: RuntimeServiceManifest) -> RuntimeServiceStep:
+        from rquant.runtime_builder_authority import runtime_health_publisher_builder
+
+        return runtime_health_publisher_builder(clock=resolved_clock, runtime_root=runtime_root)(manifest)
+
+    registry.register(RuntimeServiceKind.RUNTIME_HEALTH_PUBLISHER, build_runtime_health_publisher)
+
+    def build_lab_jobs_publisher(manifest: RuntimeServiceManifest) -> RuntimeServiceStep:
+        from rquant.runtime_builder_authority import lab_jobs_publisher_builder
+
+        return lab_jobs_publisher_builder(
             clock=resolved_clock,
             open_artifact_terminal_lifecycle=registry.open_artifact_terminal_lifecycle,
-        ),
-    )
+        )(manifest)
+
+    registry.register(RuntimeServiceKind.LAB_JOBS_PUBLISHER, build_lab_jobs_publisher)
 
     def build_artifact_catalog(manifest: RuntimeServiceManifest) -> RuntimeServiceStep:
         from rquant.runtime_builder_artifact_catalog import artifact_catalog_builder
@@ -1594,6 +1799,13 @@ def build_builtin_registry(
         )(manifest)
 
     registry.register(RuntimeServiceKind.LAB_ARTIFACT_CATALOG, build_artifact_catalog)
+
+    def build_minute_study_projection(manifest: RuntimeServiceManifest) -> RuntimeServiceStep:
+        from rquant.runtime_builder_minute_study_projection import minute_study_projection_builder
+
+        return minute_study_projection_builder(clock=resolved_clock)(manifest)
+
+    registry.register(RuntimeServiceKind.MINUTE_STUDY_PROJECTION, build_minute_study_projection)
 
     def build_artifact_retention(manifest: RuntimeServiceManifest) -> RuntimeServiceStep:
         from rquant.runtime_builder_retention import artifact_retention_builder
@@ -1606,13 +1818,15 @@ def build_builtin_registry(
         )(manifest)
 
     registry.register(RuntimeServiceKind.ARTIFACT_RETENTION, build_artifact_retention)
-    registry.register(
-        RuntimeServiceKind.PROMOTIONS_PUBLISHER,
-        promotions_publisher_builder(
+    def build_promotions_publisher(manifest: RuntimeServiceManifest) -> RuntimeServiceStep:
+        from rquant.runtime_builder_authority import promotions_publisher_builder
+
+        return promotions_publisher_builder(
             clock=resolved_clock,
             open_artifact_terminal_lifecycle=registry.open_artifact_terminal_lifecycle,
-        ),
-    )
+        )(manifest)
+
+    registry.register(RuntimeServiceKind.PROMOTIONS_PUBLISHER, build_promotions_publisher)
 
     def build_serving(manifest: RuntimeServiceManifest) -> RuntimeServiceStep:
         from rquant.runtime_builder_serving import serving_publisher_builder

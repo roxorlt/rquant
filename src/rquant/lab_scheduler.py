@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Event
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -42,6 +42,7 @@ from rquant.lab_job_protocol import (
     RequestContentConflictError,
     SubmitJobCommand,
 )
+from rquant.lab_scheduling_control import LabSchedulingBarrierPort, LabSchedulingCommandEnvelope
 from rquant.lab_jobs import (
     CurrentSchedulerFenceReceipt,
     FormalSubmissionAuthorityError,
@@ -54,6 +55,10 @@ from rquant.lab_jobs import (
     SchedulerLeaseFencedError,
 )
 from rquant.lab_logging import _safe_structured_log
+if TYPE_CHECKING:
+    from rquant.paper_research_runtime import PaperResearchRuntimeDirectory
+    from rquant.strategy_template_runtime import StrategyTemplateRuntimeDirectory
+    from rquant.experiment_platform_templates import ExperimentTemplateRuntimeBinding
 from rquant.lab_result_digest import LabResultDigestPolicy
 from rquant.lab_shard_protocol import LabClaimSpool, LabReportSpool, LabShardClaim, LabShardClaimV2
 from rquant.lab_source_stage import (
@@ -337,6 +342,9 @@ class LabScheduler:
         shard_lease_seconds: int = 300,
         max_reports_per_tick: int = 64,
         adapter_registry: StrategyJobAdapterRegistry | None = None,
+        template_directory: StrategyTemplateRuntimeDirectory | None = None,
+        experiment_template_binding: ExperimentTemplateRuntimeBinding | None = None,
+        paper_directory: PaperResearchRuntimeDirectory | None = None,
         max_plans_per_tick: int = 64,
         max_claims_per_tick: int = 16,
         max_claim_authority_per_tick: int = 128,
@@ -369,8 +377,14 @@ class LabScheduler:
         source_stage_owner_id: str | None = None,
         max_source_stage_per_tick: int = 32,
         v2_emit_permit: Callable[[str], object] | None = None,
+        scheduling_control: LabSchedulingBarrierPort | None = None,
         clock: Callable[[], datetime] = _system_clock,
     ) -> None:
+        if scheduling_control is not None and (type(scheduling_control) is not LabSchedulingBarrierPort or scheduling_control._store is not store):
+            raise TypeError("scheduler global control requires this original queue's concrete metadata port")
+        self.scheduling_control = scheduling_control
+        if scheduling_control is None:
+            store.scheduling_control_enabled = False
         if not owner_id.strip():
             raise ValueError("owner_id must not be empty")
         if heartbeat_seconds < 1:
@@ -487,6 +501,12 @@ class LabScheduler:
         self.shard_lease_seconds = shard_lease_seconds
         self.max_reports_per_tick = max_reports_per_tick
         self.adapter_registry = adapter_registry
+        from rquant.strategy_template_runtime import require_template_runtime_directory
+        self.template_directory = require_template_runtime_directory(template_directory)
+        from rquant.experiment_platform_templates import require_experiment_template_runtime_binding
+        self.experiment_template_binding = require_experiment_template_runtime_binding(experiment_template_binding)
+        from rquant.paper_research_runtime import require_paper_runtime_directory
+        self.paper_directory = require_paper_runtime_directory(paper_directory)
         self.max_plans_per_tick = max_plans_per_tick
         self.max_claims_per_tick = max_claims_per_tick
         self.max_claim_authority_per_tick = max_claim_authority_per_tick
@@ -1055,6 +1075,14 @@ class LabScheduler:
     def _v2_emit_permit(self, record: LabClaimPublicationRecord):
         """Acquire the rollout fence before any V2 stage/queue side effect."""
 
+        if self.scheduling_control is not None:
+            lease, now = self._mutation_context()
+            if not self.scheduling_control.source_emit_permission(record, lease=lease, now=now):
+                yield False
+                return
+        elif self.store.scheduling_state() is not None:
+            yield False
+            return
         if self._v2_emit_permit_provider is None:
             yield True
             return
@@ -1741,6 +1769,10 @@ class LabScheduler:
                 self._synchronize_lifecycle(job.job_id, observed_at=recovery_now)
         else:
             lease, recovery_now = self._mutation_context()
+        if self.scheduling_control is not None:
+            if self.store.scheduling_state() is None:
+                self.store.enable_scheduling_control(lease=lease, barrier_port=self.scheduling_control, now=recovery_now)
+            self.scheduling_control.reconcile(lease=lease, now=recovery_now)
         self._verify_runtime()
         source_stage = self._recover_source_stage(lease=lease, now=recovery_now)
         authority_now = recovery_now
@@ -1774,6 +1806,16 @@ class LabScheduler:
             authority_now = mutation_now
             deadline_lease = lease
             deadline_now = mutation_now
+            if isinstance(entry.envelope, LabSchedulingCommandEnvelope):
+                if self.scheduling_control is None:
+                    raise RuntimeError("scheduler control capability is unavailable; global command remains pending")
+                receipt = self.scheduling_control.apply_command(entry.envelope, lease=lease, now=mutation_now)
+                processed += 1
+                applied += int(receipt.status == "applied")
+                rejected += int(receipt.status == "rejected")
+                self.spool.ack(entry, receipt)
+                self.scheduling_control.reconcile(lease=lease, now=mutation_now)
+                continue
             try:
                 self._verify_runtime()
                 receipt = self.store.apply_command(
@@ -2006,11 +2048,27 @@ class LabScheduler:
                 self.artifact_commit_spool.ack(entry, receipt)
         plans_created = 0
         plans_failed = 0
-        if self.adapter_registry is not None:
+        if (
+            self.adapter_registry is not None
+            or self.template_directory is not None
+            or self.experiment_template_binding is not None
+            or self.paper_directory is not None
+        ):
             for job in self.store.list_unplanned_jobs(limit=self.max_plans_per_tick):
                 self._verify_runtime()
                 try:
-                    definitions = self.adapter_registry.plan(job.spec)
+                    if self.paper_directory is not None and job.spec.parameters.strategy_name in {"paper_reconcile", "paper_backtest_band"}:
+                        registry = self.paper_directory.registry_for_spec(job.spec)
+                    else:
+                        directory = self.template_directory
+                        if self.experiment_template_binding is not None:
+                            directory = self.experiment_template_binding.directory_for_job(job.job_id, job.spec) or directory
+                        if directory is not None:
+                            registry = directory.registry_for_spec(job.spec)
+                        else:
+                            from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
+                            registry = self.adapter_registry or default_strategy_job_adapter_registry()
+                    definitions = registry.plan(job.spec)
                 except Exception as exc:
                     lease, mutation_now = self._mutation_context()
                     authority_now = mutation_now

@@ -1,0 +1,11 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.13.12, pytest-9.0.3, pluggy-1.6.0
+rootdir: /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk
+configfile: pyproject.toml
+plugins: mock-3.15.1, anyio-4.13.0
+collected 43 items / 22 deselected / 21 selected
+
+tests/unit/test_research_query_review.py ..........                      [ 47%]
+tests/unit/test_research_query.py ...........                            [100%]
+
+====================== 21 passed, 22 deselected in 0.33s =======================

@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 from zoneinfo import ZoneInfo
 
 import akshare as ak
@@ -22,6 +22,9 @@ from rquant.pipeline import _compute_levels
 from rquant.price_adjustment import resolve_price_basis_adjustment
 from rquant.risk.blacklist import load_active_blacklist
 from rquant.storage.duckdb import DuckDBStore
+
+if TYPE_CHECKING:
+    from rquant.monitor_builtin_runtime import OriginalBuiltinSourceOutlet
 
 
 class RealtimeQuote(BaseModel):
@@ -257,6 +260,11 @@ class WatchItem:
     blacklist_categories: list[str] = field(default_factory=list)
     triggered: dict[str, bool] = field(
         default_factory=lambda: {
+            "40": False,
+            "30": False,
+            "20": False,
+            "strong": False,
+            "weak": False,
             "attack_open_strength": False,
             "attack_strong_carry": False,
             "attack_break_high": False,
@@ -550,6 +558,45 @@ def fetch_realtime_prices(
         payload.pop("source", None)
         result[code] = payload
     return result
+
+
+def check_levels(
+    item: WatchItem,
+    current_price: float,
+    daily_low: float,
+) -> list[dict]:
+    """检查实时价/当日最低是否触达各档位，返回新触发的事件列表。"""
+    levels = [
+        ("40", item.level_40),
+        ("30", item.level_30),
+        ("20", item.level_20),
+        ("strong", item.stop_strong),
+        ("weak", item.stop_weak),
+    ]
+
+    events = []
+    for level_name, level_price in levels:
+        if item.triggered[level_name]:
+            continue
+
+        if current_price <= level_price:
+            item.triggered[level_name] = True
+            events.append({
+                "level": level_name,
+                "trigger_price": current_price,
+                "level_price": level_price,
+                "trigger_type": "realtime",
+            })
+        elif daily_low <= level_price:
+            item.triggered[level_name] = True
+            events.append({
+                "level": level_name,
+                "trigger_price": daily_low,
+                "level_price": level_price,
+                "trigger_type": "daily_low",
+            })
+
+    return events
 
 
 def check_attack_signals(
@@ -867,9 +914,16 @@ def _recover_legacy_shadow_export(trade_date: date) -> None:
     )
 
 
-def run_monitor(interval: int = 5) -> int:
+def run_monitor(
+    interval: int = 5, *, builtin_outlet: OriginalBuiltinSourceOutlet | None = None
+) -> int:
     """盘中监控主循环。"""
     from rquant.notify import notify
+
+    if builtin_outlet is not None:
+        from rquant.monitor_builtin_runtime import require_original_builtin_source_outlet
+
+        require_original_builtin_source_outlet(builtin_outlet)
 
     today = date.today()
 
@@ -951,6 +1005,7 @@ def run_monitor(interval: int = 5) -> int:
                 continue
 
             # phase in ("morning", "afternoon")
+            builtin_requested_at = _now() if builtin_outlet is not None else None
             quotes = quote_provider.fetch(ts_codes) if quote_provider else {}
             if quote_provider is not None and not quote_provider.used_fresh_tushare:
                 fallback_codes = ts_codes
@@ -959,6 +1014,32 @@ def run_monitor(interval: int = 5) -> int:
             if fallback_codes:
                 fallback_quotes = fetch_realtime_quotes(fallback_codes)
                 quotes.update(fallback_quotes)
+
+            if builtin_outlet is not None and builtin_outlet.captures("original_monitor"):
+                from rquant.monitor_builtin_runtime import OriginalMonitorFetchReceipt
+
+                completed_at = _now()
+                cache_times = (
+                    () if quote_provider is None else tuple(
+                        value for value in (
+                            quote_provider._last_rt_min_success, quote_provider._last_daily_refresh
+                        ) if value is not None
+                    )
+                )
+                try:
+                    builtin_outlet.monitor_snapshot(
+                        watchlist=tuple(watchlist), quotes=tuple(quotes.values()),
+                        fetch=OriginalMonitorFetchReceipt(
+                            requested_at=builtin_requested_at, response_received_at=completed_at,
+                            tushare_cache_at=None if not cache_times else max(cache_times),
+                            fallback_codes=tuple(sorted(fallback_codes)),
+                        ),
+                    )
+                except Exception:
+                    builtin_outlet.unavailable(
+                        origins=("original_monitor",), observed_at=completed_at,
+                        reason="monitor_capture_unavailable",
+                    )
 
             for code, quote in quotes.items():
                 # 单票故障隔离：某只票的存库 / notify / 日期计算异常（盘中写锁竞争、
@@ -969,6 +1050,11 @@ def run_monitor(interval: int = 5) -> int:
                         continue
 
                     events = check_attack_signals(item, quote)
+                    if (
+                        builtin_outlet is not None and builtin_outlet.captures("original_monitor")
+                        and item.pool == "pool2"
+                    ):
+                        events = check_levels(item, quote.price, quote.low) + events
 
                     for evt in events:
                         # 存库
@@ -990,7 +1076,9 @@ def run_monitor(interval: int = 5) -> int:
                         )
                         store.upsert_monitor_event(evt_df)
 
-                        triggers_summary[evt["level"]] = triggers_summary.get(evt["level"], 0) + 1
+                        triggers_summary[evt["level"]] = (
+                            triggers_summary.get(evt["level"], 0) + 1
+                        )
 
                         days = _count_trading_days_since(
                             store,
@@ -999,6 +1087,11 @@ def run_monitor(interval: int = 5) -> int:
                         )
                         ref_date = item.entry_date or item.limit_up_date
 
+                        if (
+                            builtin_outlet is not None
+                            and builtin_outlet.captures("original_monitor")
+                        ):
+                            continue
                         notify(
                             "price_level",
                             ts_code=code,

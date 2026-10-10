@@ -9,8 +9,10 @@ import duckdb
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from rquant.research_lake import ResearchDataset
+from rquant.strategy_template_definition import StrategyTemplateExecutionVersion
 
 SUSPENSION_SESSION_EVIDENCE_DATASET = "stock_suspend_session_evidence"
+FACTOR_EVAL_CONTRACT_VERSION = "factor-eval-v1"
 
 
 class _DependencyModel(BaseModel):
@@ -23,6 +25,48 @@ class StrategyTableDependency(_DependencyModel):
     date_column: str | None = None
     code_column: str | None = None
     available_at_column: str | None = None
+
+
+PORTFOLIO_BACKTEST_CONTRACT_VERSION = "portfolio-daily-v1"
+_PORTFOLIO_TABLE_DEPENDENCIES = (
+    StrategyTableDependency(
+        dataset_id="portfolio_backtest_input", table_name="portfolio_backtest_input"
+    ),
+)
+
+_PAPER_TABLE_DEPENDENCIES = (
+    StrategyTableDependency(dataset_id="paper_research_input", table_name="paper_research_input"),
+)
+
+MINUTE_FORMAL_CONTRACT_VERSION = "minute-runtime-replay-input/v2"
+_MINUTE_FORMAL_TABLE_DEPENDENCIES = (
+    StrategyTableDependency(dataset_id="minute_runtime_replay_input", table_name="minute_runtime_replay_input"),
+)
+MINUTE_PARAMETER_CONTRACT_VERSION = "minute-parameter-replay-input/v1"
+_MINUTE_PARAMETER_TABLE_DEPENDENCIES = (
+    StrategyTableDependency(dataset_id="minute_parameter_replay_input", table_name="minute_parameter_replay_input"),
+)
+
+
+_FACTOR_TABLE_DEPENDENCIES = (
+    StrategyTableDependency(
+        dataset_id="daily_bar",
+        table_name="daily_bar",
+        date_column="trade_date",
+        code_column="ts_code",
+    ),
+    StrategyTableDependency(
+        dataset_id="adj_factor",
+        table_name="adj_factor",
+        date_column="trade_date",
+        code_column="ts_code",
+    ),
+    StrategyTableDependency(
+        dataset_id="trade_calendar",
+        table_name="trade_calendar",
+        date_column="cal_date",
+    ),
+)
 
 
 class BoundStrategyEligibility(_DependencyModel):
@@ -83,11 +127,40 @@ def query_bound_strategy_eligibility(
 class StrategyExecutionDependencies(_DependencyModel):
     strategy_id: str = Field(min_length=1)
     contract_version: str = Field(min_length=1)
-    lake_datasets: tuple[ResearchDataset, ...] = Field(min_length=1)
+    lake_datasets: tuple[ResearchDataset, ...]
     materialized_tables: tuple[StrategyTableDependency, ...] = Field(min_length=1)
+    template_definition: StrategyTemplateExecutionVersion | None = None
 
     @model_validator(mode="after")
     def validate_unique_dependencies(self) -> StrategyExecutionDependencies:
+        if self.template_definition is not None:
+            if (self.strategy_id, self.contract_version, self.lake_datasets, self.materialized_tables) != (self.template_definition.strategy_id, "strategy-template-input/v1", (), (StrategyTableDependency(dataset_id="strategy_template_input", table_name="strategy_template_input"),)):
+                raise ValueError("template source requires its exact committed definition and input table")
+        materialized_only = (
+            self.strategy_id == "factor_eval"
+            and self.contract_version == FACTOR_EVAL_CONTRACT_VERSION
+            and self.materialized_tables == _FACTOR_TABLE_DEPENDENCIES
+        ) or (
+            self.strategy_id == "portfolio_backtest"
+            and self.contract_version == PORTFOLIO_BACKTEST_CONTRACT_VERSION
+            and self.materialized_tables == _PORTFOLIO_TABLE_DEPENDENCIES
+        ) or (
+            self.strategy_id in {"paper_reconcile", "paper_backtest_band"}
+            and self.contract_version == "paper-research-input/v1"
+            and self.materialized_tables == _PAPER_TABLE_DEPENDENCIES
+        ) or (
+            self.strategy_id == "minute_runtime_replay"
+            and self.contract_version == MINUTE_FORMAL_CONTRACT_VERSION
+            and self.materialized_tables == _MINUTE_FORMAL_TABLE_DEPENDENCIES
+        ) or (
+            self.strategy_id == "minute_parameter_replay"
+            and self.contract_version == MINUTE_PARAMETER_CONTRACT_VERSION
+            and self.materialized_tables == _MINUTE_PARAMETER_TABLE_DEPENDENCIES
+        ) or self.template_definition is not None
+        if not self.lake_datasets and not materialized_only:
+            raise ValueError(
+                "lake_datasets may be empty only for an exact approved materialized contract"
+            )
         if len(self.lake_datasets) != len(set(self.lake_datasets)):
             raise ValueError("lake_datasets must be unique")
         table_names = [item.table_name for item in self.materialized_tables]
@@ -142,6 +215,22 @@ _COMMON_DAILY_TABLES = (
 
 
 STRATEGY_EXECUTION_DEPENDENCIES: dict[str, StrategyExecutionDependencies] = {
+    "minute_parameter_replay": StrategyExecutionDependencies(strategy_id="minute_parameter_replay",
+        contract_version=MINUTE_PARAMETER_CONTRACT_VERSION, lake_datasets=(),
+        materialized_tables=_MINUTE_PARAMETER_TABLE_DEPENDENCIES),
+    "minute_runtime_replay": StrategyExecutionDependencies(strategy_id="minute_runtime_replay",
+        contract_version=MINUTE_FORMAL_CONTRACT_VERSION, lake_datasets=(),
+        materialized_tables=_MINUTE_FORMAL_TABLE_DEPENDENCIES),
+    "paper_reconcile": StrategyExecutionDependencies(strategy_id="paper_reconcile", contract_version="paper-research-input/v1",
+                                                      lake_datasets=(), materialized_tables=_PAPER_TABLE_DEPENDENCIES),
+    "paper_backtest_band": StrategyExecutionDependencies(strategy_id="paper_backtest_band", contract_version="paper-research-input/v1",
+                                                          lake_datasets=(), materialized_tables=_PAPER_TABLE_DEPENDENCIES),
+    "portfolio_backtest": StrategyExecutionDependencies(
+        strategy_id="portfolio_backtest",
+        contract_version=PORTFOLIO_BACKTEST_CONTRACT_VERSION,
+        lake_datasets=(),
+        materialized_tables=_PORTFOLIO_TABLE_DEPENDENCIES,
+    ),
     "n_shape": StrategyExecutionDependencies(
         strategy_id="n_shape",
         contract_version="stage1-v1",
@@ -184,6 +273,17 @@ STRATEGY_EXECUTION_DEPENDENCIES: dict[str, StrategyExecutionDependencies] = {
         ),
     ),
 }
+
+FACTOR_EVAL_DEPENDENCIES = StrategyExecutionDependencies(
+    strategy_id="factor_eval",
+    contract_version=FACTOR_EVAL_CONTRACT_VERSION,
+    lake_datasets=(),
+    materialized_tables=_FACTOR_TABLE_DEPENDENCIES,
+)
+
+
+def factor_execution_dependencies() -> StrategyExecutionDependencies:
+    return FACTOR_EVAL_DEPENDENCIES
 
 
 def strategy_execution_dependencies(

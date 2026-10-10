@@ -1,0 +1,146 @@
+.pbm {
+  min-width: 0;
+  margin: 0 16px 16px;
+  padding: 16px 0;
+  border: 0;
+  border-bottom: 1px solid var(--rule);
+}
+
+.pbm-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 14px;
+}
+
+.pbm-heading h3 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.pbm-legend {
+  display: flex;
+  gap: 12px;
+  font-size: 11px;
+}
+
+.pbm-columns,
+.pbm-year {
+  display: grid;
+  grid-template-columns: 40px minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+}
+
+.pbm-year + .pbm-year {
+  margin-top: 8px;
+}
+
+.pbm-year h4 {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--muted);
+}
+
+.pbm-months {
+  display: grid;
+  grid-template-columns: repeat(12, minmax(0, 1fr));
+  gap: 4px;
+  min-width: 0;
+}
+
+.pbm-columns {
+  margin-bottom: 6px;
+  font-size: 10px;
+  text-align: center;
+  color: var(--muted);
+}
+
+.pbm-cell {
+  width: 100%;
+  min-width: 0;
+  min-height: 44px;
+  padding: 8px 2px;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  background: var(--surface-2);
+  color: var(--ink-2);
+  font: inherit;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.pbm-cell[data-tone="up"] {
+  border-color: var(--up-weak);
+  background: var(--up-weak);
+  color: var(--up-t);
+}
+
+.pbm-cell[data-tone="down"] {
+  border-color: var(--down-weak);
+  background: var(--down-weak);
+  color: var(--down-t);
+}
+
+.pbm-cell[data-tone="unknown"] {
+  color: var(--faint);
+}
+
+.pbm-cell:hover {
+  border-color: var(--rule-strong);
+}
+
+.pbm-cell:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.pbm-cell-month {
+  display: none;
+}
+
+.pbm-cell .num {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (max-width: 640px) {
+  .pbm {
+    margin-inline: 12px;
+  }
+
+  .pbm-columns {
+    display: none;
+  }
+
+  .pbm-year {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .pbm-year + .pbm-year {
+    margin-top: 18px;
+  }
+
+  .pbm-months {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 6px;
+  }
+
+  .pbm-cell {
+    min-height: 60px;
+    padding: 8px 4px;
+    font-size: 12px;
+  }
+
+  .pbm-cell-month {
+    display: block;
+    margin-bottom: 5px;
+    font-size: 10px;
+    color: var(--muted);
+  }
+}

@@ -11,10 +11,20 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Self
+from typing import Annotated, Literal, Self
 
-from pydantic import Field, StringConstraints, field_validator, model_validator
+from pydantic import Field, StrictInt, StringConstraints, field_validator, model_validator
 
+from rquant.condition_alert_route import (
+    ConditionAlertBusEventRecord,
+    ConditionAlertBusRoutedRecord,
+    ConditionAlertRecipientPolicy,
+)
+from rquant.condition_alert_runtime_contracts import (
+    ConditionAlertProducerEventRecord,
+    ConditionAlertRuntimeActivation,
+    ConditionAlertSourceDescriptor,
+)
 from rquant.delivery_contracts import (
     DeliveryChannel,
     DeliveryTarget,
@@ -24,6 +34,16 @@ from rquant.delivery_contracts import (
     RouterDisposition,
     RouterReceipt,
 )
+from rquant.price_alert_route import (
+    PriceAlertBusEventRecord,
+    PriceAlertBusRoutedRecord,
+    PriceAlertRecipientPolicy,
+)
+from rquant.price_alert_runtime_contracts import (
+    PriceAlertRuntimeActivation,
+    PriceAlertSourceDescriptor,
+)
+from rquant.price_alert_runtime_store import PriceAlertProducerEventRecord
 from rquant.runtime_contracts import (
     AwareUtcDatetime,
     RuntimeContractModel,
@@ -37,6 +57,7 @@ from rquant.signal_contracts import (
 )
 
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+_MAX_OBSERVED_PREFIX_RECORDS = 10_000
 
 
 class SignalBusLeaseError(RuntimeError):
@@ -217,6 +238,78 @@ class SignalBusRoutedRecord(SignalBusSignalRecord):
         if self.receipt.signal_id != self.signal_id:
             raise ValueError("route receipt signal_id does not match signal payload")
         return self
+
+
+def _observed_prefix_digest(
+    records: Iterable[SignalBusSignalRecord | SignalBusRoutedRecord],
+) -> str:
+    return canonical_sha256(
+        {
+            "contract": "signal-bus-observed-prefix/v1",
+            "rows": tuple(
+                (
+                    record.global_sequence,
+                    record.signal_id,
+                    record.payload_hash,
+                    record.received_at,
+                )
+                for record in records
+            ),
+        }
+    )
+
+
+class SignalBusObservedPrefixReceipt(RuntimeContractModel):
+    """A verified bus prefix. It does not attest to upstream producer coverage."""
+
+    source_generation_id: Sha256
+    source_created_at: AwareUtcDatetime
+    first_global_sequence: StrictInt = Field(ge=1)
+    source_high_watermark: StrictInt = Field(ge=0)
+    source_inspected_at: AwareUtcDatetime
+    prefix_row_count: StrictInt = Field(ge=0)
+    prefix_rows_sha256: Sha256
+    upstream_complete: Literal[False] = False
+
+    @model_validator(mode="after")
+    def validate_prefix(self) -> Self:
+        if self.first_global_sequence != 1:
+            raise ValueError("observed bus prefix must begin at global sequence one")
+        if self.prefix_row_count != self.source_high_watermark:
+            raise ValueError("observed bus prefix count differs from high watermark")
+        if self.source_created_at > self.source_inspected_at:
+            raise ValueError("bus source was created after observation")
+        return self
+
+    def matches_routed_prefix(
+        self,
+        source: SignalBusSourceDescriptor,
+        records: tuple[SignalBusRoutedRecord, ...],
+    ) -> bool:
+        """Compare a verified spool prefix to this bus cutoff without granting coverage."""
+        source = SignalBusSourceDescriptor.model_validate(source)
+        if (
+            source.generation_id != self.source_generation_id
+            or source.first_global_sequence != self.first_global_sequence
+            or source.high_watermark != self.source_high_watermark
+            or len(records) != self.prefix_row_count
+        ):
+            return False
+        verified: list[SignalBusRoutedRecord] = []
+        for expected, item in enumerate(records, start=1):
+            try:
+                record = SignalBusRoutedRecord.model_validate(item)
+            except ValueError:
+                return False
+            if (
+                record.global_sequence != expected
+                or record.received_at > self.source_inspected_at
+                or record.signal.available_at > self.source_inspected_at
+                or record.receipt.routed_at > self.source_inspected_at
+            ):
+                return False
+            verified.append(record)
+        return _observed_prefix_digest(verified) == self.prefix_rows_sha256
 
 
 class SignalRouteCursor(RuntimeContractModel):
@@ -578,6 +671,7 @@ class SignalBusStore:
 
     def _initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        fresh_file = not self.path.exists()
         connection = self._connect()
         try:
             connection.executescript(
@@ -698,51 +792,67 @@ class SignalBusStore:
                 """
             )
             connection.execute(_WATERMARK_RECOVERY_TABLE)
-            connection.execute(
-                """
-                INSERT OR IGNORE INTO signal_bus_metadata(metadata_key, metadata_value)
-                VALUES ('retry_policy_fingerprint', ?)
-                """,
-                (self.retry_policy_fingerprint,),
-            )
-            connection.execute(
-                """
-                INSERT OR IGNORE INTO signal_bus_metadata(metadata_key, metadata_value)
-                VALUES ('source_generation_id', ?)
-                """,
-                (secrets.token_hex(32),),
-            )
-            persisted, observed_max = _read_high_watermark_state(connection)
-            if persisted is None:
-                # Only a genuinely empty store may seed its own watermark. Deriving one
-                # from `MAX(global_sequence)` on a store that already holds rows is a
-                # silent self-correction, and if those rows were truncated it moves the
-                # watermark *down* with no exception and no audit row. Rebuilding a lost
-                # watermark is `recover_signal_bus_high_watermark`, nothing else.
-                if observed_max:
-                    raise SignalBusWatermarkError(
-                        "signal bus high watermark row is missing from a store that already "
-                        f"holds signal rows through {observed_max}"
-                    )
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                metadata_count = int(
+                    connection.execute("SELECT COUNT(*) FROM signal_bus_metadata").fetchone()[0]
+                )
                 connection.execute(
                     """
-                    INSERT INTO signal_bus_metadata(metadata_key, metadata_value)
-                    VALUES ('signal_high_watermark', '0')
-                    """
+                    INSERT OR IGNORE INTO signal_bus_metadata(metadata_key, metadata_value)
+                    VALUES ('retry_policy_fingerprint', ?)
+                    """,
+                    (self.retry_policy_fingerprint,),
                 )
-            observed = connection.execute(
-                """
-                SELECT metadata_value
-                FROM signal_bus_metadata
-                WHERE metadata_key = 'retry_policy_fingerprint'
-                """
-            ).fetchone()
-            if observed is None or observed["metadata_value"] != self.retry_policy_fingerprint:
-                raise ValueError("retry policy does not match the persisted signal bus policy")
-            # The seeding above only ever runs on an empty store, and an existing row is
-            # never rewritten. Opening a store whose watermark already disagrees with its
-            # rows fails closed here.
-            _require_consistent_high_watermark(connection)
+                generation_insert = connection.execute(
+                    """
+                    INSERT OR IGNORE INTO signal_bus_metadata(metadata_key, metadata_value)
+                    VALUES ('source_generation_id', ?)
+                    """,
+                    (secrets.token_hex(32),),
+                )
+                persisted, observed_max = _read_high_watermark_state(connection)
+                if (
+                    fresh_file
+                    and generation_insert.rowcount == 1
+                    and metadata_count == 0
+                    and not observed_max
+                ):
+                    connection.execute(
+                        """
+                        INSERT INTO signal_bus_metadata(metadata_key, metadata_value)
+                        VALUES ('source_created_at', ?)
+                        """,
+                        (_encode_time(datetime.now(UTC)),),
+                    )
+                if persisted is None:
+                    # A store with existing rows may never derive its missing watermark.
+                    if observed_max:
+                        raise SignalBusWatermarkError(
+                            "signal bus high watermark row is missing from a store that already "
+                            f"holds signal rows through {observed_max}"
+                        )
+                    connection.execute(
+                        """
+                        INSERT INTO signal_bus_metadata(metadata_key, metadata_value)
+                        VALUES ('signal_high_watermark', '0')
+                        """
+                    )
+                observed = connection.execute(
+                    """
+                    SELECT metadata_value
+                    FROM signal_bus_metadata
+                    WHERE metadata_key = 'retry_policy_fingerprint'
+                    """
+                ).fetchone()
+                if observed is None or observed["metadata_value"] != self.retry_policy_fingerprint:
+                    raise ValueError("retry policy does not match the persisted signal bus policy")
+                _require_consistent_high_watermark(connection)
+                connection.execute("COMMIT")
+            except BaseException:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
         finally:
             connection.close()
 
@@ -873,6 +983,93 @@ class SignalBusStore:
             generation_id=generation_id,
             high_watermark=int(high_watermark),
         )
+
+    def observed_prefix_receipt(
+        self,
+        *,
+        observed_at: datetime,
+        max_records: int = _MAX_OBSERVED_PREFIX_RECORDS,
+    ) -> SignalBusObservedPrefixReceipt | None:
+        """Verify one durable bus prefix without assuming upstream completeness."""
+        if type(max_records) is not int or not 1 <= max_records <= _MAX_OBSERVED_PREFIX_RECORDS:
+            raise ValueError("max_records must be between 1 and 10000")
+        inspected = _normalize_time(observed_at)
+        with self._read_snapshot() as connection:
+            metadata = {
+                str(row["metadata_key"]): str(row["metadata_value"])
+                for row in connection.execute(
+                    """
+                    SELECT metadata_key, metadata_value FROM signal_bus_metadata
+                    WHERE metadata_key IN (
+                        'source_generation_id', 'source_created_at', 'signal_high_watermark'
+                    )
+                    """
+                ).fetchall()
+            }
+            if not all(
+                key in metadata
+                for key in ("source_generation_id", "source_created_at", "signal_high_watermark")
+            ):
+                return None
+            if not metadata["source_created_at"].endswith("Z"):
+                return None
+            try:
+                high = _require_consistent_high_watermark(connection)
+                created_at = _require_time(metadata["source_created_at"])
+            except (SignalBusWatermarkError, TypeError, ValueError):
+                return None
+            if high > max_records or created_at > inspected:
+                return None
+            rows = connection.execute(
+                """
+                SELECT global_sequence, signal_id, payload_hash, payload_json,
+                       length(CAST(payload_json AS BLOB)) AS payload_size, received_at
+                FROM signal_envelope
+                WHERE global_sequence <= ?
+                ORDER BY global_sequence
+                LIMIT ?
+                """,
+                (high, max_records + 1),
+            ).fetchall()
+            if len(rows) != high:
+                return None
+            records: list[SignalBusSignalRecord] = []
+            try:
+                for expected, row in enumerate(rows, start=1):
+                    if int(row["global_sequence"]) != expected:
+                        return None
+                    signal = parse_stored_signal(
+                        signal_id=str(row["signal_id"]),
+                        payload_hash=str(row["payload_hash"]),
+                        payload_json=str(row["payload_json"]),
+                        payload_size=int(row["payload_size"]),
+                    )
+                    if not str(row["received_at"]).endswith("Z"):
+                        return None
+                    received_at = _require_time(row["received_at"])
+                    if received_at > inspected or signal.available_at > inspected:
+                        return None
+                    records.append(
+                        SignalBusSignalRecord(
+                            global_sequence=expected,
+                            signal_id=str(row["signal_id"]),
+                            payload_hash=str(row["payload_hash"]),
+                            payload_json=str(row["payload_json"]),
+                            signal=signal,
+                            received_at=received_at,
+                        )
+                    )
+                return SignalBusObservedPrefixReceipt(
+                    source_generation_id=metadata["source_generation_id"],
+                    source_created_at=created_at,
+                    first_global_sequence=1,
+                    source_high_watermark=high,
+                    source_inspected_at=inspected,
+                    prefix_row_count=len(records),
+                    prefix_rows_sha256=_observed_prefix_digest(records),
+                )
+            except (TypeError, ValueError):
+                return None
 
     def signals_after_global_sequence(
         self,
@@ -1528,9 +1725,7 @@ class SignalBusStore:
                 source_id=str(row["source_id"]),
                 previous_generation_id=str(row["previous_generation_id"]),
                 previous_source_generation_id=str(row["previous_source_generation_id"]),
-                previous_strategy_spec_fingerprint=str(
-                    row["previous_strategy_spec_fingerprint"]
-                ),
+                previous_strategy_spec_fingerprint=str(row["previous_strategy_spec_fingerprint"]),
                 archived_source_id=str(row["archived_source_id"]),
                 routed_through_sequence=int(row["routed_through_sequence"]),
                 abandoned_sequences=int(row["abandoned_sequences"]),
@@ -1879,6 +2074,21 @@ class SignalBusStore:
         lease_for: timedelta,
         limit: int,
     ) -> tuple[OutboxRecord, ...]:
+        return self._claim_due(
+            worker_id, now=now, lease_for=lease_for, limit=limit, include_price=False
+        )
+
+    def _claim_due(
+        self,
+        worker_id: str,
+        *,
+        now: datetime,
+        lease_for: timedelta,
+        limit: int,
+        include_price: bool,
+        include_condition: bool = False,
+        include_builtin: bool = False,
+    ) -> tuple[OutboxRecord, ...]:
         worker = worker_id.strip()
         claimed_at = _normalize_time(now)
         if not worker:
@@ -1905,22 +2115,39 @@ class SignalBusStore:
                     now_text,
                 ),
             )
+            eligible = self._merge_claim_ids(
+                connection, now=claimed_at, limit=limit,
+                include_price=include_price, include_condition=include_condition, include_builtin=include_builtin,
+            )
             candidates = connection.execute(
-                """
-                SELECT *
-                FROM delivery_outbox
-                WHERE status IN (?, ?)
-                  AND expires_at > ?
-                  AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
-                ORDER BY COALESCE(next_attempt_at, created_at),
-                         global_sequence, created_at, outbox_id
-                LIMIT ?
-                """,
+                (
+                    "\n                SELECT *\n                FROM "
+                    "delivery_outbox\n                WHERE status IN (?, ?)\n     "
+                    "             AND expires_at > ?\n                  AND "
+                    "(next_attempt_at IS NULL OR next_attempt_at <= ?)\n          "
+                    "        AND (? OR signal_id NOT IN (\n                    "
+                    "SELECT signal_id FROM signal_envelope\n                    "
+                    "WHERE json_extract(payload_json, '$.envelope_schema') = "
+                    "'rquant.price-alert-event/v1'\n                  ))\n         "
+                    "AND (? OR signal_id NOT IN (SELECT signal_id FROM signal_envelope "
+                    "WHERE json_extract(payload_json, '$.envelope_schema')='rquant.condition-alert-event/v1')) "
+                    "AND (? OR signal_id NOT IN (SELECT signal_id FROM signal_envelope "
+                    "WHERE json_extract(payload_json, '$.envelope_schema')='rquant.builtin-condition-alert-event/v1')) "
+                    "AND (? OR outbox_id IN (SELECT value FROM json_each(?))) "
+                    "       ORDER BY COALESCE(next_attempt_at, created_at),\n     "
+                    "                    global_sequence, created_at, outbox_id\n "
+                    "               LIMIT ?\n                "
+                ),
                 (
                     OutboxStatus.PENDING.value,
                     OutboxStatus.RETRY.value,
                     now_text,
                     now_text,
+                    include_price,
+                    include_condition,
+                    include_builtin,
+                    eligible is None,
+                    json.dumps(eligible or ()),
                     limit,
                 ),
             ).fetchall()
@@ -1950,6 +2177,181 @@ class SignalBusStore:
                 self._before_commit(connection)
             rows = self._rows_for_outbox_ids(connection, claimed_ids)
             return tuple(self._outbox_from_row(row) for row in rows)
+
+    def _merge_claim_ids(
+        self, connection: sqlite3.Connection, *, now: datetime, limit: int,
+        include_price: bool, include_condition: bool, include_builtin: bool = False,
+    ) -> tuple[str, ...] | None:
+        del connection, now, limit, include_price, include_condition, include_builtin
+        return None
+
+    def install_price_alert_route_v1(self, activation: PriceAlertRuntimeActivation) -> None:
+        from rquant.price_alert_route import install_price_alert_route
+
+        install_price_alert_route(self, activation)
+
+    def _price_alert_failpoint(self, _point: str) -> None:
+        """Fault-injection boundary for the dedicated price transaction."""
+
+    def install_condition_alert_route_v1(self, activation: ConditionAlertRuntimeActivation) -> None:
+        from rquant.condition_alert_route import install_condition_alert_route
+
+        install_condition_alert_route(self, activation)
+
+    def _condition_alert_failpoint(self, _point: str) -> None:
+        """Fault injection before the original condition/bus/outbox transaction commit."""
+
+    def commit_condition_alert_route(
+        self,
+        *,
+        activation: ConditionAlertRuntimeActivation,
+        policy: ConditionAlertRecipientPolicy,
+        source: ConditionAlertSourceDescriptor,
+        record: ConditionAlertProducerEventRecord,
+        source_inspected_at: datetime,
+        routed_at: datetime,
+    ) -> ConditionAlertBusRoutedRecord:
+        from rquant.condition_alert_route import route_condition_alert_event
+
+        return route_condition_alert_event(
+            self,
+            activation=activation,
+            policy=policy,
+            source=source,
+            record=record,
+            source_inspected_at=source_inspected_at,
+            routed_at=routed_at,
+        )
+
+    def commit_price_alert_route(
+        self,
+        *,
+        activation: PriceAlertRuntimeActivation,
+        policy: PriceAlertRecipientPolicy,
+        source: PriceAlertSourceDescriptor,
+        record: PriceAlertProducerEventRecord,
+        source_inspected_at: datetime,
+        routed_at: datetime,
+    ) -> PriceAlertBusRoutedRecord:
+        from rquant.price_alert_route import route_price_alert_event
+
+        return route_price_alert_event(
+            self,
+            activation=activation,
+            policy=policy,
+            source=source,
+            record=record,
+            source_inspected_at=source_inspected_at,
+            routed_at=routed_at,
+        )
+
+    def notification_event(
+        self, identifier: int | str
+    ) -> SignalBusSignalRecord | PriceAlertBusEventRecord | ConditionAlertBusEventRecord | None:
+        from rquant.condition_alert_route import notification_record
+
+        with self._read_snapshot() as connection:
+            return notification_record(connection, identifier)
+
+    def notification_events_after_global_sequence(
+        self,
+        *,
+        after_sequence: int,
+        through_sequence: int,
+        observed_at: datetime,
+        limit: int,
+    ) -> tuple[
+        SignalBusSignalRecord | PriceAlertBusEventRecord | ConditionAlertBusEventRecord, ...
+    ]:
+        return self._notification_events(
+            after_sequence=after_sequence,
+            through_sequence=through_sequence,
+            observed_at=observed_at,
+            limit=limit,
+            routed=False,
+        )
+
+    def routed_notification_events_after_global_sequence(
+        self,
+        *,
+        after_sequence: int,
+        through_sequence: int,
+        observed_at: datetime,
+        limit: int,
+    ) -> tuple[
+        SignalBusRoutedRecord | PriceAlertBusRoutedRecord | ConditionAlertBusRoutedRecord, ...
+    ]:
+        return self._notification_events(
+            after_sequence=after_sequence,
+            through_sequence=through_sequence,
+            observed_at=observed_at,
+            limit=limit,
+            routed=True,
+        )
+
+    def _notification_events(
+        self,
+        *,
+        after_sequence: int,
+        through_sequence: int,
+        observed_at: datetime,
+        limit: int,
+        routed: bool,
+    ) -> tuple[
+        SignalBusSignalRecord
+        | SignalBusRoutedRecord
+        | PriceAlertBusEventRecord
+        | PriceAlertBusRoutedRecord
+        | ConditionAlertBusEventRecord
+        | ConditionAlertBusRoutedRecord,
+        ...,
+    ]:
+        from rquant.condition_alert_route import notification_record
+
+        if (
+            type(after_sequence) is not int
+            or after_sequence < 0
+            or type(through_sequence) is not int
+            or through_sequence < after_sequence
+            or type(limit) is not int
+            or not 1 <= limit <= 100
+        ):
+            raise ValueError("mixed notification read range is outside its bounded prefix")
+        visible_at = _normalize_time(observed_at)
+        with self._read_snapshot() as connection:
+            _require_consistent_high_watermark(connection)
+            high = int(
+                connection.execute(
+                    "SELECT metadata_value FROM signal_bus_metadata WHERE me"
+                    "tadata_key='signal_high_watermark'"
+                ).fetchone()[0]
+            )
+            if through_sequence > high:
+                raise ValueError("mixed notification source watermark regressed")
+            records = []
+            for sequence in range(
+                after_sequence + 1, min(through_sequence, after_sequence + limit) + 1
+            ):
+                record = notification_record(connection, sequence, routed=routed)
+                if record is None:
+                    raise ValueError("mixed notification source has a sequence gap")
+                available_at = (
+                    record.event.available_at
+                    if type(record)
+                    in {
+                        PriceAlertBusEventRecord,
+                        PriceAlertBusRoutedRecord,
+                        ConditionAlertBusEventRecord,
+                        ConditionAlertBusRoutedRecord,
+                    }
+                    else record.signal.available_at
+                )
+                if record.received_at > visible_at or available_at > visible_at:
+                    raise ValueError("mixed notification source event is not visible")
+                if routed and record.receipt.routed_at > visible_at:
+                    raise ValueError("mixed notification route receipt is not visible")
+                records.append(record)
+            return tuple(records)
 
     def complete_success(
         self,
@@ -2004,81 +2406,93 @@ class SignalBusStore:
         provider_receipt: str | None,
         error: str | None,
     ) -> OutboxRecord:
-        completed = _normalize_time(completed_at)
         with self._write_transaction() as connection:
-            row = connection.execute(
-                "SELECT * FROM delivery_outbox WHERE outbox_id = ?",
-                (outbox_id,),
-            ).fetchone()
-            if row is None:
-                raise KeyError(f"outbox {outbox_id!r} does not exist")
-            self._verify_lease(
-                row,
-                worker_id=worker_id,
-                attempt_no=attempt_no,
-                completed_at=completed,
+            return self._complete_in_transaction(
+                connection, outbox_id, worker_id=worker_id, attempt_no=attempt_no,
+                completed_at=completed_at, success=success,
+                provider_receipt=provider_receipt, error=error,
             )
-            started_at = _require_time(row["lease_started_at"])
-            connection.execute(
-                """
-                INSERT INTO delivery_attempt(
-                    outbox_id, attempt_no, started_at, completed_at,
-                    success, provider_receipt, error
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    outbox_id,
-                    attempt_no,
-                    _encode_time(started_at),
-                    _encode_time(completed),
-                    int(success),
-                    provider_receipt,
-                    error,
-                ),
-            )
-            if success:
-                status = OutboxStatus.SUCCEEDED
+
+    def _complete_in_transaction(
+        self, connection: sqlite3.Connection, outbox_id: str, *, worker_id: str,
+        attempt_no: int, completed_at: datetime, success: bool,
+        provider_receipt: str | None, error: str | None,
+    ) -> OutboxRecord:
+        completed = _normalize_time(completed_at)
+        row = connection.execute(
+            "SELECT * FROM delivery_outbox WHERE outbox_id = ?",
+            (outbox_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"outbox {outbox_id!r} does not exist")
+        self._verify_lease(
+            row,
+            worker_id=worker_id,
+            attempt_no=attempt_no,
+            completed_at=completed,
+        )
+        started_at = _require_time(row["lease_started_at"])
+        connection.execute(
+            """
+            INSERT INTO delivery_attempt(
+                outbox_id, attempt_no, started_at, completed_at,
+                success, provider_receipt, error
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                outbox_id,
+                attempt_no,
+                _encode_time(started_at),
+                _encode_time(completed),
+                int(success),
+                provider_receipt,
+                error,
+            ),
+        )
+        if success:
+            status = OutboxStatus.SUCCEEDED
+            next_attempt_at = None
+            last_error = None
+        else:
+            assert error is not None
+            expires_at = _require_time(row["expires_at"])
+            retry_at = completed + self._retry_delay(attempt_no)
+            if completed >= expires_at or retry_at >= expires_at:
+                status = OutboxStatus.EXPIRED
                 next_attempt_at = None
-                last_error = None
+                last_error = f"delivery window expired after failure: {error}"
+            elif attempt_no >= self.max_attempts:
+                status = OutboxStatus.DEAD_LETTER
+                next_attempt_at = None
+                last_error = error
             else:
-                assert error is not None
-                expires_at = _require_time(row["expires_at"])
-                retry_at = completed + self._retry_delay(attempt_no)
-                if completed >= expires_at or retry_at >= expires_at:
-                    status = OutboxStatus.EXPIRED
-                    next_attempt_at = None
-                    last_error = f"delivery window expired after failure: {error}"
-                elif attempt_no >= self.max_attempts:
-                    status = OutboxStatus.DEAD_LETTER
-                    next_attempt_at = None
-                    last_error = error
-                else:
-                    status = OutboxStatus.RETRY
-                    next_attempt_at = retry_at
-                    last_error = error
-            connection.execute(
-                """
-                UPDATE delivery_outbox
-                SET status = ?, next_attempt_at = ?, lease_owner = NULL,
-                    lease_started_at = NULL, lease_until = NULL,
-                    last_error = ?, updated_at = ?
-                WHERE outbox_id = ?
-                """,
-                (
-                    status.value,
-                    (_encode_time(next_attempt_at) if next_attempt_at is not None else None),
-                    last_error,
-                    _encode_time(completed),
-                    outbox_id,
-                ),
-            )
-            self._before_commit(connection)
-            updated = connection.execute(
-                "SELECT * FROM delivery_outbox WHERE outbox_id = ?",
-                (outbox_id,),
-            ).fetchone()
-            assert updated is not None
-            return self._outbox_from_row(updated)
+                status = OutboxStatus.RETRY
+                next_attempt_at = retry_at
+                last_error = error
+        connection.execute(
+            """
+            UPDATE delivery_outbox
+            SET status = ?, next_attempt_at = ?, lease_owner = NULL,
+                lease_started_at = NULL, lease_until = NULL,
+                last_error = ?, updated_at = ?
+            WHERE outbox_id = ?
+            """,
+            (
+                status.value,
+                (_encode_time(next_attempt_at) if next_attempt_at is not None else None),
+                last_error,
+                _encode_time(completed),
+                outbox_id,
+            ),
+        )
+        self._before_commit(connection)
+        updated = connection.execute(
+            "SELECT * FROM delivery_outbox WHERE outbox_id = ?",
+            (outbox_id,),
+        ).fetchone()
+        assert updated is not None
+        return self._outbox_from_row(updated)
+
 
     def _retry_delay(self, attempt_no: int) -> timedelta:
         multiplier = 1 << max(attempt_no - 1, 0)
@@ -2177,6 +2591,17 @@ class SignalBusStore:
     ) -> UnknownDeliveryEvidence:
         """Persist evidence when a provider outcome or its write-back is uncertain."""
 
+        with self._write_transaction() as connection:
+            return self._record_unknown_in_transaction(
+                connection, outbox_id, worker_id=worker_id, attempt_no=attempt_no,
+                observed_at=observed_at, reason=reason, provider_receipt=provider_receipt,
+            )
+
+    def _record_unknown_in_transaction(
+        self, connection: sqlite3.Connection, outbox_id: str, *, worker_id: str,
+        attempt_no: int, observed_at: datetime, reason: str,
+        provider_receipt: str | None,
+    ) -> UnknownDeliveryEvidence:
         reason = reason.strip()
         receipt = provider_receipt.strip() if provider_receipt is not None else None
         if not reason:
@@ -2192,64 +2617,64 @@ class SignalBusStore:
             reason=reason,
             provider_receipt=receipt,
         )
-        with self._write_transaction() as connection:
-            row = connection.execute(
-                "SELECT * FROM delivery_outbox WHERE outbox_id = ?",
-                (outbox_id,),
-            ).fetchone()
-            if row is None:
-                raise KeyError(f"outbox {outbox_id!r} does not exist")
-            if row["status"] != OutboxStatus.LEASED.value:
-                raise SignalBusLeaseError("outbox does not have an active lease")
-            if row["lease_owner"] != worker_id:
-                raise SignalBusLeaseError("lease owner does not match worker")
-            if row["attempt_count"] != attempt_no:
-                raise SignalBusLeaseError("attempt number does not match active lease")
-            started_at = _require_time(row["lease_started_at"])
-            if observed < started_at:
-                raise SignalBusLeaseError("unknown outcome precedes lease start")
-            existing = connection.execute(
-                """
-                SELECT * FROM delivery_unknown
-                WHERE outbox_id = ? AND attempt_no = ?
-                """,
-                (outbox_id, attempt_no),
-            ).fetchone()
-            if existing is not None:
-                restored = self._unknown_from_row(existing)
-                if restored != evidence:
-                    raise SignalBusLeaseError("unknown delivery evidence is immutable")
-                return restored
-            connection.execute(
-                """
-                INSERT INTO delivery_unknown(
-                    outbox_id, attempt_no, worker_id, observed_at,
-                    reason, provider_receipt
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    outbox_id,
-                    attempt_no,
-                    worker_id,
-                    _encode_time(observed),
-                    reason,
-                    receipt,
-                ),
-            )
-            connection.execute(
-                """
-                UPDATE delivery_outbox
-                SET last_error = ?, updated_at = ?
-                WHERE outbox_id = ?
-                """,
-                (
-                    f"delivery outcome unknown: {reason}",
-                    _encode_time(observed),
-                    outbox_id,
-                ),
-            )
-            self._before_commit(connection)
-            return evidence
+        row = connection.execute(
+            "SELECT * FROM delivery_outbox WHERE outbox_id = ?",
+            (outbox_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"outbox {outbox_id!r} does not exist")
+        if row["status"] != OutboxStatus.LEASED.value:
+            raise SignalBusLeaseError("outbox does not have an active lease")
+        if row["lease_owner"] != worker_id:
+            raise SignalBusLeaseError("lease owner does not match worker")
+        if row["attempt_count"] != attempt_no:
+            raise SignalBusLeaseError("attempt number does not match active lease")
+        started_at = _require_time(row["lease_started_at"])
+        if observed < started_at:
+            raise SignalBusLeaseError("unknown outcome precedes lease start")
+        existing = connection.execute(
+            """
+            SELECT * FROM delivery_unknown
+            WHERE outbox_id = ? AND attempt_no = ?
+            """,
+            (outbox_id, attempt_no),
+        ).fetchone()
+        if existing is not None:
+            restored = self._unknown_from_row(existing)
+            if restored != evidence:
+                raise SignalBusLeaseError("unknown delivery evidence is immutable")
+            return restored
+        connection.execute(
+            """
+            INSERT INTO delivery_unknown(
+                outbox_id, attempt_no, worker_id, observed_at,
+                reason, provider_receipt
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                outbox_id,
+                attempt_no,
+                worker_id,
+                _encode_time(observed),
+                reason,
+                receipt,
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE delivery_outbox
+            SET last_error = ?, updated_at = ?
+            WHERE outbox_id = ?
+            """,
+            (
+                f"delivery outcome unknown: {reason}",
+                _encode_time(observed),
+                outbox_id,
+            ),
+        )
+        self._before_commit(connection)
+        return evidence
+
 
     def unknown_deliveries(
         self,

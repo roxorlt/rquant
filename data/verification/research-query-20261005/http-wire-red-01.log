@@ -1,0 +1,44 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.13.12, pytest-9.0.3, pluggy-1.6.0
+rootdir: /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk
+configfile: pyproject.toml
+plugins: mock-3.15.1, anyio-4.13.0
+collected 1 item
+
+tests/unit/test_web_research_query.py F                                  [100%]
+
+=================================== FAILURES ===================================
+_______________ test_complete_http_envelope_also_respects_16mib ________________
+
+tmp_path = PosixPath('/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-42/test_complete_http_envelope_al0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x11b68d480>
+
+    def test_complete_http_envelope_also_respects_16mib(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from rquant.research_query import QueryColumn, QueryPrivateClient, QueryResult
+        from rquant.web.routes import research_query as route
+    
+        settings = WebSettings(serving_root=tmp_path / "serving", ingress_socket_path=tmp_path / "ingress/web.sock",
+            research_query_users=frozenset({"alice"}),
+            research_query_socket_path=Path("/private/tmp/rq-absent-wire/service.sock"),
+            research_query_service_uid=99999, research_query_shared_gid=99999)
+        value = QueryResult(status="ready", columns=(QueryColumn(name="value",data_type="VARCHAR"),),
+            rows=(("x"*(16*2**20-2048),),), elapsed_ms=1)
+        def result(*args: object, **kwargs: object) -> QueryResult:
+            return value
+        monkeypatch.setattr(QueryPrivateClient,"execute",result)
+        original_meta = route._meta
+        def large_metadata(request):
+            return original_meta(request).model_copy(update={"detail":"y"*4096})
+        monkeypatch.setattr(route,"_meta",large_metadata)
+        with ProofTestClient(create_proof_test_app(settings,background=False)) as client:
+            response=client.post("/api/v1/research/query",json={"sql":"SELECT 1"},
+                headers={"x-rquant-user":"alice","x-rquant-csrf":"1","origin":"http://testserver"})
+>       assert len(response.content)<=16*2**20
+E       assert 16779601 <= (16 * (2 ** 20))
+E        +  where 16779601 = len(b'{"data":{"status":"ready","columns":[{"name":"value","data_type":"VARCHAR"}],"rows":[["xxxxxxxxxxxxxxxxxxxxxxxxxxxxx...yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"}}')
+E        +    where b'{"data":{"status":"ready","columns":[{"name":"value","data_type":"VARCHAR"}],"rows":[["xxxxxxxxxxxxxxxxxxxxxxxxxxxxx...yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"}}' = <Response [200 OK]>.content
+
+tests/unit/test_web_research_query.py:38: AssertionError
+=========================== short test summary info ============================
+FAILED tests/unit/test_web_research_query.py::test_complete_http_envelope_also_respects_16mib
+============================== 1 failed in 1.47s ===============================

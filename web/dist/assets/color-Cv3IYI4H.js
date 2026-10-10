@@ -1,0 +1,1 @@
+function e(e){return e==null||Number.isNaN(e)||e===0?`flat`:e>0?`up`:`down`}function t(e){return e===`flat`?``:e}export{e as n,t};

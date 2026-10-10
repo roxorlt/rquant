@@ -1,0 +1,107 @@
+ma5: 5日均线 [stored_price] — 已存5日均线，价格基准未核验。
+market_above_ma20_ratio_pct: 20日均线上方占比 [percent] — 全市场20日均线上方股票占比，百分比原值；前一完整SSE交易日，历史回顾。
+market_high_60d_ratio_pct: 60日新高占比 [percent] — 全市场60日新高股票占比，百分比原值；前一完整SSE交易日，历史回顾。
+{
+  "source_sha256": "00167995370a0e31b8ad68675277203db8c0bfbb9e67b13138ed01cf69803d61",
+  "prepared_source_sha256": "4162bf93c8545cdd52a8886ae7947c9d4d7ec968487f046b17c8334914b7224e",
+  "query": {
+    "source_sha256": "00167995370a0e31b8ad68675277203db8c0bfbb9e67b13138ed01cf69803d61",
+    "trade_date": "2026-07-03",
+    "stock_codes": [
+      "000001.SZ",
+      "000007.SZ"
+    ],
+    "fields": [
+      "ma5",
+      "market_above_ma20_ratio_pct",
+      "market_high_60d_ratio_pct"
+    ]
+  },
+  "trade_date": "2026-07-03",
+  "facts": [
+    {
+      "status": "valid",
+      "value": 21.0,
+      "stock_code": "000001.SZ",
+      "trade_date": "2026-07-03",
+      "column": "ma5"
+    },
+    {
+      "status": "missing",
+      "value": null,
+      "reason": "missing_market_temperature",
+      "stock_code": "000001.SZ",
+      "trade_date": "2026-07-03",
+      "column": "market_above_ma20_ratio_pct"
+    },
+    {
+      "status": "missing",
+      "value": null,
+      "reason": "missing_market_temperature",
+      "stock_code": "000001.SZ",
+      "trade_date": "2026-07-03",
+      "column": "market_high_60d_ratio_pct"
+    },
+    {
+      "status": "valid",
+      "value": 0.0,
+      "stock_code": "000007.SZ",
+      "trade_date": "2026-07-03",
+      "column": "ma5"
+    },
+    {
+      "status": "missing",
+      "value": null,
+      "reason": "missing_market_temperature",
+      "stock_code": "000007.SZ",
+      "trade_date": "2026-07-03",
+      "column": "market_above_ma20_ratio_pct"
+    },
+    {
+      "status": "missing",
+      "value": null,
+      "reason": "missing_market_temperature",
+      "stock_code": "000007.SZ",
+      "trade_date": "2026-07-03",
+      "column": "market_high_60d_ratio_pct"
+    }
+  ],
+  "counts": [
+    {
+      "column": "ma5",
+      "valid": 2,
+      "missing": 0,
+      "null": 0,
+      "non_finite": 0
+    },
+    {
+      "column": "market_above_ma20_ratio_pct",
+      "valid": 0,
+      "missing": 2,
+      "null": 0,
+      "non_finite": 0,
+      "market_reasons": [
+        {
+          "reason": "missing_market_temperature",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "column": "market_high_60d_ratio_pct",
+      "valid": 0,
+      "missing": 2,
+      "null": 0,
+      "non_finite": 0,
+      "market_reasons": [
+        {
+          "reason": "missing_market_temperature",
+          "count": 2
+        }
+      ]
+    }
+  ]
+}
+research result: 349da2ec2be5f52b0c776435940519a4ffddb10944c72ab18cbd138ecf92f71b
+sealed research content: b51e119b3ce81528bfed3f82038da98473b8bf71c3ca440bd31248dd9b8e6f2d
+display content: 7f4aacba90125fa05ca29d064a38e9dc632fbca01364e426e10905e8c3139a33

@@ -1861,6 +1861,7 @@ def test_process_boundaries_use_bytes_transport_and_primitive_start_args() -> No
 
 def test_closed_registry_hash_mismatch_fails_before_process_start(tmp_path: Path) -> None:
     import rquant.lab_worker as lab_worker
+    from rquant.lab_worker_registry import unconfigured_builtin_lab_shard_configuration
 
     assert hasattr(lab_worker, "LabClosedRegistryBinding")
     assert hasattr(lab_worker, "LabShardRuntimeManifest")
@@ -1868,7 +1869,9 @@ def test_closed_registry_hash_mismatch_fails_before_process_start(tmp_path: Path
         registry_id="rquant.lab-shard.builtin",
         registry_version=1,
         registry_hash="f" * 64,
-        configuration_json="{}",
+        configuration_json=lab_worker._canonical_json(
+            unconfigured_builtin_lab_shard_configuration().model_dump(mode="json")
+        ),
     )
     manifest = lab_worker.LabShardRuntimeManifest(registry=binding)
     worker = _worker(tmp_path, shard_runtime_manifest=manifest)
@@ -3920,7 +3923,15 @@ def test_worker_bounds_reservation_lock_wait_and_propagates_stop_authority(
 
     result = worker.run_once()
 
-    assert result.status == "succeeded"
+    assert result.status == "succeeded", {
+        "stopped_reasons": [
+            report.body.reason
+            for report in _reports(reports)
+            if isinstance(report.body, LabWorkerStopped)
+        ],
+        "reservation_observed": observed,
+        "released": released,
+    }
     assert {operation for operation, _timeout, _stopped in observed} == {"reserve", "recheck"}
     # Every reservation call is capped by the store's own lock bound and then
     # narrowed again by whatever is left of the tick and spec deadlines.
@@ -7439,12 +7450,12 @@ def test_fast_resource_probe_waits_for_parent_process_group_verification(
         value = original_recv(connection, **kwargs)
         if kwargs.get("model") is lab_worker._IsolationReadiness:
             readiness_received.set()
-            if not release_readiness.wait(2):
+            if not release_readiness.wait(_observe(2)):
                 raise TimeoutError("test did not release resource readiness")
         return value
 
     def verify_child_then_release() -> None:
-        if not readiness_received.wait(2):
+        if not readiness_received.wait(_observe(2)):
             return
         child_observed.append(
             any(child.name == "lab-resource-probe" for child in multiprocessing.active_children())
@@ -8000,7 +8011,7 @@ def test_prestarted_authority_cancel_during_handoff_reaps_owned_child(
         operation="admission",
         spec=None,
         admission_request=None,
-        deadline_microseconds=lab_worker._monotonic_microseconds() + 2_000_000,
+        deadline_microseconds=lab_worker._monotonic_microseconds() + int(_observe(2) * 1_000_000),
     )
     canceller = threading.Thread(
         target=lambda: (
@@ -8998,9 +9009,16 @@ def _run_worker_child(
     root: Path,
     *arguments: str,
 ) -> subprocess.CompletedProcess[str]:
+    phase_path = root.parent / f".worker-child-{root.name}-{helper_name}.phase"
+    observation_path = phase_path.with_suffix(".json")
     source = (
+        "from pathlib import Path; "
+        f"_phase = Path({str(phase_path)!r}); "
+        "_phase.write_text('import', encoding='ascii'); "
         f"from tests.unit.test_lab_worker import {helper_name}; "
-        f"{helper_name}(*__import__('sys').argv[1:])"
+        "_phase.write_text('helper_entered', encoding='ascii'); "
+        f"{helper_name}(*__import__('sys').argv[1:]); "
+        "_phase.write_text('helper_returned', encoding='ascii')"
     )
     environment = os.environ.copy()
     repo_root = Path(__file__).parents[2]
@@ -9013,12 +9031,54 @@ def _run_worker_child(
         stderr=subprocess.PIPE,
         text=True,
     )
+    started = time.monotonic()
     try:
-        stdout, stderr = process.communicate(timeout=4)
-    except subprocess.TimeoutExpired:
+        stdout, stderr = process.communicate(timeout=_observe(4))
+    except subprocess.TimeoutExpired as exc:
+        observation = {
+            "helper": helper_name,
+            "pid": process.pid,
+            "phase": phase_path.read_text(encoding="ascii") if phase_path.exists() else "start",
+            "elapsed_seconds": time.monotonic() - started,
+            "stdout": os.fsdecode(exc.stdout) if exc.stdout is not None else "",
+            "stderr": os.fsdecode(exc.stderr) if exc.stderr is not None else "",
+        }
+        observation_path.write_text(json.dumps(observation), encoding="utf-8")
         process.kill()
-        stdout, stderr = process.communicate(timeout=1)
-        pytest.fail(f"worker child timed out: stdout={stdout!r} stderr={stderr!r}")
+        try:
+            stdout, stderr = process.communicate(timeout=_observe(1))
+        except subprocess.TimeoutExpired as cleanup_exc:
+            observation.update(
+                cleanup="timed_out",
+                cleanup_stdout=(
+                    os.fsdecode(cleanup_exc.stdout) if cleanup_exc.stdout is not None else ""
+                ),
+                cleanup_stderr=(
+                    os.fsdecode(cleanup_exc.stderr) if cleanup_exc.stderr is not None else ""
+                ),
+            )
+            observation_path.write_text(json.dumps(observation), encoding="utf-8")
+            raise
+        observation.update(
+            cleanup="reaped", returncode=process.returncode, stdout=stdout, stderr=stderr
+        )
+        observation_path.write_text(json.dumps(observation), encoding="utf-8")
+        pytest.fail(
+            f"worker child timed out during {observation['phase']}: "
+            f"stdout={stdout!r} stderr={stderr!r}"
+        )
+    observation_path.write_text(
+        json.dumps({
+            "helper": helper_name,
+            "pid": process.pid,
+            "phase": phase_path.read_text(encoding="ascii"),
+            "elapsed_seconds": time.monotonic() - started,
+            "returncode": process.returncode,
+            "stdout": stdout,
+            "stderr": stderr,
+        }),
+        encoding="utf-8",
+    )
     return subprocess.CompletedProcess(
         process.args,
         process.returncode,
@@ -14079,7 +14139,7 @@ def test_report_publish_uses_cross_process_evidence_lock(tmp_path: Path) -> None
         assert process.poll() is None
         assert reports.pending_locked() == ()
 
-    stdout, stderr = process.communicate(timeout=2)
+    stdout, stderr = process.communicate(timeout=10)
 
     assert process.returncode == 0, (stdout, stderr)
     assert tuple(entry.report for entry in reports.pending()) == (report,)

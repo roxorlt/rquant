@@ -1,0 +1,74 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.13.12, pytest-9.0.3, pluggy-1.6.0
+rootdir: /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk
+configfile: pyproject.toml
+plugins: mock-3.15.1, anyio-4.13.0
+collected 3 items
+
+tests/unit/test_research_query_saved.py FFF                              [100%]
+
+=================================== FAILURES ===================================
+_____ test_save_and_recover_bind_exact_actor_original_command_and_version ______
+
+tmp_path = PosixPath('/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-22/test_save_and_recover_bind_exa0')
+
+    def test_save_and_recover_bind_exact_actor_original_command_and_version(tmp_path: Path) -> None:
+>       service = _service(tmp_path)
+                  ^^^^^^^^^^^^^^^^^^
+
+tests/unit/test_research_query_saved.py:30: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+tmp_path = PosixPath('/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-22/test_save_and_recover_bind_exa0')
+
+    def _service(tmp_path: Path):
+>       assert hasattr(control, "SaveResearchQuery"), "typed query save is not implemented"
+E       AssertionError: typed query save is not implemented
+E       assert False
+E        +  where False = hasattr(control, 'SaveResearchQuery')
+
+tests/unit/test_research_query_saved.py:17: AssertionError
+___ test_capacity_and_database_failure_preserve_effect_and_terminal_receipt ____
+
+tmp_path = PosixPath('/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-22/test_capacity_and_database_fai0')
+
+    def test_capacity_and_database_failure_preserve_effect_and_terminal_receipt(tmp_path: Path) -> None:
+>       service = _service(tmp_path)
+                  ^^^^^^^^^^^^^^^^^^
+
+tests/unit/test_research_query_saved.py:53: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+tmp_path = PosixPath('/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-22/test_capacity_and_database_fai0')
+
+    def _service(tmp_path: Path):
+>       assert hasattr(control, "SaveResearchQuery"), "typed query save is not implemented"
+E       AssertionError: typed query save is not implemented
+E       assert False
+E        +  where False = hasattr(control, 'SaveResearchQuery')
+
+tests/unit/test_research_query_saved.py:17: AssertionError
+__________ test_saved_name_sql_bounds_and_browser_owner_are_rejected ___________
+
+tmp_path = PosixPath('/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-22/test_saved_name_sql_bounds_and0')
+
+    def test_saved_name_sql_bounds_and_browser_owner_are_rejected(tmp_path: Path) -> None:
+>       _service(tmp_path)
+
+tests/unit/test_research_query_saved.py:77: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+tmp_path = PosixPath('/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-22/test_saved_name_sql_bounds_and0')
+
+    def _service(tmp_path: Path):
+>       assert hasattr(control, "SaveResearchQuery"), "typed query save is not implemented"
+E       AssertionError: typed query save is not implemented
+E       assert False
+E        +  where False = hasattr(control, 'SaveResearchQuery')
+
+tests/unit/test_research_query_saved.py:17: AssertionError
+=========================== short test summary info ============================
+FAILED tests/unit/test_research_query_saved.py::test_save_and_recover_bind_exact_actor_original_command_and_version
+FAILED tests/unit/test_research_query_saved.py::test_capacity_and_database_failure_preserve_effect_and_terminal_receipt
+FAILED tests/unit/test_research_query_saved.py::test_saved_name_sql_bounds_and_browser_owner_are_rejected
+============================== 3 failed in 0.72s ===============================

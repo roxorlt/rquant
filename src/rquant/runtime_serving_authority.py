@@ -442,13 +442,19 @@ class ServingSourceAuthorityReader:
         publications_fd = -1
         publications_entry: DirectoryEntry | None = None
         try:
-            pointer_bytes = _read_regular_file_at(
-                root_fd,
-                "current.json",
-                max_bytes=self.max_bytes,
-                label="current pointer",
-                missing_unavailable=True,
-            )
+            try:
+                pointer_bytes = _read_regular_file_at(
+                    root_fd,
+                    "current.json",
+                    max_bytes=self.max_bytes,
+                    label="current pointer",
+                    missing_unavailable=False,
+                )
+            except FileNotFoundError as exc:
+                _require_unpublished_authority(root_fd, chain, max_bytes=self.max_bytes)
+                raise ServingSourceAuthorityUnavailableError(
+                    "current pointer is unavailable"
+                ) from exc
             assert pointer_bytes is not None
             pointer = _parse_pointer(pointer_bytes)
             accepted_commit = self.accepted_pointer_commit(pointer.producer_commit)
@@ -508,13 +514,18 @@ class ServingSourceAuthorityReader:
                     scan_limit=self.history_scan_limit,
                 )
 
-            current_after = _read_regular_file_at(
-                root_fd,
-                "current.json",
-                max_bytes=self.max_bytes,
-                label="current pointer",
-                missing_unavailable=True,
-            )
+            try:
+                current_after = _read_regular_file_at(
+                    root_fd,
+                    "current.json",
+                    max_bytes=self.max_bytes,
+                    label="current pointer",
+                    missing_unavailable=False,
+                )
+            except FileNotFoundError as exc:
+                raise ServingSourceAuthorityIntegrityError(
+                    "current pointer disappeared while serving generation"
+                ) from exc
             if current_after != pointer_bytes:
                 raise ServingSourceAuthorityIntegrityError(
                     "current pointer changed while serving generation"
@@ -529,8 +540,8 @@ class ServingSourceAuthorityReader:
         except ServingSourceAuthorityIntegrityError:
             raise
         except FileNotFoundError as exc:
-            raise ServingSourceAuthorityUnavailableError(
-                "current authority is unavailable"
+            raise ServingSourceAuthorityIntegrityError(
+                "authority path disappeared while serving generation"
             ) from exc
         except OSError as exc:
             raise ServingSourceAuthorityIntegrityError(
@@ -727,7 +738,7 @@ def _read_historical_result(
         and scanned >= scan_limit
         and (best is None or previous_result.sequence >= best[1].sequence)
     ):
-        raise ServingSourceAuthorityUnavailableError(
+        raise ServingSourceAuthorityIntegrityError(
             "visible authority history exceeds configured scan limit"
         )
     if best is None:
@@ -1354,6 +1365,55 @@ def _open_publish_lock(root_fd: int) -> int:
         os.close(descriptor)
         raise ServingSourceAuthorityIntegrityError("publisher lock identity is unsafe")
     return descriptor
+
+
+def _require_unpublished_authority(
+    root_fd: int,
+    chain: list[DirectoryEntry],
+    *,
+    max_bytes: int,
+) -> None:
+    # A successful owner publish writes immutable generation and publication entries
+    # before selecting current.json. Their presence survives a reader process restart.
+    for name in ("generations", "publications"):
+        try:
+            directory_fd = _open_existing_child_directory(root_fd, name)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise ServingSourceAuthorityIntegrityError(
+                "missing current pointer has unsafe publication evidence"
+            ) from exc
+        try:
+            entry = _directory_entry(root_fd, directory_fd, name)
+            with os.scandir(directory_fd) as contents:
+                if next(contents, None) is not None:
+                    raise ServingSourceAuthorityIntegrityError(
+                        "current pointer is missing after authority publication"
+                    )
+            _verify_child_directory(root_fd, entry)
+        except OSError as exc:
+            raise ServingSourceAuthorityIntegrityError(
+                "missing current pointer has unsafe publication evidence"
+            ) from exc
+        finally:
+            with suppress(OSError):
+                os.close(directory_fd)
+
+    _verify_directory_chain(chain)
+    try:
+        _read_regular_file_at(
+            root_fd,
+            "current.json",
+            max_bytes=max_bytes,
+            label="current pointer",
+            missing_unavailable=False,
+        )
+    except FileNotFoundError:
+        return
+    raise ServingSourceAuthorityIntegrityError(
+        "current pointer appeared while verifying unpublished authority"
+    )
 
 
 def _read_regular_file_at(

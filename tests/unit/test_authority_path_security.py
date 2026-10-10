@@ -64,6 +64,43 @@ def test_every_descriptor_in_the_walk_is_opened_with_o_nofollow(
     assert len(opened_flags) == 3
     assert all(flags & os.O_NOFOLLOW for flags in opened_flags)
 
+    sibling = entry.with_name("sibling.json")
+    sibling.write_bytes(b"{}")
+    sibling.chmod(0o600)
+    ancestors = authority._SharedSecureFileLeaseAncestors()
+    leases: list[authority.SecureRegularFileLease] = []
+    try:
+        for path in (entry, sibling):
+            lease = authority.open_secure_regular_file_lease(
+                path,
+                trusted_root=root,
+                expected_uid=os.geteuid(),
+                expected_gid=os.getegid(),
+                allowed_modes=frozenset({0o600}),
+                max_bytes=64,
+            )
+            leases.append(lease)
+            ancestors.adopt(lease)
+        first, second = leases
+        assert first._descriptors[:-1] == second._descriptors[:-1]
+        assert first.fileno() != second.fileno()
+        retained = set(first._descriptors) | set(second._descriptors)
+        first.close()
+        first.close()
+        with pytest.raises(authority.AuthorityPathSecurityError, match="closed"):
+            first.read_all(max_bytes=64)
+        assert second.read_all(max_bytes=64) == b"{}"
+        assert all(flags & os.O_NOFOLLOW for flags in opened_flags)
+        assert all(flags & os.O_CLOEXEC for flags in opened_flags)
+    finally:
+        for lease in leases:
+            lease.close()
+        ancestors.close()
+        ancestors.close()
+    for descriptor in retained:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
 
 def test_sticky_ancestors_are_never_tolerated_for_the_filesystem_root(tmp_path: Path) -> None:
     """The relaxation exists for a lab root under /tmp and must not reach a production walk."""

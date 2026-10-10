@@ -1,0 +1,623 @@
+<meta charset="utf-8">
+<title>rQuant 投研平台对标</title>
+<!-- 2026-09-24 调研报告的固定快照（来源：调研阶段生成的报告页）。收录时加了 charset，去掉了 Google Fonts 引用，「配套页面」改指 /app/ 内的页面；正文未改。 -->
+<style>
+:root{
+  --ground:#f5f6f8;
+  --paper:#ffffff;
+  --ink:#1c2230;
+  --ink-soft:#4a5366;
+  --ink-faint:#7a8396;
+  --rule:#dde1e8;
+  --rule-strong:#c3c9d4;
+  --accent:#2c4a94;
+  --accent-soft:#e7ecf7;
+  --have:#1f7a62;   --have-bg:#e3f2ec;
+  --part:#9a6412;   --part-bg:#f7eedb;
+  --miss:#b3372f;   --miss-bg:#f8e4e1;
+  --skip:#6b7280;   --skip-bg:#eceef1;
+  --must:#1c2230;
+  --serif:"Noto Serif SC","Songti SC","SimSun",serif;
+  --sans:"Noto Sans SC","PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,"SFMono-Regular",Menlo,monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    color-scheme:dark;
+    --ground:#12151c; --paper:#191d26; --ink:#e6e9f0; --ink-soft:#b3bac8; --ink-faint:#8a92a3;
+    --rule:#2a303c; --rule-strong:#3a4252; --accent:#8fa8e8; --accent-soft:#1f2940;
+    --have:#5cc4a3; --have-bg:#15302a; --part:#e0b060; --part-bg:#33291a;
+    --miss:#ef8a80; --miss-bg:#3a1f1d; --skip:#a3a9b5; --skip-bg:#262a33; --must:#e6e9f0;
+  }
+}
+:root[data-theme="dark"]{
+  color-scheme:dark;
+  --ground:#12151c; --paper:#191d26; --ink:#e6e9f0; --ink-soft:#b3bac8; --ink-faint:#8a92a3;
+  --rule:#2a303c; --rule-strong:#3a4252; --accent:#8fa8e8; --accent-soft:#1f2940;
+  --have:#5cc4a3; --have-bg:#15302a; --part:#e0b060; --part-bg:#33291a;
+  --miss:#ef8a80; --miss-bg:#3a1f1d; --skip:#a3a9b5; --skip-bg:#262a33; --must:#e6e9f0;
+}
+*{box-sizing:border-box}
+body{background:var(--ground);color:var(--ink);font-family:var(--sans);font-size:15.5px;line-height:1.75;margin:0;padding-inline:16px;padding-block:0 64px}
+a{color:var(--accent);text-underline-offset:3px}
+a:focus-visible,summary:focus-visible{outline:2px solid var(--accent);outline-offset:3px;border-radius:4px}
+.wrap{max-width:1180px;margin:0 auto;display:grid;grid-template-columns:220px minmax(0,1fr);gap:48px}
+@media (max-width:960px){.wrap{grid-template-columns:minmax(0,1fr);gap:0}.toc{display:none}}
+.toc{position:sticky;top:calc(env(safe-area-inset-top,0px) + 32px);align-self:start;padding-top:40px;font-size:13.5px}
+.toc p{font-family:var(--mono);font-size:11.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--ink-faint);margin:0 0 10px}
+.toc ol{list-style:none;margin:0;padding:0;display:grid;gap:6px;border-left:1px solid var(--rule)}
+.toc a{display:block;padding-left:14px;color:var(--ink-soft);text-decoration:none}
+.toc a:hover{color:var(--accent)}
+main{min-width:0;padding-top:40px}
+header.head{padding-bottom:28px;border-bottom:1px solid var(--rule-strong);margin-bottom:8px}
+.eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.08em;color:var(--ink-faint);margin:0 0 12px}
+h1{font-family:var(--serif);font-weight:700;font-size:clamp(28px,4.4vw,40px);line-height:1.25;margin:0 0 14px;text-wrap:balance}
+.lede{font-size:17px;color:var(--ink-soft);max-width:44em;margin:0}
+.meta{display:flex;flex-wrap:wrap;gap:8px 20px;margin-top:18px;font-size:13px;color:var(--ink-faint)}
+.meta span b{color:var(--ink-soft);font-weight:500}
+section{padding-top:44px}
+h2{font-family:var(--serif);font-weight:700;font-size:24px;line-height:1.35;margin:0 0 6px;text-wrap:balance}
+h2 .code{font-family:var(--mono);font-size:14px;font-weight:500;color:var(--ink-faint);margin-right:10px;letter-spacing:.04em}
+.sub{color:var(--ink-soft);margin:0 0 20px;max-width:46em}
+h3{font-size:16px;font-weight:700;margin:22px 0 8px}
+p{margin:0 0 12px;max-width:46em}
+ul.plain{margin:0 0 12px;padding-left:1.2em;max-width:46em}
+ul.plain li{margin:4px 0}
+.findings{display:grid;gap:0;counter-reset:f;border-top:1px solid var(--rule)}
+.findings li{list-style:none;display:grid;grid-template-columns:36px minmax(0,1fr);gap:4px 14px;padding:16px 0;border-bottom:1px solid var(--rule)}
+.findings li::before{counter-increment:f;content:counter(f);font-family:var(--mono);font-size:13px;color:var(--accent);padding-top:3px}
+.findings b{font-weight:700}
+.findings{padding:0;margin:0}
+.scoreboard{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:22px 0 8px}
+@media (max-width:640px){.scoreboard{grid-template-columns:repeat(2,minmax(0,1fr))}}
+.score{background:var(--paper);border:1px solid var(--rule);border-radius:8px;padding:14px 16px}
+.score .n{font-family:var(--mono);font-size:28px;font-weight:500;line-height:1.1;font-variant-numeric:tabular-nums}
+.score .l{font-size:13px;color:var(--ink-soft)}
+.score.have .n{color:var(--have)} .score.part .n{color:var(--part)} .score.miss .n{color:var(--miss)} .score.skip .n{color:var(--skip)}
+.tablebox{overflow-x:auto;background:var(--paper);border:1px solid var(--rule);border-radius:8px;margin:12px 0 8px}
+table{border-collapse:collapse;width:100%;font-size:14px;line-height:1.6}
+th,td{text-align:left;vertical-align:top;padding:10px 12px;border-bottom:1px solid var(--rule)}
+th{font-size:12.5px;font-weight:500;color:var(--ink-faint);letter-spacing:.04em;background:var(--paper);position:sticky;top:0}
+tr:last-child td{border-bottom:none}
+td.mod{white-space:nowrap;font-weight:700}
+td.mod .code{display:block;font-family:var(--mono);font-size:12px;font-weight:400;color:var(--ink-faint)}
+.cmp{min-width:980px}
+.cmp td:nth-child(4){min-width:230px}.cmp td:nth-child(5){min-width:260px}
+.pill{display:inline-block;font-size:12px;font-weight:500;padding:1px 9px;border-radius:999px;white-space:nowrap;line-height:1.7}
+.pill.have{color:var(--have);background:var(--have-bg)}
+.pill.part{color:var(--part);background:var(--part-bg)}
+.pill.miss{color:var(--miss);background:var(--miss-bg)}
+.pill.skip{color:var(--skip);background:var(--skip-bg)}
+.tier{font-size:12.5px;white-space:nowrap}
+.tier.must{font-weight:700;color:var(--must)}
+.tier.opt{color:var(--ink-soft)}
+.legend{display:flex;flex-wrap:wrap;gap:8px 16px;font-size:13px;color:var(--ink-soft);margin:6px 0 0}
+details.mod{background:var(--paper);border:1px solid var(--rule);border-radius:8px;margin:10px 0}
+details.mod summary{cursor:pointer;list-style:none;padding:14px 18px;display:flex;flex-wrap:wrap;align-items:center;gap:6px 12px}
+details.mod summary::-webkit-details-marker{display:none}
+details.mod summary .code{font-family:var(--mono);font-size:12.5px;color:var(--ink-faint);min-width:30px}
+details.mod summary .t{font-weight:700;font-size:16px}
+details.mod summary .chev{margin-left:auto;color:var(--ink-faint);font-size:12px;transition:transform .15s}
+details.mod[open] summary .chev{transform:rotate(90deg)}
+details.mod .body{padding:0 18px 16px;border-top:1px solid var(--rule)}
+details.mod .body h4{font-size:13px;font-weight:500;color:var(--ink-faint);letter-spacing:.04em;margin:16px 0 6px}
+.two{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:0 28px}
+@media (max-width:720px){.two{grid-template-columns:minmax(0,1fr)}}
+.us{background:var(--accent-soft);border-radius:6px;padding:10px 14px;margin-top:14px;font-size:14.5px}
+.us b{color:var(--accent)}
+.flow{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:10px 0 16px;font-size:14px}
+.flow span{background:var(--paper);border:1px solid var(--rule-strong);border-radius:6px;padding:3px 10px}
+.flow i{font-style:normal;color:var(--ink-faint)}
+.callout{border-left:3px solid var(--part);background:var(--paper);padding:12px 16px;border-radius:0 6px 6px 0;margin:16px 0;max-width:46em}
+.callout b{color:var(--part)}
+.order{counter-reset:o;padding:0;margin:8px 0 0;display:grid;gap:10px;max-width:50em}
+.order li{list-style:none;background:var(--paper);border:1px solid var(--rule);border-radius:8px;padding:12px 16px 12px 52px;position:relative}
+.order li::before{counter-increment:o;content:counter(o);position:absolute;left:16px;top:12px;width:24px;height:24px;border-radius:50%;background:var(--accent);color:var(--paper);font-family:var(--mono);font-size:13px;display:grid;place-items:center}
+.order .why{display:block;color:var(--ink-soft);font-size:14px}
+.links{columns:2;column-gap:32px;font-size:13.5px;padding-left:1.1em;margin:8px 0}
+@media (max-width:720px){.links{columns:1}}
+.links li{break-inside:avoid;margin:3px 0}
+.mark{font-family:var(--mono);color:var(--ink-faint)}
+.mono{font-family:var(--mono);font-size:.92em}
+footer{margin-top:48px;padding-top:16px;border-top:1px solid var(--rule);font-size:13px;color:var(--ink-faint)}
+@media (prefers-reduced-motion: reduce){*{transition:none!important}}
+</style>
+
+<div class="wrap">
+<nav class="toc" aria-label="目录">
+  <p>目录</p>
+  <ol>
+    <li><a href="#summary">结论</a></li>
+    <li><a href="#compare">16 个模块对照表</a></li>
+    <li><a href="#modules">逐个模块</a></li>
+    <li><a href="#layout">平台怎么组织页面</a></li>
+    <li><a href="#trends">2025–2026 趋势</a></li>
+    <li><a href="#next">如果要做，先做什么</a></li>
+    <li><a href="#products">调研了哪些产品</a></li>
+    <li><a href="#limits">没能核实的部分</a></li>
+    <li><a href="#sources">来源</a></li>
+  </ol>
+</nav>
+
+<main>
+<header class="head">
+  <p class="eyebrow">调研日期 2026-09-24 · 对照 rQuant 代码 v0.33.21–v0.33.23</p>
+  <h1>量化投研平台调研，以及 rQuant 还差什么</h1>
+  <p class="lede">这份报告调研了 19 家国内外量化平台和开源工具。报告先把它们的功能归成 16 个模块，再逐个模块对照 rQuant 已经有什么、如果要做还缺什么。评判角度是一个人自用、做 A 股、以「条件筛选 + 盯盘 + 告警」为核心的平台。</p>
+  <div class="meta">
+    <span><b>配套页面</b> <a href="../#/reports/gap-status" target="_blank" rel="noopener">差距总览（随发布更新）</a> · <a href="../#/overview" target="_blank" rel="noopener">新版平台</a></span>
+    <span><b>方法</b> 网页搜索后逐页读原文（Chrome 渲染抓取）</span>
+  </div>
+</header>
+
+<section id="summary">
+  <h2>结论</h2>
+  <p class="sub">先说结论。下面每一条后文都有展开。</p>
+  <ol class="findings">
+    <li><div><b>所有平台都按同一条工作流组织功能：</b>数据 → 因子 / 选股 → 策略 → 回测 → 优化 → 模拟盘 → 实盘或监控。差别只在每一段做得多深，以及用代码、零代码还是自然语言来操作。</div></li>
+    <li><div><b>对个人 A 股选股盯盘平台，必需的模块有 7 个：</b>数据中心、选股、回测、基础绩效报告、实时监控告警、定时任务、运维与数据健康。rQuant 在其中 2 个上已经具备（选股、监控告警），另外 5 个做了一部分，没有哪个必需模块是完全空白的。</div></li>
+    <li><div><b>rQuant 的后台能力远多于页面。</b>数据契约、交易成本模型、实验登记、模拟撮合、任务中心都已经写好，但大多没有页面，或者页面还是「表单加表格」。这就是现在的预览页看起来像监控面板、不像投研平台的原因。</div></li>
+    <li><div><b>真正空白的是四块：</b>因子检验（判断一个筛选条件到底有没有用）、通用的组合回测和标准绩效曲线、持仓权重与组合风控、Notebook 研究环境。</div></li>
+    <li><div><b>新版页面有倒退：</b>新画布去掉了节点图、规则编辑和自然语言改池子，新实验室没有任何图表。旧版这些功能都有。</div></li>
+    <li><div><b>原型里的多面板联动、抽屉和节点画布，用 Streamlit 只能做到一部分。</b>要达到原型的效果，大概率需要单独写一个前端（React 或 Vue）。项目规则里写的是「先别开分支」，这件事要你来定。</div></li>
+  </ol>
+
+  <div class="scoreboard" role="list" aria-label="rQuant 在 16 个模块上的现状">
+    <div class="score have" role="listitem"><div class="n">2</div><div class="l">已具备</div></div>
+    <div class="score part" role="listitem"><div class="n">11</div><div class="l">做了一部分</div></div>
+    <div class="score miss" role="listitem"><div class="n">2</div><div class="l">基本没有</div></div>
+    <div class="score skip" role="listitem"><div class="n">1</div><div class="l">按边界不做（实盘下单）</div></div>
+  </div>
+</section>
+
+<section id="compare">
+  <h2>16 个模块对照表</h2>
+  <p class="sub">「分级」是从个人平台的角度判断的：<b>必需</b>表示缺了它，「数据 → 筛选 → 验证 → 监控告警」这条主线就走不下去；<b>建议</b>表示明显提高研究质量，投入适中；<b>可选</b>表示没有也不影响主线。「rQuant 现状」按 2026-09-25 的代码和主机实况填写。</p>
+  <div class="tablebox">
+  <table class="cmp">
+    <thead><tr><th>模块</th><th>分级</th><th>rQuant 现状</th><th>rQuant 已有</th><th>如果要做，还缺什么</th></tr></thead>
+    <tbody>
+      <tr><td class="mod"><span class="code">M1</span>数据中心</td><td><span class="tier must">必需</span></td><td><span class="pill part">部分</span></td><td>Tushare 约 40 个接口，AKShare 兜底；DuckDB 52 张表加只读副本；数据契约与「何时可见」规则；可以断点续跑的回补命令；每天 17:00 自动更新</td><td>数据目录与字段说明页；数据覆盖率和质量问题的页面；财务与基本面数据；日线 2024-09 至 2025-04 那段空缺的回补</td></tr>
+      <tr><td class="mod"><span class="code">M2</span>研究环境</td><td><span class="tier">建议</span></td><td><span class="pill miss">缺</span></td><td>约 116 个命令行子命令、脚本、直接写 SQL</td><td>连着只读副本和研究数据湖的 Notebook；网页里的临时查询页</td></tr>
+      <tr><td class="mod"><span class="code">M3</span>因子研究</td><td><span class="tier">建议</span></td><td><span class="pill part">部分</span></td><td>选股评分画像（约 13 项特征）；盘中分钟特征引擎，实盘和回放用同一套</td><td>因子库与因子表达式；IC、RankIC、分组收益、衰减、换手的计算和页面；因子跟踪</td></tr>
+      <tr><td class="mod"><span class="code">M4</span>选股 / 条件筛选</td><td><span class="tier must">必需</span></td><td><span class="pill have">已有</span> <span class="pill part">新版倒退</span></td><td>26 个条件积木；自然语言转条件（DeepSeek）；内置与自建池子每天自动跑；风险黑名单；旧版节点画布</td><td>多条件加权的排名打分；基本面条件与盘中条件；通达信公式导入；新版画布恢复节点图、规则编辑和自然语言改池子；记录入池时间与入池价</td></tr>
+      <tr><td class="mod"><span class="code">M5</span>策略开发</td><td><span class="tier">建议</span></td><td><span class="pill part">部分</span></td><td>三个内置策略（N 字、竞价跳空、科创创业放量）及参数；新运行时的策略状态机和实盘运行器</td><td>用受控的规则模板组合出新策略（不开放任意代码）；策略列表、版本与详情页</td></tr>
+      <tr><td class="mod"><span class="code">M6</span>回测引擎</td><td><span class="tier must">必需</span></td><td><span class="pill part">部分</span></td><td>分钟级事件驱动回放，含 T+1、09:26 竞价可见等 A 股规则；带版本的成本模型；复权；分片并行与预计耗时</td><td>按调仓周期持仓的通用日线组合回测；基准对比；实盘和回测统一成一套引擎（现在两套并存）</td></tr>
+      <tr><td class="mod"><span class="code">M7</span>绩效报告</td><td><span class="tier must">基础必需</span></td><td><span class="pill part">部分</span></td><td>胜率、均值、中位数、最好与最差、稳健评分等汇总指标；可复现的 ZIP 报告</td><td>净值曲线和回撤曲线；年化、夏普、索提诺、卡玛；月度收益热力图；相对基准的超额；换手；新版实验室的图表</td></tr>
+      <tr><td class="mod"><span class="code">M8</span>参数优化与实验</td><td><span class="tier">建议</span></td><td><span class="pill part">部分</span></td><td>网格搜索；训练 / 验证切分；滚动前推验证；任务中心（暂停、恢复、重试、预计耗时）；实验登记模型（多重检验校正、冻结样本外、四级晋级）</td><td>让实验登记真正写入；参数热力图；回测记录对比页；概率夏普一类的过拟合指标</td></tr>
+      <tr><td class="mod"><span class="code">M9</span>组合与风控</td><td><span class="tier">简单版建议</span></td><td><span class="pill miss">缺</span></td><td>单票止损、止盈、移动止盈；价量动态风控；黑名单</td><td>持仓权重规则（等权、单票上限、行业上限）；组合回撤；行业暴露</td></tr>
+      <tr><td class="mod"><span class="code">M10</span>模拟盘</td><td><span class="tier">建议</span></td><td><span class="pill part">部分</span></td><td>模拟账户在新运行时里运行（10 万初始资金、T+1、交易成本、对账）；用 9 月 24 日真实数据回放时产出了 2 笔成交</td><td>账户、净值、持仓、当日指令的页面（运行控制台正在挂到预览上）；模拟结果与回测区间对照</td></tr>
+      <tr><td class="mod"><span class="code">M11</span>实盘交易</td><td><span class="tier opt">可选</span></td><td><span class="pill skip">不做</span></td><td>项目边界明确不做下单</td><td>超出边界，要扩张需要你决定</td></tr>
+      <tr><td class="mod"><span class="code">M12</span>实时监控与告警</td><td><span class="tier must">必需</span></td><td><span class="pill have">已有</span></td><td>盘中监控、爆量与异动检测、定时战报、盘前体检；PushDeer / PushPlus 推送，带去重和熔断；新运行时的通知目前是影子档，按你的决定，9 月 28 日上午两个检查点通过后当天切正式</td><td>告警规则配置页；告警时间线与已读处理</td></tr>
+      <tr><td class="mod"><span class="code">M13</span>任务调度</td><td><span class="tier must">定时必需</span></td><td><span class="pill part">部分</span></td><td>约 13 个系统定时任务，加新运行时约 20 个常驻服务；研究任务中心</td><td>任务与调度总览页；运行日志查看；手动「立即运行」</td></tr>
+      <tr><td class="mod"><span class="code">M14</span>AI 辅助</td><td><span class="tier">建议</span></td><td><span class="pill part">部分</span></td><td>自然语言选股</td><td>回测结果解读；公告与研报摘要；生成条件后直接预览结果并回测；新版画布里用自然语言改池子</td></tr>
+      <tr><td class="mod"><span class="code">M15</span>协作与权限</td><td><span class="tier opt">可选</span></td><td><span class="pill part">部分</span></td><td>页面登录（全景页多账户）；协作者单独的推送通道</td><td>按用户划分权限（个人自用可以不做）</td></tr>
+      <tr><td class="mod"><span class="code">M16</span>运维与数据健康</td><td><span class="tier must">必需</span></td><td><span class="pill part">部分</span></td><td>受控发布器、备份、只读副本、看门狗、盘前体检；新运行时的健康状态与页面数据发布；整日真实数据回放工具（9 月 25 日新增）</td><td>新运行时健康、信号、模拟盘、任务的可视页面（运行控制台正在挂到预览上）</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <div class="legend">
+    <span><span class="pill have">已有</span> 已上线或代码完整可用</span>
+    <span><span class="pill part">部分</span> 有核心能力，缺页面或缺关键部件</span>
+    <span><span class="pill miss">缺</span> 基本没有</span>
+    <span><span class="pill skip">不做</span> 超出项目边界</span>
+  </div>
+</section>
+
+<section id="modules">
+  <h2>逐个模块</h2>
+  <p class="sub">每个模块写三件事：业界一般做到什么程度，常见的页面长什么样，以及 rQuant 对照下来的情况。点开查看。</p>
+
+  <details class="mod" open>
+    <summary><span class="code">M1</span><span class="t">数据中心</span><span class="tier must">必需</span><span class="pill part">部分</span><span class="chev" aria-hidden="true">▶</span></summary>
+    <div class="body two">
+      <div>
+        <h4>业界一般做到</h4>
+        <ul class="plain">
+          <li>日线、分钟、tick 多频率行情，覆盖指数、ETF、可转债等。</li>
+          <li>财务数据按「公告那一刻才可见」提供，也叫 PIT 数据，防止回测用到当时还没公布的信息（优矿、Qlib）。</li>
+          <li>资金流、分析师预期、融资融券、分红送股等特色数据（SuperMind）。</li>
+          <li>前复权、后复权、真实价格三种口径可选（果仁、掘金、聚宽）。</li>
+          <li>数据字典和数据健康检查：缺失、价格或成交量异常跳变（Qlib 的检查脚本）。</li>
+        </ul>
+      </div>
+      <div>
+        <h4>常见页面</h4>
+        <p>左边是数据分类树，右边是字段表，下方放样例数据。另有一张「数据覆盖表」：每张表的最早日期、最新日期、行数、最近更新时间。</p>
+        <div class="us"><b>rQuant：</b>取数、存储、可见时刻规则都有，而且比很多平台严格（取不到就直接拒绝，不拿旧数据凑）。缺的是给人看的部分：数据目录页、覆盖率与质量页；另外还缺财务基本面数据。</div>
+      </div>
+    </div>
+  </details>
+
+  <details class="mod">
+    <summary><span class="code">M2</span><span class="t">研究环境</span><span class="tier">建议</span><span class="pill miss">缺</span><span class="chev" aria-hidden="true">▶</span></summary>
+    <div class="body two">
+      <div>
+        <h4>业界一般做到</h4>
+        <ul class="plain">
+          <li>在线 Jupyter Notebook：代码与说明混排，能画图、能分享（聚宽、SuperMind、QuantConnect）。</li>
+          <li>在 Notebook 里直接发起回测、取回结果做二次分析（聚宽、QuantConnect）。</li>
+          <li>本地 SDK，让本机 IDE 和 AI 编程工具直接调用平台数据（米筐专门写了 Claude Code、Cursor 的配置指南）。</li>
+        </ul>
+      </div>
+      <div>
+        <h4>常见页面</h4>
+        <p>文件浏览器加 Notebook；或者三栏 IDE：左侧文件树，中间编辑器，右侧 AI 对话或日志。</p>
+        <div class="us"><b>rQuant：</b>现在的研究方式是命令行、脚本和直接写 SQL。一个人用时，可以用本机 Jupyter 连只读副本代替在线环境。关键是研究用的数据接口要和生产筛选用的是同一套。</div>
+      </div>
+    </div>
+  </details>
+
+  <details class="mod">
+    <summary><span class="code">M3</span><span class="t">因子研究</span><span class="tier">建议</span><span class="pill part">部分</span><span class="chev" aria-hidden="true">▶</span></summary>
+    <div class="body two">
+      <div>
+        <h4>业界一般做到</h4>
+        <ul class="plain">
+          <li>几百到几千个因子的因子库，带表达式和算子（米筐、BigQuant、优矿）。</li>
+          <li>单因子检验的参数：股票池、基准、区间、调仓周期、分组数（默认 5 组）、是否行业中性化、IC 算法。</li>
+          <li>单因子检验的输出：IC 统计表、IC 时序、IC 衰减、行业 IC、分组累计收益、分组换手（米筐列得最全，开源的 alphalens 也是这四块）。</li>
+          <li>因子跟踪面板：每天增量计算后刷新昨日收益、近一周收益、平均 IC。</li>
+        </ul>
+      </div>
+      <div>
+        <h4>常见页面</h4>
+        <p>左侧参数表单，右侧结果分三个标签页：IC 分析、收益分析、换手分析。</p>
+        <div class="us"><b>rQuant：</b>对「条件筛选」型平台，单因子检验是判断某条筛选条件到底有没有用的主要工具，因子跟踪能提醒条件失效。rQuant 有特征和评分，但没有 IC 与分组检验，也没有对应的页面。这是四块真正空白里的第一块。</div>
+      </div>
+    </div>
+  </details>
+
+  <details class="mod">
+    <summary><span class="code">M4</span><span class="t">选股 / 条件筛选</span><span class="tier must">必需</span><span class="pill have">已有</span><span class="chev" aria-hidden="true">▶</span></summary>
+    <div class="body two">
+      <div>
+        <h4>业界一般做到</h4>
+        <ul class="plain">
+          <li>果仁网的零代码向导分四段：股票池 → 筛选条件（设门槛）→ 排名条件（多指标加权打分取前 N）→ 调仓规则与大盘择时，最后回测。</li>
+          <li>通达信的「策略股票池」：在画布上用连线连接「备选池 → 转移条件 → 状态池」，状态池记录入池时间和入池价，有股票进入就预警。</li>
+          <li>自然语言选股：i问财输入中文问句，直接返回结果表。</li>
+          <li>结果可以一键「保存为股票池 / 回测这组条件 / 加入监控」。</li>
+        </ul>
+      </div>
+      <div>
+        <h4>常见页面</h4>
+        <p>上半部分是条件编辑区，每行一个条件，排名条件多一列权重；旁边是自然语言输入框。下半部分是结果表。</p>
+        <div class="us"><b>rQuant：</b>这是 rQuant 的核心，积木、自然语言、池子都有，旧版画布的「节点 = 池子」和通达信策略股票池的思路一致。问题在新版：新画布去掉了节点图、规则编辑和自然语言改池子。另外还缺排名打分和入池价记录。</div>
+      </div>
+    </div>
+  </details>
+
+  <details class="mod">
+    <summary><span class="code">M5</span><span class="t">策略开发</span><span class="tier">建议</span><span class="pill part">部分</span><span class="chev" aria-hidden="true">▶</span></summary>
+    <div class="body two">
+      <div>
+        <h4>业界一般做到</h4>
+        <ul class="plain">
+          <li>策略列表、编辑器、回测历史，对象关系是「策略 → 回测 → 模拟交易」（聚宽、掘金）。</li>
+          <li>拖拽画布：模块像函数一样有输入输出，连线组成策略（BigQuant）。</li>
+          <li>每次回测保存当时的代码快照，回测可以命名、克隆（QuantConnect）。</li>
+        </ul>
+      </div>
+      <div>
+        <h4>常见页面</h4>
+        <p>三栏 IDE，或「左模块库、中画布、右参数」的画布式页面。</p>
+        <div class="us"><b>rQuant：</b>对选股平台，「策略」可以定义为「一组筛选与排名条件 + 调仓规则 + 择时」，不一定需要代码编辑器，但要有版本号，保证每次回测能对应到当时的规则。rQuant 现在只有三个写死的内置策略，你还不能自己组合新策略。</div>
+      </div>
+    </div>
+  </details>
+
+  <details class="mod">
+    <summary><span class="code">M6</span><span class="t">回测引擎</span><span class="tier must">必需</span><span class="pill part">部分</span><span class="chev" aria-hidden="true">▶</span></summary>
+    <div class="body two">
+      <div>
+        <h4>业界一般做到</h4>
+        <ul class="plain">
+          <li>回测参数：区间、初始资金、手续费、滑点、成交比例、复权方式、基准（掘金、聚宽）。</li>
+          <li>A 股规则：涨跌停和停牌不能成交、T+1、真实成本（果仁网写明已内置）。</li>
+          <li>频率从日线到 tick，事件驱动与向量化两类引擎都有。</li>
+        </ul>
+      </div>
+      <div>
+        <h4>常见页面</h4>
+        <p>策略页右上角「运行回测」→ 参数弹窗 → 进度条 → 结果页。</p>
+        <div class="us"><b>rQuant：</b>分钟级回放和 A 股规则做得很细，成本模型带版本号（佣金万 2.5、印花税万 5、过户费、滑点）。缺的是「按调仓周期持仓」的通用日线组合回测和基准对比。另外实盘和回测现在是两套实现，结果可能对不上。</div>
+      </div>
+    </div>
+  </details>
+
+  <details class="mod">
+    <summary><span class="code">M7</span><span class="t">绩效报告</span><span class="tier must">基础必需</span><span class="pill part">部分</span><span class="chev" aria-hidden="true">▶</span></summary>
+    <div class="body two">
+      <div>
+        <h4>业界一般做到</h4>
+        <ul class="plain">
+          <li>顶部一排指标：策略收益、基准收益、年化、最大回撤、夏普、alpha、beta。</li>
+          <li>主图是「策略 vs 基准」收益曲线，带回撤副图，可切换 1 个月到全部区间。</li>
+          <li>下方分标签页：持仓、交易、每日明细、日志；每一轮买卖的盈亏与持有时长统计（pyfolio）。</li>
+          <li>月度收益热力图、滚动夏普（quantstats）；果仁网的 100 分制综合评分，策略一改，「实盘分」清零。</li>
+        </ul>
+      </div>
+      <div>
+        <h4>常见页面</h4>
+        <p>KPI 卡片 → 主图 → 标签页明细；另有回测列表页，可排序、备注、克隆。</p>
+        <div class="us"><b>rQuant：</b>有汇总数字，没有曲线。净值、回撤、夏普、月度热力、基准超额都没有，新版实验室连一张图都没有。这是页面「不像投研平台」最直观的原因。</div>
+      </div>
+    </div>
+  </details>
+
+  <details class="mod">
+    <summary><span class="code">M8</span><span class="t">参数优化与实验管理</span><span class="tier">建议</span><span class="pill part">部分</span><span class="chev" aria-hidden="true">▶</span></summary>
+    <div class="body two">
+      <div>
+        <h4>业界一般做到</h4>
+        <ul class="plain">
+          <li>网格搜索，结果用热力图看参数敏感性（QuantConnect、vn.py）。</li>
+          <li>滚动前推优化；样本外保留期，即强制回测不能用最近 N 个月的数据（QuantConnect）。</li>
+          <li>过拟合提示：按回测次数、参数个数给出「可能过拟合」提醒，并显示概率夏普。</li>
+          <li>所有回测自动留档，可勾选两条以上对比。</li>
+        </ul>
+      </div>
+      <div>
+        <h4>常见页面</h4>
+        <p>优化配置表单 → 二维热力图 → 按目标排序的结果表；回测列表勾选后进入对比视图。</p>
+        <div class="us"><b>rQuant：</b>设计上已经想得很周全（实验登记、多重检验校正、冻结样本外、四级晋级门），但实验登记还没有真正写入数据，也没有热力图和对比页。一个人最容易犯的错是反复调条件直到回测好看，这块投入不大、收益很高。</div>
+      </div>
+    </div>
+  </details>
+
+  <details class="mod">
+    <summary><span class="code">M9</span><span class="t">组合与风控</span><span class="tier">简单版建议</span><span class="pill miss">缺</span><span class="chev" aria-hidden="true">▶</span></summary>
+    <div class="body two">
+      <div>
+        <h4>业界一般做到</h4>
+        <ul class="plain">
+          <li>机构级：风险模型、组合优化器（风险最小、夏普最大、风险平价……）、行业与风格约束（米筐、优矿、Barra）。</li>
+          <li>个人适用的轻量版：等权或按排名分加权、单票权重上限、持股数与仓位规则（果仁网的交易模型）。</li>
+        </ul>
+      </div>
+      <div>
+        <h4>常见页面</h4>
+        <p>左边是目标与约束表单，右边是权重结果表，下方是组合与基准的行业暴露对比条形图。</p>
+        <div class="us"><b>rQuant：</b>有单票层面的止损止盈和黑名单，没有组合层面的东西：现在每笔固定 100 股，没有权重规则，也没有行业暴露和组合回撤。</div>
+      </div>
+    </div>
+  </details>
+
+  <details class="mod">
+    <summary><span class="code">M10</span><span class="t">模拟盘</span><span class="tier">建议</span><span class="pill part">部分</span><span class="chev" aria-hidden="true">▶</span></summary>
+    <div class="body two">
+      <div>
+        <h4>业界一般做到</h4>
+        <ul class="plain">
+          <li>从回测一键创建模拟交易，每天给出调仓指令并推送（聚宽、果仁网）。</li>
+          <li>SuperMind 专门列出回测与仿真的差异：回测里委托立即成交、没有初始持仓、没有延迟，仿真里都相反。</li>
+          <li>模拟结果要落在回测的统计区间内，才算通过（QuantConnect）。</li>
+        </ul>
+      </div>
+      <div>
+        <h4>常见页面</h4>
+        <p>模拟账户列表（运行天数、今日收益、累计收益、最大回撤）→ 详情页：净值曲线叠加回测曲线、当日指令、持仓、成交、日志。</p>
+        <div class="us"><b>rQuant：</b>新运行时里的模拟账户已经按规则记账（10 万初始资金、每笔 100 股、T+1、真实成本）。9 月 24 日回放时买入了 603937.SH 和 002238.SZ 各 100 股。缺的是页面，运行控制台正在挂到预览上。</div>
+      </div>
+    </div>
+  </details>
+
+  <details class="mod">
+    <summary><span class="code">M11</span><span class="t">实盘交易</span><span class="tier opt">可选</span><span class="pill skip">不做</span><span class="chev" aria-hidden="true">▶</span></summary>
+    <div class="body">
+      <h4>业界一般做到</h4>
+      <p>对接券商与期货公司、算法拆单（TWAP、VWAP、冰山单）、条件单、前端风控（QMT、掘金、vn.py）。国内《程序化交易管理实施细则》2025-07-07 起施行，自动下单要报告，并有异常交易和高频认定标准。</p>
+      <div class="us"><b>rQuant：</b>项目规则写明暂时不做下单，这一块超出边界。可以借鉴的只有「到价提醒、不下单」式的条件提醒。</div>
+    </div>
+  </details>
+
+  <details class="mod">
+    <summary><span class="code">M12</span><span class="t">实时监控与告警</span><span class="tier must">必需</span><span class="pill have">已有</span><span class="chev" aria-hidden="true">▶</span></summary>
+    <div class="body two">
+      <div>
+        <h4>业界一般做到</h4>
+        <ul class="plain">
+          <li>条件预警：到价、涨跌幅、大单、技术形态、均线，可设有效时段（同花顺）。</li>
+          <li>通达信「市场雷达」预设 12 类盘中异动场景：连续大量、涨跌停、快涨快跌、巨额成交等。</li>
+          <li>告警治理：同一指标 5 分钟内只发一条，恢复时再发一条；上游数据断开时自动压住下游告警。</li>
+        </ul>
+      </div>
+      <div>
+        <h4>常见页面</h4>
+        <p>左边规则列表，中间实时行情表（触发的行高亮），右边告警时间线，顶部是各推送通道最近一次成功的时间。</p>
+        <div class="us"><b>rQuant：</b>这是另一个核心，检测、推送、去重、熔断都有。新运行时的通知按你的决定，9 月 28 日上午两个检查点通过后当天切正式。缺的是告警规则配置页和告警时间线。</div>
+      </div>
+    </div>
+  </details>
+
+  <details class="mod">
+    <summary><span class="code">M13</span><span class="t">任务调度</span><span class="tier must">定时必需</span><span class="pill part">部分</span><span class="chev" aria-hidden="true">▶</span></summary>
+    <div class="body two">
+      <div>
+        <h4>业界一般做到</h4>
+        <ul class="plain">
+          <li>每日定时增量计算，算完刷新因子跟踪（米筐、Qlib）。</li>
+          <li>用户常提的需求：设置运行时间、手动重新运行按钮（BigQuant 社区反馈）。</li>
+        </ul>
+      </div>
+      <div>
+        <h4>常见页面</h4>
+        <p>任务表（名称、触发时间、上次运行、耗时、状态、下次运行）加日志抽屉，带「立即运行 / 暂停」按钮。</p>
+        <div class="us"><b>rQuant：</b>定时任务和常驻服务都在运行，但没有一个页面能看全，也不能在页面上手动运行。</div>
+      </div>
+    </div>
+  </details>
+
+  <details class="mod">
+    <summary><span class="code">M14</span><span class="t">AI 辅助</span><span class="tier">建议</span><span class="pill part">部分</span><span class="chev" aria-hidden="true">▶</span></summary>
+    <div class="body two">
+      <div>
+        <h4>业界一般做到</h4>
+        <ul class="plain">
+          <li>自然语言 → 策略代码 → 自动回测 → 出错自动修改再跑（QuantConnect 的 Mia、BigQuant 的 Quant Agent）。</li>
+          <li>按研究阶段分工的 Agent 看板：想法 → 研究 → 回测 → 模拟 → 实盘，每列有专门的 Agent，并有验证 Agent 给出「通过 / 不通过」的理由（QuantConnect）。</li>
+          <li>自动挖因子（微软 RD-Agent）、个股研报生成（BigQuant）。</li>
+        </ul>
+      </div>
+      <div>
+        <h4>常见页面</h4>
+        <p>页面右侧的对话抽屉，带「应用到编辑器 / 运行回测」按钮；或首页大输入框配示例提示卡片。</p>
+        <div class="us"><b>rQuant：</b>有自然语言选股，已经是比较实用的一环。建议补上的是「生成条件后直接预览结果并回测」，以及回测结果的文字解读。</div>
+      </div>
+    </div>
+  </details>
+
+  <details class="mod">
+    <summary><span class="code">M15</span><span class="t">协作与权限</span><span class="tier opt">可选</span><span class="pill part">部分</span><span class="chev" aria-hidden="true">▶</span></summary>
+    <div class="body">
+      <p>社区策略广场、一键复制策略、比赛、工作空间与成员权限（聚宽、SuperMind、米筐）。单用户不需要这些。rQuant 已有的「管理员 + 协作者分通道推送」和页面登录已经够用，最多再加一个「只读分享某个结果页」。</p>
+    </div>
+  </details>
+
+  <details class="mod">
+    <summary><span class="code">M16</span><span class="t">运维与数据健康</span><span class="tier must">必需</span><span class="pill part">部分</span><span class="chev" aria-hidden="true">▶</span></summary>
+    <div class="body two">
+      <div>
+        <h4>业界一般做到</h4>
+        <ul class="plain">
+          <li>数据新鲜度与质量检查、服务心跳、日志检索（Qlib、QuantConnect）。</li>
+          <li>每次回测保存代码快照，结果可追溯。</li>
+          <li>分层监控：基础设施 → 行情数据流 → 策略与信号 → 与回测预期的偏离。</li>
+        </ul>
+      </div>
+      <div>
+        <h4>常见页面</h4>
+        <p>健康总览页：每张数据表一行（最新日期、应有日期、延迟天数、状态灯），每个后台服务一行（状态、上次心跳、最近错误）。</p>
+        <div class="us"><b>rQuant：</b>后台做得很重：发布器、备份、副本、看门狗，以及 9 月 25 日新增的整日回放工具。个人平台没有运维团队，「今天数据到了没有、任务跑了没有、推送通不通」必须在一个页面上一眼看清。现在的健康看板只覆盖旧系统，新系统的部分要等运行控制台。</div>
+      </div>
+    </div>
+  </details>
+</section>
+
+<section id="layout">
+  <h2>平台怎么组织页面</h2>
+  <p class="sub">各平台的顶层菜单大致分三种组织方式，原型里用的是第一种和第三种的结合。</p>
+  <div class="tablebox">
+  <table>
+    <thead><tr><th>组织方式</th><th>代表</th><th>特点</th></tr></thead>
+    <tbody>
+      <tr><td><b>按工作流分菜单</b></td><td>果仁、SuperMind、BigQuant</td><td>数据 → 研究 / 选股 → 策略 → 回测 → 模拟 → 实盘，新手最容易理解</td></tr>
+      <tr><td><b>按对象分菜单</b></td><td>聚宽、掘金、QuantConnect</td><td>「我的策略」是中心，点进一个策略，它的回测历史、优化记录、模拟盘都挂在下面</td></tr>
+      <tr><td><b>看板或画布为中心</b></td><td>OpenBB、TradingView、通达信策略股票池</td><td>一个页面放多个联动组件，改代码或日期，所有组件一起刷新</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <h3>压缩到 rQuant 的主线</h3>
+  <div class="flow" aria-label="rQuant 主线">
+    <span>数据健康</span><i>→</i><span>条件 / 池子</span><i>→</i><span>回测验证</span><i>→</i><span>模拟盘记账</span><i>→</i><span>盘中监控告警</span><i>→</i><span>复盘</span>
+  </div>
+  <p>发现条件失效时，要回到因子检验或修改筛选条件，新版本重新回测。果仁网在这一步会把「实盘分」清零，防止拿旧成绩给新规则背书。</p>
+</section>
+
+<section id="trends">
+  <h2>2025–2026 趋势</h2>
+  <ul class="plain">
+    <li><b>AI 从问答助手变成会动手的 Agent。</b>能自己写代码、跑回测、改错，并按研究阶段分工（QuantConnect、BigQuant、SuperMind）。</li>
+    <li><b>Agent 的产出要求可以审查。</b>研究 Agent 产出带假设、图表和结论的 Notebook，由验证 Agent 给出通过或不通过的理由。</li>
+    <li><b>数据和工具主动做成 AI 可以调用的形态。</b>米筐的命令行工具、OpenBB 的 MCP 服务、Tushare 官方 MCP<span class="mark">†</span>。</li>
+    <li><b>防过拟合做进了产品。</b>概率夏普、样本外保留期、滚动前推、「模拟盘须落在回测统计区间内」、果仁网的实盘分清零。</li>
+    <li><b>国内监管收紧程序化交易。</b>对只做选股和提醒、不自动下单的个人平台影响很小。</li>
+  </ul>
+</section>
+
+<section id="next">
+  <h2>如果要做，先做什么</h2>
+  <p class="sub">下面是按「对你每天用得上的程度」排的建议顺序，都在项目边界内，服务于判断筛选条件好不好用、以及盯盘告警。要不要做、做到哪一步，由你来定。</p>
+  <ol class="order">
+    <li><b>新运行时的运行控制台页</b>：信号、模拟盘账户和持仓、服务健康、推送记录。<span class="why">正在进行，会先挂到预览上。它直接回答「新系统今天在干什么」。</span></li>
+    <li><b>标准绩效曲线与回测对比</b>（M7、M8）：净值、回撤、夏普、月度热力，勾选两次回测并排对比。<span class="why">后台数据都有，主要是补页面和几个指标，是「看起来像投研平台」最快的一步。</span></li>
+    <li><b>因子检验</b>（M3）：对任意一个筛选条件做 IC 与分组收益检验。<span class="why">这是判断一条条件到底有没有用的工具，也是四块空白里对选股帮助最大的一块。</span></li>
+    <li><b>选股器补齐</b>（M4）：排名打分、入池时间与入池价，新版画布恢复节点图和规则编辑。<span class="why">把新版丢掉的功能补回来。</span></li>
+    <li><b>告警规则页与告警时间线</b>（M12）。<span class="why">切正式推送以后，这页的作用会立刻显现。</span></li>
+  </ol>
+  <div class="callout"><b>技术栈要先定：</b>第 2 到第 4 项用 Streamlit 可以先做一个能用的版本（图表用 Plotly 或 ECharts 组件）。如果要做到原型里多面板联动、抽屉和节点画布的体验，就需要单独的前端，这是项目规则里写着「先别开分支」的事。</div>
+</section>
+
+<section id="products">
+  <h2>调研了哪些产品</h2>
+  <p class="sub">「材料」一列说明本次读到的是什么：官方原文最可靠；标 <span class="mark">‡</span> 的是第三方文章；标 <span class="mark">†</span> 的只在搜索摘要里看到。</p>
+  <div class="tablebox">
+  <table>
+    <thead><tr><th>产品</th><th>形态</th><th>主打</th><th>材料</th></tr></thead>
+    <tbody>
+      <tr><td><b>聚宽</b></td><td>云端平台 + 本地数据</td><td>在线 Notebook 研究、回测、模拟交易、社区</td><td>新手指南、因子分析仓库（官网首页抓取为空）</td></tr>
+      <tr><td><b>米筐</b></td><td>网页平台 + 本地套件</td><td>因子研究全流程、组合优化器、绩效归因，偏机构</td><td>平台简介、因子研究、优化器、归因、风险模型文档</td></tr>
+      <tr><td><b>BigQuant</b></td><td>云 IDE + 拖拽画布</td><td>机器学习策略、模块化画布、Quant Agent</td><td>首页、画布、IDE、Agent 教程、模拟实盘专题</td></tr>
+      <tr><td><b>优矿</b></td><td>网页平台 + 本地部署</td><td>PIT 数据、风险模型、优化器、归因</td><td>官网功能清单（当前运营状态未核实）</td></tr>
+      <tr><td><b>掘金量化</b></td><td>Windows 桌面终端</td><td>回测 → 仿真 → 实盘一体</td><td>官网、回测与绩效、数据管理文档</td></tr>
+      <tr><td><b>同花顺 SuperMind / i问财</b></td><td>网页平台；问财是自然语言选股</td><td>偏实盘；Notebook；自然语言选股</td><td>首页、仿真与回测差异官方文章；问财教程 <span class="mark">‡</span></td></tr>
+      <tr><td><b>迅投 QMT</b></td><td>券商分发的 Windows 客户端</td><td>投研 + 实盘 + 算法拆单 + 风控</td><td>第三方介绍 <span class="mark">‡</span></td></tr>
+      <tr><td><b>Wind 万矿</b></td><td>云端 Notebook</td><td>Wind 数据 + 500 多个因子</td><td>一篇 2018 年博客 <span class="mark">‡</span></td></tr>
+      <tr><td><b>天勤 TqSdk</b></td><td>开源 Python 库</td><td>tick 级回测、模拟、期货实盘</td><td>官网产品页、官方仓库</td></tr>
+      <tr><td><b>果仁网</b></td><td>网页零代码</td><td>向导式选股回测、策略评分、每日调仓推送</td><td>官网、完整帮助文档</td></tr>
+      <tr><td><b>QuantConnect</b></td><td>云平台 + 开源引擎</td><td>研究 → 回测 → 优化 → 实盘；AI Agent 流水线</td><td>回测结果、参数优化、Agent 公告与文档</td></tr>
+      <tr><td><b>WorldQuant BRAIN</b></td><td>网页 alpha 模拟器</td><td>表达式挖 alpha、众包</td><td>第三方介绍 <span class="mark">‡</span></td></tr>
+      <tr><td><b>TradingView</b></td><td>图表平台 + 脚本</td><td>图表内策略报告、筛选器、告警</td><td>策略报告、深度回测、筛选器文档</td></tr>
+      <tr><td><b>微软 Qlib / RD-Agent</b></td><td>开源框架</td><td>机器学习量化流程；大模型自动挖因子</td><td>仓库说明、实验记录与在线服务文档</td></tr>
+      <tr><td><b>OpenBB</b></td><td>开源数据平台 + 看板</td><td>数据集成、组件看板、AI 助手</td><td>看板文档、数据平台发布博客</td></tr>
+      <tr><td><b>vn.py</b></td><td>开源桌面框架</td><td>CTA、组合策略、alpha 模块、前端风控</td><td>官方仓库说明</td></tr>
+      <tr><td><b>Quantopian</b></td><td>2020 年已关闭</td><td>众包对冲基金，留下 zipline、alphalens、pyfolio</td><td>维基百科</td></tr>
+      <tr><td><b>alphalens / pyfolio / quantstats / backtrader</b></td><td>开源库</td><td>因子检验、绩效报告、回测引擎</td><td>各自仓库或文档</td></tr>
+      <tr><td><b>MSCI Barra / Axioma</b></td><td>机构商业平台</td><td>风险模型、优化、归因、情景分析</td><td>Barra 官网页；Axioma 只有搜索摘要 <span class="mark">†</span></td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<section id="limits">
+  <h2>没能核实的部分</h2>
+  <ul class="plain">
+    <li>各平台登录后的真实界面都没有看到，「常见页面」是按官方文档的文字说明、官网示意图和第三方教程归纳的，没有逐张截图核对。</li>
+    <li>Wind 万矿、迅投 QMT、WorldQuant BRAIN 只读到第三方材料；优矿当前是否仍在运营没有确认。</li>
+    <li>i问财能否直接回测，两份材料说法相反，没有定论。</li>
+    <li>SuperMind 的「Agent 生成策略代码」公告正文需要登录，只看到标题和日期。</li>
+    <li>聚宽官网首页、OpenBB Copilot 文档、QuantConnect Mia 文档页抓取为空或 404，相关描述来自其他官方页面和搜索摘要。</li>
+  </ul>
+</section>
+
+<section id="sources">
+  <h2>来源</h2>
+  <p class="sub">下面只列本次读过原文的主要页面。</p>
+  <ul class="links">
+    <li><a href="https://www.joinquant.com/view/community/detail/34426b055bc8600cba6abec85d164ea5" target="_blank" rel="noopener">聚宽 · 新手指南·投资研究</a></li>
+    <li><a href="https://github.com/JoinQuant/jqfactor_analyzer" target="_blank" rel="noopener">聚宽 · jqfactor_analyzer</a></li>
+    <li><a href="https://www.ricequant.com/doc/quant/" target="_blank" rel="noopener">米筐 · 平台简介与企业版对比</a></li>
+    <li><a href="https://www.ricequant.com/doc/quant/factor-system" target="_blank" rel="noopener">米筐 · 因子研究</a></li>
+    <li><a href="https://www.ricequant.com/doc/rqoptimize/doc/index-rqoptimize" target="_blank" rel="noopener">米筐 · RQOptimizer 组合优化</a></li>
+    <li><a href="https://www.ricequant.com/doc/rqpattr/doc/model-introduction" target="_blank" rel="noopener">米筐 · RQPAttr 归因模型</a></li>
+    <li><a href="https://bigquant.com/wiki/doc/ckQDwcysqe" target="_blank" rel="noopener">BigQuant · BigStudio 可视化画布</a></li>
+    <li><a href="https://bigquant.com/wiki/doc/X4E2u2Wtnn" target="_blank" rel="noopener">BigQuant · Quant Agent 教程</a></li>
+    <li><a href="https://bigquant.com/wiki/topic/4aff13a015" target="_blank" rel="noopener">BigQuant · 模拟实盘专题</a></li>
+    <li><a href="https://uqer.datayes.com/" target="_blank" rel="noopener">优矿 · 官网</a></li>
+    <li><a href="https://www.myquant.cn/" target="_blank" rel="noopener">掘金量化 · 官网</a></li>
+    <li><a href="https://quant.10jqka.com.cn/view/article/2185" target="_blank" rel="noopener">SuperMind · 仿真 / 实盘与回测的差异</a></li>
+    <li><a href="https://www.shinnytech.com/products/tqsdk" target="_blank" rel="noopener">天勤 · TqSdk 产品页</a></li>
+    <li><a href="https://guorn.com/stock/help" target="_blank" rel="noopener">果仁网 · 帮助文档</a></li>
+    <li><a href="http://www.sse.com.cn/aboutus/mediacenter/hotandd/c/c_20250403_10776805.shtml" target="_blank" rel="noopener">上交所 · 程序化交易实施细则答记者问</a></li>
+    <li><a href="https://www.quantconnect.com/docs/v2/cloud-platform/backtesting/results" target="_blank" rel="noopener">QuantConnect · 回测结果</a></li>
+    <li><a href="https://www.quantconnect.com/docs/v2/cloud-platform/optimization" target="_blank" rel="noopener">QuantConnect · 参数优化</a></li>
+    <li><a href="https://www.quantconnect.com/docs/v2/cloud-platform/research-pipeline" target="_blank" rel="noopener">QuantConnect · Research Pipeline</a></li>
+    <li><a href="https://www.quantconnect.com/announcements/20802/assistants-agent-teams-for-systematic-research/" target="_blank" rel="noopener">QuantConnect · Assistants 公告</a></li>
+    <li><a href="https://www.tradingview.com/support/solutions/43000764138-tradingview-strategy-report-how-to-start/" target="_blank" rel="noopener">TradingView · 策略报告</a></li>
+    <li><a href="https://www.tradingview.com/support/solutions/43000742436-tradingview-pine-screener-key-features-and-requirements/" target="_blank" rel="noopener">TradingView · Pine Screener</a></li>
+    <li><a href="https://github.com/microsoft/qlib" target="_blank" rel="noopener">微软 · Qlib</a></li>
+    <li><a href="https://github.com/microsoft/RD-Agent" target="_blank" rel="noopener">微软 · RD-Agent</a></li>
+    <li><a href="https://docs.openbb.co/workspace" target="_blank" rel="noopener">OpenBB · Workspace 文档</a></li>
+    <li><a href="https://github.com/vnpy/vnpy" target="_blank" rel="noopener">vn.py · 官方仓库</a></li>
+    <li><a href="https://github.com/quantopian/alphalens" target="_blank" rel="noopener">alphalens</a></li>
+    <li><a href="https://github.com/ranaroussi/quantstats" target="_blank" rel="noopener">quantstats</a></li>
+    <li><a href="https://pyfolio.ml4trading.io/notebooks/round_trip_tear_sheet_example.html" target="_blank" rel="noopener">pyfolio · 逐轮交易分析</a></li>
+    <li><a href="https://www.msci.com/data-and-analytics/portfolio-management/barra-portfolio-manager" target="_blank" rel="noopener">MSCI · Barra PortfolioManager</a></li>
+    <li><a href="https://en.wikipedia.org/wiki/Quantopian" target="_blank" rel="noopener">Quantopian · 维基百科</a></li>
+  </ul>
+</section>
+
+<footer>调研日期 2026-09-24；rQuant 现状按 2026-09-25 的代码与主机实况填写。标记：<span class="mark">‡</span> 第三方文章，<span class="mark">†</span> 仅见搜索摘要。</footer>
+</main>
+</div>

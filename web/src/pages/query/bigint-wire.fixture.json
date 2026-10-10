@@ -1,0 +1,13 @@
+{
+  "origin": "Actual DuckDB BIGINT → child.scalar → QueryResult JSON",
+  "duckdb_version": "1.5.2",
+  "wire_json": "{\"status\":\"ready\",\"columns\":[{\"name\":\"n\",\"data_type\":\"BIGINT\"}],\"rows\":[[{\"kind\":\"integer\",\"text\":\"-9007199254740993\"}],[{\"kind\":\"integer\",\"text\":\"-9007199254740992\"}],[-9007199254740991],[9007199254740991],[{\"kind\":\"integer\",\"text\":\"9007199254740992\"}],[{\"kind\":\"integer\",\"text\":\"9007199254740993\"}]],\"elapsed_ms\":1.0,\"source_at\":null,\"snapshot_sha256\":null,\"message\":\"\"}",
+  "expected_text": [
+    "-9007199254740993",
+    "-9007199254740992",
+    "-9007199254740991",
+    "9007199254740991",
+    "9007199254740992",
+    "9007199254740993"
+  ]
+}

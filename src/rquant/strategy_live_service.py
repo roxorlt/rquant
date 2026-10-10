@@ -2,20 +2,30 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import date, datetime, time
-from typing import Protocol
+from contextlib import closing
+from datetime import UTC, date, datetime, time
+from decimal import Decimal
+from time import perf_counter
+from typing import Protocol, TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from rquant.feature_spool import FeatureBatchSpool, FeatureConsumerCursor
 from rquant.runtime_candidate_universe import RuntimeCandidateUniverseLoader
 from rquant.runtime_contracts import (
     AwareUtcDatetime,
     RuntimeContractModel,
+    canonical_sha256,
     normalize_aware_utc,
+)
+from rquant.runtime_health_details import (
+    RuntimeHealthAsOfValidity,
+    RuntimeHealthMetric,
+    RuntimeHealthStrategyScope,
 )
 from rquant.runtime_market_session import MarketCalendarAuthority
 from rquant.runtime_shadow_validation import CompletionAttestationSigner
@@ -31,6 +41,99 @@ from rquant.strategy_runner import (
 
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _SESSION_CLOSE = time(15, 0)
+
+if TYPE_CHECKING:
+    from rquant.paper_research_runtime import NativeMinuteForwardViewSource
+    from rquant.paper_portfolio_views import PaperDailyNav
+
+
+class StrategyHealthBatchFacts(RuntimeContractModel):
+    original_batch_id: str
+    source_receipt: StrategySourceBatchReceipt
+    runner_generation_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    result_identity: str = Field(pattern=r"^[0-9a-f]{64}$")
+    event_time: AwareUtcDatetime
+    available_at: AwareUtcDatetime
+    processing_started_at: AwareUtcDatetime | None = None
+    processing_finished_at: AwareUtcDatetime | None = None
+    processed_candidates: int = Field(strict=True, ge=0)
+    duration_seconds: Decimal | None = Field(default=None, ge=0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def actual_receipt_and_interval(self) -> StrategyHealthBatchFacts:
+        if self.original_batch_id != self.source_receipt.source_batch_id:
+            raise ValueError("strategy health fact is detached from its original source receipt")
+        if self.event_time > self.available_at:
+            raise ValueError("strategy health fact contains a future source event")
+        if self.duration_seconds is None:
+            if self.processing_started_at is not None or self.processing_finished_at is not None:
+                raise ValueError("replayed strategy fact cannot manufacture a processing interval")
+        elif not (
+            self.processing_started_at is not None
+            and self.processing_finished_at is not None
+            and self.event_time
+            <= self.processing_started_at
+            <= self.processing_finished_at
+            == self.available_at
+        ):
+            raise ValueError("strategy duration requires its actual complete processing interval")
+        return self
+
+
+def strategy_health_metrics(fact: StrategyHealthBatchFacts) -> tuple[RuntimeHealthMetric, ...]:
+    scope = RuntimeHealthStrategyScope(
+        batch_id=canonical_sha256(fact.source_receipt), processed=True
+    )
+    common = dict(
+        owner_dataset_id="runner_signal",
+        source_generation_id=fact.runner_generation_id,
+        source_identity=canonical_sha256(fact),
+        scope=scope,
+        event_time_start=fact.event_time,
+        event_time_end=fact.event_time,
+        available_at=fact.available_at,
+        observed_at=fact.available_at,
+    )
+    duration_common = common | dict(
+        event_time_start=fact.processing_started_at or fact.event_time,
+        event_time_end=fact.processing_finished_at or fact.event_time,
+    )
+
+    def validity(material: dict[str, object]) -> RuntimeHealthAsOfValidity:
+        return RuntimeHealthAsOfValidity(
+            basis="batch",
+            basis_identity=scope.batch_id,
+            as_of=fact.available_at,
+            scope_identity=canonical_sha256(scope),
+            **{
+                key: value for key, value in material.items() if key not in {"scope", "observed_at"}
+            },
+        )
+
+    return (
+        RuntimeHealthMetric(
+            metric_id="strategy_duration",
+            unit="seconds",
+            **duration_common,
+            validity=validity(duration_common),
+            completeness="complete" if fact.duration_seconds is not None else "unavailable",
+            value=fact.duration_seconds,
+            verdict="unassessed" if fact.duration_seconds is not None else "unavailable",
+            reason_code="actual_strategy_batch"
+            if fact.duration_seconds is not None
+            else "replayed_duration_unavailable",
+        ),
+        RuntimeHealthMetric(
+            metric_id="strategy_candidates",
+            unit="count",
+            **common,
+            validity=validity(common),
+            completeness="complete",
+            value=fact.processed_candidates,
+            verdict="unassessed",
+            reason_code="actual_strategy_batch",
+        ),
+    )
 
 
 class StrategyLiveBatchSummary(RuntimeContractModel):
@@ -56,6 +159,9 @@ class StrategyLiveBatchSummary(RuntimeContractModel):
     #: is skipped instead of failing the whole batch, so this is where a held position
     #: whose exits are not being evaluated shows up.
     last_batch_skipped_candidates: int | None = Field(default=None, ge=0)
+    last_batch_health: StrategyHealthBatchFacts | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 StrategyLiveFaultHook = Callable[[str], None]
@@ -111,6 +217,61 @@ def _completion_authority_configured(
     return all(configured)
 
 
+def publish_native_forward_close(
+    source: NativeMinuteForwardViewSource, *, observed_at: datetime,
+    completion_receipt_id: str | None,
+) -> PaperDailyNav | None:
+    """Publish after the original runner/router and broker finish the same day."""
+    from rquant.paper_research_runtime import NativeMinuteForwardViewSource
+    from rquant.paper_signal_worker import PaperSignalQueueStatus
+    from rquant.paper_portfolio_ledger import MAX_FULL_ORDERS
+
+    if type(source) is not NativeMinuteForwardViewSource:
+        raise TypeError("forward close requires its installed original native source")
+    runtime = source.runtime
+    runtime.require_original_peers()
+    configuration = runtime.state.configuration
+    runtime.state.authorize(configuration.target.owner_id)
+    observed = normalize_aware_utc(observed_at)
+    local = observed.astimezone(_SHANGHAI)
+    day = local.date()
+    if (day not in runtime.calendar.dates or local.time().replace(tzinfo=None) < _SESSION_CLOSE
+        or local.time().replace(tzinfo=None) > time(21)
+        or day <= configuration.paper_approved_at.astimezone(_SHANGHAI).date()):
+        return None
+    if completion_receipt_id is None:
+        return None
+    receipt = runtime.runner.session_close_receipt(day)
+    if receipt is None or receipt.completion_attestation is None:
+        raise ValueError("native close lacks its original complete runner/route receipt")
+    claims = receipt.completion_attestation.claims
+    if (receipt.receipt_id != completion_receipt_id or receipt.produced_at > observed
+        or receipt.complete_through < receipt.session_close_at
+        or (receipt.source_id, receipt.runner_generation_id, receipt.calendar_generation_id,
+            receipt.high_watermark) != (runtime.manifest.service_id, runtime.runner.source_generation_id,
+            runtime.market_calendar.content_sha256, runtime.runner.signal_high_watermark())
+        or (claims.strategy_id, claims.strategy_version, claims.strategy_spec_fingerprint,
+            claims.strategy_registration_fingerprint, claims.producer_manifest_fingerprint)
+        != (configuration.target.strategy_id, configuration.target.head.version,
+            configuration.target.head.spec_fingerprint, configuration.target.head.registration_fingerprint,
+            runtime.manifest.manifest_fingerprint)):
+        raise ValueError("native close differs from its exact original completion authority")
+    with closing(runtime.queue._connect()) as connection:
+        connection.execute("BEGIN")
+        if connection.execute("SELECT COUNT(*) FROM paper_signal_queue").fetchone()[0] > MAX_FULL_ORDERS:
+            raise ValueError("native forward queue exceeds its complete financial read budget")
+        pending = connection.execute("SELECT COUNT(*) FROM paper_signal_queue WHERE status IN (?,?)",
+            (PaperSignalQueueStatus.PENDING.value, PaperSignalQueueStatus.PREPARED.value)).fetchone()[0]
+    if pending:
+        return None
+    old = tuple(point for point in source.views.nav_series() if point.trade_date == day)
+    if old:
+        if old[0].published_at > observed:
+            raise ValueError("native close contains a future original NAV publication")
+        return old[0]
+    return source.record_close(observed_at=observed, published_at=observed)
+
+
 def run_strategy_live_batch(
     *,
     feature_spool: FeatureBatchSpool,
@@ -128,8 +289,20 @@ def run_strategy_live_batch(
     producer_instance_id: str | None = None,
     producer_version: str | None = None,
     completion_attestation: StrategyCompletionAttestationConfig | None = None,
+    health_metrics_enabled: bool = False,
+    completion_clock: Callable[[], datetime] | None = None,
+    monotonic_clock: Callable[[], float] = perf_counter,
+    native_forward_source: NativeMinuteForwardViewSource | None = None,
 ) -> StrategyLiveBatchSummary:
+    if type(health_metrics_enabled) is not bool:
+        raise TypeError("strategy health opt-in must be bool")
     observed = normalize_aware_utc(observed_at)
+    if native_forward_source is not None:
+        from rquant.paper_research_runtime import NativeMinuteForwardViewSource
+        if type(native_forward_source) is not NativeMinuteForwardViewSource or native_forward_source.runtime.runner is not runner:
+            raise TypeError("strategy execution requires its exact original native forward runner")
+        native_forward_source.runtime.require_original_peers()
+        native_forward_source.runtime.state.authorize(native_forward_source.runtime.state.configuration.target.owner_id)
     if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
         raise ValueError("limit must be a positive integer")
     resolved_consumer_id = consumer_id or (
@@ -161,6 +334,7 @@ def run_strategy_live_batch(
     replayed = 0
     signal_count = 0
     last_batch_skipped: int | None = None
+    last_batch_health: StrategyHealthBatchFacts | None = None
     last_sequence = started_after
     for record in records:
         envelope = record.envelope
@@ -177,6 +351,16 @@ def run_strategy_live_batch(
             observed_at=observed,
         )
         was_processed = result is not None
+        processing_started = None
+        if health_metrics_enabled and not was_processed:
+            processing_started = normalize_aware_utc(
+                (completion_clock or (lambda: datetime.now(UTC)))()
+            )
+            if processing_started < observed:
+                raise ValueError("strategy processing clock precedes its original observation")
+        measurement_start = (
+            monotonic_clock() if health_metrics_enabled and not was_processed else None
+        )
         if result is None:
             stored = feature_spool.read_result(record)
             frame = stored.frame
@@ -202,6 +386,33 @@ def run_strategy_live_batch(
                 dataset_snapshot_id=joined.envelope.input_fingerprint,
                 observed_at=observed,
                 evaluator=evaluator,
+            )
+        if health_metrics_enabled:
+            duration = None
+            finished = observed
+            if not was_processed:
+                measurement_end = monotonic_clock()
+                if measurement_start is None or not (
+                    math.isfinite(measurement_start)
+                    and math.isfinite(measurement_end)
+                    and measurement_start <= measurement_end
+                ):
+                    raise ValueError("strategy measurement requires an ordered monotonic interval")
+                duration = Decimal(str(measurement_end - measurement_start))
+                finished = normalize_aware_utc((completion_clock or (lambda: datetime.now(UTC)))())
+                if finished < processing_started:
+                    raise ValueError("strategy completion precedes its processing start")
+            last_batch_health = StrategyHealthBatchFacts(
+                original_batch_id=envelope.batch_id,
+                source_receipt=source_receipt,
+                runner_generation_id=runner.source_generation_id,
+                result_identity=canonical_sha256(result),
+                event_time=envelope.event_time,
+                available_at=finished,
+                processing_started_at=processing_started,
+                processing_finished_at=None if was_processed else finished,
+                processed_candidates=result.processed_candidates,
+                duration_seconds=duration,
             )
         if fault_hook is not None:
             fault_hook("after_runner_commit")
@@ -304,6 +515,10 @@ def run_strategy_live_batch(
                         )
                         completion_receipt_id = receipt.receipt_id
 
+    if native_forward_source is not None and not has_deferred_batches:
+        publish_native_forward_close(native_forward_source, observed_at=observed,
+            completion_receipt_id=completion_receipt_id)
+
     return StrategyLiveBatchSummary(
         observed_at=observed,
         strategy_id=runner.spec.strategy_id,
@@ -319,6 +534,7 @@ def run_strategy_live_batch(
         has_deferred_batches=has_deferred_batches,
         completion_receipt_id=completion_receipt_id,
         last_batch_skipped_candidates=last_batch_skipped,
+        last_batch_health=last_batch_health,
     )
 
 

@@ -28,6 +28,7 @@ from rquant.runtime_service_control import (
 
 if TYPE_CHECKING:
     from rquant.runtime_artifact_terminal_lifecycle import ProductionArtifactTerminalLifecycle
+    from rquant.runtime_health_authority import RuntimeHealthTrustedOpsProvider
 
 CommitSha = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{40}$")]
 _GENERATION_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -67,6 +68,8 @@ class RuntimeServiceKind(StrEnum):
     AUCTION_MATCH_SOURCE = "auction_match_source"
     MARKET_MINUTE_SOURCE = "market_minute_source"
     WATCHLIST_QUOTE_SOURCE = "watchlist_quote_source"
+    PRICE_ALERT_RUNTIME = "price_alert_runtime"
+    CONDITION_ALERT_RUNTIME = "condition_alert_runtime"
     DAILY_CLOSE_SOURCE = "daily_close_source"
     SHADOW_SESSION = "shadow_session"
     DAILY_PIPELINE_ORCHESTRATOR = "daily_pipeline_orchestrator"
@@ -81,6 +84,7 @@ class RuntimeServiceKind(StrEnum):
     RUNTIME_HEALTH_PUBLISHER = "runtime_health_publisher"
     LAB_JOBS_PUBLISHER = "lab_jobs_publisher"
     LAB_ARTIFACT_CATALOG = "lab_artifact_catalog"
+    MINUTE_STUDY_PROJECTION = "minute_study_projection"
     ARTIFACT_RETENTION = "artifact_retention"
     PROMOTIONS_PUBLISHER = "promotions_publisher"
     SERVING_PUBLISHER = "serving_publisher"
@@ -174,9 +178,15 @@ class RuntimeServiceRegistry:
         artifact_terminal_lifecycle_factory: (
             Callable[[], ProductionArtifactTerminalLifecycle] | None
         ) = None,
+        ops_context_provider: RuntimeHealthTrustedOpsProvider | None = None,
     ) -> None:
         self._builders: dict[RuntimeServiceKind, RuntimeServiceBuilder] = {}
         self._artifact_terminal_lifecycle_factory = artifact_terminal_lifecycle_factory
+        self._ops_context_provider = ops_context_provider
+
+    @property
+    def ops_context_provider(self) -> RuntimeHealthTrustedOpsProvider | None:
+        return self._ops_context_provider
 
     def open_artifact_terminal_lifecycle(self) -> ProductionArtifactTerminalLifecycle:
         """Open the production-only terminal-owner composition on demand.
@@ -331,6 +341,7 @@ def run_runtime_service_manifest(
         control_root,
         spec=manifest.service_spec,
         clock=clock,
+        ops_context_provider=registry.ops_context_provider,
     )
     try:
         return run_service_loop(

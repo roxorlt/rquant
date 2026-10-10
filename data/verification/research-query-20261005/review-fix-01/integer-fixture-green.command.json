@@ -1,0 +1,15 @@
+{
+  "argv": [
+    "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/.venv/bin/python",
+    "-I",
+    "-B",
+    "data/verification/research-query-20261005/review-fix-01/generate_integer_fixture.py"
+  ],
+  "cwd": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk",
+  "started_utc": "2026-10-04T22:11:47.350837+00:00",
+  "elapsed_seconds": 0.304669291999744,
+  "exit_code": 0,
+  "stdout_sha256": "c9893685fbe053bdf97f83859829aeb00d7b5d4fd2ec5c46614c41daec0483d5",
+  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "starting_candidate": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb"
+}

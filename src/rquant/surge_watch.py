@@ -49,6 +49,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta, timezone
 from datetime import time as dt_time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
@@ -58,6 +59,9 @@ from pydantic import BaseModel, Field
 from rquant.legacy_shadow_export import LegacySurgeCollectionProof
 from rquant.runtime_contracts import canonical_sha256
 from rquant.state.derive import _classify_board, _detect_st
+
+if TYPE_CHECKING:
+    from rquant.monitor_builtin_runtime import OriginalBuiltinSourceOutlet
 
 CST = timezone(timedelta(hours=8))  # A 股墙钟（Asia/Shanghai）
 
@@ -1645,6 +1649,7 @@ def run_surge_watch(
     recent_trading_days_fn: Callable[[date], tuple[date, ...] | list[date]] | None = None,
     baseline: SurgeBaseline | None = None,
     max_ticks: int | None = None,
+    builtin_outlet: OriginalBuiltinSourceOutlet | None = None,
 ) -> int:
     """常驻主循环：守卫 → 每分钟拉**全市场**快照 → 落 snapshot_full → 检测层过滤 → tick
     → 推送/落盘 → 15:02 退出。
@@ -1657,6 +1662,10 @@ def run_surge_watch(
     60/120/300。``force_session`` 忽略时段守卫（盘后验收）；``max_ticks`` 限定循环次数。
     """
     config = config or SurgeConfig()
+    if builtin_outlet is not None:
+        from rquant.monitor_builtin_runtime import require_original_builtin_source_outlet
+
+        require_original_builtin_source_outlet(builtin_outlet)
     started_at = now_fn()
     day = started_at.date()
     trading_check = is_trading_day_fn or _load_is_trading_day
@@ -1716,7 +1725,8 @@ def run_surge_watch(
     from rquant.pulse_watch import PulseSession  # 函数级导入：pulse_watch 顶层引本模块，避免环
 
     write_runtime_config(live_dir, config, day)
-    pulse_session = PulseSession(live_dir, day, notify_fn=notify_fn, dry_run=dry_run)
+    pulse_session = PulseSession(live_dir, day, notify_fn=notify_fn, dry_run=dry_run,
+        builtin_outlet=builtin_outlet, market_universe=tuple(sorted(baseline.code_universe)), builtin_clock=now_fn)
 
     miss_streak = 0
     degraded_alerted = False
@@ -1756,6 +1766,8 @@ def run_surge_watch(
             route = full.attrs.get("route", "none") if full is not None else "none"
             collection_tracker.observe_snapshot(now, full)
             if full is None or full.empty:
+                if builtin_outlet is not None:
+                    builtin_outlet.unavailable(origins=("original_surge", "original_pulse"), observed_at=now_fn(), reason="snapshot_unavailable")
                 miss_streak += 1
                 logger.warning(f"surge 快照 miss（连续 {miss_streak}），route={route}")
                 if miss_streak >= config.miss_circuit_threshold:
@@ -1786,7 +1798,15 @@ def run_surge_watch(
 
             if result.confirmed:
                 append_events(events_path, result.confirmed)
+            if builtin_outlet is not None and builtin_outlet.captures("original_surge"):
+                try:
+                    builtin_outlet.surge_snapshot(snapshot=full, detection_snapshot=detection, watcher=watcher, result=result,
+                        observed_at=now, available_at=now_fn(), events_path=events_path)
+                except Exception:
+                    builtin_outlet.unavailable(origins=("original_surge",), observed_at=now_fn(), reason="surge_capture_unavailable")
             for title, body in result.pushes:
+                if builtin_outlet is not None and builtin_outlet.captures("original_surge"):
+                    continue
                 if dry_run:
                     print(f"\n===== [DRY-RUN] {title} =====\n{body}\n")
                 else:

@@ -666,9 +666,52 @@ def _prior_days_had_surge(
         """,
         [ts_code, signal_date, lookback_days],
     ).fetchall()
-    if len(rows) < lookback_days:
+    return prior_days_had_surge(
+        tuple(row[0] for row in rows), lookback_days=lookback_days,
+        max_prior_volume_ratio=max_prior_volume_ratio,
+    )
+
+
+def prior_days_had_surge(
+    nonmissing_ratios: tuple[float, ...],
+    *,
+    lookback_days: int,
+    max_prior_volume_ratio: float,
+) -> bool | None:
+    """Apply the original kernel to the selected nonmissing prior daily rows."""
+    if len(nonmissing_ratios) < lookback_days:
         return None
-    return any(float(r[0]) >= max_prior_volume_ratio for r in rows)
+    return any(float(ratio) >= max_prior_volume_ratio for ratio in nonmissing_ratios)
+
+
+def passes_growth_listing_filter(listed_trading_days: int, config: GrowthBoardSurgeConfig) -> bool:
+    return (
+        config.min_listing_trading_days <= 0
+        or listed_trading_days >= config.min_listing_trading_days
+    )
+
+
+def passes_growth_fresh_filter(prior_surge: bool | None, config: GrowthBoardSurgeConfig) -> bool:
+    return not config.require_fresh_surge or prior_surge is not True
+
+
+def passes_growth_board_filter(
+    board_strength: dict[str, object] | None,
+    config: GrowthBoardSurgeConfig,
+) -> bool:
+    if not config.require_board_favor:
+        return True
+    if board_strength is None:
+        return False
+    gap_ratio = board_strength.get("board_gap_up_ratio")
+    amt_ratio = board_strength.get("board_auction_amount_ratio")
+    if gap_ratio is None or float(gap_ratio) < config.min_board_gap_up_ratio:
+        return False
+    if (  # noqa: SIM103 -- 冻结 evaluator AST，保持旧封存指纹。
+        amt_ratio is None or float(amt_ratio) < config.min_board_auction_amount_ratio
+    ):
+        return False
+    return True
 
 
 def _query_large_net_vol(
@@ -772,6 +815,74 @@ def _passes_surge_filter(
         and float(accel_5m) >= config.min_amount_accel_5m
     )
     return has_same_minute_surge or has_accel_surge
+
+
+class GrowthEntryCheck(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    eligible: bool = False
+    abort_candidate: bool = False
+    needs_relative_features: bool = False
+    needs_static_factors: bool = False
+    factor_score: float | None = None
+    raw_factor_values: dict[str, float | int | None] | None = None
+
+
+def evaluate_growth_entry(
+    *,
+    config: GrowthBoardSurgeConfig,
+    quote_time: datetime,
+    latest_price: float,
+    limit_up_price: float,
+    vwap: float | None,
+    features: dict[str, float | int | None] | None,
+    inner_outer_ratio: float | None,
+    static_factors: dict[str, float | int | None] | None,
+    board_strength: dict[str, object] | None,
+) -> GrowthEntryCheck:
+    """原放量追击当时入场门；不读取下一根行情或全日结果。"""
+    if quote_time.time() < config.min_signal_time:
+        return GrowthEntryCheck()
+    if latest_price >= limit_up_price - config.price_tol:
+        return GrowthEntryCheck()
+    if (config.require_vwap_strength and vwap is not None
+            and latest_price < vwap * (1 + config.vwap_buffer_pct)):
+        return GrowthEntryCheck()
+    if features is None:
+        return GrowthEntryCheck(needs_relative_features=True)
+    if not _passes_surge_filter(features, config):
+        return GrowthEntryCheck()
+    if config.require_inner_outer and (
+        inner_outer_ratio is None or inner_outer_ratio >= config.max_inner_outer_ratio
+    ):
+        return GrowthEntryCheck()
+    if config.factor_layer_enabled and static_factors is None:
+        return GrowthEntryCheck(needs_static_factors=True)
+    if config.require_large_net_vol:
+        large_net = (static_factors or {}).get("large_net_vol_t1")
+        if large_net is None or float(large_net) <= config.min_large_net_vol:
+            return GrowthEntryCheck(abort_candidate=True)
+    factor_score: float | None = None
+    raw_factor_values: dict[str, float | int | None] | None = None
+    if config.factor_layer_enabled:
+        raw_factor_values = {
+            **(static_factors or {}),
+            "rel_cum_amount_asof": features.get("signal_rel_cum_amount_asof"),
+            "rel_amount_same_minute": features.get("signal_rel_amount_same_minute"),
+            "amount_accel_5m": features.get("signal_amount_accel_5m"),
+            "inner_outer_ratio": inner_outer_ratio,
+        }
+        if board_strength is not None:
+            raw_factor_values["board_gap_up_ratio"] = board_strength.get("board_gap_up_ratio")
+            raw_factor_values["board_auction_amount_ratio"] = board_strength.get(
+                "board_auction_amount_ratio"
+            )
+        factor_score = score_feature_terms(raw_factor_values, GROWTH_SURGE_B_V1_SCORE_TERMS)
+        if config.enable_factor_confirm and factor_score < config.factor_score_threshold:
+            return GrowthEntryCheck(factor_score=factor_score, raw_factor_values=raw_factor_values)
+    return GrowthEntryCheck(
+        eligible=True, factor_score=factor_score, raw_factor_values=raw_factor_values
+    )
 
 
 def _previous_window_date(window_dates: list[date], trading_date: date) -> date | None:
@@ -989,17 +1100,12 @@ def _find_entry_position(
             prev_minute_close = minute_close
         vwap = cum_amount / cum_vol if cum_vol > 0 else None
         quote = _quote_from_close(row)
-        if quote_time.time() < config.min_signal_time:
-            clocked_amount_history.append((quote_time.time(), minute_amount))
-            continue
-        if quote.price >= candidate.limit_up_price - config.price_tol:
-            clocked_amount_history.append((quote_time.time(), minute_amount))
-            continue
-        if (
-            config.require_vwap_strength
-            and vwap is not None
-            and quote.price < vwap * (1 + config.vwap_buffer_pct)
-        ):
+        preliminary = evaluate_growth_entry(
+            config=config, quote_time=quote_time, latest_price=quote.price,
+            limit_up_price=candidate.limit_up_price, vwap=vwap, features=None,
+            inner_outer_ratio=None, static_factors=None, board_strength=board_strength,
+        )
+        if not preliminary.needs_relative_features:
             clocked_amount_history.append((quote_time.time(), minute_amount))
             continue
 
@@ -1017,58 +1123,34 @@ def _find_entry_position(
             raw_features,
             config.lookback_days,
         )
-        if not _passes_surge_filter(features, config):
-            clocked_amount_history.append((quote_time.time(), minute_amount))
-            continue
-
         inner_outer_ratio = (
             round(inner_vol / outer_vol, 4) if outer_vol > 0 else None
         )
-        if config.require_inner_outer and (
-            inner_outer_ratio is None
-            or inner_outer_ratio >= config.max_inner_outer_ratio
-        ):
-            clocked_amount_history.append((quote_time.time(), minute_amount))
-            continue
-        if config.factor_layer_enabled and static_factors is None:
+        entry_check = evaluate_growth_entry(
+            config=config, quote_time=quote_time, latest_price=quote.price,
+            limit_up_price=candidate.limit_up_price, vwap=vwap, features=features,
+            inner_outer_ratio=inner_outer_ratio, static_factors=static_factors,
+            board_strength=board_strength,
+        )
+        if entry_check.needs_static_factors:
             static_factors = _prefetch_growth_static_factors(
                 store,
                 ts_code=candidate.ts_code,
                 previous_date=candidate.previous_date,
             )
-        if config.require_large_net_vol:
-            large_net = (static_factors or {}).get("large_net_vol_t1")
-            # T-1 静态条件当日不再变化，不满足（含缺数据）直接放弃该候选
-            if large_net is None or float(large_net) <= config.min_large_net_vol:
-                return None
-        factor_score: float | None = None
-        raw_factor_values: dict[str, object] | None = None
-        if config.factor_layer_enabled:
-            raw_factor_values = {
-                **(static_factors or {}),
-                "rel_cum_amount_asof": features.get("signal_rel_cum_amount_asof"),
-                "rel_amount_same_minute": features.get(
-                    "signal_rel_amount_same_minute"
-                ),
-                "amount_accel_5m": features.get("signal_amount_accel_5m"),
-                "inner_outer_ratio": inner_outer_ratio,
-            }
-            if board_strength is not None:
-                raw_factor_values["board_gap_up_ratio"] = board_strength.get(
-                    "board_gap_up_ratio"
-                )
-                raw_factor_values["board_auction_amount_ratio"] = (
-                    board_strength.get("board_auction_amount_ratio")
-                )
-            factor_score = score_feature_terms(
-                raw_factor_values, GROWTH_SURGE_B_V1_SCORE_TERMS
+            entry_check = evaluate_growth_entry(
+                config=config, quote_time=quote_time, latest_price=quote.price,
+                limit_up_price=candidate.limit_up_price, vwap=vwap, features=features,
+                inner_outer_ratio=inner_outer_ratio, static_factors=static_factors,
+                board_strength=board_strength,
             )
-            if (
-                config.enable_factor_confirm
-                and factor_score < config.factor_score_threshold
-            ):
-                clocked_amount_history.append((quote_time.time(), minute_amount))
-                continue
+        if entry_check.abort_candidate:
+            return None
+        if not entry_check.eligible:
+            clocked_amount_history.append((quote_time.time(), minute_amount))
+            continue
+        factor_score = entry_check.factor_score
+        raw_factor_values = entry_check.raw_factor_values
 
         execution_index = idx + 1
         if execution_index >= len(day_minutes):
@@ -1256,9 +1338,8 @@ def run_growth_board_surge_replay(
             structural_excluded_codes=structural_exclusions[trading_date],
         ):
             # 不做新股（候选级）：上市不满 N 个交易日跳过
-            if cfg.min_listing_trading_days > 0 and (
-                _listed_trading_days(store, candidate.ts_code, trading_date)
-                < cfg.min_listing_trading_days
+            if cfg.min_listing_trading_days > 0 and not passes_growth_listing_filter(
+                _listed_trading_days(store, candidate.ts_code, trading_date), cfg,
             ):
                 continue
             # 首爆过滤（候选级日线条件，早于分钟查询以省算力）：前 N 日放过量则跳过
@@ -1270,7 +1351,7 @@ def run_growth_board_surge_replay(
                     cfg.fresh_lookback_days,
                     cfg.fresh_max_prior_volume_ratio,
                 )
-                if prior_surge is True:
+                if not passes_growth_fresh_filter(prior_surge, cfg):
                     continue
             # 板块集合竞价强度闸门（候选级，早于分钟查询）：题材竞价整体不达标跳过。
             # 缺题材归属或缺竞价历史（ratio=None）保守拦截，与其他闸门一致。
@@ -1287,16 +1368,7 @@ def run_growth_board_surge_replay(
                         tzinfo=SHANGHAI,
                     ),
                 )
-                if board_strength is None:
-                    continue
-                gap_ratio = board_strength.get("board_gap_up_ratio")
-                amt_ratio = board_strength.get("board_auction_amount_ratio")
-                if gap_ratio is None or float(gap_ratio) < cfg.min_board_gap_up_ratio:
-                    continue
-                if (
-                    amt_ratio is None
-                    or float(amt_ratio) < cfg.min_board_auction_amount_ratio
-                ):
+                if not passes_growth_board_filter(board_strength, cfg):
                     continue
             day_start, _ = _day_bounds(trading_date)
             minutes = store.query_minute_bars(

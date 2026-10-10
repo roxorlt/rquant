@@ -206,6 +206,17 @@ def test_retaining_lease_rejects_symlink_hardlink_and_fifo(tmp_path: Path) -> No
                 allowed_modes=frozenset({0o444}),
                 max_bytes=1024,
             )
+    hardlink.unlink()
+    with pytest.raises(AuthorityPathSecurityError, match="owner"):
+        open_secure_regular_file_lease(
+            regular,
+            trusted_root=root,
+            allowed_ancestor_uids=frozenset({os.getuid()}),
+            expected_uid=os.getuid() + 1,
+            expected_gid=os.getgid(),
+            allowed_modes=frozenset({0o444}),
+            max_bytes=1024,
+        )
 
 
 def test_collector_is_fd_anchored_and_rejects_input_replacement(
@@ -643,7 +654,9 @@ def test_live_capability_reuses_verified_generation_but_rechecks_current_promoti
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from rquant import authority_path_security as authority
     from rquant import runtime_code_generation as generation_module
+    from rquant.runtime_code_attestation import RuntimeCodeBundleEntry
     from rquant.runtime_code_generation import RuntimeCodeGenerationError
     from tests.runtime_code_e2e_support import (
         build_test_package,
@@ -651,7 +664,17 @@ def test_live_capability_reuses_verified_generation_but_rechecks_current_promoti
         open_test_capability,
     )
 
-    package = build_test_package(tmp_path / "package")
+    package = build_test_package(
+        tmp_path / "package",
+        extra_entries=tuple(
+            RuntimeCodeBundleEntry(
+                path=f"release/src/rquant/diagnostic_{index:04d}.py",
+                mode=0o444,
+                content=b"VALUE = 1\n",
+            )
+            for index in range(160)
+        ),
+    )
     trusted_base, runtime_root, _installer = install_test_package(tmp_path, package)
     real_load = generation_module.require_attested_runtime_generation
     full_verifications = 0
@@ -671,7 +694,12 @@ def test_live_capability_reuses_verified_generation_but_rechecks_current_promoti
         runtime_root=runtime_root,
         package=package,
     )
+    leases = (capability._pointer_lease, *capability._artifact_leases)
+    retained = {descriptor for lease in leases for descriptor in lease._descriptors}
+    file_descriptors = {lease.fileno() for lease in leases}
     try:
+        assert len(file_descriptors) == len(leases)
+        assert len(retained - file_descriptors) == 8
         assert full_verifications == 1
         capability.require_live()
         assert full_verifications == 1
@@ -682,6 +710,65 @@ def test_live_capability_reuses_verified_generation_but_rechecks_current_promoti
         assert full_verifications == 1
     finally:
         capability.close()
+        capability.close()
+    with pytest.raises(RuntimeCodeGenerationError, match="closed"):
+        capability.require_live()
+    for descriptor in retained:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+    package.promotion_state.current_bytes = package.receipt_bytes
+    real_open = authority.os.open
+    opened: set[int] = set()
+
+    def record_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        descriptor = real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+        opened.add(descriptor)
+        return descriptor
+
+    real_adopt = authority._SharedSecureFileLeaseAncestors.adopt
+    real_fstat = authority.os.fstat
+    for phase in ("during-adopt", "after-adopt"):
+        adoptions = 0
+
+        def fail_adoption(
+            owner: authority._SharedSecureFileLeaseAncestors,
+            lease: authority.SecureRegularFileLease,
+            adoption_phase: str = phase,
+        ) -> None:
+            nonlocal adoptions
+            adoptions += 1
+            if adoptions == 3 and adoption_phase == "during-adopt":
+                observations = 0
+
+                def fail_mid_adoption(opened_descriptor: int) -> os.stat_result:
+                    nonlocal observations
+                    observations += 1
+                    if observations == 2:
+                        raise RuntimeError("diagnostic partial capability construction")
+                    return real_fstat(opened_descriptor)
+
+                with monkeypatch.context() as patch:
+                    patch.setattr(authority.os, "fstat", fail_mid_adoption)
+                    real_adopt(owner, lease)
+                return
+            real_adopt(owner, lease)
+            if adoptions == 3:
+                raise RuntimeError("diagnostic partial capability construction")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(authority.os, "open", record_open)
+            patch.setattr(authority._SharedSecureFileLeaseAncestors, "adopt", fail_adoption)
+            with pytest.raises(RuntimeError, match="partial capability construction"):
+                open_test_capability(
+                    trusted_base=trusted_base,
+                    runtime_root=runtime_root,
+                    package=package,
+                )
+        for descriptor in opened:
+            with pytest.raises(OSError):
+                os.fstat(descriptor)
+        opened.clear()
 
 
 def test_live_capability_rejects_unlisted_file_added_after_open(tmp_path: Path) -> None:
@@ -716,6 +803,7 @@ def test_live_capability_rejects_unlisted_file_added_after_open(tmp_path: Path) 
 
 
 def test_live_capability_rejects_unsafe_ancestor_mode_after_open(tmp_path: Path) -> None:
+    from rquant.authority_path_security import AuthorityPathSecurityError
     from rquant.runtime_code_generation import RuntimeCodeGenerationError
     from tests.runtime_code_e2e_support import (
         build_test_package,
@@ -736,3 +824,45 @@ def test_live_capability_rejects_unsafe_ancestor_mode_after_open(tmp_path: Path)
             capability.require_live()
     finally:
         capability.close()
+
+    trusted_base.chmod(0o700)
+    generation = runtime_root / "generations" / package.receipt.generation_id
+    source_root = generation / "release/src/rquant"
+    source_root.chmod(0o755)
+    app = source_root / "app.py"
+    for path in (app, runtime_root / "current"):
+        capability = open_test_capability(
+            trusted_base=trusted_base,
+            runtime_root=runtime_root,
+            package=package,
+        )
+        try:
+            replacement = path.with_name(f"{path.name}.replacement")
+            replacement.write_bytes(path.read_bytes())
+            replacement.chmod(0o444)
+            os.replace(replacement, path)
+            with pytest.raises(AuthorityPathSecurityError, match="file changed"):
+                capability.require_live()
+        finally:
+            capability.close()
+
+    capability = open_test_capability(
+        trusted_base=trusted_base,
+        runtime_root=runtime_root,
+        package=package,
+    )
+    moved = source_root.with_name("rquant-moved")
+    source_root.parent.chmod(0o755)
+    try:
+        source_root.rename(moved)
+        source_root.mkdir(mode=0o755)
+        replacement_app = source_root / "app.py"
+        replacement_app.write_bytes((moved / "app.py").read_bytes())
+        replacement_app.chmod(0o444)
+        with pytest.raises(AuthorityPathSecurityError, match="ancestor changed"):
+            capability.require_live()
+    finally:
+        capability.close()
+        (source_root / "app.py").unlink()
+        source_root.rmdir()
+        moved.rename(source_root)

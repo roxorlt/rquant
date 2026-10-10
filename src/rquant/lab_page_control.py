@@ -24,6 +24,7 @@ from rquant.lab_job_protocol import (
     SubmitJobCommand,
 )
 from rquant.lab_jobs import LabJobReader
+from rquant.lab_scheduling_control import LabSchedulingCommandEnvelope, LabSchedulingSubmission
 from rquant.page_control import DiscardLabArtifactZip
 from rquant.runtime_artifact_terminal_lifecycle import (
     build_production_artifact_terminal_lifecycle,
@@ -45,6 +46,8 @@ class _CommandWriter(Protocol):
     def submit_cancel(self, job_id: UUID, **kwargs: object) -> CommandSubmissionResult: ...
 
     def submit_retry(self, job_id: UUID, **kwargs: object) -> CommandSubmissionResult: ...
+
+    def submit_scheduling_control(self, envelope: LabSchedulingCommandEnvelope) -> LabSchedulingSubmission: ...
 
 
 class _ZipWriter(Protocol):
@@ -103,6 +106,9 @@ class LabPageControlWriter:
     def export_zip(self, job_id: UUID) -> JsonValue:
         receipt = self.zip_exports.export(job_id)
         return receipt.model_dump(mode="json")
+
+    def submit_scheduling_control(self, envelope: LabSchedulingCommandEnvelope) -> JsonValue:
+        return self.commands.submit_scheduling_control(envelope).model_dump(mode="json")
 
     def discard_zip(self, command: DiscardLabArtifactZip) -> JsonValue:
         self.zip_exports.discard(

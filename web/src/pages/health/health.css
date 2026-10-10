@@ -1,0 +1,86 @@
+.health-layers {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.health-layers .panel,
+.health-layer-body,
+.health-exposure {
+  min-width: 0;
+}
+
+.health-layer-body {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.health-metrics {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.health-metrics li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.health-metric-name {
+  overflow-wrap: anywhere;
+}
+
+.health-metric-scope {
+  display: block;
+}
+
+.health-detail-btn {
+  min-height: 44px;
+}
+
+.health-layer-footer,
+.health-layer-links {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+}
+
+.health-layer-footer {
+  justify-content: space-between;
+}
+
+.health-layer-links a {
+  display: inline-flex;
+  min-height: 44px;
+  align-items: center;
+}
+
+.health-exposure h3 {
+  margin: 0 0 8px;
+  font-size: inherit;
+}
+
+.health-tip {
+  max-width: 300px;
+  overflow-wrap: anywhere;
+}
+
+.health-observation {
+  display: contents;
+}
+
+@media (max-width: 760px) {
+  .health-layers {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 12px;
+  }
+
+  .health-layers .panel-h {
+    flex-wrap: wrap;
+  }
+}

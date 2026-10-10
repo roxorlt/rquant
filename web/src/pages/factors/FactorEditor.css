@@ -1,0 +1,220 @@
+.factor-editor {
+  display: grid;
+  gap: 18px;
+  min-width: 0;
+}
+
+.factor-editor-basics {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.factor-editor-basics > :first-child {
+  grid-column: 1 / -1;
+}
+
+.factor-editor-field {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+  color: var(--ink-2);
+  font-size: 13px;
+}
+
+.factor-editor-field > span,
+.factor-editor-help {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.factor-editor-field .inp {
+  width: 100%;
+  min-width: 0;
+}
+
+.factor-editor-field textarea {
+  min-height: 150px;
+  resize: vertical;
+  line-height: 1.7;
+}
+
+.factor-editor-field [aria-invalid="true"] {
+  border-color: var(--crit);
+}
+
+.factor-editor-field small {
+  color: var(--crit-t);
+  font-size: 12px;
+}
+
+.factor-editor-help {
+  margin-bottom: -9px;
+  color: var(--ink-2);
+  font-size: 13px;
+}
+
+.factor-editor-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.factor-editor-field-group {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.factor-editor-field-group legend {
+  margin-bottom: 8px;
+  padding: 0;
+  color: var(--ink-2);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.factor-editor-field-tools {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.factor-editor-search {
+  width: 100%;
+  min-width: 0;
+}
+
+.factor-editor-field-choice {
+  display: flex;
+  min-width: 0;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--surface-2);
+}
+
+.factor-editor-field-choice .btn {
+  border: 0;
+  border-radius: 0;
+}
+
+.factor-editor-field-choice > .btn {
+  flex: 1;
+  min-width: 0;
+  justify-content: flex-start;
+  white-space: normal;
+}
+
+.factor-editor-field-info {
+  flex: none;
+  width: 36px;
+  color: var(--muted);
+}
+
+.factor-editor-fields .btn {
+  min-height: 36px;
+  background: var(--surface-2);
+}
+
+.factor-editor-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.factor-editor-warning {
+  padding: 12px;
+  margin: 0;
+  border: 1px solid var(--warn);
+  border-radius: 6px;
+  background: var(--warn-weak);
+  color: var(--warn-t);
+  font-size: 13px;
+}
+
+.factor-editor-warning p {
+  margin: 0 0 10px;
+}
+
+.factor-editor-comparison {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  background: var(--surface-2);
+}
+
+.factor-editor-comparison h3 {
+  margin: 0;
+  font-size: 13px;
+}
+
+.factor-editor-comparison-meta {
+  display: grid;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.factor-editor-comparison-meta strong {
+  color: var(--ink-2);
+  font-weight: 600;
+}
+
+.factor-editor-comparison code {
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+
+.factor-editor-actions,
+.factor-command-actions {
+  display: flex;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.factor-editor-actions .btn {
+  min-height: 42px;
+}
+
+@media (max-width: 540px) {
+  .factor-editor-basics {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 14px;
+  }
+
+  .factor-editor-field .inp,
+  .factor-editor-search {
+    min-height: 44px;
+    font-size: 16px;
+  }
+
+  .factor-editor-fields .btn {
+    min-height: 44px;
+  }
+
+  .factor-editor-field-info {
+    width: 44px;
+  }
+
+  .factor-editor-actions {
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+
+  .factor-editor-actions .btn {
+    flex: 1;
+    min-height: 44px;
+  }
+}

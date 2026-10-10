@@ -165,6 +165,42 @@ class AuctionGapMinuteReplayConfig(BaseModel):
         )
 
 
+class AuctionGapEntryCheck(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    support_ok: bool
+    price_floor: float
+    limit_progress: float | None
+    eligible: bool
+
+
+def evaluate_auction_gap_entry(
+    *,
+    config: AuctionGapMinuteReplayConfig,
+    quote_time: datetime,
+    latest_price: float,
+    session_low: float,
+    session_high: float,
+    auction_price: float,
+    limit_up_price: float,
+    vwap: float | None,
+) -> AuctionGapEntryCheck:
+    """原分钟竞价入场判断；价格和累计数据截止当前 bar。"""
+    support_ok = session_low >= auction_price * (1 - config.entry_pullback_tolerance_pct)
+    price_floor = auction_price
+    if vwap is not None:
+        price_floor = max(price_floor, vwap * (1 + config.entry_vwap_buffer_pct))
+    limit_progress = ((session_high - auction_price) / (limit_up_price - auction_price)
+                      if limit_up_price > auction_price else None)
+    eligible = (
+        quote_time.time() >= config.entry_start_time and limit_progress is not None
+        and support_ok and latest_price >= price_floor
+        and limit_progress >= config.min_limit_progress_pct
+    )
+    return AuctionGapEntryCheck(support_ok=support_ok, price_floor=price_floor,
+        limit_progress=limit_progress, eligible=eligible)
+
+
 class AuctionGapMinuteSummary(BaseModel):
     """集合竞价候选 + 分钟 B/S 回放摘要。"""
 
@@ -462,6 +498,18 @@ def _resolve_hold_policy(
         str(candidate["ts_code"]),
         _as_date(candidate["signal_date"]),
     )
+    return resolve_auction_hold_policy(b_strength, config=config, official=official)
+
+
+def resolve_auction_hold_policy(
+    b_strength: dict[str, object],
+    *,
+    config: AuctionGapMinuteReplayConfig,
+    official: pd.Series | None,
+) -> tuple[HoldPolicy, int]:
+    """Apply the original seal gate to already visible minute and official facts."""
+    if not config.seal_hold_enabled or not bool(b_strength.get("b_close_at_limit_up")):
+        return "t1", config.max_hold_days
     if official is not None:
         open_times = (
             int(official["open_times"])
@@ -483,6 +531,24 @@ def _resolve_hold_policy(
         if int(b_strength.get("b_open_times") or 0) > config.seal_hold_max_open_times:
             return "t1", config.max_hold_days
     return "seal_hold", config.seal_hold_max_days
+
+
+def auction_morning_vwap_break(
+    position: PaperPosition,
+    *,
+    quote_time: datetime,
+    price: float,
+    day_vwap: float | None,
+    config: AuctionGapMinuteReplayConfig,
+) -> bool:
+    """The original morning exit gate, with no later quote or database read."""
+    return (
+        quote_time.date() >= position.earliest_exit_date
+        and quote_time.time() <= config.next_morning_exit_until
+        and day_vwap is not None
+        and price < position.entry_price
+        and price < day_vwap * (1 - config.next_morning_vwap_break_buffer_pct)
+    )
 
 
 def _find_auction_gap_entry(
@@ -523,15 +589,17 @@ def _find_auction_gap_entry(
         if limit_up_price <= auction_price:
             amount_history.append((quote_time.time(), minute_amount))
             continue
-        support_ok = cum_low >= auction_price * (1 - config.entry_pullback_tolerance_pct)
-        price_floor = auction_price
-        if vwap is not None:
-            price_floor = max(price_floor, vwap * (1 + config.entry_vwap_buffer_pct))
         quote = _minute_quote(row)
-        vwap_ok = quote.price >= price_floor
-        limit_progress = (cum_high - auction_price) / (limit_up_price - auction_price)
-        progress_ok = limit_progress >= config.min_limit_progress_pct
-        if not (support_ok and vwap_ok and progress_ok):
+        entry_check = evaluate_auction_gap_entry(
+            config=config, quote_time=quote_time, latest_price=quote.price,
+            session_low=cum_low, session_high=cum_high, auction_price=auction_price,
+            limit_up_price=limit_up_price, vwap=vwap,
+        )
+        support_ok = entry_check.support_ok
+        price_floor = entry_check.price_floor
+        limit_progress = entry_check.limit_progress
+        assert limit_progress is not None
+        if not entry_check.eligible:
             amount_history.append((quote_time.time(), minute_amount))
             continue
 
@@ -920,12 +988,9 @@ def _run_auction_gap_exit_scan(
             }
 
         quote = _minute_quote(row)
-        if (
-            quote_date >= position.earliest_exit_date
-            and quote_time.time() <= config.next_morning_exit_until
-            and day_vwap is not None
-            and quote.price < position.entry_price
-            and quote.price < day_vwap * (1 - config.next_morning_vwap_break_buffer_pct)
+        if auction_morning_vwap_break(
+            position, quote_time=quote_time, price=quote.price,
+            day_vwap=day_vwap, config=config,
         ):
             return _close_position(
                 position,
@@ -1404,13 +1469,30 @@ def run_auction_gap_replay(
     out["gap_pct_close"] = (out["entry_price"] / out["pre_close"] - 1) * 100
     out["gap_pct_high"] = (out["entry_price"] / out["pre_high"] - 1) * 100
 
+    mask = auction_candidate_mask(out, config)
+    out = out[mask].copy()
+    out["entry_to_limit_up_pct"] = (
+        out["limit_up_price"] / out["entry_price"] - 1
+    ) * 100
+    out["intraday_high_ret_pct"] = (out["day_high"] / out["entry_price"] - 1) * 100
+    out["intraday_low_ret_pct"] = (out["day_low"] / out["entry_price"] - 1) * 100
+    out["day_close_ret_pct"] = (out["day_close"] / out["entry_price"] - 1) * 100
+    out["next_open_ret_pct"] = (out["next_open"] / out["entry_price"] - 1) * 100
+    out["next_close_ret_pct"] = (out["next_close"] / out["entry_price"] - 1) * 100
+    out["next_high_ret_pct"] = (out["next_high"] / out["entry_price"] - 1) * 100
+    out["next_low_ret_pct"] = (out["next_low"] / out["entry_price"] - 1) * 100
+
+    return out.sort_values(["signal_date", "ts_code"]).reset_index(drop=True)
+
+
+def auction_candidate_mask(out: pd.DataFrame, config: AuctionGapConfig) -> pd.Series:
+    """Original candidate selection on complete, already derived input rows."""
     if config.gap_mode == "close":
         mask = out["entry_price"] > out["pre_close"]
     elif config.gap_mode == "strict_high":
         mask = out["entry_price"] > out["pre_high"]
     else:
         raise ValueError(f"unsupported gap_mode: {config.gap_mode}")
-
     mask &= out["auction_vol_ratio_5d"].between(
         config.min_auction_vol_ratio_5d,
         config.max_auction_vol_ratio_5d,
@@ -1425,20 +1507,7 @@ def run_auction_gap_replay(
         raise ValueError(f"unsupported st_filter: {config.st_filter}")
     if config.require_next_day:
         mask &= out["next_open"].notna()
-
-    out = out[mask].copy()
-    out["entry_to_limit_up_pct"] = (
-        out["limit_up_price"] / out["entry_price"] - 1
-    ) * 100
-    out["intraday_high_ret_pct"] = (out["day_high"] / out["entry_price"] - 1) * 100
-    out["intraday_low_ret_pct"] = (out["day_low"] / out["entry_price"] - 1) * 100
-    out["day_close_ret_pct"] = (out["day_close"] / out["entry_price"] - 1) * 100
-    out["next_open_ret_pct"] = (out["next_open"] / out["entry_price"] - 1) * 100
-    out["next_close_ret_pct"] = (out["next_close"] / out["entry_price"] - 1) * 100
-    out["next_high_ret_pct"] = (out["next_high"] / out["entry_price"] - 1) * 100
-    out["next_low_ret_pct"] = (out["next_low"] / out["entry_price"] - 1) * 100
-
-    return out.sort_values(["signal_date", "ts_code"]).reset_index(drop=True)
+    return mask
 
 
 def summarize_auction_gap_replay(trades: pd.DataFrame) -> AuctionGapSummary:

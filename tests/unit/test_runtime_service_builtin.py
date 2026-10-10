@@ -757,11 +757,13 @@ def test_builtin_registry_registers_dependency_free_concrete_builders(tmp_path: 
         RuntimeServiceKind.STRATEGY_LIVE,
         RuntimeServiceKind.SIGNAL_ROUTER,
         RuntimeServiceKind.NOTIFIER,
+        RuntimeServiceKind.PRICE_ALERT_RUNTIME,
         RuntimeServiceKind.PAPER_CONSTRAINT_PUBLISHER,
         RuntimeServiceKind.PAPER_BROKER,
         RuntimeServiceKind.RUNTIME_HEALTH_PUBLISHER,
         RuntimeServiceKind.LAB_JOBS_PUBLISHER,
         RuntimeServiceKind.LAB_ARTIFACT_CATALOG,
+        RuntimeServiceKind.MINUTE_STUDY_PROJECTION,
         RuntimeServiceKind.ARTIFACT_RETENTION,
         RuntimeServiceKind.PROMOTIONS_PUBLISHER,
         RuntimeServiceKind.SERVING_PUBLISHER,
@@ -993,9 +995,10 @@ def test_complete_builtin_registry_registers_watchlist_quote_source() -> None:
         serving_snapshot_loader=lambda _now: object(),  # type: ignore[arg-type]
     )
 
-    assert registry.registered_kinds == tuple(
-        kind for kind in RuntimeServiceKind if kind is not RuntimeServiceKind.PAPER_CONSUMER
-    )
+    assert set(registry.registered_kinds) == {
+        kind for kind in RuntimeServiceKind
+        if kind not in {RuntimeServiceKind.PAPER_CONSUMER, RuntimeServiceKind.CONDITION_ALERT_RUNTIME}
+    }
     assert RuntimeServiceKind.WATCHLIST_QUOTE_SOURCE in registry.registered_kinds
 
 
@@ -1305,11 +1308,13 @@ def test_builtin_registry_preserves_injected_strategy_evaluator_loader(
         evaluator_loader: object,
         clock: object,
         runtime_root: object = None,
+        native_forward_source_factory: object = None,
     ) -> object:
         observed.update(
             evaluator_loader=evaluator_loader,
             clock=clock,
             runtime_root=runtime_root,
+            native_forward_source_factory=native_forward_source_factory,
         )
         return lambda _manifest: lambda: None
 
@@ -1327,6 +1332,7 @@ def test_builtin_registry_preserves_injected_strategy_evaluator_loader(
 
     assert RuntimeServiceKind.STRATEGY_LIVE in registry.registered_kinds
     assert observed["evaluator_loader"] is injected_loader
+    assert observed["native_forward_source_factory"] is None
 
 
 def test_builtin_registry_fans_in_profile_completion_signer_to_strategy_builder(

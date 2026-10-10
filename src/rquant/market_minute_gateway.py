@@ -78,6 +78,20 @@ class MarketMinuteGatewayConfig(RuntimeContractModel):
 class MarketMinuteCapture(RuntimeContractModel):
     pointer: CurrentPointer | BatchPointer
     published: bool
+    health_material: MarketMinuteHealthMaterial | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+
+
+class MarketMinuteHealthMaterial(RuntimeContractModel):
+    envelope: BatchEnvelope
+    source_generation_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    accepted_codes: tuple[str, ...]
+    expected_codes: tuple[str, ...] | None = None
+
+    @property
+    def identity(self) -> str:
+        return canonical_sha256(self)
 
 
 class MarketMinuteGateway:
@@ -103,6 +117,7 @@ class MarketMinuteGateway:
         self._schema_dual_writer = schema_dual_writer
         self._latest_by_event_window: dict[tuple[datetime, datetime], BatchEnvelope] | None = None
         self._latest_published: BatchEnvelope | None = None
+        self._last_health_material: MarketMinuteHealthMaterial | None = None
         if config.quota_units_per_window is not None and quota_store is None:
             raise ValueError("quota_store is required when quota governance is enabled")
         if config.quota_units_per_window is not None and transport_observer is None:
@@ -248,7 +263,22 @@ class MarketMinuteGateway:
         *,
         received_at: datetime,
         quota_cost_units: int | None = None,
+        include_health_material: bool = False,
+        expected_codes: tuple[str, ...] | None = None,
     ) -> MarketMinuteCapture:
+        if type(include_health_material) is not bool:
+            raise TypeError("minute health opt-in must be bool")
+        if include_health_material and expected_codes is not None:
+            if (
+                type(expected_codes) is not tuple
+                or any(
+                    type(code) is not str or not code.strip() or code != code.strip()
+                    for code in expected_codes
+                )
+                or len(expected_codes) != len(set(expected_codes))
+            ):
+                raise ValueError("minute expected universe must contain distinct actual codes")
+            expected_codes = tuple(sorted(expected_codes))
         received = normalize_aware_utc(received_at)
         resolved_quota_cost = self._resolve_quota_cost(quota_cost_units)
         revision_index = self._revision_index()
@@ -339,6 +369,9 @@ class MarketMinuteGateway:
             return MarketMinuteCapture(
                 pointer=pointer,
                 published=False,
+                health_material=(
+                    self._duplicate_health_material(pointer) if include_health_material else None
+                ),
             )
 
         sequence = 0 if latest is None else latest.sequence + 1
@@ -398,7 +431,39 @@ class MarketMinuteGateway:
             )
         revision_index[event_window] = envelope
         self._latest_published = envelope
-        return MarketMinuteCapture(pointer=pointer, published=True)
+        material = None
+        if include_health_material:
+            material = MarketMinuteHealthMaterial(
+                envelope=envelope,
+                source_generation_id=pointer.source_generation_id,
+                accepted_codes=tuple(sorted(set(frame["ts_code"]))),
+                expected_codes=expected_codes,
+            )
+            self._last_health_material = material
+        return MarketMinuteCapture(pointer=pointer, published=True, health_material=material)
+
+    def _duplicate_health_material(
+        self,
+        pointer: CurrentPointer | BatchPointer,
+    ) -> MarketMinuteHealthMaterial:
+        previous = self._last_health_material
+        if previous is not None and (previous.envelope.batch_id, previous.source_generation_id) == (
+            pointer.batch_id,
+            pointer.source_generation_id,
+        ):
+            return previous
+        records = self.spool.list_after(pointer.channel, sequence=pointer.sequence - 1, limit=1)
+        if not records or records[0].envelope.batch_id != pointer.batch_id:
+            raise MarketMinuteValidationError("minute detail lost its selected immutable batch")
+        record = records[0]
+        frame = self.decode_payload(self.spool.read_payload(record))
+        # A restart or a different selected current batch has no original request scope.
+        # The latest request's universe cannot be assigned to an older envelope.
+        return MarketMinuteHealthMaterial(
+            envelope=record.envelope,
+            source_generation_id=pointer.source_generation_id,
+            accepted_codes=tuple(sorted(set(frame["ts_code"]))),
+        )
 
     @staticmethod
     def _is_current_eligible(quality_status: BatchQualityStatus) -> bool:

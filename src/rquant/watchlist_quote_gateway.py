@@ -11,6 +11,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import stat
 import tempfile
 from collections.abc import Callable, Iterator
@@ -61,6 +62,9 @@ _COLUMNS = (
     "producer_commit",
     "schema_version",
 )
+_OPTIONAL_QUOTE_VALUES = ("pre_close", "pct_chg", "turnover_rate", "float_shares", "up_limit")
+_COLUMNS_V3 = (*_COLUMNS, *_OPTIONAL_QUOTE_VALUES, "no_price_limit", "vendor_time_text",
+    "units_contract_id", "volume_unit", "amount_unit", "requested_universe_digest", "requested_universe_count")
 
 
 class WatchlistQuoteValidationError(ValueError):
@@ -76,7 +80,10 @@ class WatchlistQuoteGatewayConfig(RuntimeContractModel):
     dataset_id: str = Field(default="watchlist_quote", min_length=1)
     producer_version: str = Field(min_length=1)
     producer_commit: CommitSha
-    schema_version: int = Field(default=2, ge=2)
+    schema_version: Literal[2,3] = 2
+    units_contract_id: str | None = Field(default=None,pattern=r"^[0-9a-f]{64}$")
+    volume_unit: Literal["shares","lot100"] | None = None
+    amount_unit: Literal["CNY"] | None = None
     rollout_mode: Literal["candidate", "published"] = "candidate"
     minimum_cadence_seconds: float = Field(default=5.0, gt=0, le=60)
     request_timeout_seconds: float = Field(default=2.5, gt=0, le=30)
@@ -85,6 +92,12 @@ class WatchlistQuoteGatewayConfig(RuntimeContractModel):
     max_backoff_seconds: float = Field(default=60, gt=0, le=900)
     quota_units_per_window: int | None = Field(default=None, gt=0)
     quota_cost_per_request: int = Field(default=1, gt=0)
+
+    @model_validator(mode="after")
+    def require_explicit_v3_units(self) -> WatchlistQuoteGatewayConfig:
+        if self.schema_version==3 and any(value is None for value in (self.units_contract_id,self.volume_unit,self.amount_unit)):
+            raise ValueError("v3 quote source requires its observed units contract")
+        return self
 
 
 class WatchlistQuoteCapture(RuntimeContractModel):
@@ -160,7 +173,8 @@ def _empty_frame() -> pd.DataFrame:
 
 def encode_watchlist_quote_payload(frame: pd.DataFrame) -> bytes:
     output = BytesIO()
-    frame.loc[:, _COLUMNS].to_parquet(output, index=False)
+    columns = _COLUMNS_V3 if set(_COLUMNS_V3).issubset(frame.columns) else _COLUMNS
+    frame.loc[:, columns].to_parquet(output, index=False)
     return output.getvalue()
 
 
@@ -180,7 +194,13 @@ def decode_watchlist_quote_payload(payload: bytes) -> pd.DataFrame:
     frame["source_timestamp_provenance"] = frame["source_timestamp_provenance"].astype("string")
     frame["producer_commit"] = frame["producer_commit"].astype("string")
     frame["schema_version"] = frame["schema_version"].astype("int64")
-    return frame.loc[:, _COLUMNS]
+    versions = set(frame.schema_version)
+    if versions-set((2,3)) or len(versions)>1:
+        raise WatchlistQuoteValidationError("quote payload schema version is unsupported")
+    columns = _COLUMNS_V3 if 3 in versions or set(_COLUMNS_V3).issubset(frame.columns) else _COLUMNS
+    if set(columns)!=set(frame.columns):
+        raise WatchlistQuoteValidationError("quote payload schema fields changed")
+    return frame.loc[:, columns]
 
 
 class WatchlistQuoteGateway:
@@ -419,6 +439,7 @@ class WatchlistQuoteGateway:
             requested_at=requested_at,
             response_received_at=response_received_at,
             trade_date=trade_date,
+            codes=codes,
         )
         payload = encode_watchlist_quote_payload(frame)
         content_sha256 = hashlib.sha256(payload).hexdigest()
@@ -555,7 +576,19 @@ class WatchlistQuoteGateway:
             raise WatchlistQuoteValidationError(
                 "quote provider returned duplicate code observations"
             )
-        if "source_observed_at" in raw.columns:
+        if self.config.schema_version==3 and "source_observed_at" in raw.columns:
+            def observed_time(value: object) -> datetime | None:
+                if isinstance(value,str) and not re.match(r"^\d{4}-\d{2}-\d{2}[T ]",value):
+                    return None
+                if not isinstance(value,(str,datetime,pd.Timestamp)):
+                    return None
+                try:
+                    stamp=pd.Timestamp(value)
+                    return None if pd.isna(stamp) or stamp.tzinfo is None else stamp.tz_convert("UTC").to_pydatetime()
+                except (ValueError,TypeError):
+                    return None
+            source_observed=pd.to_datetime(raw["source_observed_at"].map(observed_time),utc=True).reset_index(drop=True)
+        elif "source_observed_at" in raw.columns:
             source_observed = pd.to_datetime(
                 raw["source_observed_at"],
                 errors="coerce",
@@ -585,6 +618,27 @@ class WatchlistQuoteGateway:
             raise WatchlistQuoteValidationError("quote prices must be positive")
         if (frame[["volume", "amount"]] < 0).any().any():
             raise WatchlistQuoteValidationError("quote volume and amount cannot be negative")
+        if self.config.schema_version==3:
+            if len(codes)>8000 or len(frame)>8000:
+                raise WatchlistQuoteValidationError("quote universe exceeds its bound")
+            for column in _OPTIONAL_QUOTE_VALUES:
+                values=pd.to_numeric(raw[column],errors="raise").reset_index(drop=True).astype("float64") if column in raw else pd.Series(float("nan"),index=frame.index)
+                if values.notna().any() and not values.dropna().map(math.isfinite).all():
+                    raise WatchlistQuoteValidationError("quote optional value is non-finite")
+                if column in {"pre_close","up_limit","float_shares"} and (values.dropna()<=0).any():
+                    raise WatchlistQuoteValidationError("quote optional reference must be positive")
+                if column=="turnover_rate" and (values.dropna()<0).any():
+                    raise WatchlistQuoteValidationError("quote turnover cannot be negative")
+                frame[column]=values
+            unlimited=raw.no_price_limit.reset_index(drop=True) if "no_price_limit" in raw else pd.Series(None,index=frame.index)
+            if any(type(value) is not bool for value in unlimited.dropna()):
+                raise WatchlistQuoteValidationError("quote price-limit status must be observed")
+            frame["no_price_limit"]=unlimited.astype("boolean")
+            if (frame.no_price_limit.fillna(False) & frame.up_limit.notna()).any():
+                raise WatchlistQuoteValidationError("unlimited quote cannot claim an up limit")
+            frame["vendor_time_text"]=(raw.vendor_time_text.reset_index(drop=True).astype("string") if "vendor_time_text" in raw else pd.Series(None,index=frame.index,dtype="string"))
+            if frame.vendor_time_text.str.len().fillna(0).gt(64).any():
+                raise WatchlistQuoteValidationError("quote vendor time text exceeds its bound")
         return frame.sort_values("ts_code", kind="stable", ignore_index=True)
 
     def _attach_provenance(
@@ -596,6 +650,7 @@ class WatchlistQuoteGateway:
         requested_at: datetime,
         response_received_at: datetime,
         trade_date: date,
+        codes: tuple[str,...] = (),
     ) -> pd.DataFrame:
         attached = frame.copy() if not frame.empty else _empty_frame()
         attached["trade_date"] = trade_date
@@ -607,6 +662,18 @@ class WatchlistQuoteGateway:
         attached["fetched_at"] = response_received_at
         attached["producer_commit"] = self.config.producer_commit
         attached["schema_version"] = self.config.schema_version
+        if self.config.schema_version==3:
+            if not codes or len(codes)>8000:
+                raise WatchlistQuoteValidationError("v3 quote request universe is missing")
+            for column in (*_OPTIONAL_QUOTE_VALUES,"no_price_limit","vendor_time_text"):
+                if column not in attached:
+                    attached[column]=None
+            attached["units_contract_id"]=self.config.units_contract_id
+            attached["volume_unit"]=self.config.volume_unit
+            attached["amount_unit"]=self.config.amount_unit
+            attached["requested_universe_digest"]=canonical_sha256({"codes":codes,"as_of":universe_as_of,"trade_date":trade_date})
+            attached["requested_universe_count"]=len(codes)
+            return attached.loc[:,_COLUMNS_V3]
         return attached.loc[:, _COLUMNS]
 
     @contextmanager

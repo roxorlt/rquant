@@ -45,7 +45,7 @@ from rquant.signal_family_differential_gate import (
 from rquant.strict_json import canonical_json_bytes, strict_canonical_json_loads
 
 SUPPORTED_GENERATOR_PYTHON = ((3, 11), (3, 12))
-_ARCHITECTURE_DIRECTORIES = ("deploy/", "scripts/", "docs/", ".github/")
+_ARCHITECTURE_DIRECTORIES = ("deploy/", "scripts/", "docs/", ".github/", "web/")
 _ARCHITECTURE_ROOT_FILES = (
     ".env.example",
     ".gitignore",
@@ -64,16 +64,19 @@ def diff_category(path: str) -> str:
 
     ``src/rquant`` is the declaration-scanned production surface, ``tests/fixtures`` is
     fixture data, the rest of ``tests`` is test code, and the reviewed deployment, tooling,
-    documentation, workflow, and root configuration surface is architecture. Anything else
-    is unclassified on purpose: a new top-level entry must be categorized by a reviewer, not
-    by a silent default.
+    documentation, workflow, and root configuration surface is architecture. ``web/`` (the
+    React front end, its committed build ``web/dist`` and its own tests) is architecture
+    too: nothing in it is Python the declaration scan could read, and it reaches production
+    only as static files. Anything else is unclassified on purpose: a new top-level entry
+    must be categorized by a reviewer, not by a silent default.
+    The reviewed ``data/verification/`` archive is fixture data.
     """
 
     if path.startswith("src/"):
         if not path.startswith("src/rquant/"):
             raise ValueError(f"only src/rquant is a declared production surface: {path}")
         return "production"
-    if path.startswith("tests/fixtures/"):
+    if path.startswith(("tests/fixtures/", "data/verification/")):
         return "fixture"
     if path.startswith("tests/"):
         return "test"

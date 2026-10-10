@@ -1,0 +1,19 @@
+{
+  "argv": [
+    "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/.venv/bin/ruff",
+    "check",
+    "src/rquant/research_query/contracts.py",
+    "src/rquant/research_query/child.py",
+    "src/rquant/research_query/snapshot.py",
+    "src/rquant/web/routes/research_query.py",
+    "tests/unit/test_research_query_review.py",
+    "tests/unit/test_web_research_query.py"
+  ],
+  "cwd": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk",
+  "started_utc": "2026-10-04T22:30:59.755787+00:00",
+  "elapsed_seconds": 0.04711525000311667,
+  "exit_code": 0,
+  "stdout_sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18",
+  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "starting_candidate": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb"
+}

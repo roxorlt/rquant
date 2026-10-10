@@ -1,0 +1,10 @@
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+    import sys; sys.path.insert(0,"/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/src"); from rquant.web.cli import main; raise SystemExit(main(["web-openapi"]))
+                                                                                                                                                              ~~~~^^^^^^^^^^^^^^^^^
+  File "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/src/rquant/web/cli.py", line 57, in main
+    from rquant.web.app import create_app, openapi_document
+  File "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/src/rquant/web/app.py", line 115, in <module>
+    "/api/v1/research/query": research_query.MAX_REQUEST_BYTES,
+                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: module 'rquant.web.routes.research_query' has no attribute 'MAX_REQUEST_BYTES'

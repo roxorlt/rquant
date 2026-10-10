@@ -62,14 +62,6 @@ FIXTURE_ROOT: Final[Path] = (
     REPOSITORY_ROOT / "tests" / "fixtures" / "signal_family_producer"
 )
 
-#: Ruling B-3 fixed `deploy/` at `architecture`; the rest of the rule is read straight off
-#: the categories the existing entries already carry, so a regeneration reproduces them.
-#: `tests/manifests/` is deliberately absent: `r07_policy_regenerate.diff_category()` is the
-#: authority CI enforces with `--check`, and it classifies everything under `tests/` that is
-#: not `tests/fixtures/` as `test`. Listing the manifests here made this script report a
-#: correct tree as stale on those six paths and offer a `--write` the authority rejects.
-_FIXTURE_PREFIXES: Final[tuple[str, ...]] = ("tests/fixtures/",)
-
 
 @dataclass(frozen=True)
 class Outcome:
@@ -239,13 +231,7 @@ def recompute_expectation_set() -> Outcome:
 
 
 def _category(path: str) -> str:
-    if path.startswith("src/"):
-        return "production"
-    if path.startswith(_FIXTURE_PREFIXES):
-        return "fixture"
-    if path.startswith("tests/"):
-        return "test"
-    return "architecture"
+    return _load_script("r07_policy_regenerate").diff_category(path)
 
 
 def _raw_diff(baseline: str) -> tuple[dict[str, Any], ...]:

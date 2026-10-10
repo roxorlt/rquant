@@ -4075,7 +4075,10 @@ def test_store_and_reader_fail_closed_on_unknown_schema_version(
 
 
 def test_reader_rejects_same_name_structurally_wrong_v5_trigger(tmp_path: Path) -> None:
+    lab_jobs._normalized_expected_sql_tokens.cache_clear()
     store = _store(tmp_path)
+    assert LabJobReader(store.path).get_job(uuid4()) is None
+    assert lab_jobs._normalized_expected_sql_tokens.cache_info().hits > 0
     with sqlite3.connect(store.path) as connection:
         connection.execute("DROP TRIGGER trg_lab_result_artifact_no_delete")
         connection.execute(
@@ -4095,6 +4098,8 @@ def test_reader_rejects_same_name_structurally_wrong_v5_trigger(tmp_path: Path) 
 
 
 def test_sql_ddl_equivalence_preserves_quoted_literal_bytes_and_escapes() -> None:
+    cached_expected = lab_jobs._normalized_expected_sql_tokens
+    cached_expected.cache_clear()
     expected = "SELECT 'it''s ready', X'AB', \"MiXeD\" FROM jobs WHERE state = 'ready'"
     equivalent = (
         " select /* spacing */ 'it''s ready' , x'AB', \"MiXeD\" "
@@ -4107,6 +4112,8 @@ def test_sql_ddl_equivalence_preserves_quoted_literal_bytes_and_escapes() -> Non
 
     assert lab_jobs._sql_ddl_equivalent(expected, equivalent)
     assert lab_jobs._sql_ddl_equivalent(expected, carriage_return_comment)
+    assert cached_expected.cache_info().hits == 1
+    assert cached_expected.cache_info().currsize == 1
     assert not lab_jobs._sql_ddl_equivalent(
         expected,
         equivalent.replace("'it''s ready'", "'it''s READY'"),
@@ -4119,6 +4126,18 @@ def test_sql_ddl_equivalence_preserves_quoted_literal_bytes_and_escapes() -> Non
         expected,
         equivalent.replace('"MiXeD"', '"MIXED"'),
     )
+    changed_expected = expected.replace("'it''s ready'", "'it''s READY'")
+    assert lab_jobs._sql_ddl_equivalent(
+        changed_expected, equivalent.replace("'it''s ready'", "'it''s READY'")
+    )
+    assert cached_expected.cache_info().currsize == 2
+    assert 0 < cached_expected.cache_parameters()["maxsize"] <= 256
+    tokens = cached_expected(expected)
+    assert isinstance(tokens, tuple) and all(isinstance(token, tuple) for token in tokens)
+    for malformed in ("SELECT 'unterminated", "SELECT /* unterminated", "SELECT [unterminated"):
+        assert not lab_jobs._sql_ddl_equivalent(malformed, "SELECT 1")
+        assert not lab_jobs._sql_ddl_equivalent(malformed, "SELECT 1")
+        assert cached_expected.cache_info().currsize == 2
 
 
 def test_v5_trigger_validator_accepts_keyword_case_and_spacing(tmp_path: Path) -> None:

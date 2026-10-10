@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from types import MappingProxyType
-from typing import Literal, TypeVar
+from typing import TYPE_CHECKING, Literal, TypeVar
 from uuid import uuid4
 
 from pydantic import Field, ValidationError, model_validator
@@ -36,6 +36,9 @@ from rquant.strict_json import (
     strict_json_loads,
     strict_model_validate_canonical_json,
 )
+
+if TYPE_CHECKING:
+    from rquant.minute_backtest_parameters import MinuteParameterSet
 
 _FINGERPRINT_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _ID_KEY_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -219,6 +222,37 @@ class StrategyExitRule(RuntimeContractModel):
         return self
 
 
+class MinuteParameterExitRule(RuntimeContractModel):
+    contract: Literal["minute-parameter-exit/v1"] = "minute-parameter-exit/v1"
+    event: str = Field(min_length=1)
+    fill_event: str | None = Field(default=None, min_length=1)
+    action: str = Field(min_length=1)
+    evaluator_id: str = Field(min_length=1)
+    eligibility: StrategyExitEligibility
+    price_basis: StrategyExitPriceBasis
+    sell_tranche: StrategySellTranche
+    parameter_contract: Literal["minute-parameter-set/v1"] = "minute-parameter-set/v1"
+    parameter_json: str = Field(min_length=1, max_length=32_768)
+    parameter_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @property
+    def parameter_set(self) -> MinuteParameterSet:
+        # Legacy math owners import the registry through their source gates.
+        from rquant.minute_backtest_parameters import MinuteParameterSet
+
+        return MinuteParameterSet.model_validate(strict_json_loads(self.parameter_json))
+
+    @model_validator(mode="after")
+    def validate_exact_parameters(self) -> MinuteParameterExitRule:
+        parameters = self.parameter_set
+        if self.parameter_fingerprint != parameters.fingerprint:
+            raise ValueError("minute exit parameter fingerprint differs from the complete config")
+        if self.parameter_json != parameters.model_dump_json():
+            raise ValueError("minute exit requires the complete canonical parameter JSON")
+        StrategyExitRule.validate_sell_semantics(self)  # type: ignore[arg-type]
+        return self
+
+
 class StrategyExecutionBinding(RuntimeContractModel):
     candidate_schema_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     entry_event: str = Field(min_length=1)
@@ -232,7 +266,7 @@ class StrategyExecutionBinding(RuntimeContractModel):
     runtime_evaluator_version: str = Field(default="1.0.0", min_length=1)
     runtime_evaluator_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     decision_formula_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
-    exit_rules: tuple[StrategyExitRule, ...] = Field(min_length=1)
+    exit_rules: tuple[StrategyExitRule | MinuteParameterExitRule, ...] = Field(min_length=1)
 
     @model_validator(mode="after")
     def validate_exit_rules(self) -> StrategyExecutionBinding:
@@ -275,7 +309,7 @@ class TrustedStrategyImplementation:
     exit_evaluator: Callable[..., object]
     runtime_evaluator: Callable[..., object]
     entry_event: str
-    exit_rules: tuple[StrategyExitRule, ...]
+    exit_rules: tuple[StrategyExitRule | MinuteParameterExitRule, ...]
 
 
 class TrustedExecutableRegistry:
@@ -477,6 +511,18 @@ class StrategySpecRegistration(RuntimeContractModel):
             raise ValueError("producer_commit does not match strategy spec")
         if self.candidate_schema_fingerprint != self.execution_binding.candidate_schema_fingerprint:
             raise ValueError("candidate schema fingerprint does not match execution binding")
+        for rule in self.execution_binding.exit_rules:
+            if isinstance(rule, MinuteParameterExitRule):
+                parameters = rule.parameter_set
+                if (self.spec.parameters.get("minute_parameter_set_json") != rule.parameter_json
+                    or self.spec.parameters.get("minute_parameter_set_hash") != rule.parameter_fingerprint
+                    or self.logical_id != parameters.definition_id or self.version != parameters.definition_version
+                    or any(version != parameters.evaluator_semantic_version for version in (
+                        self.execution_binding.entry_evaluator_version,
+                        self.execution_binding.exit_evaluator_version,
+                        self.execution_binding.runtime_evaluator_version,
+                    ))):
+                    raise ValueError("minute exit descriptor differs from the full parameter spec or version")
         if self.version == 1:
             if any(
                 value is not None
@@ -2239,8 +2285,10 @@ class ImmutableDefinitionRegistry:
         if limit < 1:
             raise DefinitionIntegrityError("definition directory limit is invalid")
         names: list[str] = []
+        scan_fd = -1
         try:
-            with os.scandir(directory_fd) as entries:
+            scan_fd = os.open(".", _DIRECTORY_FLAGS, dir_fd=directory_fd)
+            with os.scandir(scan_fd) as entries:
                 for entry in entries:
                     if len(names) == limit:
                         raise DefinitionIntegrityError(overflow_message)
@@ -2249,6 +2297,9 @@ class ImmutableDefinitionRegistry:
             raise
         except OSError as exc:
             raise DefinitionIntegrityError("definition directory cannot be listed safely") from exc
+        finally:
+            if scan_fd >= 0:
+                os.close(scan_fd)
         names.sort()
         if any(name in {"", ".", ".."} for name in names):
             raise DefinitionIntegrityError("definition path contains an invalid name")
@@ -3624,3 +3675,41 @@ class ImmutableDefinitionRegistry:
         except FileNotFoundError:
             return False
         return True
+
+
+class _MinuteStudyInputDefinitionView(ImmutableDefinitionRegistry):
+    """Fresh original records within one authenticated minute input read."""
+
+    def __init__(self, original: ImmutableDefinitionRegistry, *, _minute_input_read: object) -> None:
+        from rquant.minute_backtest_parameter_study_projection import _MinuteStudyVerifiedInputRead
+
+        if type(_minute_input_read) is not _MinuteStudyVerifiedInputRead:
+            raise TypeError("minute definition view requires the actual authenticated input read")
+        _minute_input_read._assert_active()
+        if original is not _minute_input_read._projection.installation.definitions:
+            raise PermissionError("minute definition view differs from the installed original registry")
+        super().__init__(original.root, execution_registry=original._execution_registry)
+        self._minute_input_read = _minute_input_read
+
+    def _input_proof(self) -> object:
+        proof = self._minute_input_read._assert_active()
+        if self.root != self._minute_input_read._projection.installation.definitions.root:
+            raise PermissionError("minute definition view root changed during the authenticated read")
+        return proof
+
+    def _validate_stored_feature_execution(self, record: FeatureContractRegistration) -> None:
+        proof = self._input_proof()
+        if record not in proof.feature_registrations:
+            raise DefinitionExecutableIntegrityError("current feature differs from complete verified input records")
+
+    def _validate_stored_strategy_execution(self, record: StrategySpecRegistration) -> None:
+        proof = self._input_proof()
+        if record not in (proof.native_registration, proof.parameter_registration):
+            raise DefinitionExecutableIntegrityError("current strategy differs from complete verified input records")
+        try:
+            self._validate_strategy_execution_binding(record.spec, record.execution_binding)
+        except DefinitionReferenceError as exc:
+            raise DefinitionExecutableIntegrityError("stored strategy execution semantics are invalid") from exc
+
+    def _publish(self, *args: object, **kwargs: object) -> object:
+        raise PermissionError("an authenticated minute input definition view is readonly")

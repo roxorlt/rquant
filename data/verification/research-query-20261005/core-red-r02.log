@@ -1,0 +1,2492 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.13.12, pytest-9.0.3, pluggy-1.6.0
+rootdir: /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk
+configfile: pyproject.toml
+plugins: mock-3.15.1, anyio-4.13.0
+collected 20 items
+
+tests/unit/test_research_query.py EEEEEEEEEEEEEEEEEEEE                   [100%]
+
+==================================== ERRORS ====================================
+_ ERROR at setup of test_public_snapshot_contains_only_exact_public_columns_and_source_is_unchanged _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10adbf6f0>
+
+    @pytest.fixture(autouse=True)
+    def _disable_real_pushdeer(monkeypatch):
+        """所有测试默认禁用真实推送通道（PushDeer + PushPlus），避免刷手机。
+    
+        显式想测推送的用例（如 test_notify_client.py 直接传 keys/tokens 给
+        client，或 test_cli notify-test 用 monkeypatch.setattr 覆盖）不受影响。
+        """
+        import rquant.config as cfg
+>       monkeypatch.setattr(cfg.settings, "pushdeer_keys", "")
+                            ^^^^^^^^^^^^
+
+tests/conftest.py:18: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/rquant/config.py:755: in __getattr__
+    return get_settings()
+           ^^^^^^^^^^^^^^
+src/rquant/config.py:740: in get_settings
+    _SETTINGS = Settings(_env_file=_default_settings_env_file())  # type: ignore[call-arg]
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+__pydantic_self__ = Settings(), _case_sensitive = None
+_nested_model_default_partial_update = None, _env_prefix = None
+_env_prefix_target = None, _env_file = None, _env_file_encoding = None
+_env_ignore_empty = None, _env_nested_delimiter = None
+_env_nested_max_split = None, _env_parse_none_str = None
+_env_parse_enums = None, _cli_prog_name = None, _cli_parse_args = None
+_cli_settings_source = None, _cli_parse_none_str = None
+_cli_hide_none_type = None, _cli_avoid_json = None, _cli_enforce_required = None
+_cli_use_class_docs_for_groups = None, _cli_exit_on_error = None
+_cli_prefix = None, _cli_flag_prefix_char = None, _cli_implicit_flags = None
+_cli_ignore_unknown_args = None, _cli_kebab_case = None, _cli_shortcuts = None
+_secrets_dir = None, _build_sources = None, values = {}
+sources = (InitSettingsSource(init_kwargs={}), EnvSettingsSource(env_nested_delimiter=None, env_prefix_len=0), DotEnvSettingsSou...efix_len=0), SecretsSettingsSource(secrets_dir=None), DefaultSettingsSource(nested_model_default_partial_update=False))
+init_kwargs = {}
+
+    def __init__(
+        __pydantic_self__,
+        _case_sensitive: bool | None = None,
+        _nested_model_default_partial_update: bool | None = None,
+        _env_prefix: str | None = None,
+        _env_prefix_target: EnvPrefixTarget | None = None,
+        _env_file: DotenvType | None = ENV_FILE_SENTINEL,
+        _env_file_encoding: str | None = None,
+        _env_ignore_empty: bool | None = None,
+        _env_nested_delimiter: str | None = None,
+        _env_nested_max_split: int | None = None,
+        _env_parse_none_str: str | None = None,
+        _env_parse_enums: bool | None = None,
+        _cli_prog_name: str | None = None,
+        _cli_parse_args: bool | list[str] | tuple[str, ...] | None = None,
+        _cli_settings_source: CliSettingsSource[Any] | None = None,
+        _cli_parse_none_str: str | None = None,
+        _cli_hide_none_type: bool | None = None,
+        _cli_avoid_json: bool | None = None,
+        _cli_enforce_required: bool | None = None,
+        _cli_use_class_docs_for_groups: bool | None = None,
+        _cli_exit_on_error: bool | None = None,
+        _cli_prefix: str | None = None,
+        _cli_flag_prefix_char: str | None = None,
+        _cli_implicit_flags: bool | Literal['dual', 'toggle'] | None = None,
+        _cli_ignore_unknown_args: bool | None = None,
+        _cli_kebab_case: bool | Literal['all', 'no_enums'] | None = None,
+        _cli_shortcuts: Mapping[str, str | list[str]] | None = None,
+        _secrets_dir: PathType | None = None,
+        _build_sources: tuple[tuple[PydanticBaseSettingsSource, ...], dict[str, Any]] | None = None,
+        **values: Any,
+    ) -> None:
+        sources, init_kwargs = (
+            _build_sources
+            if _build_sources is not None
+            else __pydantic_self__.__class__._settings_init_sources(
+                _case_sensitive=_case_sensitive,
+                _nested_model_default_partial_update=_nested_model_default_partial_update,
+                _env_prefix=_env_prefix,
+                _env_prefix_target=_env_prefix_target,
+                _env_file=_env_file,
+                _env_file_encoding=_env_file_encoding,
+                _env_ignore_empty=_env_ignore_empty,
+                _env_nested_delimiter=_env_nested_delimiter,
+                _env_nested_max_split=_env_nested_max_split,
+                _env_parse_none_str=_env_parse_none_str,
+                _env_parse_enums=_env_parse_enums,
+                _cli_prog_name=_cli_prog_name,
+                _cli_parse_args=_cli_parse_args,
+                _cli_settings_source=_cli_settings_source,
+                _cli_parse_none_str=_cli_parse_none_str,
+                _cli_hide_none_type=_cli_hide_none_type,
+                _cli_avoid_json=_cli_avoid_json,
+                _cli_enforce_required=_cli_enforce_required,
+                _cli_use_class_docs_for_groups=_cli_use_class_docs_for_groups,
+                _cli_exit_on_error=_cli_exit_on_error,
+                _cli_prefix=_cli_prefix,
+                _cli_flag_prefix_char=_cli_flag_prefix_char,
+                _cli_implicit_flags=_cli_implicit_flags,
+                _cli_ignore_unknown_args=_cli_ignore_unknown_args,
+                _cli_kebab_case=_cli_kebab_case,
+                _cli_shortcuts=_cli_shortcuts,
+                _secrets_dir=_secrets_dir,
+                **values,
+            )
+        )
+    
+>       super().__init__(**__pydantic_self__.__class__._settings_build_values(sources, init_kwargs))
+E       pydantic_core._pydantic_core.ValidationError: 4 validation errors for Settings
+E       data_dir
+E         Value error, DATA_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       duckdb_path
+E         Value error, DUCKDB_PATH must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/main.duckdb', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       parquet_dir
+E         Value error, PARQUET_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/parquet', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       log_dir
+E         Value error, LOG_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/logs', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+
+../cdx-factor-source-integration/.venv/lib/python3.13/site-packages/pydantic_settings/main.py:242: ValidationError
+_ ERROR at setup of test_full_original_database_and_extra_objects_are_rejected _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10adbf360>
+
+    @pytest.fixture(autouse=True)
+    def _disable_real_pushdeer(monkeypatch):
+        """所有测试默认禁用真实推送通道（PushDeer + PushPlus），避免刷手机。
+    
+        显式想测推送的用例（如 test_notify_client.py 直接传 keys/tokens 给
+        client，或 test_cli notify-test 用 monkeypatch.setattr 覆盖）不受影响。
+        """
+        import rquant.config as cfg
+>       monkeypatch.setattr(cfg.settings, "pushdeer_keys", "")
+                            ^^^^^^^^^^^^
+
+tests/conftest.py:18: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/rquant/config.py:755: in __getattr__
+    return get_settings()
+           ^^^^^^^^^^^^^^
+src/rquant/config.py:740: in get_settings
+    _SETTINGS = Settings(_env_file=_default_settings_env_file())  # type: ignore[call-arg]
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+__pydantic_self__ = Settings(), _case_sensitive = None
+_nested_model_default_partial_update = None, _env_prefix = None
+_env_prefix_target = None, _env_file = None, _env_file_encoding = None
+_env_ignore_empty = None, _env_nested_delimiter = None
+_env_nested_max_split = None, _env_parse_none_str = None
+_env_parse_enums = None, _cli_prog_name = None, _cli_parse_args = None
+_cli_settings_source = None, _cli_parse_none_str = None
+_cli_hide_none_type = None, _cli_avoid_json = None, _cli_enforce_required = None
+_cli_use_class_docs_for_groups = None, _cli_exit_on_error = None
+_cli_prefix = None, _cli_flag_prefix_char = None, _cli_implicit_flags = None
+_cli_ignore_unknown_args = None, _cli_kebab_case = None, _cli_shortcuts = None
+_secrets_dir = None, _build_sources = None, values = {}
+sources = (InitSettingsSource(init_kwargs={}), EnvSettingsSource(env_nested_delimiter=None, env_prefix_len=0), DotEnvSettingsSou...efix_len=0), SecretsSettingsSource(secrets_dir=None), DefaultSettingsSource(nested_model_default_partial_update=False))
+init_kwargs = {}
+
+    def __init__(
+        __pydantic_self__,
+        _case_sensitive: bool | None = None,
+        _nested_model_default_partial_update: bool | None = None,
+        _env_prefix: str | None = None,
+        _env_prefix_target: EnvPrefixTarget | None = None,
+        _env_file: DotenvType | None = ENV_FILE_SENTINEL,
+        _env_file_encoding: str | None = None,
+        _env_ignore_empty: bool | None = None,
+        _env_nested_delimiter: str | None = None,
+        _env_nested_max_split: int | None = None,
+        _env_parse_none_str: str | None = None,
+        _env_parse_enums: bool | None = None,
+        _cli_prog_name: str | None = None,
+        _cli_parse_args: bool | list[str] | tuple[str, ...] | None = None,
+        _cli_settings_source: CliSettingsSource[Any] | None = None,
+        _cli_parse_none_str: str | None = None,
+        _cli_hide_none_type: bool | None = None,
+        _cli_avoid_json: bool | None = None,
+        _cli_enforce_required: bool | None = None,
+        _cli_use_class_docs_for_groups: bool | None = None,
+        _cli_exit_on_error: bool | None = None,
+        _cli_prefix: str | None = None,
+        _cli_flag_prefix_char: str | None = None,
+        _cli_implicit_flags: bool | Literal['dual', 'toggle'] | None = None,
+        _cli_ignore_unknown_args: bool | None = None,
+        _cli_kebab_case: bool | Literal['all', 'no_enums'] | None = None,
+        _cli_shortcuts: Mapping[str, str | list[str]] | None = None,
+        _secrets_dir: PathType | None = None,
+        _build_sources: tuple[tuple[PydanticBaseSettingsSource, ...], dict[str, Any]] | None = None,
+        **values: Any,
+    ) -> None:
+        sources, init_kwargs = (
+            _build_sources
+            if _build_sources is not None
+            else __pydantic_self__.__class__._settings_init_sources(
+                _case_sensitive=_case_sensitive,
+                _nested_model_default_partial_update=_nested_model_default_partial_update,
+                _env_prefix=_env_prefix,
+                _env_prefix_target=_env_prefix_target,
+                _env_file=_env_file,
+                _env_file_encoding=_env_file_encoding,
+                _env_ignore_empty=_env_ignore_empty,
+                _env_nested_delimiter=_env_nested_delimiter,
+                _env_nested_max_split=_env_nested_max_split,
+                _env_parse_none_str=_env_parse_none_str,
+                _env_parse_enums=_env_parse_enums,
+                _cli_prog_name=_cli_prog_name,
+                _cli_parse_args=_cli_parse_args,
+                _cli_settings_source=_cli_settings_source,
+                _cli_parse_none_str=_cli_parse_none_str,
+                _cli_hide_none_type=_cli_hide_none_type,
+                _cli_avoid_json=_cli_avoid_json,
+                _cli_enforce_required=_cli_enforce_required,
+                _cli_use_class_docs_for_groups=_cli_use_class_docs_for_groups,
+                _cli_exit_on_error=_cli_exit_on_error,
+                _cli_prefix=_cli_prefix,
+                _cli_flag_prefix_char=_cli_flag_prefix_char,
+                _cli_implicit_flags=_cli_implicit_flags,
+                _cli_ignore_unknown_args=_cli_ignore_unknown_args,
+                _cli_kebab_case=_cli_kebab_case,
+                _cli_shortcuts=_cli_shortcuts,
+                _secrets_dir=_secrets_dir,
+                **values,
+            )
+        )
+    
+>       super().__init__(**__pydantic_self__.__class__._settings_build_values(sources, init_kwargs))
+E       pydantic_core._pydantic_core.ValidationError: 4 validation errors for Settings
+E       data_dir
+E         Value error, DATA_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       duckdb_path
+E         Value error, DUCKDB_PATH must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/main.duckdb', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       parquet_dir
+E         Value error, PARQUET_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/parquet', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       log_dir
+E         Value error, LOG_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/logs', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+
+../cdx-factor-source-integration/.venv/lib/python3.13/site-packages/pydantic_settings/main.py:242: ValidationError
+_ ERROR at setup of test_snapshot_bad_digest_symlink_and_source_change_fail_closed _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10b36c5f0>
+
+    @pytest.fixture(autouse=True)
+    def _disable_real_pushdeer(monkeypatch):
+        """所有测试默认禁用真实推送通道（PushDeer + PushPlus），避免刷手机。
+    
+        显式想测推送的用例（如 test_notify_client.py 直接传 keys/tokens 给
+        client，或 test_cli notify-test 用 monkeypatch.setattr 覆盖）不受影响。
+        """
+        import rquant.config as cfg
+>       monkeypatch.setattr(cfg.settings, "pushdeer_keys", "")
+                            ^^^^^^^^^^^^
+
+tests/conftest.py:18: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/rquant/config.py:755: in __getattr__
+    return get_settings()
+           ^^^^^^^^^^^^^^
+src/rquant/config.py:740: in get_settings
+    _SETTINGS = Settings(_env_file=_default_settings_env_file())  # type: ignore[call-arg]
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+__pydantic_self__ = Settings(), _case_sensitive = None
+_nested_model_default_partial_update = None, _env_prefix = None
+_env_prefix_target = None, _env_file = None, _env_file_encoding = None
+_env_ignore_empty = None, _env_nested_delimiter = None
+_env_nested_max_split = None, _env_parse_none_str = None
+_env_parse_enums = None, _cli_prog_name = None, _cli_parse_args = None
+_cli_settings_source = None, _cli_parse_none_str = None
+_cli_hide_none_type = None, _cli_avoid_json = None, _cli_enforce_required = None
+_cli_use_class_docs_for_groups = None, _cli_exit_on_error = None
+_cli_prefix = None, _cli_flag_prefix_char = None, _cli_implicit_flags = None
+_cli_ignore_unknown_args = None, _cli_kebab_case = None, _cli_shortcuts = None
+_secrets_dir = None, _build_sources = None, values = {}
+sources = (InitSettingsSource(init_kwargs={}), EnvSettingsSource(env_nested_delimiter=None, env_prefix_len=0), DotEnvSettingsSou...efix_len=0), SecretsSettingsSource(secrets_dir=None), DefaultSettingsSource(nested_model_default_partial_update=False))
+init_kwargs = {}
+
+    def __init__(
+        __pydantic_self__,
+        _case_sensitive: bool | None = None,
+        _nested_model_default_partial_update: bool | None = None,
+        _env_prefix: str | None = None,
+        _env_prefix_target: EnvPrefixTarget | None = None,
+        _env_file: DotenvType | None = ENV_FILE_SENTINEL,
+        _env_file_encoding: str | None = None,
+        _env_ignore_empty: bool | None = None,
+        _env_nested_delimiter: str | None = None,
+        _env_nested_max_split: int | None = None,
+        _env_parse_none_str: str | None = None,
+        _env_parse_enums: bool | None = None,
+        _cli_prog_name: str | None = None,
+        _cli_parse_args: bool | list[str] | tuple[str, ...] | None = None,
+        _cli_settings_source: CliSettingsSource[Any] | None = None,
+        _cli_parse_none_str: str | None = None,
+        _cli_hide_none_type: bool | None = None,
+        _cli_avoid_json: bool | None = None,
+        _cli_enforce_required: bool | None = None,
+        _cli_use_class_docs_for_groups: bool | None = None,
+        _cli_exit_on_error: bool | None = None,
+        _cli_prefix: str | None = None,
+        _cli_flag_prefix_char: str | None = None,
+        _cli_implicit_flags: bool | Literal['dual', 'toggle'] | None = None,
+        _cli_ignore_unknown_args: bool | None = None,
+        _cli_kebab_case: bool | Literal['all', 'no_enums'] | None = None,
+        _cli_shortcuts: Mapping[str, str | list[str]] | None = None,
+        _secrets_dir: PathType | None = None,
+        _build_sources: tuple[tuple[PydanticBaseSettingsSource, ...], dict[str, Any]] | None = None,
+        **values: Any,
+    ) -> None:
+        sources, init_kwargs = (
+            _build_sources
+            if _build_sources is not None
+            else __pydantic_self__.__class__._settings_init_sources(
+                _case_sensitive=_case_sensitive,
+                _nested_model_default_partial_update=_nested_model_default_partial_update,
+                _env_prefix=_env_prefix,
+                _env_prefix_target=_env_prefix_target,
+                _env_file=_env_file,
+                _env_file_encoding=_env_file_encoding,
+                _env_ignore_empty=_env_ignore_empty,
+                _env_nested_delimiter=_env_nested_delimiter,
+                _env_nested_max_split=_env_nested_max_split,
+                _env_parse_none_str=_env_parse_none_str,
+                _env_parse_enums=_env_parse_enums,
+                _cli_prog_name=_cli_prog_name,
+                _cli_parse_args=_cli_parse_args,
+                _cli_settings_source=_cli_settings_source,
+                _cli_parse_none_str=_cli_parse_none_str,
+                _cli_hide_none_type=_cli_hide_none_type,
+                _cli_avoid_json=_cli_avoid_json,
+                _cli_enforce_required=_cli_enforce_required,
+                _cli_use_class_docs_for_groups=_cli_use_class_docs_for_groups,
+                _cli_exit_on_error=_cli_exit_on_error,
+                _cli_prefix=_cli_prefix,
+                _cli_flag_prefix_char=_cli_flag_prefix_char,
+                _cli_implicit_flags=_cli_implicit_flags,
+                _cli_ignore_unknown_args=_cli_ignore_unknown_args,
+                _cli_kebab_case=_cli_kebab_case,
+                _cli_shortcuts=_cli_shortcuts,
+                _secrets_dir=_secrets_dir,
+                **values,
+            )
+        )
+    
+>       super().__init__(**__pydantic_self__.__class__._settings_build_values(sources, init_kwargs))
+E       pydantic_core._pydantic_core.ValidationError: 4 validation errors for Settings
+E       data_dir
+E         Value error, DATA_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       duckdb_path
+E         Value error, DUCKDB_PATH must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/main.duckdb', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       parquet_dir
+E         Value error, PARQUET_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/parquet', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       log_dir
+E         Value error, LOG_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/logs', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+
+../cdx-factor-source-integration/.venv/lib/python3.13/site-packages/pydantic_settings/main.py:242: ValidationError
+_ ERROR at setup of test_forbidden_sql_is_rejected_before_execution[INSERT INTO daily_bar VALUES (1)] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10b3869c0>
+
+    @pytest.fixture(autouse=True)
+    def _disable_real_pushdeer(monkeypatch):
+        """所有测试默认禁用真实推送通道（PushDeer + PushPlus），避免刷手机。
+    
+        显式想测推送的用例（如 test_notify_client.py 直接传 keys/tokens 给
+        client，或 test_cli notify-test 用 monkeypatch.setattr 覆盖）不受影响。
+        """
+        import rquant.config as cfg
+>       monkeypatch.setattr(cfg.settings, "pushdeer_keys", "")
+                            ^^^^^^^^^^^^
+
+tests/conftest.py:18: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/rquant/config.py:755: in __getattr__
+    return get_settings()
+           ^^^^^^^^^^^^^^
+src/rquant/config.py:740: in get_settings
+    _SETTINGS = Settings(_env_file=_default_settings_env_file())  # type: ignore[call-arg]
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+__pydantic_self__ = Settings(), _case_sensitive = None
+_nested_model_default_partial_update = None, _env_prefix = None
+_env_prefix_target = None, _env_file = None, _env_file_encoding = None
+_env_ignore_empty = None, _env_nested_delimiter = None
+_env_nested_max_split = None, _env_parse_none_str = None
+_env_parse_enums = None, _cli_prog_name = None, _cli_parse_args = None
+_cli_settings_source = None, _cli_parse_none_str = None
+_cli_hide_none_type = None, _cli_avoid_json = None, _cli_enforce_required = None
+_cli_use_class_docs_for_groups = None, _cli_exit_on_error = None
+_cli_prefix = None, _cli_flag_prefix_char = None, _cli_implicit_flags = None
+_cli_ignore_unknown_args = None, _cli_kebab_case = None, _cli_shortcuts = None
+_secrets_dir = None, _build_sources = None, values = {}
+sources = (InitSettingsSource(init_kwargs={}), EnvSettingsSource(env_nested_delimiter=None, env_prefix_len=0), DotEnvSettingsSou...efix_len=0), SecretsSettingsSource(secrets_dir=None), DefaultSettingsSource(nested_model_default_partial_update=False))
+init_kwargs = {}
+
+    def __init__(
+        __pydantic_self__,
+        _case_sensitive: bool | None = None,
+        _nested_model_default_partial_update: bool | None = None,
+        _env_prefix: str | None = None,
+        _env_prefix_target: EnvPrefixTarget | None = None,
+        _env_file: DotenvType | None = ENV_FILE_SENTINEL,
+        _env_file_encoding: str | None = None,
+        _env_ignore_empty: bool | None = None,
+        _env_nested_delimiter: str | None = None,
+        _env_nested_max_split: int | None = None,
+        _env_parse_none_str: str | None = None,
+        _env_parse_enums: bool | None = None,
+        _cli_prog_name: str | None = None,
+        _cli_parse_args: bool | list[str] | tuple[str, ...] | None = None,
+        _cli_settings_source: CliSettingsSource[Any] | None = None,
+        _cli_parse_none_str: str | None = None,
+        _cli_hide_none_type: bool | None = None,
+        _cli_avoid_json: bool | None = None,
+        _cli_enforce_required: bool | None = None,
+        _cli_use_class_docs_for_groups: bool | None = None,
+        _cli_exit_on_error: bool | None = None,
+        _cli_prefix: str | None = None,
+        _cli_flag_prefix_char: str | None = None,
+        _cli_implicit_flags: bool | Literal['dual', 'toggle'] | None = None,
+        _cli_ignore_unknown_args: bool | None = None,
+        _cli_kebab_case: bool | Literal['all', 'no_enums'] | None = None,
+        _cli_shortcuts: Mapping[str, str | list[str]] | None = None,
+        _secrets_dir: PathType | None = None,
+        _build_sources: tuple[tuple[PydanticBaseSettingsSource, ...], dict[str, Any]] | None = None,
+        **values: Any,
+    ) -> None:
+        sources, init_kwargs = (
+            _build_sources
+            if _build_sources is not None
+            else __pydantic_self__.__class__._settings_init_sources(
+                _case_sensitive=_case_sensitive,
+                _nested_model_default_partial_update=_nested_model_default_partial_update,
+                _env_prefix=_env_prefix,
+                _env_prefix_target=_env_prefix_target,
+                _env_file=_env_file,
+                _env_file_encoding=_env_file_encoding,
+                _env_ignore_empty=_env_ignore_empty,
+                _env_nested_delimiter=_env_nested_delimiter,
+                _env_nested_max_split=_env_nested_max_split,
+                _env_parse_none_str=_env_parse_none_str,
+                _env_parse_enums=_env_parse_enums,
+                _cli_prog_name=_cli_prog_name,
+                _cli_parse_args=_cli_parse_args,
+                _cli_settings_source=_cli_settings_source,
+                _cli_parse_none_str=_cli_parse_none_str,
+                _cli_hide_none_type=_cli_hide_none_type,
+                _cli_avoid_json=_cli_avoid_json,
+                _cli_enforce_required=_cli_enforce_required,
+                _cli_use_class_docs_for_groups=_cli_use_class_docs_for_groups,
+                _cli_exit_on_error=_cli_exit_on_error,
+                _cli_prefix=_cli_prefix,
+                _cli_flag_prefix_char=_cli_flag_prefix_char,
+                _cli_implicit_flags=_cli_implicit_flags,
+                _cli_ignore_unknown_args=_cli_ignore_unknown_args,
+                _cli_kebab_case=_cli_kebab_case,
+                _cli_shortcuts=_cli_shortcuts,
+                _secrets_dir=_secrets_dir,
+                **values,
+            )
+        )
+    
+>       super().__init__(**__pydantic_self__.__class__._settings_build_values(sources, init_kwargs))
+E       pydantic_core._pydantic_core.ValidationError: 4 validation errors for Settings
+E       data_dir
+E         Value error, DATA_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       duckdb_path
+E         Value error, DUCKDB_PATH must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/main.duckdb', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       parquet_dir
+E         Value error, PARQUET_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/parquet', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       log_dir
+E         Value error, LOG_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/logs', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+
+../cdx-factor-source-integration/.venv/lib/python3.13/site-packages/pydantic_settings/main.py:242: ValidationError
+_ ERROR at setup of test_forbidden_sql_is_rejected_before_execution[WITH x AS (DELETE FROM daily_bar RETURNING *) SELECT * FROM x] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10b387350>
+
+    @pytest.fixture(autouse=True)
+    def _disable_real_pushdeer(monkeypatch):
+        """所有测试默认禁用真实推送通道（PushDeer + PushPlus），避免刷手机。
+    
+        显式想测推送的用例（如 test_notify_client.py 直接传 keys/tokens 给
+        client，或 test_cli notify-test 用 monkeypatch.setattr 覆盖）不受影响。
+        """
+        import rquant.config as cfg
+>       monkeypatch.setattr(cfg.settings, "pushdeer_keys", "")
+                            ^^^^^^^^^^^^
+
+tests/conftest.py:18: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/rquant/config.py:755: in __getattr__
+    return get_settings()
+           ^^^^^^^^^^^^^^
+src/rquant/config.py:740: in get_settings
+    _SETTINGS = Settings(_env_file=_default_settings_env_file())  # type: ignore[call-arg]
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+__pydantic_self__ = Settings(), _case_sensitive = None
+_nested_model_default_partial_update = None, _env_prefix = None
+_env_prefix_target = None, _env_file = None, _env_file_encoding = None
+_env_ignore_empty = None, _env_nested_delimiter = None
+_env_nested_max_split = None, _env_parse_none_str = None
+_env_parse_enums = None, _cli_prog_name = None, _cli_parse_args = None
+_cli_settings_source = None, _cli_parse_none_str = None
+_cli_hide_none_type = None, _cli_avoid_json = None, _cli_enforce_required = None
+_cli_use_class_docs_for_groups = None, _cli_exit_on_error = None
+_cli_prefix = None, _cli_flag_prefix_char = None, _cli_implicit_flags = None
+_cli_ignore_unknown_args = None, _cli_kebab_case = None, _cli_shortcuts = None
+_secrets_dir = None, _build_sources = None, values = {}
+sources = (InitSettingsSource(init_kwargs={}), EnvSettingsSource(env_nested_delimiter=None, env_prefix_len=0), DotEnvSettingsSou...efix_len=0), SecretsSettingsSource(secrets_dir=None), DefaultSettingsSource(nested_model_default_partial_update=False))
+init_kwargs = {}
+
+    def __init__(
+        __pydantic_self__,
+        _case_sensitive: bool | None = None,
+        _nested_model_default_partial_update: bool | None = None,
+        _env_prefix: str | None = None,
+        _env_prefix_target: EnvPrefixTarget | None = None,
+        _env_file: DotenvType | None = ENV_FILE_SENTINEL,
+        _env_file_encoding: str | None = None,
+        _env_ignore_empty: bool | None = None,
+        _env_nested_delimiter: str | None = None,
+        _env_nested_max_split: int | None = None,
+        _env_parse_none_str: str | None = None,
+        _env_parse_enums: bool | None = None,
+        _cli_prog_name: str | None = None,
+        _cli_parse_args: bool | list[str] | tuple[str, ...] | None = None,
+        _cli_settings_source: CliSettingsSource[Any] | None = None,
+        _cli_parse_none_str: str | None = None,
+        _cli_hide_none_type: bool | None = None,
+        _cli_avoid_json: bool | None = None,
+        _cli_enforce_required: bool | None = None,
+        _cli_use_class_docs_for_groups: bool | None = None,
+        _cli_exit_on_error: bool | None = None,
+        _cli_prefix: str | None = None,
+        _cli_flag_prefix_char: str | None = None,
+        _cli_implicit_flags: bool | Literal['dual', 'toggle'] | None = None,
+        _cli_ignore_unknown_args: bool | None = None,
+        _cli_kebab_case: bool | Literal['all', 'no_enums'] | None = None,
+        _cli_shortcuts: Mapping[str, str | list[str]] | None = None,
+        _secrets_dir: PathType | None = None,
+        _build_sources: tuple[tuple[PydanticBaseSettingsSource, ...], dict[str, Any]] | None = None,
+        **values: Any,
+    ) -> None:
+        sources, init_kwargs = (
+            _build_sources
+            if _build_sources is not None
+            else __pydantic_self__.__class__._settings_init_sources(
+                _case_sensitive=_case_sensitive,
+                _nested_model_default_partial_update=_nested_model_default_partial_update,
+                _env_prefix=_env_prefix,
+                _env_prefix_target=_env_prefix_target,
+                _env_file=_env_file,
+                _env_file_encoding=_env_file_encoding,
+                _env_ignore_empty=_env_ignore_empty,
+                _env_nested_delimiter=_env_nested_delimiter,
+                _env_nested_max_split=_env_nested_max_split,
+                _env_parse_none_str=_env_parse_none_str,
+                _env_parse_enums=_env_parse_enums,
+                _cli_prog_name=_cli_prog_name,
+                _cli_parse_args=_cli_parse_args,
+                _cli_settings_source=_cli_settings_source,
+                _cli_parse_none_str=_cli_parse_none_str,
+                _cli_hide_none_type=_cli_hide_none_type,
+                _cli_avoid_json=_cli_avoid_json,
+                _cli_enforce_required=_cli_enforce_required,
+                _cli_use_class_docs_for_groups=_cli_use_class_docs_for_groups,
+                _cli_exit_on_error=_cli_exit_on_error,
+                _cli_prefix=_cli_prefix,
+                _cli_flag_prefix_char=_cli_flag_prefix_char,
+                _cli_implicit_flags=_cli_implicit_flags,
+                _cli_ignore_unknown_args=_cli_ignore_unknown_args,
+                _cli_kebab_case=_cli_kebab_case,
+                _cli_shortcuts=_cli_shortcuts,
+                _secrets_dir=_secrets_dir,
+                **values,
+            )
+        )
+    
+>       super().__init__(**__pydantic_self__.__class__._settings_build_values(sources, init_kwargs))
+E       pydantic_core._pydantic_core.ValidationError: 4 validation errors for Settings
+E       data_dir
+E         Value error, DATA_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       duckdb_path
+E         Value error, DUCKDB_PATH must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/main.duckdb', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       parquet_dir
+E         Value error, PARQUET_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/parquet', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       log_dir
+E         Value error, LOG_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/logs', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+
+../cdx-factor-source-integration/.venv/lib/python3.13/site-packages/pydantic_settings/main.py:242: ValidationError
+_ ERROR at setup of test_forbidden_sql_is_rejected_before_execution[SELECT 1; SELECT 2] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10ba1c750>
+
+    @pytest.fixture(autouse=True)
+    def _disable_real_pushdeer(monkeypatch):
+        """所有测试默认禁用真实推送通道（PushDeer + PushPlus），避免刷手机。
+    
+        显式想测推送的用例（如 test_notify_client.py 直接传 keys/tokens 给
+        client，或 test_cli notify-test 用 monkeypatch.setattr 覆盖）不受影响。
+        """
+        import rquant.config as cfg
+>       monkeypatch.setattr(cfg.settings, "pushdeer_keys", "")
+                            ^^^^^^^^^^^^
+
+tests/conftest.py:18: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/rquant/config.py:755: in __getattr__
+    return get_settings()
+           ^^^^^^^^^^^^^^
+src/rquant/config.py:740: in get_settings
+    _SETTINGS = Settings(_env_file=_default_settings_env_file())  # type: ignore[call-arg]
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+__pydantic_self__ = Settings(), _case_sensitive = None
+_nested_model_default_partial_update = None, _env_prefix = None
+_env_prefix_target = None, _env_file = None, _env_file_encoding = None
+_env_ignore_empty = None, _env_nested_delimiter = None
+_env_nested_max_split = None, _env_parse_none_str = None
+_env_parse_enums = None, _cli_prog_name = None, _cli_parse_args = None
+_cli_settings_source = None, _cli_parse_none_str = None
+_cli_hide_none_type = None, _cli_avoid_json = None, _cli_enforce_required = None
+_cli_use_class_docs_for_groups = None, _cli_exit_on_error = None
+_cli_prefix = None, _cli_flag_prefix_char = None, _cli_implicit_flags = None
+_cli_ignore_unknown_args = None, _cli_kebab_case = None, _cli_shortcuts = None
+_secrets_dir = None, _build_sources = None, values = {}
+sources = (InitSettingsSource(init_kwargs={}), EnvSettingsSource(env_nested_delimiter=None, env_prefix_len=0), DotEnvSettingsSou...efix_len=0), SecretsSettingsSource(secrets_dir=None), DefaultSettingsSource(nested_model_default_partial_update=False))
+init_kwargs = {}
+
+    def __init__(
+        __pydantic_self__,
+        _case_sensitive: bool | None = None,
+        _nested_model_default_partial_update: bool | None = None,
+        _env_prefix: str | None = None,
+        _env_prefix_target: EnvPrefixTarget | None = None,
+        _env_file: DotenvType | None = ENV_FILE_SENTINEL,
+        _env_file_encoding: str | None = None,
+        _env_ignore_empty: bool | None = None,
+        _env_nested_delimiter: str | None = None,
+        _env_nested_max_split: int | None = None,
+        _env_parse_none_str: str | None = None,
+        _env_parse_enums: bool | None = None,
+        _cli_prog_name: str | None = None,
+        _cli_parse_args: bool | list[str] | tuple[str, ...] | None = None,
+        _cli_settings_source: CliSettingsSource[Any] | None = None,
+        _cli_parse_none_str: str | None = None,
+        _cli_hide_none_type: bool | None = None,
+        _cli_avoid_json: bool | None = None,
+        _cli_enforce_required: bool | None = None,
+        _cli_use_class_docs_for_groups: bool | None = None,
+        _cli_exit_on_error: bool | None = None,
+        _cli_prefix: str | None = None,
+        _cli_flag_prefix_char: str | None = None,
+        _cli_implicit_flags: bool | Literal['dual', 'toggle'] | None = None,
+        _cli_ignore_unknown_args: bool | None = None,
+        _cli_kebab_case: bool | Literal['all', 'no_enums'] | None = None,
+        _cli_shortcuts: Mapping[str, str | list[str]] | None = None,
+        _secrets_dir: PathType | None = None,
+        _build_sources: tuple[tuple[PydanticBaseSettingsSource, ...], dict[str, Any]] | None = None,
+        **values: Any,
+    ) -> None:
+        sources, init_kwargs = (
+            _build_sources
+            if _build_sources is not None
+            else __pydantic_self__.__class__._settings_init_sources(
+                _case_sensitive=_case_sensitive,
+                _nested_model_default_partial_update=_nested_model_default_partial_update,
+                _env_prefix=_env_prefix,
+                _env_prefix_target=_env_prefix_target,
+                _env_file=_env_file,
+                _env_file_encoding=_env_file_encoding,
+                _env_ignore_empty=_env_ignore_empty,
+                _env_nested_delimiter=_env_nested_delimiter,
+                _env_nested_max_split=_env_nested_max_split,
+                _env_parse_none_str=_env_parse_none_str,
+                _env_parse_enums=_env_parse_enums,
+                _cli_prog_name=_cli_prog_name,
+                _cli_parse_args=_cli_parse_args,
+                _cli_settings_source=_cli_settings_source,
+                _cli_parse_none_str=_cli_parse_none_str,
+                _cli_hide_none_type=_cli_hide_none_type,
+                _cli_avoid_json=_cli_avoid_json,
+                _cli_enforce_required=_cli_enforce_required,
+                _cli_use_class_docs_for_groups=_cli_use_class_docs_for_groups,
+                _cli_exit_on_error=_cli_exit_on_error,
+                _cli_prefix=_cli_prefix,
+                _cli_flag_prefix_char=_cli_flag_prefix_char,
+                _cli_implicit_flags=_cli_implicit_flags,
+                _cli_ignore_unknown_args=_cli_ignore_unknown_args,
+                _cli_kebab_case=_cli_kebab_case,
+                _cli_shortcuts=_cli_shortcuts,
+                _secrets_dir=_secrets_dir,
+                **values,
+            )
+        )
+    
+>       super().__init__(**__pydantic_self__.__class__._settings_build_values(sources, init_kwargs))
+E       pydantic_core._pydantic_core.ValidationError: 4 validation errors for Settings
+E       data_dir
+E         Value error, DATA_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       duckdb_path
+E         Value error, DUCKDB_PATH must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/main.duckdb', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       parquet_dir
+E         Value error, PARQUET_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/parquet', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       log_dir
+E         Value error, LOG_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/logs', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+
+../cdx-factor-source-integration/.venv/lib/python3.13/site-packages/pydantic_settings/main.py:242: ValidationError
+_ ERROR at setup of test_forbidden_sql_is_rejected_before_execution[ATTACH '/tmp/private' AS p] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10ba1cd50>
+
+    @pytest.fixture(autouse=True)
+    def _disable_real_pushdeer(monkeypatch):
+        """所有测试默认禁用真实推送通道（PushDeer + PushPlus），避免刷手机。
+    
+        显式想测推送的用例（如 test_notify_client.py 直接传 keys/tokens 给
+        client，或 test_cli notify-test 用 monkeypatch.setattr 覆盖）不受影响。
+        """
+        import rquant.config as cfg
+>       monkeypatch.setattr(cfg.settings, "pushdeer_keys", "")
+                            ^^^^^^^^^^^^
+
+tests/conftest.py:18: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/rquant/config.py:755: in __getattr__
+    return get_settings()
+           ^^^^^^^^^^^^^^
+src/rquant/config.py:740: in get_settings
+    _SETTINGS = Settings(_env_file=_default_settings_env_file())  # type: ignore[call-arg]
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+__pydantic_self__ = Settings(), _case_sensitive = None
+_nested_model_default_partial_update = None, _env_prefix = None
+_env_prefix_target = None, _env_file = None, _env_file_encoding = None
+_env_ignore_empty = None, _env_nested_delimiter = None
+_env_nested_max_split = None, _env_parse_none_str = None
+_env_parse_enums = None, _cli_prog_name = None, _cli_parse_args = None
+_cli_settings_source = None, _cli_parse_none_str = None
+_cli_hide_none_type = None, _cli_avoid_json = None, _cli_enforce_required = None
+_cli_use_class_docs_for_groups = None, _cli_exit_on_error = None
+_cli_prefix = None, _cli_flag_prefix_char = None, _cli_implicit_flags = None
+_cli_ignore_unknown_args = None, _cli_kebab_case = None, _cli_shortcuts = None
+_secrets_dir = None, _build_sources = None, values = {}
+sources = (InitSettingsSource(init_kwargs={}), EnvSettingsSource(env_nested_delimiter=None, env_prefix_len=0), DotEnvSettingsSou...efix_len=0), SecretsSettingsSource(secrets_dir=None), DefaultSettingsSource(nested_model_default_partial_update=False))
+init_kwargs = {}
+
+    def __init__(
+        __pydantic_self__,
+        _case_sensitive: bool | None = None,
+        _nested_model_default_partial_update: bool | None = None,
+        _env_prefix: str | None = None,
+        _env_prefix_target: EnvPrefixTarget | None = None,
+        _env_file: DotenvType | None = ENV_FILE_SENTINEL,
+        _env_file_encoding: str | None = None,
+        _env_ignore_empty: bool | None = None,
+        _env_nested_delimiter: str | None = None,
+        _env_nested_max_split: int | None = None,
+        _env_parse_none_str: str | None = None,
+        _env_parse_enums: bool | None = None,
+        _cli_prog_name: str | None = None,
+        _cli_parse_args: bool | list[str] | tuple[str, ...] | None = None,
+        _cli_settings_source: CliSettingsSource[Any] | None = None,
+        _cli_parse_none_str: str | None = None,
+        _cli_hide_none_type: bool | None = None,
+        _cli_avoid_json: bool | None = None,
+        _cli_enforce_required: bool | None = None,
+        _cli_use_class_docs_for_groups: bool | None = None,
+        _cli_exit_on_error: bool | None = None,
+        _cli_prefix: str | None = None,
+        _cli_flag_prefix_char: str | None = None,
+        _cli_implicit_flags: bool | Literal['dual', 'toggle'] | None = None,
+        _cli_ignore_unknown_args: bool | None = None,
+        _cli_kebab_case: bool | Literal['all', 'no_enums'] | None = None,
+        _cli_shortcuts: Mapping[str, str | list[str]] | None = None,
+        _secrets_dir: PathType | None = None,
+        _build_sources: tuple[tuple[PydanticBaseSettingsSource, ...], dict[str, Any]] | None = None,
+        **values: Any,
+    ) -> None:
+        sources, init_kwargs = (
+            _build_sources
+            if _build_sources is not None
+            else __pydantic_self__.__class__._settings_init_sources(
+                _case_sensitive=_case_sensitive,
+                _nested_model_default_partial_update=_nested_model_default_partial_update,
+                _env_prefix=_env_prefix,
+                _env_prefix_target=_env_prefix_target,
+                _env_file=_env_file,
+                _env_file_encoding=_env_file_encoding,
+                _env_ignore_empty=_env_ignore_empty,
+                _env_nested_delimiter=_env_nested_delimiter,
+                _env_nested_max_split=_env_nested_max_split,
+                _env_parse_none_str=_env_parse_none_str,
+                _env_parse_enums=_env_parse_enums,
+                _cli_prog_name=_cli_prog_name,
+                _cli_parse_args=_cli_parse_args,
+                _cli_settings_source=_cli_settings_source,
+                _cli_parse_none_str=_cli_parse_none_str,
+                _cli_hide_none_type=_cli_hide_none_type,
+                _cli_avoid_json=_cli_avoid_json,
+                _cli_enforce_required=_cli_enforce_required,
+                _cli_use_class_docs_for_groups=_cli_use_class_docs_for_groups,
+                _cli_exit_on_error=_cli_exit_on_error,
+                _cli_prefix=_cli_prefix,
+                _cli_flag_prefix_char=_cli_flag_prefix_char,
+                _cli_implicit_flags=_cli_implicit_flags,
+                _cli_ignore_unknown_args=_cli_ignore_unknown_args,
+                _cli_kebab_case=_cli_kebab_case,
+                _cli_shortcuts=_cli_shortcuts,
+                _secrets_dir=_secrets_dir,
+                **values,
+            )
+        )
+    
+>       super().__init__(**__pydantic_self__.__class__._settings_build_values(sources, init_kwargs))
+E       pydantic_core._pydantic_core.ValidationError: 4 validation errors for Settings
+E       data_dir
+E         Value error, DATA_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       duckdb_path
+E         Value error, DUCKDB_PATH must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/main.duckdb', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       parquet_dir
+E         Value error, PARQUET_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/parquet', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       log_dir
+E         Value error, LOG_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/logs', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+
+../cdx-factor-source-integration/.venv/lib/python3.13/site-packages/pydantic_settings/main.py:242: ValidationError
+_ ERROR at setup of test_forbidden_sql_is_rejected_before_execution[COPY (SELECT 1) TO '/tmp/out'] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10b3fbb60>
+
+    @pytest.fixture(autouse=True)
+    def _disable_real_pushdeer(monkeypatch):
+        """所有测试默认禁用真实推送通道（PushDeer + PushPlus），避免刷手机。
+    
+        显式想测推送的用例（如 test_notify_client.py 直接传 keys/tokens 给
+        client，或 test_cli notify-test 用 monkeypatch.setattr 覆盖）不受影响。
+        """
+        import rquant.config as cfg
+>       monkeypatch.setattr(cfg.settings, "pushdeer_keys", "")
+                            ^^^^^^^^^^^^
+
+tests/conftest.py:18: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/rquant/config.py:755: in __getattr__
+    return get_settings()
+           ^^^^^^^^^^^^^^
+src/rquant/config.py:740: in get_settings
+    _SETTINGS = Settings(_env_file=_default_settings_env_file())  # type: ignore[call-arg]
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+__pydantic_self__ = Settings(), _case_sensitive = None
+_nested_model_default_partial_update = None, _env_prefix = None
+_env_prefix_target = None, _env_file = None, _env_file_encoding = None
+_env_ignore_empty = None, _env_nested_delimiter = None
+_env_nested_max_split = None, _env_parse_none_str = None
+_env_parse_enums = None, _cli_prog_name = None, _cli_parse_args = None
+_cli_settings_source = None, _cli_parse_none_str = None
+_cli_hide_none_type = None, _cli_avoid_json = None, _cli_enforce_required = None
+_cli_use_class_docs_for_groups = None, _cli_exit_on_error = None
+_cli_prefix = None, _cli_flag_prefix_char = None, _cli_implicit_flags = None
+_cli_ignore_unknown_args = None, _cli_kebab_case = None, _cli_shortcuts = None
+_secrets_dir = None, _build_sources = None, values = {}
+sources = (InitSettingsSource(init_kwargs={}), EnvSettingsSource(env_nested_delimiter=None, env_prefix_len=0), DotEnvSettingsSou...efix_len=0), SecretsSettingsSource(secrets_dir=None), DefaultSettingsSource(nested_model_default_partial_update=False))
+init_kwargs = {}
+
+    def __init__(
+        __pydantic_self__,
+        _case_sensitive: bool | None = None,
+        _nested_model_default_partial_update: bool | None = None,
+        _env_prefix: str | None = None,
+        _env_prefix_target: EnvPrefixTarget | None = None,
+        _env_file: DotenvType | None = ENV_FILE_SENTINEL,
+        _env_file_encoding: str | None = None,
+        _env_ignore_empty: bool | None = None,
+        _env_nested_delimiter: str | None = None,
+        _env_nested_max_split: int | None = None,
+        _env_parse_none_str: str | None = None,
+        _env_parse_enums: bool | None = None,
+        _cli_prog_name: str | None = None,
+        _cli_parse_args: bool | list[str] | tuple[str, ...] | None = None,
+        _cli_settings_source: CliSettingsSource[Any] | None = None,
+        _cli_parse_none_str: str | None = None,
+        _cli_hide_none_type: bool | None = None,
+        _cli_avoid_json: bool | None = None,
+        _cli_enforce_required: bool | None = None,
+        _cli_use_class_docs_for_groups: bool | None = None,
+        _cli_exit_on_error: bool | None = None,
+        _cli_prefix: str | None = None,
+        _cli_flag_prefix_char: str | None = None,
+        _cli_implicit_flags: bool | Literal['dual', 'toggle'] | None = None,
+        _cli_ignore_unknown_args: bool | None = None,
+        _cli_kebab_case: bool | Literal['all', 'no_enums'] | None = None,
+        _cli_shortcuts: Mapping[str, str | list[str]] | None = None,
+        _secrets_dir: PathType | None = None,
+        _build_sources: tuple[tuple[PydanticBaseSettingsSource, ...], dict[str, Any]] | None = None,
+        **values: Any,
+    ) -> None:
+        sources, init_kwargs = (
+            _build_sources
+            if _build_sources is not None
+            else __pydantic_self__.__class__._settings_init_sources(
+                _case_sensitive=_case_sensitive,
+                _nested_model_default_partial_update=_nested_model_default_partial_update,
+                _env_prefix=_env_prefix,
+                _env_prefix_target=_env_prefix_target,
+                _env_file=_env_file,
+                _env_file_encoding=_env_file_encoding,
+                _env_ignore_empty=_env_ignore_empty,
+                _env_nested_delimiter=_env_nested_delimiter,
+                _env_nested_max_split=_env_nested_max_split,
+                _env_parse_none_str=_env_parse_none_str,
+                _env_parse_enums=_env_parse_enums,
+                _cli_prog_name=_cli_prog_name,
+                _cli_parse_args=_cli_parse_args,
+                _cli_settings_source=_cli_settings_source,
+                _cli_parse_none_str=_cli_parse_none_str,
+                _cli_hide_none_type=_cli_hide_none_type,
+                _cli_avoid_json=_cli_avoid_json,
+                _cli_enforce_required=_cli_enforce_required,
+                _cli_use_class_docs_for_groups=_cli_use_class_docs_for_groups,
+                _cli_exit_on_error=_cli_exit_on_error,
+                _cli_prefix=_cli_prefix,
+                _cli_flag_prefix_char=_cli_flag_prefix_char,
+                _cli_implicit_flags=_cli_implicit_flags,
+                _cli_ignore_unknown_args=_cli_ignore_unknown_args,
+                _cli_kebab_case=_cli_kebab_case,
+                _cli_shortcuts=_cli_shortcuts,
+                _secrets_dir=_secrets_dir,
+                **values,
+            )
+        )
+    
+>       super().__init__(**__pydantic_self__.__class__._settings_build_values(sources, init_kwargs))
+E       pydantic_core._pydantic_core.ValidationError: 4 validation errors for Settings
+E       data_dir
+E         Value error, DATA_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       duckdb_path
+E         Value error, DUCKDB_PATH must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/main.duckdb', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       parquet_dir
+E         Value error, PARQUET_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/parquet', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       log_dir
+E         Value error, LOG_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/logs', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+
+../cdx-factor-source-integration/.venv/lib/python3.13/site-packages/pydantic_settings/main.py:242: ValidationError
+_ ERROR at setup of test_forbidden_sql_is_rejected_before_execution[SELECT * FROM read_csv('/tmp/private')] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10b434410>
+
+    @pytest.fixture(autouse=True)
+    def _disable_real_pushdeer(monkeypatch):
+        """所有测试默认禁用真实推送通道（PushDeer + PushPlus），避免刷手机。
+    
+        显式想测推送的用例（如 test_notify_client.py 直接传 keys/tokens 给
+        client，或 test_cli notify-test 用 monkeypatch.setattr 覆盖）不受影响。
+        """
+        import rquant.config as cfg
+>       monkeypatch.setattr(cfg.settings, "pushdeer_keys", "")
+                            ^^^^^^^^^^^^
+
+tests/conftest.py:18: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/rquant/config.py:755: in __getattr__
+    return get_settings()
+           ^^^^^^^^^^^^^^
+src/rquant/config.py:740: in get_settings
+    _SETTINGS = Settings(_env_file=_default_settings_env_file())  # type: ignore[call-arg]
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+__pydantic_self__ = Settings(), _case_sensitive = None
+_nested_model_default_partial_update = None, _env_prefix = None
+_env_prefix_target = None, _env_file = None, _env_file_encoding = None
+_env_ignore_empty = None, _env_nested_delimiter = None
+_env_nested_max_split = None, _env_parse_none_str = None
+_env_parse_enums = None, _cli_prog_name = None, _cli_parse_args = None
+_cli_settings_source = None, _cli_parse_none_str = None
+_cli_hide_none_type = None, _cli_avoid_json = None, _cli_enforce_required = None
+_cli_use_class_docs_for_groups = None, _cli_exit_on_error = None
+_cli_prefix = None, _cli_flag_prefix_char = None, _cli_implicit_flags = None
+_cli_ignore_unknown_args = None, _cli_kebab_case = None, _cli_shortcuts = None
+_secrets_dir = None, _build_sources = None, values = {}
+sources = (InitSettingsSource(init_kwargs={}), EnvSettingsSource(env_nested_delimiter=None, env_prefix_len=0), DotEnvSettingsSou...efix_len=0), SecretsSettingsSource(secrets_dir=None), DefaultSettingsSource(nested_model_default_partial_update=False))
+init_kwargs = {}
+
+    def __init__(
+        __pydantic_self__,
+        _case_sensitive: bool | None = None,
+        _nested_model_default_partial_update: bool | None = None,
+        _env_prefix: str | None = None,
+        _env_prefix_target: EnvPrefixTarget | None = None,
+        _env_file: DotenvType | None = ENV_FILE_SENTINEL,
+        _env_file_encoding: str | None = None,
+        _env_ignore_empty: bool | None = None,
+        _env_nested_delimiter: str | None = None,
+        _env_nested_max_split: int | None = None,
+        _env_parse_none_str: str | None = None,
+        _env_parse_enums: bool | None = None,
+        _cli_prog_name: str | None = None,
+        _cli_parse_args: bool | list[str] | tuple[str, ...] | None = None,
+        _cli_settings_source: CliSettingsSource[Any] | None = None,
+        _cli_parse_none_str: str | None = None,
+        _cli_hide_none_type: bool | None = None,
+        _cli_avoid_json: bool | None = None,
+        _cli_enforce_required: bool | None = None,
+        _cli_use_class_docs_for_groups: bool | None = None,
+        _cli_exit_on_error: bool | None = None,
+        _cli_prefix: str | None = None,
+        _cli_flag_prefix_char: str | None = None,
+        _cli_implicit_flags: bool | Literal['dual', 'toggle'] | None = None,
+        _cli_ignore_unknown_args: bool | None = None,
+        _cli_kebab_case: bool | Literal['all', 'no_enums'] | None = None,
+        _cli_shortcuts: Mapping[str, str | list[str]] | None = None,
+        _secrets_dir: PathType | None = None,
+        _build_sources: tuple[tuple[PydanticBaseSettingsSource, ...], dict[str, Any]] | None = None,
+        **values: Any,
+    ) -> None:
+        sources, init_kwargs = (
+            _build_sources
+            if _build_sources is not None
+            else __pydantic_self__.__class__._settings_init_sources(
+                _case_sensitive=_case_sensitive,
+                _nested_model_default_partial_update=_nested_model_default_partial_update,
+                _env_prefix=_env_prefix,
+                _env_prefix_target=_env_prefix_target,
+                _env_file=_env_file,
+                _env_file_encoding=_env_file_encoding,
+                _env_ignore_empty=_env_ignore_empty,
+                _env_nested_delimiter=_env_nested_delimiter,
+                _env_nested_max_split=_env_nested_max_split,
+                _env_parse_none_str=_env_parse_none_str,
+                _env_parse_enums=_env_parse_enums,
+                _cli_prog_name=_cli_prog_name,
+                _cli_parse_args=_cli_parse_args,
+                _cli_settings_source=_cli_settings_source,
+                _cli_parse_none_str=_cli_parse_none_str,
+                _cli_hide_none_type=_cli_hide_none_type,
+                _cli_avoid_json=_cli_avoid_json,
+                _cli_enforce_required=_cli_enforce_required,
+                _cli_use_class_docs_for_groups=_cli_use_class_docs_for_groups,
+                _cli_exit_on_error=_cli_exit_on_error,
+                _cli_prefix=_cli_prefix,
+                _cli_flag_prefix_char=_cli_flag_prefix_char,
+                _cli_implicit_flags=_cli_implicit_flags,
+                _cli_ignore_unknown_args=_cli_ignore_unknown_args,
+                _cli_kebab_case=_cli_kebab_case,
+                _cli_shortcuts=_cli_shortcuts,
+                _secrets_dir=_secrets_dir,
+                **values,
+            )
+        )
+    
+>       super().__init__(**__pydantic_self__.__class__._settings_build_values(sources, init_kwargs))
+E       pydantic_core._pydantic_core.ValidationError: 4 validation errors for Settings
+E       data_dir
+E         Value error, DATA_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       duckdb_path
+E         Value error, DUCKDB_PATH must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/main.duckdb', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       parquet_dir
+E         Value error, PARQUET_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/parquet', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       log_dir
+E         Value error, LOG_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/logs', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+
+../cdx-factor-source-integration/.venv/lib/python3.13/site-packages/pydantic_settings/main.py:242: ValidationError
+_ ERROR at setup of test_forbidden_sql_is_rejected_before_execution[SELECT * FROM read_parquet('/tmp/private')] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10b43ec10>
+
+    @pytest.fixture(autouse=True)
+    def _disable_real_pushdeer(monkeypatch):
+        """所有测试默认禁用真实推送通道（PushDeer + PushPlus），避免刷手机。
+    
+        显式想测推送的用例（如 test_notify_client.py 直接传 keys/tokens 给
+        client，或 test_cli notify-test 用 monkeypatch.setattr 覆盖）不受影响。
+        """
+        import rquant.config as cfg
+>       monkeypatch.setattr(cfg.settings, "pushdeer_keys", "")
+                            ^^^^^^^^^^^^
+
+tests/conftest.py:18: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/rquant/config.py:755: in __getattr__
+    return get_settings()
+           ^^^^^^^^^^^^^^
+src/rquant/config.py:740: in get_settings
+    _SETTINGS = Settings(_env_file=_default_settings_env_file())  # type: ignore[call-arg]
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+__pydantic_self__ = Settings(), _case_sensitive = None
+_nested_model_default_partial_update = None, _env_prefix = None
+_env_prefix_target = None, _env_file = None, _env_file_encoding = None
+_env_ignore_empty = None, _env_nested_delimiter = None
+_env_nested_max_split = None, _env_parse_none_str = None
+_env_parse_enums = None, _cli_prog_name = None, _cli_parse_args = None
+_cli_settings_source = None, _cli_parse_none_str = None
+_cli_hide_none_type = None, _cli_avoid_json = None, _cli_enforce_required = None
+_cli_use_class_docs_for_groups = None, _cli_exit_on_error = None
+_cli_prefix = None, _cli_flag_prefix_char = None, _cli_implicit_flags = None
+_cli_ignore_unknown_args = None, _cli_kebab_case = None, _cli_shortcuts = None
+_secrets_dir = None, _build_sources = None, values = {}
+sources = (InitSettingsSource(init_kwargs={}), EnvSettingsSource(env_nested_delimiter=None, env_prefix_len=0), DotEnvSettingsSou...efix_len=0), SecretsSettingsSource(secrets_dir=None), DefaultSettingsSource(nested_model_default_partial_update=False))
+init_kwargs = {}
+
+    def __init__(
+        __pydantic_self__,
+        _case_sensitive: bool | None = None,
+        _nested_model_default_partial_update: bool | None = None,
+        _env_prefix: str | None = None,
+        _env_prefix_target: EnvPrefixTarget | None = None,
+        _env_file: DotenvType | None = ENV_FILE_SENTINEL,
+        _env_file_encoding: str | None = None,
+        _env_ignore_empty: bool | None = None,
+        _env_nested_delimiter: str | None = None,
+        _env_nested_max_split: int | None = None,
+        _env_parse_none_str: str | None = None,
+        _env_parse_enums: bool | None = None,
+        _cli_prog_name: str | None = None,
+        _cli_parse_args: bool | list[str] | tuple[str, ...] | None = None,
+        _cli_settings_source: CliSettingsSource[Any] | None = None,
+        _cli_parse_none_str: str | None = None,
+        _cli_hide_none_type: bool | None = None,
+        _cli_avoid_json: bool | None = None,
+        _cli_enforce_required: bool | None = None,
+        _cli_use_class_docs_for_groups: bool | None = None,
+        _cli_exit_on_error: bool | None = None,
+        _cli_prefix: str | None = None,
+        _cli_flag_prefix_char: str | None = None,
+        _cli_implicit_flags: bool | Literal['dual', 'toggle'] | None = None,
+        _cli_ignore_unknown_args: bool | None = None,
+        _cli_kebab_case: bool | Literal['all', 'no_enums'] | None = None,
+        _cli_shortcuts: Mapping[str, str | list[str]] | None = None,
+        _secrets_dir: PathType | None = None,
+        _build_sources: tuple[tuple[PydanticBaseSettingsSource, ...], dict[str, Any]] | None = None,
+        **values: Any,
+    ) -> None:
+        sources, init_kwargs = (
+            _build_sources
+            if _build_sources is not None
+            else __pydantic_self__.__class__._settings_init_sources(
+                _case_sensitive=_case_sensitive,
+                _nested_model_default_partial_update=_nested_model_default_partial_update,
+                _env_prefix=_env_prefix,
+                _env_prefix_target=_env_prefix_target,
+                _env_file=_env_file,
+                _env_file_encoding=_env_file_encoding,
+                _env_ignore_empty=_env_ignore_empty,
+                _env_nested_delimiter=_env_nested_delimiter,
+                _env_nested_max_split=_env_nested_max_split,
+                _env_parse_none_str=_env_parse_none_str,
+                _env_parse_enums=_env_parse_enums,
+                _cli_prog_name=_cli_prog_name,
+                _cli_parse_args=_cli_parse_args,
+                _cli_settings_source=_cli_settings_source,
+                _cli_parse_none_str=_cli_parse_none_str,
+                _cli_hide_none_type=_cli_hide_none_type,
+                _cli_avoid_json=_cli_avoid_json,
+                _cli_enforce_required=_cli_enforce_required,
+                _cli_use_class_docs_for_groups=_cli_use_class_docs_for_groups,
+                _cli_exit_on_error=_cli_exit_on_error,
+                _cli_prefix=_cli_prefix,
+                _cli_flag_prefix_char=_cli_flag_prefix_char,
+                _cli_implicit_flags=_cli_implicit_flags,
+                _cli_ignore_unknown_args=_cli_ignore_unknown_args,
+                _cli_kebab_case=_cli_kebab_case,
+                _cli_shortcuts=_cli_shortcuts,
+                _secrets_dir=_secrets_dir,
+                **values,
+            )
+        )
+    
+>       super().__init__(**__pydantic_self__.__class__._settings_build_values(sources, init_kwargs))
+E       pydantic_core._pydantic_core.ValidationError: 4 validation errors for Settings
+E       data_dir
+E         Value error, DATA_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       duckdb_path
+E         Value error, DUCKDB_PATH must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/main.duckdb', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       parquet_dir
+E         Value error, PARQUET_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/parquet', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       log_dir
+E         Value error, LOG_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/logs', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+
+../cdx-factor-source-integration/.venv/lib/python3.13/site-packages/pydantic_settings/main.py:242: ValidationError
+_ ERROR at setup of test_forbidden_sql_is_rejected_before_execution[INSTALL httpfs] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10b444130>
+
+    @pytest.fixture(autouse=True)
+    def _disable_real_pushdeer(monkeypatch):
+        """所有测试默认禁用真实推送通道（PushDeer + PushPlus），避免刷手机。
+    
+        显式想测推送的用例（如 test_notify_client.py 直接传 keys/tokens 给
+        client，或 test_cli notify-test 用 monkeypatch.setattr 覆盖）不受影响。
+        """
+        import rquant.config as cfg
+>       monkeypatch.setattr(cfg.settings, "pushdeer_keys", "")
+                            ^^^^^^^^^^^^
+
+tests/conftest.py:18: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/rquant/config.py:755: in __getattr__
+    return get_settings()
+           ^^^^^^^^^^^^^^
+src/rquant/config.py:740: in get_settings
+    _SETTINGS = Settings(_env_file=_default_settings_env_file())  # type: ignore[call-arg]
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+__pydantic_self__ = Settings(), _case_sensitive = None
+_nested_model_default_partial_update = None, _env_prefix = None
+_env_prefix_target = None, _env_file = None, _env_file_encoding = None
+_env_ignore_empty = None, _env_nested_delimiter = None
+_env_nested_max_split = None, _env_parse_none_str = None
+_env_parse_enums = None, _cli_prog_name = None, _cli_parse_args = None
+_cli_settings_source = None, _cli_parse_none_str = None
+_cli_hide_none_type = None, _cli_avoid_json = None, _cli_enforce_required = None
+_cli_use_class_docs_for_groups = None, _cli_exit_on_error = None
+_cli_prefix = None, _cli_flag_prefix_char = None, _cli_implicit_flags = None
+_cli_ignore_unknown_args = None, _cli_kebab_case = None, _cli_shortcuts = None
+_secrets_dir = None, _build_sources = None, values = {}
+sources = (InitSettingsSource(init_kwargs={}), EnvSettingsSource(env_nested_delimiter=None, env_prefix_len=0), DotEnvSettingsSou...efix_len=0), SecretsSettingsSource(secrets_dir=None), DefaultSettingsSource(nested_model_default_partial_update=False))
+init_kwargs = {}
+
+    def __init__(
+        __pydantic_self__,
+        _case_sensitive: bool | None = None,
+        _nested_model_default_partial_update: bool | None = None,
+        _env_prefix: str | None = None,
+        _env_prefix_target: EnvPrefixTarget | None = None,
+        _env_file: DotenvType | None = ENV_FILE_SENTINEL,
+        _env_file_encoding: str | None = None,
+        _env_ignore_empty: bool | None = None,
+        _env_nested_delimiter: str | None = None,
+        _env_nested_max_split: int | None = None,
+        _env_parse_none_str: str | None = None,
+        _env_parse_enums: bool | None = None,
+        _cli_prog_name: str | None = None,
+        _cli_parse_args: bool | list[str] | tuple[str, ...] | None = None,
+        _cli_settings_source: CliSettingsSource[Any] | None = None,
+        _cli_parse_none_str: str | None = None,
+        _cli_hide_none_type: bool | None = None,
+        _cli_avoid_json: bool | None = None,
+        _cli_enforce_required: bool | None = None,
+        _cli_use_class_docs_for_groups: bool | None = None,
+        _cli_exit_on_error: bool | None = None,
+        _cli_prefix: str | None = None,
+        _cli_flag_prefix_char: str | None = None,
+        _cli_implicit_flags: bool | Literal['dual', 'toggle'] | None = None,
+        _cli_ignore_unknown_args: bool | None = None,
+        _cli_kebab_case: bool | Literal['all', 'no_enums'] | None = None,
+        _cli_shortcuts: Mapping[str, str | list[str]] | None = None,
+        _secrets_dir: PathType | None = None,
+        _build_sources: tuple[tuple[PydanticBaseSettingsSource, ...], dict[str, Any]] | None = None,
+        **values: Any,
+    ) -> None:
+        sources, init_kwargs = (
+            _build_sources
+            if _build_sources is not None
+            else __pydantic_self__.__class__._settings_init_sources(
+                _case_sensitive=_case_sensitive,
+                _nested_model_default_partial_update=_nested_model_default_partial_update,
+                _env_prefix=_env_prefix,
+                _env_prefix_target=_env_prefix_target,
+                _env_file=_env_file,
+                _env_file_encoding=_env_file_encoding,
+                _env_ignore_empty=_env_ignore_empty,
+                _env_nested_delimiter=_env_nested_delimiter,
+                _env_nested_max_split=_env_nested_max_split,
+                _env_parse_none_str=_env_parse_none_str,
+                _env_parse_enums=_env_parse_enums,
+                _cli_prog_name=_cli_prog_name,
+                _cli_parse_args=_cli_parse_args,
+                _cli_settings_source=_cli_settings_source,
+                _cli_parse_none_str=_cli_parse_none_str,
+                _cli_hide_none_type=_cli_hide_none_type,
+                _cli_avoid_json=_cli_avoid_json,
+                _cli_enforce_required=_cli_enforce_required,
+                _cli_use_class_docs_for_groups=_cli_use_class_docs_for_groups,
+                _cli_exit_on_error=_cli_exit_on_error,
+                _cli_prefix=_cli_prefix,
+                _cli_flag_prefix_char=_cli_flag_prefix_char,
+                _cli_implicit_flags=_cli_implicit_flags,
+                _cli_ignore_unknown_args=_cli_ignore_unknown_args,
+                _cli_kebab_case=_cli_kebab_case,
+                _cli_shortcuts=_cli_shortcuts,
+                _secrets_dir=_secrets_dir,
+                **values,
+            )
+        )
+    
+>       super().__init__(**__pydantic_self__.__class__._settings_build_values(sources, init_kwargs))
+E       pydantic_core._pydantic_core.ValidationError: 4 validation errors for Settings
+E       data_dir
+E         Value error, DATA_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       duckdb_path
+E         Value error, DUCKDB_PATH must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/main.duckdb', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       parquet_dir
+E         Value error, PARQUET_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/parquet', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       log_dir
+E         Value error, LOG_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/logs', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+
+../cdx-factor-source-integration/.venv/lib/python3.13/site-packages/pydantic_settings/main.py:242: ValidationError
+_ ERROR at setup of test_forbidden_sql_is_rejected_before_execution[LOAD httpfs] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10bb39b20>
+
+    @pytest.fixture(autouse=True)
+    def _disable_real_pushdeer(monkeypatch):
+        """所有测试默认禁用真实推送通道（PushDeer + PushPlus），避免刷手机。
+    
+        显式想测推送的用例（如 test_notify_client.py 直接传 keys/tokens 给
+        client，或 test_cli notify-test 用 monkeypatch.setattr 覆盖）不受影响。
+        """
+        import rquant.config as cfg
+>       monkeypatch.setattr(cfg.settings, "pushdeer_keys", "")
+                            ^^^^^^^^^^^^
+
+tests/conftest.py:18: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/rquant/config.py:755: in __getattr__
+    return get_settings()
+           ^^^^^^^^^^^^^^
+src/rquant/config.py:740: in get_settings
+    _SETTINGS = Settings(_env_file=_default_settings_env_file())  # type: ignore[call-arg]
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+__pydantic_self__ = Settings(), _case_sensitive = None
+_nested_model_default_partial_update = None, _env_prefix = None
+_env_prefix_target = None, _env_file = None, _env_file_encoding = None
+_env_ignore_empty = None, _env_nested_delimiter = None
+_env_nested_max_split = None, _env_parse_none_str = None
+_env_parse_enums = None, _cli_prog_name = None, _cli_parse_args = None
+_cli_settings_source = None, _cli_parse_none_str = None
+_cli_hide_none_type = None, _cli_avoid_json = None, _cli_enforce_required = None
+_cli_use_class_docs_for_groups = None, _cli_exit_on_error = None
+_cli_prefix = None, _cli_flag_prefix_char = None, _cli_implicit_flags = None
+_cli_ignore_unknown_args = None, _cli_kebab_case = None, _cli_shortcuts = None
+_secrets_dir = None, _build_sources = None, values = {}
+sources = (InitSettingsSource(init_kwargs={}), EnvSettingsSource(env_nested_delimiter=None, env_prefix_len=0), DotEnvSettingsSou...efix_len=0), SecretsSettingsSource(secrets_dir=None), DefaultSettingsSource(nested_model_default_partial_update=False))
+init_kwargs = {}
+
+    def __init__(
+        __pydantic_self__,
+        _case_sensitive: bool | None = None,
+        _nested_model_default_partial_update: bool | None = None,
+        _env_prefix: str | None = None,
+        _env_prefix_target: EnvPrefixTarget | None = None,
+        _env_file: DotenvType | None = ENV_FILE_SENTINEL,
+        _env_file_encoding: str | None = None,
+        _env_ignore_empty: bool | None = None,
+        _env_nested_delimiter: str | None = None,
+        _env_nested_max_split: int | None = None,
+        _env_parse_none_str: str | None = None,
+        _env_parse_enums: bool | None = None,
+        _cli_prog_name: str | None = None,
+        _cli_parse_args: bool | list[str] | tuple[str, ...] | None = None,
+        _cli_settings_source: CliSettingsSource[Any] | None = None,
+        _cli_parse_none_str: str | None = None,
+        _cli_hide_none_type: bool | None = None,
+        _cli_avoid_json: bool | None = None,
+        _cli_enforce_required: bool | None = None,
+        _cli_use_class_docs_for_groups: bool | None = None,
+        _cli_exit_on_error: bool | None = None,
+        _cli_prefix: str | None = None,
+        _cli_flag_prefix_char: str | None = None,
+        _cli_implicit_flags: bool | Literal['dual', 'toggle'] | None = None,
+        _cli_ignore_unknown_args: bool | None = None,
+        _cli_kebab_case: bool | Literal['all', 'no_enums'] | None = None,
+        _cli_shortcuts: Mapping[str, str | list[str]] | None = None,
+        _secrets_dir: PathType | None = None,
+        _build_sources: tuple[tuple[PydanticBaseSettingsSource, ...], dict[str, Any]] | None = None,
+        **values: Any,
+    ) -> None:
+        sources, init_kwargs = (
+            _build_sources
+            if _build_sources is not None
+            else __pydantic_self__.__class__._settings_init_sources(
+                _case_sensitive=_case_sensitive,
+                _nested_model_default_partial_update=_nested_model_default_partial_update,
+                _env_prefix=_env_prefix,
+                _env_prefix_target=_env_prefix_target,
+                _env_file=_env_file,
+                _env_file_encoding=_env_file_encoding,
+                _env_ignore_empty=_env_ignore_empty,
+                _env_nested_delimiter=_env_nested_delimiter,
+                _env_nested_max_split=_env_nested_max_split,
+                _env_parse_none_str=_env_parse_none_str,
+                _env_parse_enums=_env_parse_enums,
+                _cli_prog_name=_cli_prog_name,
+                _cli_parse_args=_cli_parse_args,
+                _cli_settings_source=_cli_settings_source,
+                _cli_parse_none_str=_cli_parse_none_str,
+                _cli_hide_none_type=_cli_hide_none_type,
+                _cli_avoid_json=_cli_avoid_json,
+                _cli_enforce_required=_cli_enforce_required,
+                _cli_use_class_docs_for_groups=_cli_use_class_docs_for_groups,
+                _cli_exit_on_error=_cli_exit_on_error,
+                _cli_prefix=_cli_prefix,
+                _cli_flag_prefix_char=_cli_flag_prefix_char,
+                _cli_implicit_flags=_cli_implicit_flags,
+                _cli_ignore_unknown_args=_cli_ignore_unknown_args,
+                _cli_kebab_case=_cli_kebab_case,
+                _cli_shortcuts=_cli_shortcuts,
+                _secrets_dir=_secrets_dir,
+                **values,
+            )
+        )
+    
+>       super().__init__(**__pydantic_self__.__class__._settings_build_values(sources, init_kwargs))
+E       pydantic_core._pydantic_core.ValidationError: 4 validation errors for Settings
+E       data_dir
+E         Value error, DATA_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       duckdb_path
+E         Value error, DUCKDB_PATH must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/main.duckdb', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       parquet_dir
+E         Value error, PARQUET_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/parquet', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       log_dir
+E         Value error, LOG_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/logs', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+
+../cdx-factor-source-integration/.venv/lib/python3.13/site-packages/pydantic_settings/main.py:242: ValidationError
+_ ERROR at setup of test_forbidden_sql_is_rejected_before_execution[SET enable_external_access=true] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10b419d90>
+
+    @pytest.fixture(autouse=True)
+    def _disable_real_pushdeer(monkeypatch):
+        """所有测试默认禁用真实推送通道（PushDeer + PushPlus），避免刷手机。
+    
+        显式想测推送的用例（如 test_notify_client.py 直接传 keys/tokens 给
+        client，或 test_cli notify-test 用 monkeypatch.setattr 覆盖）不受影响。
+        """
+        import rquant.config as cfg
+>       monkeypatch.setattr(cfg.settings, "pushdeer_keys", "")
+                            ^^^^^^^^^^^^
+
+tests/conftest.py:18: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/rquant/config.py:755: in __getattr__
+    return get_settings()
+           ^^^^^^^^^^^^^^
+src/rquant/config.py:740: in get_settings
+    _SETTINGS = Settings(_env_file=_default_settings_env_file())  # type: ignore[call-arg]
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+__pydantic_self__ = Settings(), _case_sensitive = None
+_nested_model_default_partial_update = None, _env_prefix = None
+_env_prefix_target = None, _env_file = None, _env_file_encoding = None
+_env_ignore_empty = None, _env_nested_delimiter = None
+_env_nested_max_split = None, _env_parse_none_str = None
+_env_parse_enums = None, _cli_prog_name = None, _cli_parse_args = None
+_cli_settings_source = None, _cli_parse_none_str = None
+_cli_hide_none_type = None, _cli_avoid_json = None, _cli_enforce_required = None
+_cli_use_class_docs_for_groups = None, _cli_exit_on_error = None
+_cli_prefix = None, _cli_flag_prefix_char = None, _cli_implicit_flags = None
+_cli_ignore_unknown_args = None, _cli_kebab_case = None, _cli_shortcuts = None
+_secrets_dir = None, _build_sources = None, values = {}
+sources = (InitSettingsSource(init_kwargs={}), EnvSettingsSource(env_nested_delimiter=None, env_prefix_len=0), DotEnvSettingsSou...efix_len=0), SecretsSettingsSource(secrets_dir=None), DefaultSettingsSource(nested_model_default_partial_update=False))
+init_kwargs = {}
+
+    def __init__(
+        __pydantic_self__,
+        _case_sensitive: bool | None = None,
+        _nested_model_default_partial_update: bool | None = None,
+        _env_prefix: str | None = None,
+        _env_prefix_target: EnvPrefixTarget | None = None,
+        _env_file: DotenvType | None = ENV_FILE_SENTINEL,
+        _env_file_encoding: str | None = None,
+        _env_ignore_empty: bool | None = None,
+        _env_nested_delimiter: str | None = None,
+        _env_nested_max_split: int | None = None,
+        _env_parse_none_str: str | None = None,
+        _env_parse_enums: bool | None = None,
+        _cli_prog_name: str | None = None,
+        _cli_parse_args: bool | list[str] | tuple[str, ...] | None = None,
+        _cli_settings_source: CliSettingsSource[Any] | None = None,
+        _cli_parse_none_str: str | None = None,
+        _cli_hide_none_type: bool | None = None,
+        _cli_avoid_json: bool | None = None,
+        _cli_enforce_required: bool | None = None,
+        _cli_use_class_docs_for_groups: bool | None = None,
+        _cli_exit_on_error: bool | None = None,
+        _cli_prefix: str | None = None,
+        _cli_flag_prefix_char: str | None = None,
+        _cli_implicit_flags: bool | Literal['dual', 'toggle'] | None = None,
+        _cli_ignore_unknown_args: bool | None = None,
+        _cli_kebab_case: bool | Literal['all', 'no_enums'] | None = None,
+        _cli_shortcuts: Mapping[str, str | list[str]] | None = None,
+        _secrets_dir: PathType | None = None,
+        _build_sources: tuple[tuple[PydanticBaseSettingsSource, ...], dict[str, Any]] | None = None,
+        **values: Any,
+    ) -> None:
+        sources, init_kwargs = (
+            _build_sources
+            if _build_sources is not None
+            else __pydantic_self__.__class__._settings_init_sources(
+                _case_sensitive=_case_sensitive,
+                _nested_model_default_partial_update=_nested_model_default_partial_update,
+                _env_prefix=_env_prefix,
+                _env_prefix_target=_env_prefix_target,
+                _env_file=_env_file,
+                _env_file_encoding=_env_file_encoding,
+                _env_ignore_empty=_env_ignore_empty,
+                _env_nested_delimiter=_env_nested_delimiter,
+                _env_nested_max_split=_env_nested_max_split,
+                _env_parse_none_str=_env_parse_none_str,
+                _env_parse_enums=_env_parse_enums,
+                _cli_prog_name=_cli_prog_name,
+                _cli_parse_args=_cli_parse_args,
+                _cli_settings_source=_cli_settings_source,
+                _cli_parse_none_str=_cli_parse_none_str,
+                _cli_hide_none_type=_cli_hide_none_type,
+                _cli_avoid_json=_cli_avoid_json,
+                _cli_enforce_required=_cli_enforce_required,
+                _cli_use_class_docs_for_groups=_cli_use_class_docs_for_groups,
+                _cli_exit_on_error=_cli_exit_on_error,
+                _cli_prefix=_cli_prefix,
+                _cli_flag_prefix_char=_cli_flag_prefix_char,
+                _cli_implicit_flags=_cli_implicit_flags,
+                _cli_ignore_unknown_args=_cli_ignore_unknown_args,
+                _cli_kebab_case=_cli_kebab_case,
+                _cli_shortcuts=_cli_shortcuts,
+                _secrets_dir=_secrets_dir,
+                **values,
+            )
+        )
+    
+>       super().__init__(**__pydantic_self__.__class__._settings_build_values(sources, init_kwargs))
+E       pydantic_core._pydantic_core.ValidationError: 4 validation errors for Settings
+E       data_dir
+E         Value error, DATA_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       duckdb_path
+E         Value error, DUCKDB_PATH must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/main.duckdb', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       parquet_dir
+E         Value error, PARQUET_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/parquet', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       log_dir
+E         Value error, LOG_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/logs', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+
+../cdx-factor-source-integration/.venv/lib/python3.13/site-packages/pydantic_settings/main.py:242: ValidationError
+_ ERROR at setup of test_forbidden_sql_is_rejected_before_execution[PRAGMA database_list] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10b41a090>
+
+    @pytest.fixture(autouse=True)
+    def _disable_real_pushdeer(monkeypatch):
+        """所有测试默认禁用真实推送通道（PushDeer + PushPlus），避免刷手机。
+    
+        显式想测推送的用例（如 test_notify_client.py 直接传 keys/tokens 给
+        client，或 test_cli notify-test 用 monkeypatch.setattr 覆盖）不受影响。
+        """
+        import rquant.config as cfg
+>       monkeypatch.setattr(cfg.settings, "pushdeer_keys", "")
+                            ^^^^^^^^^^^^
+
+tests/conftest.py:18: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/rquant/config.py:755: in __getattr__
+    return get_settings()
+           ^^^^^^^^^^^^^^
+src/rquant/config.py:740: in get_settings
+    _SETTINGS = Settings(_env_file=_default_settings_env_file())  # type: ignore[call-arg]
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+__pydantic_self__ = Settings(), _case_sensitive = None
+_nested_model_default_partial_update = None, _env_prefix = None
+_env_prefix_target = None, _env_file = None, _env_file_encoding = None
+_env_ignore_empty = None, _env_nested_delimiter = None
+_env_nested_max_split = None, _env_parse_none_str = None
+_env_parse_enums = None, _cli_prog_name = None, _cli_parse_args = None
+_cli_settings_source = None, _cli_parse_none_str = None
+_cli_hide_none_type = None, _cli_avoid_json = None, _cli_enforce_required = None
+_cli_use_class_docs_for_groups = None, _cli_exit_on_error = None
+_cli_prefix = None, _cli_flag_prefix_char = None, _cli_implicit_flags = None
+_cli_ignore_unknown_args = None, _cli_kebab_case = None, _cli_shortcuts = None
+_secrets_dir = None, _build_sources = None, values = {}
+sources = (InitSettingsSource(init_kwargs={}), EnvSettingsSource(env_nested_delimiter=None, env_prefix_len=0), DotEnvSettingsSou...efix_len=0), SecretsSettingsSource(secrets_dir=None), DefaultSettingsSource(nested_model_default_partial_update=False))
+init_kwargs = {}
+
+    def __init__(
+        __pydantic_self__,
+        _case_sensitive: bool | None = None,
+        _nested_model_default_partial_update: bool | None = None,
+        _env_prefix: str | None = None,
+        _env_prefix_target: EnvPrefixTarget | None = None,
+        _env_file: DotenvType | None = ENV_FILE_SENTINEL,
+        _env_file_encoding: str | None = None,
+        _env_ignore_empty: bool | None = None,
+        _env_nested_delimiter: str | None = None,
+        _env_nested_max_split: int | None = None,
+        _env_parse_none_str: str | None = None,
+        _env_parse_enums: bool | None = None,
+        _cli_prog_name: str | None = None,
+        _cli_parse_args: bool | list[str] | tuple[str, ...] | None = None,
+        _cli_settings_source: CliSettingsSource[Any] | None = None,
+        _cli_parse_none_str: str | None = None,
+        _cli_hide_none_type: bool | None = None,
+        _cli_avoid_json: bool | None = None,
+        _cli_enforce_required: bool | None = None,
+        _cli_use_class_docs_for_groups: bool | None = None,
+        _cli_exit_on_error: bool | None = None,
+        _cli_prefix: str | None = None,
+        _cli_flag_prefix_char: str | None = None,
+        _cli_implicit_flags: bool | Literal['dual', 'toggle'] | None = None,
+        _cli_ignore_unknown_args: bool | None = None,
+        _cli_kebab_case: bool | Literal['all', 'no_enums'] | None = None,
+        _cli_shortcuts: Mapping[str, str | list[str]] | None = None,
+        _secrets_dir: PathType | None = None,
+        _build_sources: tuple[tuple[PydanticBaseSettingsSource, ...], dict[str, Any]] | None = None,
+        **values: Any,
+    ) -> None:
+        sources, init_kwargs = (
+            _build_sources
+            if _build_sources is not None
+            else __pydantic_self__.__class__._settings_init_sources(
+                _case_sensitive=_case_sensitive,
+                _nested_model_default_partial_update=_nested_model_default_partial_update,
+                _env_prefix=_env_prefix,
+                _env_prefix_target=_env_prefix_target,
+                _env_file=_env_file,
+                _env_file_encoding=_env_file_encoding,
+                _env_ignore_empty=_env_ignore_empty,
+                _env_nested_delimiter=_env_nested_delimiter,
+                _env_nested_max_split=_env_nested_max_split,
+                _env_parse_none_str=_env_parse_none_str,
+                _env_parse_enums=_env_parse_enums,
+                _cli_prog_name=_cli_prog_name,
+                _cli_parse_args=_cli_parse_args,
+                _cli_settings_source=_cli_settings_source,
+                _cli_parse_none_str=_cli_parse_none_str,
+                _cli_hide_none_type=_cli_hide_none_type,
+                _cli_avoid_json=_cli_avoid_json,
+                _cli_enforce_required=_cli_enforce_required,
+                _cli_use_class_docs_for_groups=_cli_use_class_docs_for_groups,
+                _cli_exit_on_error=_cli_exit_on_error,
+                _cli_prefix=_cli_prefix,
+                _cli_flag_prefix_char=_cli_flag_prefix_char,
+                _cli_implicit_flags=_cli_implicit_flags,
+                _cli_ignore_unknown_args=_cli_ignore_unknown_args,
+                _cli_kebab_case=_cli_kebab_case,
+                _cli_shortcuts=_cli_shortcuts,
+                _secrets_dir=_secrets_dir,
+                **values,
+            )
+        )
+    
+>       super().__init__(**__pydantic_self__.__class__._settings_build_values(sources, init_kwargs))
+E       pydantic_core._pydantic_core.ValidationError: 4 validation errors for Settings
+E       data_dir
+E         Value error, DATA_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       duckdb_path
+E         Value error, DUCKDB_PATH must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/main.duckdb', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       parquet_dir
+E         Value error, PARQUET_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/parquet', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       log_dir
+E         Value error, LOG_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/logs', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+
+../cdx-factor-source-integration/.venv/lib/python3.13/site-packages/pydantic_settings/main.py:242: ValidationError
+_ ERROR at setup of test_quoted_content_and_comments_do_not_change_actual_select[SELECT 'INSERT; COPY; read_csv' AS text;] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10b489d30>
+
+    @pytest.fixture(autouse=True)
+    def _disable_real_pushdeer(monkeypatch):
+        """所有测试默认禁用真实推送通道（PushDeer + PushPlus），避免刷手机。
+    
+        显式想测推送的用例（如 test_notify_client.py 直接传 keys/tokens 给
+        client，或 test_cli notify-test 用 monkeypatch.setattr 覆盖）不受影响。
+        """
+        import rquant.config as cfg
+>       monkeypatch.setattr(cfg.settings, "pushdeer_keys", "")
+                            ^^^^^^^^^^^^
+
+tests/conftest.py:18: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/rquant/config.py:755: in __getattr__
+    return get_settings()
+           ^^^^^^^^^^^^^^
+src/rquant/config.py:740: in get_settings
+    _SETTINGS = Settings(_env_file=_default_settings_env_file())  # type: ignore[call-arg]
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+__pydantic_self__ = Settings(), _case_sensitive = None
+_nested_model_default_partial_update = None, _env_prefix = None
+_env_prefix_target = None, _env_file = None, _env_file_encoding = None
+_env_ignore_empty = None, _env_nested_delimiter = None
+_env_nested_max_split = None, _env_parse_none_str = None
+_env_parse_enums = None, _cli_prog_name = None, _cli_parse_args = None
+_cli_settings_source = None, _cli_parse_none_str = None
+_cli_hide_none_type = None, _cli_avoid_json = None, _cli_enforce_required = None
+_cli_use_class_docs_for_groups = None, _cli_exit_on_error = None
+_cli_prefix = None, _cli_flag_prefix_char = None, _cli_implicit_flags = None
+_cli_ignore_unknown_args = None, _cli_kebab_case = None, _cli_shortcuts = None
+_secrets_dir = None, _build_sources = None, values = {}
+sources = (InitSettingsSource(init_kwargs={}), EnvSettingsSource(env_nested_delimiter=None, env_prefix_len=0), DotEnvSettingsSou...efix_len=0), SecretsSettingsSource(secrets_dir=None), DefaultSettingsSource(nested_model_default_partial_update=False))
+init_kwargs = {}
+
+    def __init__(
+        __pydantic_self__,
+        _case_sensitive: bool | None = None,
+        _nested_model_default_partial_update: bool | None = None,
+        _env_prefix: str | None = None,
+        _env_prefix_target: EnvPrefixTarget | None = None,
+        _env_file: DotenvType | None = ENV_FILE_SENTINEL,
+        _env_file_encoding: str | None = None,
+        _env_ignore_empty: bool | None = None,
+        _env_nested_delimiter: str | None = None,
+        _env_nested_max_split: int | None = None,
+        _env_parse_none_str: str | None = None,
+        _env_parse_enums: bool | None = None,
+        _cli_prog_name: str | None = None,
+        _cli_parse_args: bool | list[str] | tuple[str, ...] | None = None,
+        _cli_settings_source: CliSettingsSource[Any] | None = None,
+        _cli_parse_none_str: str | None = None,
+        _cli_hide_none_type: bool | None = None,
+        _cli_avoid_json: bool | None = None,
+        _cli_enforce_required: bool | None = None,
+        _cli_use_class_docs_for_groups: bool | None = None,
+        _cli_exit_on_error: bool | None = None,
+        _cli_prefix: str | None = None,
+        _cli_flag_prefix_char: str | None = None,
+        _cli_implicit_flags: bool | Literal['dual', 'toggle'] | None = None,
+        _cli_ignore_unknown_args: bool | None = None,
+        _cli_kebab_case: bool | Literal['all', 'no_enums'] | None = None,
+        _cli_shortcuts: Mapping[str, str | list[str]] | None = None,
+        _secrets_dir: PathType | None = None,
+        _build_sources: tuple[tuple[PydanticBaseSettingsSource, ...], dict[str, Any]] | None = None,
+        **values: Any,
+    ) -> None:
+        sources, init_kwargs = (
+            _build_sources
+            if _build_sources is not None
+            else __pydantic_self__.__class__._settings_init_sources(
+                _case_sensitive=_case_sensitive,
+                _nested_model_default_partial_update=_nested_model_default_partial_update,
+                _env_prefix=_env_prefix,
+                _env_prefix_target=_env_prefix_target,
+                _env_file=_env_file,
+                _env_file_encoding=_env_file_encoding,
+                _env_ignore_empty=_env_ignore_empty,
+                _env_nested_delimiter=_env_nested_delimiter,
+                _env_nested_max_split=_env_nested_max_split,
+                _env_parse_none_str=_env_parse_none_str,
+                _env_parse_enums=_env_parse_enums,
+                _cli_prog_name=_cli_prog_name,
+                _cli_parse_args=_cli_parse_args,
+                _cli_settings_source=_cli_settings_source,
+                _cli_parse_none_str=_cli_parse_none_str,
+                _cli_hide_none_type=_cli_hide_none_type,
+                _cli_avoid_json=_cli_avoid_json,
+                _cli_enforce_required=_cli_enforce_required,
+                _cli_use_class_docs_for_groups=_cli_use_class_docs_for_groups,
+                _cli_exit_on_error=_cli_exit_on_error,
+                _cli_prefix=_cli_prefix,
+                _cli_flag_prefix_char=_cli_flag_prefix_char,
+                _cli_implicit_flags=_cli_implicit_flags,
+                _cli_ignore_unknown_args=_cli_ignore_unknown_args,
+                _cli_kebab_case=_cli_kebab_case,
+                _cli_shortcuts=_cli_shortcuts,
+                _secrets_dir=_secrets_dir,
+                **values,
+            )
+        )
+    
+>       super().__init__(**__pydantic_self__.__class__._settings_build_values(sources, init_kwargs))
+E       pydantic_core._pydantic_core.ValidationError: 4 validation errors for Settings
+E       data_dir
+E         Value error, DATA_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       duckdb_path
+E         Value error, DUCKDB_PATH must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/main.duckdb', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       parquet_dir
+E         Value error, PARQUET_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/parquet', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       log_dir
+E         Value error, LOG_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/logs', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+
+../cdx-factor-source-integration/.venv/lib/python3.13/site-packages/pydantic_settings/main.py:242: ValidationError
+_ ERROR at setup of test_quoted_content_and_comments_do_not_change_actual_select[-- DROP\nWITH x AS (SELECT 1) SELECT * FROM x] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10b48a150>
+
+    @pytest.fixture(autouse=True)
+    def _disable_real_pushdeer(monkeypatch):
+        """所有测试默认禁用真实推送通道（PushDeer + PushPlus），避免刷手机。
+    
+        显式想测推送的用例（如 test_notify_client.py 直接传 keys/tokens 给
+        client，或 test_cli notify-test 用 monkeypatch.setattr 覆盖）不受影响。
+        """
+        import rquant.config as cfg
+>       monkeypatch.setattr(cfg.settings, "pushdeer_keys", "")
+                            ^^^^^^^^^^^^
+
+tests/conftest.py:18: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/rquant/config.py:755: in __getattr__
+    return get_settings()
+           ^^^^^^^^^^^^^^
+src/rquant/config.py:740: in get_settings
+    _SETTINGS = Settings(_env_file=_default_settings_env_file())  # type: ignore[call-arg]
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+__pydantic_self__ = Settings(), _case_sensitive = None
+_nested_model_default_partial_update = None, _env_prefix = None
+_env_prefix_target = None, _env_file = None, _env_file_encoding = None
+_env_ignore_empty = None, _env_nested_delimiter = None
+_env_nested_max_split = None, _env_parse_none_str = None
+_env_parse_enums = None, _cli_prog_name = None, _cli_parse_args = None
+_cli_settings_source = None, _cli_parse_none_str = None
+_cli_hide_none_type = None, _cli_avoid_json = None, _cli_enforce_required = None
+_cli_use_class_docs_for_groups = None, _cli_exit_on_error = None
+_cli_prefix = None, _cli_flag_prefix_char = None, _cli_implicit_flags = None
+_cli_ignore_unknown_args = None, _cli_kebab_case = None, _cli_shortcuts = None
+_secrets_dir = None, _build_sources = None, values = {}
+sources = (InitSettingsSource(init_kwargs={}), EnvSettingsSource(env_nested_delimiter=None, env_prefix_len=0), DotEnvSettingsSou...efix_len=0), SecretsSettingsSource(secrets_dir=None), DefaultSettingsSource(nested_model_default_partial_update=False))
+init_kwargs = {}
+
+    def __init__(
+        __pydantic_self__,
+        _case_sensitive: bool | None = None,
+        _nested_model_default_partial_update: bool | None = None,
+        _env_prefix: str | None = None,
+        _env_prefix_target: EnvPrefixTarget | None = None,
+        _env_file: DotenvType | None = ENV_FILE_SENTINEL,
+        _env_file_encoding: str | None = None,
+        _env_ignore_empty: bool | None = None,
+        _env_nested_delimiter: str | None = None,
+        _env_nested_max_split: int | None = None,
+        _env_parse_none_str: str | None = None,
+        _env_parse_enums: bool | None = None,
+        _cli_prog_name: str | None = None,
+        _cli_parse_args: bool | list[str] | tuple[str, ...] | None = None,
+        _cli_settings_source: CliSettingsSource[Any] | None = None,
+        _cli_parse_none_str: str | None = None,
+        _cli_hide_none_type: bool | None = None,
+        _cli_avoid_json: bool | None = None,
+        _cli_enforce_required: bool | None = None,
+        _cli_use_class_docs_for_groups: bool | None = None,
+        _cli_exit_on_error: bool | None = None,
+        _cli_prefix: str | None = None,
+        _cli_flag_prefix_char: str | None = None,
+        _cli_implicit_flags: bool | Literal['dual', 'toggle'] | None = None,
+        _cli_ignore_unknown_args: bool | None = None,
+        _cli_kebab_case: bool | Literal['all', 'no_enums'] | None = None,
+        _cli_shortcuts: Mapping[str, str | list[str]] | None = None,
+        _secrets_dir: PathType | None = None,
+        _build_sources: tuple[tuple[PydanticBaseSettingsSource, ...], dict[str, Any]] | None = None,
+        **values: Any,
+    ) -> None:
+        sources, init_kwargs = (
+            _build_sources
+            if _build_sources is not None
+            else __pydantic_self__.__class__._settings_init_sources(
+                _case_sensitive=_case_sensitive,
+                _nested_model_default_partial_update=_nested_model_default_partial_update,
+                _env_prefix=_env_prefix,
+                _env_prefix_target=_env_prefix_target,
+                _env_file=_env_file,
+                _env_file_encoding=_env_file_encoding,
+                _env_ignore_empty=_env_ignore_empty,
+                _env_nested_delimiter=_env_nested_delimiter,
+                _env_nested_max_split=_env_nested_max_split,
+                _env_parse_none_str=_env_parse_none_str,
+                _env_parse_enums=_env_parse_enums,
+                _cli_prog_name=_cli_prog_name,
+                _cli_parse_args=_cli_parse_args,
+                _cli_settings_source=_cli_settings_source,
+                _cli_parse_none_str=_cli_parse_none_str,
+                _cli_hide_none_type=_cli_hide_none_type,
+                _cli_avoid_json=_cli_avoid_json,
+                _cli_enforce_required=_cli_enforce_required,
+                _cli_use_class_docs_for_groups=_cli_use_class_docs_for_groups,
+                _cli_exit_on_error=_cli_exit_on_error,
+                _cli_prefix=_cli_prefix,
+                _cli_flag_prefix_char=_cli_flag_prefix_char,
+                _cli_implicit_flags=_cli_implicit_flags,
+                _cli_ignore_unknown_args=_cli_ignore_unknown_args,
+                _cli_kebab_case=_cli_kebab_case,
+                _cli_shortcuts=_cli_shortcuts,
+                _secrets_dir=_secrets_dir,
+                **values,
+            )
+        )
+    
+>       super().__init__(**__pydantic_self__.__class__._settings_build_values(sources, init_kwargs))
+E       pydantic_core._pydantic_core.ValidationError: 4 validation errors for Settings
+E       data_dir
+E         Value error, DATA_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       duckdb_path
+E         Value error, DUCKDB_PATH must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/main.duckdb', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       parquet_dir
+E         Value error, PARQUET_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/parquet', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       log_dir
+E         Value error, LOG_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/logs', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+
+../cdx-factor-source-integration/.venv/lib/python3.13/site-packages/pydantic_settings/main.py:242: ValidationError
+_ ERROR at setup of test_quoted_content_and_comments_do_not_change_actual_select[SELECT 1 /* ATTACH */] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10b490690>
+
+    @pytest.fixture(autouse=True)
+    def _disable_real_pushdeer(monkeypatch):
+        """所有测试默认禁用真实推送通道（PushDeer + PushPlus），避免刷手机。
+    
+        显式想测推送的用例（如 test_notify_client.py 直接传 keys/tokens 给
+        client，或 test_cli notify-test 用 monkeypatch.setattr 覆盖）不受影响。
+        """
+        import rquant.config as cfg
+>       monkeypatch.setattr(cfg.settings, "pushdeer_keys", "")
+                            ^^^^^^^^^^^^
+
+tests/conftest.py:18: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/rquant/config.py:755: in __getattr__
+    return get_settings()
+           ^^^^^^^^^^^^^^
+src/rquant/config.py:740: in get_settings
+    _SETTINGS = Settings(_env_file=_default_settings_env_file())  # type: ignore[call-arg]
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+__pydantic_self__ = Settings(), _case_sensitive = None
+_nested_model_default_partial_update = None, _env_prefix = None
+_env_prefix_target = None, _env_file = None, _env_file_encoding = None
+_env_ignore_empty = None, _env_nested_delimiter = None
+_env_nested_max_split = None, _env_parse_none_str = None
+_env_parse_enums = None, _cli_prog_name = None, _cli_parse_args = None
+_cli_settings_source = None, _cli_parse_none_str = None
+_cli_hide_none_type = None, _cli_avoid_json = None, _cli_enforce_required = None
+_cli_use_class_docs_for_groups = None, _cli_exit_on_error = None
+_cli_prefix = None, _cli_flag_prefix_char = None, _cli_implicit_flags = None
+_cli_ignore_unknown_args = None, _cli_kebab_case = None, _cli_shortcuts = None
+_secrets_dir = None, _build_sources = None, values = {}
+sources = (InitSettingsSource(init_kwargs={}), EnvSettingsSource(env_nested_delimiter=None, env_prefix_len=0), DotEnvSettingsSou...efix_len=0), SecretsSettingsSource(secrets_dir=None), DefaultSettingsSource(nested_model_default_partial_update=False))
+init_kwargs = {}
+
+    def __init__(
+        __pydantic_self__,
+        _case_sensitive: bool | None = None,
+        _nested_model_default_partial_update: bool | None = None,
+        _env_prefix: str | None = None,
+        _env_prefix_target: EnvPrefixTarget | None = None,
+        _env_file: DotenvType | None = ENV_FILE_SENTINEL,
+        _env_file_encoding: str | None = None,
+        _env_ignore_empty: bool | None = None,
+        _env_nested_delimiter: str | None = None,
+        _env_nested_max_split: int | None = None,
+        _env_parse_none_str: str | None = None,
+        _env_parse_enums: bool | None = None,
+        _cli_prog_name: str | None = None,
+        _cli_parse_args: bool | list[str] | tuple[str, ...] | None = None,
+        _cli_settings_source: CliSettingsSource[Any] | None = None,
+        _cli_parse_none_str: str | None = None,
+        _cli_hide_none_type: bool | None = None,
+        _cli_avoid_json: bool | None = None,
+        _cli_enforce_required: bool | None = None,
+        _cli_use_class_docs_for_groups: bool | None = None,
+        _cli_exit_on_error: bool | None = None,
+        _cli_prefix: str | None = None,
+        _cli_flag_prefix_char: str | None = None,
+        _cli_implicit_flags: bool | Literal['dual', 'toggle'] | None = None,
+        _cli_ignore_unknown_args: bool | None = None,
+        _cli_kebab_case: bool | Literal['all', 'no_enums'] | None = None,
+        _cli_shortcuts: Mapping[str, str | list[str]] | None = None,
+        _secrets_dir: PathType | None = None,
+        _build_sources: tuple[tuple[PydanticBaseSettingsSource, ...], dict[str, Any]] | None = None,
+        **values: Any,
+    ) -> None:
+        sources, init_kwargs = (
+            _build_sources
+            if _build_sources is not None
+            else __pydantic_self__.__class__._settings_init_sources(
+                _case_sensitive=_case_sensitive,
+                _nested_model_default_partial_update=_nested_model_default_partial_update,
+                _env_prefix=_env_prefix,
+                _env_prefix_target=_env_prefix_target,
+                _env_file=_env_file,
+                _env_file_encoding=_env_file_encoding,
+                _env_ignore_empty=_env_ignore_empty,
+                _env_nested_delimiter=_env_nested_delimiter,
+                _env_nested_max_split=_env_nested_max_split,
+                _env_parse_none_str=_env_parse_none_str,
+                _env_parse_enums=_env_parse_enums,
+                _cli_prog_name=_cli_prog_name,
+                _cli_parse_args=_cli_parse_args,
+                _cli_settings_source=_cli_settings_source,
+                _cli_parse_none_str=_cli_parse_none_str,
+                _cli_hide_none_type=_cli_hide_none_type,
+                _cli_avoid_json=_cli_avoid_json,
+                _cli_enforce_required=_cli_enforce_required,
+                _cli_use_class_docs_for_groups=_cli_use_class_docs_for_groups,
+                _cli_exit_on_error=_cli_exit_on_error,
+                _cli_prefix=_cli_prefix,
+                _cli_flag_prefix_char=_cli_flag_prefix_char,
+                _cli_implicit_flags=_cli_implicit_flags,
+                _cli_ignore_unknown_args=_cli_ignore_unknown_args,
+                _cli_kebab_case=_cli_kebab_case,
+                _cli_shortcuts=_cli_shortcuts,
+                _secrets_dir=_secrets_dir,
+                **values,
+            )
+        )
+    
+>       super().__init__(**__pydantic_self__.__class__._settings_build_values(sources, init_kwargs))
+E       pydantic_core._pydantic_core.ValidationError: 4 validation errors for Settings
+E       data_dir
+E         Value error, DATA_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       duckdb_path
+E         Value error, DUCKDB_PATH must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/main.duckdb', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       parquet_dir
+E         Value error, PARQUET_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/parquet', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       log_dir
+E         Value error, LOG_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/logs', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+
+../cdx-factor-source-integration/.venv/lib/python3.13/site-packages/pydantic_settings/main.py:242: ValidationError
+_ ERROR at setup of test_quoted_content_and_comments_do_not_change_actual_select[SELECT 1 AS "UPDATE"] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10b490d70>
+
+    @pytest.fixture(autouse=True)
+    def _disable_real_pushdeer(monkeypatch):
+        """所有测试默认禁用真实推送通道（PushDeer + PushPlus），避免刷手机。
+    
+        显式想测推送的用例（如 test_notify_client.py 直接传 keys/tokens 给
+        client，或 test_cli notify-test 用 monkeypatch.setattr 覆盖）不受影响。
+        """
+        import rquant.config as cfg
+>       monkeypatch.setattr(cfg.settings, "pushdeer_keys", "")
+                            ^^^^^^^^^^^^
+
+tests/conftest.py:18: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/rquant/config.py:755: in __getattr__
+    return get_settings()
+           ^^^^^^^^^^^^^^
+src/rquant/config.py:740: in get_settings
+    _SETTINGS = Settings(_env_file=_default_settings_env_file())  # type: ignore[call-arg]
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+__pydantic_self__ = Settings(), _case_sensitive = None
+_nested_model_default_partial_update = None, _env_prefix = None
+_env_prefix_target = None, _env_file = None, _env_file_encoding = None
+_env_ignore_empty = None, _env_nested_delimiter = None
+_env_nested_max_split = None, _env_parse_none_str = None
+_env_parse_enums = None, _cli_prog_name = None, _cli_parse_args = None
+_cli_settings_source = None, _cli_parse_none_str = None
+_cli_hide_none_type = None, _cli_avoid_json = None, _cli_enforce_required = None
+_cli_use_class_docs_for_groups = None, _cli_exit_on_error = None
+_cli_prefix = None, _cli_flag_prefix_char = None, _cli_implicit_flags = None
+_cli_ignore_unknown_args = None, _cli_kebab_case = None, _cli_shortcuts = None
+_secrets_dir = None, _build_sources = None, values = {}
+sources = (InitSettingsSource(init_kwargs={}), EnvSettingsSource(env_nested_delimiter=None, env_prefix_len=0), DotEnvSettingsSou...efix_len=0), SecretsSettingsSource(secrets_dir=None), DefaultSettingsSource(nested_model_default_partial_update=False))
+init_kwargs = {}
+
+    def __init__(
+        __pydantic_self__,
+        _case_sensitive: bool | None = None,
+        _nested_model_default_partial_update: bool | None = None,
+        _env_prefix: str | None = None,
+        _env_prefix_target: EnvPrefixTarget | None = None,
+        _env_file: DotenvType | None = ENV_FILE_SENTINEL,
+        _env_file_encoding: str | None = None,
+        _env_ignore_empty: bool | None = None,
+        _env_nested_delimiter: str | None = None,
+        _env_nested_max_split: int | None = None,
+        _env_parse_none_str: str | None = None,
+        _env_parse_enums: bool | None = None,
+        _cli_prog_name: str | None = None,
+        _cli_parse_args: bool | list[str] | tuple[str, ...] | None = None,
+        _cli_settings_source: CliSettingsSource[Any] | None = None,
+        _cli_parse_none_str: str | None = None,
+        _cli_hide_none_type: bool | None = None,
+        _cli_avoid_json: bool | None = None,
+        _cli_enforce_required: bool | None = None,
+        _cli_use_class_docs_for_groups: bool | None = None,
+        _cli_exit_on_error: bool | None = None,
+        _cli_prefix: str | None = None,
+        _cli_flag_prefix_char: str | None = None,
+        _cli_implicit_flags: bool | Literal['dual', 'toggle'] | None = None,
+        _cli_ignore_unknown_args: bool | None = None,
+        _cli_kebab_case: bool | Literal['all', 'no_enums'] | None = None,
+        _cli_shortcuts: Mapping[str, str | list[str]] | None = None,
+        _secrets_dir: PathType | None = None,
+        _build_sources: tuple[tuple[PydanticBaseSettingsSource, ...], dict[str, Any]] | None = None,
+        **values: Any,
+    ) -> None:
+        sources, init_kwargs = (
+            _build_sources
+            if _build_sources is not None
+            else __pydantic_self__.__class__._settings_init_sources(
+                _case_sensitive=_case_sensitive,
+                _nested_model_default_partial_update=_nested_model_default_partial_update,
+                _env_prefix=_env_prefix,
+                _env_prefix_target=_env_prefix_target,
+                _env_file=_env_file,
+                _env_file_encoding=_env_file_encoding,
+                _env_ignore_empty=_env_ignore_empty,
+                _env_nested_delimiter=_env_nested_delimiter,
+                _env_nested_max_split=_env_nested_max_split,
+                _env_parse_none_str=_env_parse_none_str,
+                _env_parse_enums=_env_parse_enums,
+                _cli_prog_name=_cli_prog_name,
+                _cli_parse_args=_cli_parse_args,
+                _cli_settings_source=_cli_settings_source,
+                _cli_parse_none_str=_cli_parse_none_str,
+                _cli_hide_none_type=_cli_hide_none_type,
+                _cli_avoid_json=_cli_avoid_json,
+                _cli_enforce_required=_cli_enforce_required,
+                _cli_use_class_docs_for_groups=_cli_use_class_docs_for_groups,
+                _cli_exit_on_error=_cli_exit_on_error,
+                _cli_prefix=_cli_prefix,
+                _cli_flag_prefix_char=_cli_flag_prefix_char,
+                _cli_implicit_flags=_cli_implicit_flags,
+                _cli_ignore_unknown_args=_cli_ignore_unknown_args,
+                _cli_kebab_case=_cli_kebab_case,
+                _cli_shortcuts=_cli_shortcuts,
+                _secrets_dir=_secrets_dir,
+                **values,
+            )
+        )
+    
+>       super().__init__(**__pydantic_self__.__class__._settings_build_values(sources, init_kwargs))
+E       pydantic_core._pydantic_core.ValidationError: 4 validation errors for Settings
+E       data_dir
+E         Value error, DATA_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       duckdb_path
+E         Value error, DUCKDB_PATH must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/main.duckdb', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       parquet_dir
+E         Value error, PARQUET_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/parquet', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       log_dir
+E         Value error, LOG_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/logs', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+
+../cdx-factor-source-integration/.venv/lib/python3.13/site-packages/pydantic_settings/main.py:242: ValidationError
+____ ERROR at setup of test_sql_byte_budget_and_client_cannot_raise_limits _____
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10b495e20>
+
+    @pytest.fixture(autouse=True)
+    def _disable_real_pushdeer(monkeypatch):
+        """所有测试默认禁用真实推送通道（PushDeer + PushPlus），避免刷手机。
+    
+        显式想测推送的用例（如 test_notify_client.py 直接传 keys/tokens 给
+        client，或 test_cli notify-test 用 monkeypatch.setattr 覆盖）不受影响。
+        """
+        import rquant.config as cfg
+>       monkeypatch.setattr(cfg.settings, "pushdeer_keys", "")
+                            ^^^^^^^^^^^^
+
+tests/conftest.py:18: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/rquant/config.py:755: in __getattr__
+    return get_settings()
+           ^^^^^^^^^^^^^^
+src/rquant/config.py:740: in get_settings
+    _SETTINGS = Settings(_env_file=_default_settings_env_file())  # type: ignore[call-arg]
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+__pydantic_self__ = Settings(), _case_sensitive = None
+_nested_model_default_partial_update = None, _env_prefix = None
+_env_prefix_target = None, _env_file = None, _env_file_encoding = None
+_env_ignore_empty = None, _env_nested_delimiter = None
+_env_nested_max_split = None, _env_parse_none_str = None
+_env_parse_enums = None, _cli_prog_name = None, _cli_parse_args = None
+_cli_settings_source = None, _cli_parse_none_str = None
+_cli_hide_none_type = None, _cli_avoid_json = None, _cli_enforce_required = None
+_cli_use_class_docs_for_groups = None, _cli_exit_on_error = None
+_cli_prefix = None, _cli_flag_prefix_char = None, _cli_implicit_flags = None
+_cli_ignore_unknown_args = None, _cli_kebab_case = None, _cli_shortcuts = None
+_secrets_dir = None, _build_sources = None, values = {}
+sources = (InitSettingsSource(init_kwargs={}), EnvSettingsSource(env_nested_delimiter=None, env_prefix_len=0), DotEnvSettingsSou...efix_len=0), SecretsSettingsSource(secrets_dir=None), DefaultSettingsSource(nested_model_default_partial_update=False))
+init_kwargs = {}
+
+    def __init__(
+        __pydantic_self__,
+        _case_sensitive: bool | None = None,
+        _nested_model_default_partial_update: bool | None = None,
+        _env_prefix: str | None = None,
+        _env_prefix_target: EnvPrefixTarget | None = None,
+        _env_file: DotenvType | None = ENV_FILE_SENTINEL,
+        _env_file_encoding: str | None = None,
+        _env_ignore_empty: bool | None = None,
+        _env_nested_delimiter: str | None = None,
+        _env_nested_max_split: int | None = None,
+        _env_parse_none_str: str | None = None,
+        _env_parse_enums: bool | None = None,
+        _cli_prog_name: str | None = None,
+        _cli_parse_args: bool | list[str] | tuple[str, ...] | None = None,
+        _cli_settings_source: CliSettingsSource[Any] | None = None,
+        _cli_parse_none_str: str | None = None,
+        _cli_hide_none_type: bool | None = None,
+        _cli_avoid_json: bool | None = None,
+        _cli_enforce_required: bool | None = None,
+        _cli_use_class_docs_for_groups: bool | None = None,
+        _cli_exit_on_error: bool | None = None,
+        _cli_prefix: str | None = None,
+        _cli_flag_prefix_char: str | None = None,
+        _cli_implicit_flags: bool | Literal['dual', 'toggle'] | None = None,
+        _cli_ignore_unknown_args: bool | None = None,
+        _cli_kebab_case: bool | Literal['all', 'no_enums'] | None = None,
+        _cli_shortcuts: Mapping[str, str | list[str]] | None = None,
+        _secrets_dir: PathType | None = None,
+        _build_sources: tuple[tuple[PydanticBaseSettingsSource, ...], dict[str, Any]] | None = None,
+        **values: Any,
+    ) -> None:
+        sources, init_kwargs = (
+            _build_sources
+            if _build_sources is not None
+            else __pydantic_self__.__class__._settings_init_sources(
+                _case_sensitive=_case_sensitive,
+                _nested_model_default_partial_update=_nested_model_default_partial_update,
+                _env_prefix=_env_prefix,
+                _env_prefix_target=_env_prefix_target,
+                _env_file=_env_file,
+                _env_file_encoding=_env_file_encoding,
+                _env_ignore_empty=_env_ignore_empty,
+                _env_nested_delimiter=_env_nested_delimiter,
+                _env_nested_max_split=_env_nested_max_split,
+                _env_parse_none_str=_env_parse_none_str,
+                _env_parse_enums=_env_parse_enums,
+                _cli_prog_name=_cli_prog_name,
+                _cli_parse_args=_cli_parse_args,
+                _cli_settings_source=_cli_settings_source,
+                _cli_parse_none_str=_cli_parse_none_str,
+                _cli_hide_none_type=_cli_hide_none_type,
+                _cli_avoid_json=_cli_avoid_json,
+                _cli_enforce_required=_cli_enforce_required,
+                _cli_use_class_docs_for_groups=_cli_use_class_docs_for_groups,
+                _cli_exit_on_error=_cli_exit_on_error,
+                _cli_prefix=_cli_prefix,
+                _cli_flag_prefix_char=_cli_flag_prefix_char,
+                _cli_implicit_flags=_cli_implicit_flags,
+                _cli_ignore_unknown_args=_cli_ignore_unknown_args,
+                _cli_kebab_case=_cli_kebab_case,
+                _cli_shortcuts=_cli_shortcuts,
+                _secrets_dir=_secrets_dir,
+                **values,
+            )
+        )
+    
+>       super().__init__(**__pydantic_self__.__class__._settings_build_values(sources, init_kwargs))
+E       pydantic_core._pydantic_core.ValidationError: 4 validation errors for Settings
+E       data_dir
+E         Value error, DATA_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       duckdb_path
+E         Value error, DUCKDB_PATH must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/main.duckdb', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       parquet_dir
+E         Value error, PARQUET_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/parquet', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       log_dir
+E         Value error, LOG_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/logs', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+
+../cdx-factor-source-integration/.venv/lib/python3.13/site-packages/pydantic_settings/main.py:242: ValidationError
+_ ERROR at setup of test_csv_formula_prefixes_quotes_binary_nonfinite_and_duplicates _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10ba35150>
+
+    @pytest.fixture(autouse=True)
+    def _disable_real_pushdeer(monkeypatch):
+        """所有测试默认禁用真实推送通道（PushDeer + PushPlus），避免刷手机。
+    
+        显式想测推送的用例（如 test_notify_client.py 直接传 keys/tokens 给
+        client，或 test_cli notify-test 用 monkeypatch.setattr 覆盖）不受影响。
+        """
+        import rquant.config as cfg
+>       monkeypatch.setattr(cfg.settings, "pushdeer_keys", "")
+                            ^^^^^^^^^^^^
+
+tests/conftest.py:18: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/rquant/config.py:755: in __getattr__
+    return get_settings()
+           ^^^^^^^^^^^^^^
+src/rquant/config.py:740: in get_settings
+    _SETTINGS = Settings(_env_file=_default_settings_env_file())  # type: ignore[call-arg]
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+__pydantic_self__ = Settings(), _case_sensitive = None
+_nested_model_default_partial_update = None, _env_prefix = None
+_env_prefix_target = None, _env_file = None, _env_file_encoding = None
+_env_ignore_empty = None, _env_nested_delimiter = None
+_env_nested_max_split = None, _env_parse_none_str = None
+_env_parse_enums = None, _cli_prog_name = None, _cli_parse_args = None
+_cli_settings_source = None, _cli_parse_none_str = None
+_cli_hide_none_type = None, _cli_avoid_json = None, _cli_enforce_required = None
+_cli_use_class_docs_for_groups = None, _cli_exit_on_error = None
+_cli_prefix = None, _cli_flag_prefix_char = None, _cli_implicit_flags = None
+_cli_ignore_unknown_args = None, _cli_kebab_case = None, _cli_shortcuts = None
+_secrets_dir = None, _build_sources = None, values = {}
+sources = (InitSettingsSource(init_kwargs={}), EnvSettingsSource(env_nested_delimiter=None, env_prefix_len=0), DotEnvSettingsSou...efix_len=0), SecretsSettingsSource(secrets_dir=None), DefaultSettingsSource(nested_model_default_partial_update=False))
+init_kwargs = {}
+
+    def __init__(
+        __pydantic_self__,
+        _case_sensitive: bool | None = None,
+        _nested_model_default_partial_update: bool | None = None,
+        _env_prefix: str | None = None,
+        _env_prefix_target: EnvPrefixTarget | None = None,
+        _env_file: DotenvType | None = ENV_FILE_SENTINEL,
+        _env_file_encoding: str | None = None,
+        _env_ignore_empty: bool | None = None,
+        _env_nested_delimiter: str | None = None,
+        _env_nested_max_split: int | None = None,
+        _env_parse_none_str: str | None = None,
+        _env_parse_enums: bool | None = None,
+        _cli_prog_name: str | None = None,
+        _cli_parse_args: bool | list[str] | tuple[str, ...] | None = None,
+        _cli_settings_source: CliSettingsSource[Any] | None = None,
+        _cli_parse_none_str: str | None = None,
+        _cli_hide_none_type: bool | None = None,
+        _cli_avoid_json: bool | None = None,
+        _cli_enforce_required: bool | None = None,
+        _cli_use_class_docs_for_groups: bool | None = None,
+        _cli_exit_on_error: bool | None = None,
+        _cli_prefix: str | None = None,
+        _cli_flag_prefix_char: str | None = None,
+        _cli_implicit_flags: bool | Literal['dual', 'toggle'] | None = None,
+        _cli_ignore_unknown_args: bool | None = None,
+        _cli_kebab_case: bool | Literal['all', 'no_enums'] | None = None,
+        _cli_shortcuts: Mapping[str, str | list[str]] | None = None,
+        _secrets_dir: PathType | None = None,
+        _build_sources: tuple[tuple[PydanticBaseSettingsSource, ...], dict[str, Any]] | None = None,
+        **values: Any,
+    ) -> None:
+        sources, init_kwargs = (
+            _build_sources
+            if _build_sources is not None
+            else __pydantic_self__.__class__._settings_init_sources(
+                _case_sensitive=_case_sensitive,
+                _nested_model_default_partial_update=_nested_model_default_partial_update,
+                _env_prefix=_env_prefix,
+                _env_prefix_target=_env_prefix_target,
+                _env_file=_env_file,
+                _env_file_encoding=_env_file_encoding,
+                _env_ignore_empty=_env_ignore_empty,
+                _env_nested_delimiter=_env_nested_delimiter,
+                _env_nested_max_split=_env_nested_max_split,
+                _env_parse_none_str=_env_parse_none_str,
+                _env_parse_enums=_env_parse_enums,
+                _cli_prog_name=_cli_prog_name,
+                _cli_parse_args=_cli_parse_args,
+                _cli_settings_source=_cli_settings_source,
+                _cli_parse_none_str=_cli_parse_none_str,
+                _cli_hide_none_type=_cli_hide_none_type,
+                _cli_avoid_json=_cli_avoid_json,
+                _cli_enforce_required=_cli_enforce_required,
+                _cli_use_class_docs_for_groups=_cli_use_class_docs_for_groups,
+                _cli_exit_on_error=_cli_exit_on_error,
+                _cli_prefix=_cli_prefix,
+                _cli_flag_prefix_char=_cli_flag_prefix_char,
+                _cli_implicit_flags=_cli_implicit_flags,
+                _cli_ignore_unknown_args=_cli_ignore_unknown_args,
+                _cli_kebab_case=_cli_kebab_case,
+                _cli_shortcuts=_cli_shortcuts,
+                _secrets_dir=_secrets_dir,
+                **values,
+            )
+        )
+    
+>       super().__init__(**__pydantic_self__.__class__._settings_build_values(sources, init_kwargs))
+E       pydantic_core._pydantic_core.ValidationError: 4 validation errors for Settings
+E       data_dir
+E         Value error, DATA_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       duckdb_path
+E         Value error, DUCKDB_PATH must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/main.duckdb', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       parquet_dir
+E         Value error, PARQUET_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/parquet', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+E       log_dir
+E         Value error, LOG_DIR must be canonical (no symlink aliases) [type=value_error, input_value='/tmp/rquant-query-tests/logs', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+
+../cdx-factor-source-integration/.venv/lib/python3.13/site-packages/pydantic_settings/main.py:242: ValidationError
+=========================== short test summary info ============================
+ERROR tests/unit/test_research_query.py::test_public_snapshot_contains_only_exact_public_columns_and_source_is_unchanged
+ERROR tests/unit/test_research_query.py::test_full_original_database_and_extra_objects_are_rejected
+ERROR tests/unit/test_research_query.py::test_snapshot_bad_digest_symlink_and_source_change_fail_closed
+ERROR tests/unit/test_research_query.py::test_forbidden_sql_is_rejected_before_execution[INSERT INTO daily_bar VALUES (1)]
+ERROR tests/unit/test_research_query.py::test_forbidden_sql_is_rejected_before_execution[WITH x AS (DELETE FROM daily_bar RETURNING *) SELECT * FROM x]
+ERROR tests/unit/test_research_query.py::test_forbidden_sql_is_rejected_before_execution[SELECT 1; SELECT 2]
+ERROR tests/unit/test_research_query.py::test_forbidden_sql_is_rejected_before_execution[ATTACH '/tmp/private' AS p]
+ERROR tests/unit/test_research_query.py::test_forbidden_sql_is_rejected_before_execution[COPY (SELECT 1) TO '/tmp/out']
+ERROR tests/unit/test_research_query.py::test_forbidden_sql_is_rejected_before_execution[SELECT * FROM read_csv('/tmp/private')]
+ERROR tests/unit/test_research_query.py::test_forbidden_sql_is_rejected_before_execution[SELECT * FROM read_parquet('/tmp/private')]
+ERROR tests/unit/test_research_query.py::test_forbidden_sql_is_rejected_before_execution[INSTALL httpfs]
+ERROR tests/unit/test_research_query.py::test_forbidden_sql_is_rejected_before_execution[LOAD httpfs]
+ERROR tests/unit/test_research_query.py::test_forbidden_sql_is_rejected_before_execution[SET enable_external_access=true]
+ERROR tests/unit/test_research_query.py::test_forbidden_sql_is_rejected_before_execution[PRAGMA database_list]
+ERROR tests/unit/test_research_query.py::test_quoted_content_and_comments_do_not_change_actual_select[SELECT 'INSERT; COPY; read_csv' AS text;]
+ERROR tests/unit/test_research_query.py::test_quoted_content_and_comments_do_not_change_actual_select[-- DROP\nWITH x AS (SELECT 1) SELECT * FROM x]
+ERROR tests/unit/test_research_query.py::test_quoted_content_and_comments_do_not_change_actual_select[SELECT 1 /* ATTACH */]
+ERROR tests/unit/test_research_query.py::test_quoted_content_and_comments_do_not_change_actual_select[SELECT 1 AS "UPDATE"]
+ERROR tests/unit/test_research_query.py::test_sql_byte_budget_and_client_cannot_raise_limits
+ERROR tests/unit/test_research_query.py::test_csv_formula_prefixes_quotes_binary_nonfinite_and_duplicates
+============================== 20 errors in 0.31s ==============================

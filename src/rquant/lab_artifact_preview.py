@@ -21,8 +21,11 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue
 from rquant.lab_artifacts import (
     LabArtifactFileIdentity,
     LabJobArtifactManifest,
+    LabParquetIdentity,
+    _rebuild_research_run_spec,
 )
 from rquant.lab_jobs import LabArtifactPreviewAuthority, LabJobReader
+from rquant.research_run_spec import ResearchRunSpec
 from rquant.strict_json import (
     StrictJsonError,
     canonical_json_bytes,
@@ -73,6 +76,39 @@ class ArtifactPreview(ArtifactPreviewModel):
     metrics: JsonValue
     available_tables: tuple[str, ...]
     table: ArtifactTablePreview | None
+
+
+class ArtifactCompleteTableBudget(ArtifactPreviewModel):
+    max_table_count: int = Field(default=8, ge=1, le=8)
+    max_table_bytes: int = Field(default=33_554_432, ge=1, le=33_554_432)
+    max_total_bytes: int = Field(default=62_128_104, ge=1, le=62_128_104)
+
+
+class ArtifactCompleteTable(ArtifactPreviewModel):
+    parquet: LabParquetIdentity
+    rows: tuple[tuple[ArtifactScalar, ...], ...]
+
+
+class ArtifactCompleteTables(ArtifactPreviewModel):
+    authority: LabArtifactPreviewAuthority
+    manifest: LabJobArtifactManifest
+    spec: ResearchRunSpec
+    report_markdown: str
+    metrics: JsonValue
+    tables: tuple[ArtifactCompleteTable, ...]
+
+
+class ArtifactCompleteByteEvidence(ArtifactPreviewModel):
+    """Complete sealed byte identity; Parquet data semantics require full materialization."""
+
+    authority: LabArtifactPreviewAuthority
+    manifest: LabJobArtifactManifest
+    spec: ResearchRunSpec
+    metrics: JsonValue
+    file_identities: tuple[LabArtifactFileIdentity, ...]
+    tables: tuple[LabParquetIdentity, ...]
+    encoded_table_bytes: int = Field(ge=0)
+    verified_bundle_bytes: int = Field(ge=0)
 
 
 def _same_file_identity(observed: os.stat_result, expected: LabArtifactFileIdentity) -> bool:
@@ -314,6 +350,32 @@ class ArtifactPreviewReader:
             )
         )
 
+    def _validate_parquet_metadata(
+        self,
+        parquet_file: pq.ParquetFile,
+        *,
+        relative_path: str,
+        expected_rows: int,
+        expected_columns: tuple[str, ...],
+        selected_columns: tuple[str, ...],
+    ) -> int:
+        metadata = parquet_file.metadata
+        if metadata.num_rows != expected_rows or tuple(parquet_file.schema_arrow.names) != expected_columns:
+            raise ArtifactPreviewIntegrityError(f"Parquet metadata conflicts: {relative_path}")
+        uncompressed_bytes = 0
+        for index in range(metadata.num_row_groups):
+            size = metadata.row_group(index).total_byte_size
+            if type(size) is not int or size < 0:
+                raise ArtifactPreviewIntegrityError(f"Parquet row-group metadata is invalid: {relative_path}")
+            uncompressed_bytes += size
+            if uncompressed_bytes > self.max_parquet_uncompressed_bytes:
+                raise ArtifactPreviewIntegrityError(f"Parquet uncompressed data exceeds preview budget: {relative_path}")
+        for name in selected_columns:
+            data_type = parquet_file.schema_arrow.field(name).type
+            if not self._arrow_preview_type_supported(data_type):
+                raise ArtifactPreviewIntegrityError(f"Parquet preview contains unsupported type {data_type}")
+        return uncompressed_bytes
+
     def _read_parquet_preview_rows(
         self,
         descriptor: int,
@@ -327,30 +389,8 @@ class ArtifactPreviewReader:
         os.lseek(descriptor, 0, os.SEEK_SET)
         with os.fdopen(os.dup(descriptor), "rb") as stream:
             parquet_file = pq.ParquetFile(stream)
-            metadata = parquet_file.metadata
-            if (
-                metadata.num_rows != expected_rows
-                or tuple(parquet_file.schema_arrow.names) != expected_columns
-            ):
-                raise ArtifactPreviewIntegrityError(f"Parquet metadata conflicts: {relative_path}")
-            uncompressed_bytes = 0
-            for row_group_index in range(metadata.num_row_groups):
-                row_group_bytes = metadata.row_group(row_group_index).total_byte_size
-                if type(row_group_bytes) is not int or row_group_bytes < 0:
-                    raise ArtifactPreviewIntegrityError(
-                        f"Parquet row-group metadata is invalid: {relative_path}"
-                    )
-                uncompressed_bytes += row_group_bytes
-                if uncompressed_bytes > self.max_parquet_uncompressed_bytes:
-                    raise ArtifactPreviewIntegrityError(
-                        f"Parquet uncompressed data exceeds preview budget: {relative_path}"
-                    )
-            for column_name in selected_columns:
-                data_type = parquet_file.schema_arrow.field(column_name).type
-                if not self._arrow_preview_type_supported(data_type):
-                    raise ArtifactPreviewIntegrityError(
-                        f"Parquet preview contains unsupported type {data_type}"
-                    )
+            self._validate_parquet_metadata(parquet_file, relative_path=relative_path,
+                expected_rows=expected_rows, expected_columns=expected_columns, selected_columns=selected_columns)
 
             rows: list[tuple[ArtifactScalar, ...]] = []
             arrow_bytes = 0
@@ -417,6 +457,87 @@ class ArtifactPreviewReader:
             column_limit=column_limit,
         )
 
+    def read_complete_tables(
+        self,
+        job_id: UUID,
+        *,
+        table_names: tuple[str, ...],
+        budget: ArtifactCompleteTableBudget,
+    ) -> ArtifactCompleteTables:
+        budget = ArtifactCompleteTableBudget.model_validate(budget.model_dump(mode="python"))
+        if not table_names or len(table_names) != len(set(table_names)) or len(table_names) > budget.max_table_count:
+            raise ValueError("complete artifact table selection must be unique and bounded")
+        authority = self.reader.get_artifact_preview_authority(job_id)
+        if authority is None:
+            raise ArtifactPreviewUnavailableError(
+                "artifact preview requires a succeeded job with sealed result evidence"
+            )
+        result = self._read_authorized_bundle(authority, table_name=None, row_limit=1,
+            column_limit=1, complete_budget=budget, table_names=table_names)
+        assert isinstance(result, ArtifactCompleteTables)
+        return result
+
+    def read_complete_byte_evidence(
+        self,
+        job_id: UUID,
+        *,
+        table_names: tuple[str, ...],
+        budget: ArtifactCompleteTableBudget,
+    ) -> ArtifactCompleteByteEvidence:
+        budget = ArtifactCompleteTableBudget.model_validate(budget.model_dump(mode="python"))
+        if not table_names or len(table_names) != len(set(table_names)) or len(table_names) > budget.max_table_count:
+            raise ValueError("complete artifact table selection must be unique and bounded")
+        authority = self.reader.get_artifact_preview_authority(job_id)
+        if authority is None:
+            raise ArtifactPreviewUnavailableError(
+                "artifact preview requires a succeeded job with sealed result evidence"
+            )
+        result = self._read_authorized_bundle(authority, table_name=None, row_limit=1,
+            column_limit=1, complete_budget=budget, table_names=table_names, byte_evidence=True)
+        assert isinstance(result, ArtifactCompleteByteEvidence)
+        return result
+
+    def _read_parquet_complete_rows(
+        self,
+        descriptor: int,
+        *,
+        relative_path: str,
+        expected: LabParquetIdentity,
+        byte_limit: int,
+    ) -> tuple[tuple[tuple[ArtifactScalar, ...], ...], int]:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        with os.fdopen(os.dup(descriptor), "rb") as stream:
+            parquet_file = pq.ParquetFile(stream)
+            uncompressed_bytes = self._validate_parquet_metadata(parquet_file, relative_path=relative_path,
+                expected_rows=expected.row_count, expected_columns=expected.columns, selected_columns=expected.columns)
+            if uncompressed_bytes > byte_limit:
+                raise ArtifactPreviewIntegrityError(f"Parquet uncompressed data exceeds complete budget: {relative_path}")
+            rows: list[tuple[ArtifactScalar, ...]] = []
+            arrow_bytes = 0
+            serialized_bytes = 2
+            for batch in parquet_file.iter_batches(batch_size=100):
+                arrow_bytes += batch.nbytes
+                if arrow_bytes > byte_limit:
+                    raise ArtifactPreviewIntegrityError(f"Parquet materialized data exceeds complete budget: {relative_path}")
+                for row_index in range(batch.num_rows):
+                    row: list[ArtifactScalar] = []
+                    row_bytes = 2
+                    for column_index in range(batch.num_columns):
+                        array = batch.column(column_index)
+                        cell_bytes = self._variable_cell_bytes(array, row_index)
+                        if cell_bytes is not None and cell_bytes > byte_limit:
+                            raise ArtifactPreviewIntegrityError(f"Parquet complete cell exceeds byte budget: {relative_path}")
+                        value = _preview_scalar(array[row_index].as_py())
+                        row_bytes += len(canonical_json_bytes(value)) + (1 if row else 0)
+                        if serialized_bytes + row_bytes + (1 if rows else 0) > byte_limit:
+                            raise ArtifactPreviewIntegrityError(f"Parquet serialized complete data exceeds byte budget: {relative_path}")
+                        row.append(value)
+                    serialized_bytes += row_bytes + (1 if rows else 0)
+                    rows.append(tuple(row))
+            if len(rows) != expected.row_count:
+                raise ArtifactPreviewIntegrityError(f"Parquet complete row count conflicts: {relative_path}")
+            return tuple(rows), max(uncompressed_bytes, arrow_bytes, serialized_bytes)
+
     def _preview_authorized(
         self,
         authority: LabArtifactPreviewAuthority,
@@ -425,6 +546,22 @@ class ArtifactPreviewReader:
         row_limit: int,
         column_limit: int,
     ) -> ArtifactPreview:
+        result = self._read_authorized_bundle(authority, table_name=table_name,
+            row_limit=row_limit, column_limit=column_limit)
+        assert isinstance(result, ArtifactPreview)
+        return result
+
+    def _read_authorized_bundle(
+        self,
+        authority: LabArtifactPreviewAuthority,
+        *,
+        table_name: str | None,
+        row_limit: int,
+        column_limit: int,
+        complete_budget: ArtifactCompleteTableBudget | None = None,
+        table_names: tuple[str, ...] = (),
+        byte_evidence: bool = False,
+    ) -> ArtifactPreview | ArtifactCompleteTables | ArtifactCompleteByteEvidence:
         evidence = authority.evidence
         expected_path = self.artifact_root / "sealed" / authority.job.job_id.hex
         if evidence.sealed_path != expected_path:
@@ -435,10 +572,28 @@ class ArtifactPreviewReader:
         try:
             if self.artifact_root.resolve(strict=True) != self.artifact_root:
                 raise ArtifactPreviewIntegrityError("artifact root contains a symlink")
+            root_before = os.stat(self.artifact_root, follow_symlinks=False) if byte_evidence else None
             root_fd = self._open_directory(self.artifact_root)
             descriptors.append(root_fd)
+            root_opened = os.fstat(root_fd) if byte_evidence else None
+            if byte_evidence and (
+                root_before is None or root_opened is None
+                or not _same_opened_file(root_before, root_opened)
+                or not stat.S_ISDIR(root_opened.st_mode)
+                or stat.S_IMODE(root_opened.st_mode) != 0o700
+            ):
+                raise ArtifactPreviewIntegrityError("artifact root identity or permissions are unsafe")
+            sealed_before = os.stat("sealed", dir_fd=root_fd, follow_symlinks=False) if byte_evidence else None
             sealed_fd = self._open_directory(root_fd, "sealed")
             descriptors.append(sealed_fd)
+            sealed_opened = os.fstat(sealed_fd) if byte_evidence else None
+            if byte_evidence and (
+                sealed_before is None or sealed_opened is None
+                or not _same_opened_file(sealed_before, sealed_opened)
+                or not stat.S_ISDIR(sealed_opened.st_mode)
+                or stat.S_IMODE(sealed_opened.st_mode) != 0o700
+            ):
+                raise ArtifactPreviewIntegrityError("sealed directory identity or permissions are unsafe")
             bundle_before = os.stat(
                 authority.job.job_id.hex,
                 dir_fd=sealed_fd,
@@ -455,6 +610,7 @@ class ArtifactPreviewReader:
                 != (evidence.bundle_device, evidence.bundle_inode)
             ):
                 raise ArtifactPreviewIntegrityError("sealed bundle identity is unsafe or changed")
+            tables_before = os.stat("tables", dir_fd=bundle_fd, follow_symlinks=False) if byte_evidence else None
             tables_fd = self._open_directory(bundle_fd, "tables")
             descriptors.append(tables_fd)
             tables_opened = os.fstat(tables_fd)
@@ -463,6 +619,8 @@ class ArtifactPreviewReader:
                 or stat.S_IMODE(tables_opened.st_mode) != 0o500
             ):
                 raise ArtifactPreviewIntegrityError("sealed tables directory is unsafe")
+            if byte_evidence and (tables_before is None or not _same_opened_file(tables_before, tables_opened)):
+                raise ArtifactPreviewIntegrityError("sealed tables directory changed while opening")
 
             identities = {item.relative_path: item for item in evidence.file_identities}
             manifest_identity = identities.get("manifest.json")
@@ -493,6 +651,26 @@ class ArtifactPreviewReader:
             }
             if set(identities) != expected_paths:
                 raise ArtifactPreviewIntegrityError("artifact evidence inventory conflicts")
+            if byte_evidence:
+                if len(identities) != len(evidence.file_identities):
+                    raise ArtifactPreviewIntegrityError("artifact evidence inventory contains duplicate identities")
+                byte_tables = tuple(item for item in manifest.files if item.parquet is not None)
+                if {item.parquet.table_name for item in byte_tables if item.parquet} != set(table_names) or len(byte_tables) != len(table_names):
+                    raise ArtifactPreviewIntegrityError("complete artifact exact table inventory conflicts")
+                if any(item.size != identities[item.relative_path].size for item in manifest.files):
+                    raise ArtifactPreviewIntegrityError("artifact manifest file size conflicts with bound evidence")
+                for directory_fd, expected_names in (
+                    (bundle_fd, {"manifest.json", "SHA256SUMS", "spec.json", "metrics.json", "report.md", "tables"}),
+                    (tables_fd, {PurePosixPath(item.relative_path).name for item in byte_tables}),
+                ):
+                    observed_names: set[str] = set()
+                    with os.scandir(directory_fd) as entries:
+                        for entry in entries:
+                            if entry.name not in expected_names:
+                                raise ArtifactPreviewIntegrityError("sealed directory inventory conflicts")
+                            observed_names.add(entry.name)
+                    if observed_names != expected_names:
+                        raise ArtifactPreviewIntegrityError("sealed directory inventory conflicts")
             total_bytes = sum(item.size for item in evidence.file_identities)
             if total_bytes > self.max_bundle_bytes:
                 raise ArtifactPreviewIntegrityError("artifact bundle exceeds its size limit")
@@ -559,43 +737,88 @@ class ArtifactPreviewReader:
             available_tables = tuple(
                 item.parquet.table_name for item in table_entries if item.parquet
             )
-            selected_name = table_name or available_tables[0]
-            selected = next(
-                (
-                    item
-                    for item in table_entries
-                    if item.parquet and item.parquet.table_name == selected_name
-                ),
-                None,
-            )
-            if selected is None or selected.parquet is None:
-                raise ValueError(f"unknown artifact table: {selected_name}")
-            parquet = selected.parquet
-            columns = parquet.columns[:column_limit]
-            parquet_fd = opened_files[selected.relative_path]
-            rows = self._read_parquet_preview_rows(
-                parquet_fd,
-                relative_path=selected.relative_path,
-                expected_rows=parquet.row_count,
-                expected_columns=parquet.columns,
-                selected_columns=columns,
-                row_limit=row_limit,
-            )
-            table = ArtifactTablePreview(
-                table_name=selected_name,
-                total_rows=parquet.row_count,
-                total_columns=len(parquet.columns),
-                columns=columns,
-                rows=rows,
-                rows_truncated=parquet.row_count > len(rows),
-                columns_truncated=len(parquet.columns) > len(columns),
-            )
+            complete: ArtifactCompleteTables | ArtifactCompleteByteEvidence | None = None
+            table: ArtifactTablePreview | None = None
+            if complete_budget is not None:
+                if set(available_tables) != set(table_names) or len(table_entries) != len(table_names):
+                    raise ArtifactPreviewIntegrityError("complete artifact exact table inventory conflicts")
+                encoded_bytes = sum(item.size for item in table_entries)
+                if encoded_bytes > complete_budget.max_total_bytes or any(item.size > complete_budget.max_table_bytes for item in table_entries):
+                    raise ArtifactPreviewIntegrityError("complete artifact tables exceed byte budget")
+                spec_bytes = _read_descriptor(opened_files["spec.json"], limit=self.max_text_bytes, label="spec.json")
+                try:
+                    spec = _rebuild_research_run_spec(spec_bytes)
+                except Exception as exc:
+                    raise ArtifactPreviewIntegrityError("complete artifact spec is invalid") from exc
+                if spec_bytes != spec.canonical_json().encode("utf-8") or spec != authority.job.spec:
+                    raise ArtifactPreviewIntegrityError("complete artifact spec differs from accepted job")
+                if byte_evidence:
+                    complete = ArtifactCompleteByteEvidence(authority=authority, manifest=manifest,
+                        spec=spec, metrics=metrics, file_identities=evidence.file_identities,
+                        tables=tuple(entry.parquet for entry in table_entries if entry.parquet),
+                        encoded_table_bytes=encoded_bytes, verified_bundle_bytes=total_bytes)
+                else:
+                    complete_tables: list[ArtifactCompleteTable] = []
+                    decoded_bytes = 0
+                    for entry in table_entries:
+                        assert entry.parquet is not None
+                        rows, usage = self._read_parquet_complete_rows(opened_files[entry.relative_path],
+                            relative_path=entry.relative_path, expected=entry.parquet,
+                            byte_limit=min(complete_budget.max_table_bytes, complete_budget.max_total_bytes - decoded_bytes))
+                        decoded_bytes += usage
+                        if decoded_bytes > complete_budget.max_total_bytes:
+                            raise ArtifactPreviewIntegrityError("complete artifact decoded tables exceed byte budget")
+                        complete_tables.append(ArtifactCompleteTable(parquet=entry.parquet, rows=rows))
+                    complete = ArtifactCompleteTables(authority=authority, manifest=manifest, spec=spec,
+                        report_markdown=report, metrics=metrics, tables=tuple(complete_tables))
+            else:
+                selected_name = table_name or available_tables[0]
+                selected = next(
+                    (
+                        item
+                        for item in table_entries
+                        if item.parquet and item.parquet.table_name == selected_name
+                    ),
+                    None,
+                )
+                if selected is None or selected.parquet is None:
+                    raise ValueError(f"unknown artifact table: {selected_name}")
+                parquet = selected.parquet
+                columns = parquet.columns[:column_limit]
+                parquet_fd = opened_files[selected.relative_path]
+                rows = self._read_parquet_preview_rows(
+                    parquet_fd,
+                    relative_path=selected.relative_path,
+                    expected_rows=parquet.row_count,
+                    expected_columns=parquet.columns,
+                    selected_columns=columns,
+                    row_limit=row_limit,
+                )
+                table = ArtifactTablePreview(
+                    table_name=selected_name,
+                    total_rows=parquet.row_count,
+                    total_columns=len(parquet.columns),
+                    columns=columns,
+                    rows=rows,
+                    rows_truncated=parquet.row_count > len(rows),
+                    columns_truncated=len(parquet.columns) > len(columns),
+                )
 
+            if byte_evidence and self.reader.get_artifact_preview_authority(authority.job.job_id) != authority:
+                raise ArtifactPreviewIntegrityError("artifact authority changed during complete byte read")
             for relative_path, descriptor in opened_files.items():
                 if not _same_opened_file(originals[relative_path], os.fstat(descriptor)):
                     raise ArtifactPreviewIntegrityError(
                         f"artifact file changed during preview: {relative_path}"
                     )
+                pure = PurePosixPath(relative_path)
+                parent_fd = tables_fd if pure.parent.as_posix() == "tables" else bundle_fd
+                at_path = os.stat(pure.name, dir_fd=parent_fd, follow_symlinks=False)
+                if not _same_opened_file(originals[relative_path], at_path):
+                    raise ArtifactPreviewIntegrityError(f"artifact file changed during preview: {relative_path}")
+            if not _same_opened_file(tables_opened, os.fstat(tables_fd)) or not _same_opened_file(
+                tables_opened, os.stat("tables", dir_fd=bundle_fd, follow_symlinks=False)):
+                raise ArtifactPreviewIntegrityError("sealed tables directory changed during preview")
             bundle_at_path = os.stat(
                 authority.job.job_id.hex,
                 dir_fd=sealed_fd,
@@ -603,6 +826,19 @@ class ArtifactPreviewReader:
             )
             if not _same_opened_file(bundle_opened, bundle_at_path):
                 raise ArtifactPreviewIntegrityError("sealed bundle changed during preview")
+            if byte_evidence:
+                assert root_opened is not None and sealed_opened is not None
+                if (
+                    not _same_opened_file(bundle_opened, os.fstat(bundle_fd))
+                    or not _same_opened_file(sealed_opened, os.fstat(sealed_fd))
+                    or not _same_opened_file(sealed_opened, os.stat("sealed", dir_fd=root_fd, follow_symlinks=False))
+                    or not _same_opened_file(root_opened, os.fstat(root_fd))
+                    or not _same_opened_file(root_opened, os.stat(self.artifact_root, follow_symlinks=False))
+                    or self.artifact_root.resolve(strict=True) != self.artifact_root
+                ):
+                    raise ArtifactPreviewIntegrityError("sealed directory graph changed during complete byte read")
+            if complete is not None:
+                return complete
             return ArtifactPreview(
                 job_id=authority.job.job_id,
                 spec_hash=authority.job.spec_hash,

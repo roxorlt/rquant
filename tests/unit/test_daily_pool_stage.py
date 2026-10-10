@@ -117,3 +117,69 @@ def test_artifacts_require_a_canonical_receipt_identity(tmp_path: Path) -> None:
     artifact = _screen_artifact().model_copy(update={"canonical_receipt_id": ""})
     with pytest.raises(ValueError):
         DailyDownstreamArtifactStore(tmp_path / "artifacts").persist_screen(artifact)
+
+
+def test_original_screen_stage_binds_canonical_authority_in_its_transaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from contextlib import contextmanager
+    from datetime import timedelta
+    import rquant.daily_pool_stage as stages
+    import rquant.pipeline as pipeline
+    from rquant.daily_pipeline_ledger import DailyStageAttempt
+    from rquant.storage.duckdb import DuckDBStore
+    from tests.unit.test_daily_screen_reproducible import _daily_preset
+    from tests.unit.test_screen_dynamic_ma import _world
+
+    _, primary, _, days, _, _ = _world(tmp_path)
+    canonical = DailyCanonicalPublishReceipt.model_validate(
+        _canonical_receipt().model_dump(exclude={"receipt_id"}) | {"trade_date": days[0]}
+    )
+    monkeypatch.setattr(pipeline, "PRESET_SCREENS", {"reproducible": _daily_preset()})
+
+    class Fence:
+        def assert_current(self, checked_at: datetime, /) -> None:
+            assert checked_at == NOW
+
+        def assert_source(self, generation: str, content: str, /) -> None:
+            assert generation == canonical.source_generation_id
+            assert content == canonical.raw_content_sha256
+
+        def assert_input(self, identity: str, /) -> None:
+            assert identity == "c" * 64
+
+    @contextmanager
+    def guard(attempt: DailyStageAttempt, checked_at: datetime, /):
+        assert attempt.stage_id == "screen" and checked_at == NOW
+        yield Fence()
+
+    original = pipeline.run_daily_screen_stage
+    observed = []
+
+    def run(trade_date: str, **kwargs):
+        assert kwargs["transaction_open"] is True
+        output = original(trade_date, **kwargs, preset_directory=tmp_path / "presets")
+        proof = kwargs["store"].query_screen_run_evidence(trade_date, "reproducible")
+        assert proof.input.canonical_authority.canonical_receipt_id == canonical.receipt_id
+        assert proof.input.canonical_authority.canonical_generation_id == canonical.generation_id
+        assert proof.input.canonical_authority.source_generation_id == canonical.source_generation_id
+        observed.append(proof)
+        return output
+
+    monkeypatch.setattr(stages, "run_daily_screen_stage", run)
+    stage = stages.DailyScreenStage(
+        writer_factory=lambda: DuckDBStore(primary),
+        artifact_store=DailyDownstreamArtifactStore(tmp_path / "artifacts"),
+        ledger_fence_verifier=guard,
+        clock=lambda: NOW,
+        canonical_verifier=lambda store, receipt, checked_at: None,
+    )
+    output = stage.run(
+        canonical,
+        attempt=DailyStageAttempt(run_id="daily-unit", stage_id="screen", attempt_number=1,
+            fencing_token=1, claimed_at=NOW, lease_expires_at=NOW + timedelta(minutes=5)),
+        ledger_input_identity="c" * 64, preset_names=["reproducible"],
+    )
+    assert output.preset_hits == {"reproducible": 1}
+    with DuckDBStore(primary) as store:
+        assert store.query_screen_run_evidence(days[0].isoformat(), "reproducible") == observed[0]

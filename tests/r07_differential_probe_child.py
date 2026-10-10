@@ -43,6 +43,7 @@ import json
 import sqlite3
 import sys
 from collections.abc import Callable
+from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -114,7 +115,9 @@ from tests.unit.test_signal_dual_read_r06 import (
     _database_snapshot,
     _insert_literal_signal_rows,
     _routed_record,
-    _store,
+)
+from tests.unit.test_signal_dual_read_r06 import (
+    _store as _signal_bus_store,
 )
 from tests.unit.test_strategy_runner import NOW as RUNNER_NOW
 from tests.unit.test_strategy_runner import _entry_decision, _envelope, _frame
@@ -146,6 +149,18 @@ _assert_rquant_modules_are_from_candidate_source()
 
 NOW = datetime(2026, 8, 16, 2, 30, tzinfo=UTC)
 ROOT = Path(__file__).parents[1]
+
+
+def _store(path: Path) -> signal_bus.SignalBusStore:
+    store = _signal_bus_store(path)
+    # Full logical snapshots include the fixture's creation time.
+    with closing(sqlite3.connect(path)) as connection, connection:
+        connection.execute(
+            "UPDATE signal_bus_metadata SET metadata_value = ? "
+            "WHERE metadata_key = 'source_created_at'",
+            (NOW.isoformat(timespec="microseconds").replace("+00:00", "Z"),),
+        )
+    return store
 
 
 @dataclass(frozen=True)
@@ -722,6 +737,12 @@ def _configure_probe(harness: _Harness, inventory_id: str) -> None:
     if inventory_id == "R07-B12":
         path = harness.tmp_path / "notification.sqlite3"
         store = NotificationStateStore(path)
+        with closing(sqlite3.connect(path)) as connection, connection:
+            connection.execute(
+                "UPDATE signal_bus_metadata SET metadata_value = ? "
+                "WHERE metadata_key = 'source_created_at'",
+                (NOW.isoformat(timespec="microseconds").replace("+00:00", "Z"),),
+            )
         current_record = _routed_record(
             base64.b64decode(
                 next(

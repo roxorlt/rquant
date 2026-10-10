@@ -1,0 +1,107 @@
+{
+  "manifest_version": 1,
+  "snapshot_id": "2f677f296452195313253fb3ec4a2edefaaeabc8ebf07fa397f2c2a59b9cd78c",
+  "strategy_name": "factor_eval",
+  "start_date": "2026-07-01",
+  "end_date": "2026-07-03",
+  "as_of_time": "2026-08-01T08:00:00Z",
+  "code_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "dependency_contract_version": "factor-stream-source-v2",
+  "builder_version": "factor-stream-snapshot-v2",
+  "eligibility_resolution_hash": null,
+  "eligibility_expected_dates": null,
+  "eligibility_complete_dates": null,
+  "artifacts": [
+    {
+      "artifact_type": "materialized_table",
+      "dataset_id": "adj_factor",
+      "table_name": "adj_factor",
+      "artifact_key": "adj_factor:2026-07-01:2026-07-03",
+      "partition_id": null,
+      "relative_path": "tables/adj_factor/versions/fb01338332744955389bb04cd680dfb4559eb1928e90149d2a9a7935787f48ee.parquet",
+      "row_count": 24,
+      "schema_hash": "367c454e34e8e9c0e5299d071f68041b70f2bfebac4325a1efb9f9bd1983e5fa",
+      "content_hash": "5b506dcee5695fae196d0d899c420926896addf294b06ae30feab458ddd8ec4d",
+      "file_hash": "fb01338332744955389bb04cd680dfb4559eb1928e90149d2a9a7935787f48ee",
+      "file_size": 719,
+      "earliest_time": "2026-07-01",
+      "latest_time": "2026-07-03",
+      "event_column": "trade_date",
+      "source": "snapshot_materialization",
+      "primary_key": [
+        "ts_code",
+        "trade_date"
+      ],
+      "revision_created_at": null,
+      "catalog_updated_at": null
+    },
+    {
+      "artifact_type": "materialized_table",
+      "dataset_id": "daily_bar",
+      "table_name": "daily_bar",
+      "artifact_key": "daily_bar:2026-07-01:2026-07-03",
+      "partition_id": null,
+      "relative_path": "tables/daily_bar/versions/3fa569d9a7e3516dda7abfffead8c30546fb6ee66ae363537c2401a4b173de1c.parquet",
+      "row_count": 24,
+      "schema_hash": "cd42944231b39d4560205341eeed66fbe2385bd42f1366094c0fe8886dbe659e",
+      "content_hash": "68ca0253ba5609cf78a9887ae22ce74c5be29194d3ad57a729dae145a7c50735",
+      "file_hash": "3fa569d9a7e3516dda7abfffead8c30546fb6ee66ae363537c2401a4b173de1c",
+      "file_size": 1792,
+      "earliest_time": "2026-07-01",
+      "latest_time": "2026-07-03",
+      "event_column": "trade_date",
+      "source": "snapshot_materialization",
+      "primary_key": [
+        "ts_code",
+        "trade_date"
+      ],
+      "revision_created_at": null,
+      "catalog_updated_at": null
+    },
+    {
+      "artifact_type": "materialized_table",
+      "dataset_id": "factor_computation_scope",
+      "table_name": "factor_computation_scope",
+      "artifact_key": "factor_computation_scope:2026-07-01:2026-07-03",
+      "partition_id": null,
+      "relative_path": "tables/factor_computation_scope/versions/bfbc75d6a749066a1927ccd8639ddd7a56028aa1eee4b7e28ba45c994c2f4937.parquet",
+      "row_count": 8,
+      "schema_hash": "a84f6b4b80c14d973b986b50c63795a3ef113015436763c9bbac1d35e82e3794",
+      "content_hash": "8e018553e157511ed7cc60942dd2af9b0fd1f73de008362e4569516b05692f86",
+      "file_hash": "bfbc75d6a749066a1927ccd8639ddd7a56028aa1eee4b7e28ba45c994c2f4937",
+      "file_size": 908,
+      "earliest_time": null,
+      "latest_time": null,
+      "event_column": null,
+      "source": "snapshot_materialization",
+      "primary_key": [
+        "ts_code"
+      ],
+      "revision_created_at": null,
+      "catalog_updated_at": null
+    },
+    {
+      "artifact_type": "materialized_table",
+      "dataset_id": "trade_calendar",
+      "table_name": "trade_calendar",
+      "artifact_key": "trade_calendar:2026-07-01:2026-07-03",
+      "partition_id": null,
+      "relative_path": "tables/trade_calendar/versions/8dc81e5922aa7259b86c6b956e8e2aee9f55523bdb56f0b3eef41a49bc838f02.parquet",
+      "row_count": 3,
+      "schema_hash": "4bd92f91643f4627782dec8d320df2e00c38f2a0d5d5563cc2979f159c1b81f2",
+      "content_hash": "b560b4a42dbca1f6a167f983edcf10c976ea7711237a3826389401a80ebbb3e1",
+      "file_hash": "8dc81e5922aa7259b86c6b956e8e2aee9f55523bdb56f0b3eef41a49bc838f02",
+      "file_size": 580,
+      "earliest_time": "2026-07-01",
+      "latest_time": "2026-07-03",
+      "event_column": "cal_date",
+      "source": "snapshot_materialization",
+      "primary_key": [
+        "exchange",
+        "cal_date"
+      ],
+      "revision_created_at": null,
+      "catalog_updated_at": null
+    }
+  ]
+}

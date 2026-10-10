@@ -704,7 +704,9 @@ def test_the_page_control_entry_point_cannot_take_a_runtime_root_from_its_argv()
 
     source = inspect.getsource(page_control.main)
 
-    assert "return _serve(runtime_root=runtime_root, expected_commit=expected_commit)" in source
+    assert "return _serve(" in source
+    assert "runtime_root=runtime_root," in source
+    assert "expected_commit=expected_commit," in source
     assert "runtime_root" not in {action.dest for action in page_control.build_parser()._actions}
     serve = inspect.getsource(page_control._serve)
     assert "resolved_runtime_root = runtime_root or LINUX_PRODUCTION_RUNTIME_ROOT" in serve

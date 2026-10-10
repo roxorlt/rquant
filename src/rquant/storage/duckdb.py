@@ -30,6 +30,15 @@ from rquant.data_metadata import (
     normalize_utc_datetime,
     utc_now,
 )
+from rquant.pool_result_receipt import (
+    ScreenRunReceipt,
+    ScreenRunReceiptDraft,
+    ScreenRunEvidence,
+    ScreenRunEvidenceDraft,
+    persisted_result_digests,
+    member_price_digest,
+    member_set_digest,
+)
 from rquant.price_adjustment import resolve_price_factor_basis
 from rquant.security_status import (
     INTENTIONAL_STATUS_EXCLUSION_REASONS,
@@ -42,6 +51,10 @@ from rquant.security_status import (
     deduplicate_security_status_rows,
 )
 from rquant.storage.migrations import initialize_schema
+from rquant.storage.primary_writer_gate import (
+    PrimaryWriterGate, PrimaryWriterGateConfig, PrimaryWriterIdentityError,
+    PrimaryWriterLease, configured_primary_gate,
+)
 from rquant.suspension_evidence import suspension_session_evidence_sql
 from rquant.trade_calendar import (
     TradeCalendarConflictError,
@@ -443,12 +456,37 @@ class DuckDBStore:
         *,
         read_only: bool = False,
         artifact_terminal_hook: Callable[[str, str, datetime], None] | None = None,
+        primary_writer_gate: PrimaryWriterGateConfig | None = None,
+        primary_writer_lease: PrimaryWriterLease | None = None,
     ) -> None:
         self.path = path or _settings().duckdb_path
         self._artifact_terminal_hook = artifact_terminal_hook
-        self._conn = duckdb.connect(str(self.path), read_only=read_only)
+        self._owned_primary_lease: PrimaryWriterLease | None = None
+        if primary_writer_gate is not None and primary_writer_lease is not None:
+            raise ValueError('writer gate and borrowed lease are mutually exclusive')
         if not read_only:
-            self._init_schema()
+            if primary_writer_lease is not None:
+                primary_writer_lease.verify(self.path)
+            else:
+                gate = primary_writer_gate or configured_primary_gate(
+                    self.path,getattr(_settings(),'primary_writer_gate_path',None),
+                )
+                if gate is not None:
+                    if self.path != gate.primary_path:
+                        raise PrimaryWriterIdentityError('configured primary path mismatch')
+                    self._owned_primary_lease = PrimaryWriterGate(gate).acquire()
+        try:
+            self._conn = duckdb.connect(str(self.path), read_only=read_only)
+            if not read_only:
+                self._init_schema()
+        except BaseException:
+            try:
+                if hasattr(self,'_conn'):
+                    self._conn.close()
+            finally:
+                if self._owned_primary_lease is not None:
+                    self._owned_primary_lease.close()
+            raise
 
     def _init_schema(self) -> None:
         initialize_schema(self._conn)
@@ -2526,6 +2564,217 @@ class DuckDBStore:
         logger.info(f"DuckDB upsert screen_result: {count} 行")
         return count
 
+    def replace_screen_result(
+        self, trade_date: str, preset_name: str, df: pd.DataFrame
+    ) -> int:
+        """Atomically replace one preset/date snapshot, including an empty result."""
+        if not df.empty and (
+            not (df["trade_date"] == trade_date).all()
+            or not (df["preset_name"] == preset_name).all()
+        ):
+            raise ValueError("screen result replacement contains another preset or date")
+        self._conn.register("screen_result_replace_tmp", df)
+        try:
+            self._conn.execute(
+                """
+                MERGE INTO screen_result AS target
+                USING screen_result_replace_tmp AS source
+                  ON target.trade_date = source.trade_date
+                 AND target.preset_name = source.preset_name
+                 AND target.ts_code = source.ts_code
+                WHEN MATCHED THEN UPDATE SET
+                    name = source.name,
+                    close = source.close,
+                    pct_chg = source.pct_chg,
+                    extra = source.extra
+                WHEN NOT MATCHED THEN INSERT
+                    (trade_date, preset_name, ts_code, name, close, pct_chg, extra)
+                    VALUES (source.trade_date, source.preset_name, source.ts_code,
+                            source.name, source.close, source.pct_chg, source.extra)
+                WHEN NOT MATCHED BY SOURCE
+                 AND target.trade_date = ? AND target.preset_name = ?
+                THEN DELETE
+                """,
+                [trade_date, preset_name],
+            )
+        finally:
+            self._conn.unregister("screen_result_replace_tmp")
+        logger.info(f"DuckDB replace screen_result {preset_name} {trade_date}: {len(df)} 行")
+        return len(df)
+
+    def replace_screen_result_with_receipt(
+        self,
+        trade_date: str,
+        preset_name: str,
+        df: pd.DataFrame,
+        receipt: ScreenRunReceipt | ScreenRunReceiptDraft,
+        *,
+        manage_transaction: bool = True,
+        evidence: ScreenRunEvidenceDraft | None = None,
+    ) -> int:
+        """Commit the exact member set and its proof together, including zero rows."""
+        if isinstance(receipt, ScreenRunReceiptDraft):
+            receipt = ScreenRunReceiptDraft.model_validate(receipt)
+        else:
+            receipt = ScreenRunReceipt.model_validate(receipt)
+            if receipt.contract == "screen-run-receipt/v2":
+                raise ValueError(
+                    "v2 price receipt requires an unsealed draft and persisted readback"
+                )
+        codes = [] if df.empty else df["ts_code"].tolist()
+        if (
+            receipt.trade_date.isoformat() != trade_date
+            or receipt.preset_name != preset_name
+            or receipt.hit_count != len(codes)
+            or receipt.member_digest != member_set_digest(codes)
+        ):
+            raise ValueError("screen run receipt does not describe replacement members")
+        started = False
+        try:
+            if manage_transaction:
+                self._conn.execute("BEGIN")
+                started = True
+            self.replace_screen_result(trade_date, preset_name, df)
+            if isinstance(receipt, ScreenRunReceiptDraft):
+                persisted = self._conn.execute(
+                    """
+                    SELECT ts_code, close FROM screen_result
+                    WHERE trade_date = ? AND preset_name = ?
+                    ORDER BY ts_code
+                    """,
+                    [trade_date, preset_name],
+                ).fetchall()
+                persisted_codes = [code for code, _ in persisted]
+                if (
+                    receipt.hit_count != len(persisted_codes)
+                    or receipt.member_digest != member_set_digest(persisted_codes)
+                ):
+                    raise ValueError("persisted screen members differ from receipt draft")
+                sealed = ScreenRunReceipt.model_validate(
+                    {
+                        **receipt.model_dump(mode="python"),
+                        "price_digest": member_price_digest(persisted),
+                    }
+                )
+            else:
+                sealed = receipt
+            self._upsert_screen_run_receipt(sealed)
+            self._conn.execute("DELETE FROM screen_run_evidence WHERE trade_date=? AND preset_name=?", [trade_date, preset_name])
+            if evidence is not None:
+                if (evidence.input.trade_date != sealed.trade_date
+                        or evidence.definition_version != sealed.definition_version
+                        or (evidence.input.unknown_count and sealed.lineage_complete)):
+                    raise ValueError("daily input evidence differs from result receipt")
+                persisted_extra = self._conn.execute(
+                    "SELECT ts_code,extra FROM screen_result WHERE trade_date=? AND preset_name=? ORDER BY ts_code",
+                    [trade_date, preset_name],
+                ).fetchall()
+                extra_digest, rank_digest = persisted_result_digests(persisted_extra, ranked=evidence.ranking_plan_digest is not None)
+                proof = ScreenRunEvidence(
+                    **evidence.model_dump(mode="python"), preset_name=preset_name,
+                    result_version=sealed.result_version, hit_count=sealed.hit_count,
+                    persisted_extra_digest=extra_digest, member_rank_digest=rank_digest,
+                    completed_at=sealed.completed_at,
+                )
+                self._upsert_screen_run_evidence(proof)
+            if started:
+                self._conn.execute("COMMIT")
+                started = False
+        except Exception:
+            if started:
+                self._conn.execute("ROLLBACK")
+            raise
+        return len(codes)
+
+    def _upsert_screen_run_evidence(self, proof: ScreenRunEvidence) -> None:
+        self._conn.execute("INSERT INTO screen_run_evidence VALUES (?,?,?,?,?)", [proof.input.trade_date,proof.preset_name,proof.result_version,proof.evidence_version,proof.model_dump_json()])
+
+    def query_screen_run_evidence(self, trade_date: str, preset_name: str) -> ScreenRunEvidence | None:
+        row = self._conn.execute("SELECT result_version,evidence_version,payload_json FROM screen_run_evidence WHERE trade_date=? AND preset_name=?", [trade_date,preset_name]).fetchone()
+        if row is None:
+            return None
+        proof = ScreenRunEvidence.model_validate_json(row[2])
+        receipt = self.query_screen_run_receipt(trade_date, preset_name)
+        actual = self._conn.execute("SELECT ts_code,extra FROM screen_result WHERE trade_date=? AND preset_name=? ORDER BY ts_code", [trade_date,preset_name]).fetchall()
+        digests = persisted_result_digests(actual, ranked=proof.ranking_plan_digest is not None)
+        if (receipt is None or (row[0],row[1]) != (proof.result_version,proof.evidence_version)
+                or proof.input.trade_date.isoformat() != trade_date or proof.preset_name != preset_name
+                or receipt.result_version != proof.result_version or receipt.hit_count != proof.hit_count
+                or receipt.definition_version != proof.definition_version
+                or receipt.completed_at != proof.completed_at
+                or len(actual) != proof.hit_count
+                or digests != (proof.persisted_extra_digest,proof.member_rank_digest)):
+            raise ValueError("persisted screen evidence differs from actual result")
+        return proof
+
+    def _upsert_screen_run_receipt(self, receipt: ScreenRunReceipt) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO screen_run_receipt (
+                trade_date, preset_name, definition_version, parent_trade_date,
+                parent_result_version, hit_count, member_digest, lineage_complete,
+                completed_at, result_version, contract, price_digest
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (trade_date, preset_name) DO UPDATE SET
+                definition_version = excluded.definition_version,
+                parent_trade_date = excluded.parent_trade_date,
+                parent_result_version = excluded.parent_result_version,
+                hit_count = excluded.hit_count,
+                member_digest = excluded.member_digest,
+                lineage_complete = excluded.lineage_complete,
+                completed_at = excluded.completed_at,
+                result_version = excluded.result_version,
+                contract = excluded.contract,
+                price_digest = excluded.price_digest
+            """,
+            [
+                receipt.trade_date,
+                receipt.preset_name,
+                receipt.definition_version,
+                receipt.parent_trade_date,
+                receipt.parent_result_version,
+                receipt.hit_count,
+                receipt.member_digest,
+                receipt.lineage_complete,
+                receipt.completed_at,
+                receipt.result_version,
+                receipt.contract,
+                receipt.price_digest,
+            ],
+        )
+
+    def query_screen_run_receipt(
+        self, trade_date: str, preset_name: str
+    ) -> ScreenRunReceipt | None:
+        columns = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info('screen_run_receipt')").fetchall()
+        }
+        price_columns = {"contract", "price_digest"}
+        if columns & price_columns and not price_columns <= columns:
+            raise ValueError("screen run receipt has incomplete price proof columns")
+        extra_select = ", contract, price_digest" if price_columns <= columns else ""
+        row = self._conn.execute(
+            f"""
+            SELECT trade_date, preset_name, definition_version, parent_trade_date,
+                   parent_result_version, hit_count, member_digest, lineage_complete,
+                   completed_at, result_version{extra_select}
+            FROM screen_run_receipt
+            WHERE trade_date = ? AND preset_name = ?
+            """,
+            [trade_date, preset_name],
+        ).fetchone()
+        if row is None:
+            return None
+        fields = (
+            "trade_date", "preset_name", "definition_version", "parent_trade_date",
+            "parent_result_version", "hit_count", "member_digest", "lineage_complete",
+            "completed_at", "result_version",
+        )
+        if price_columns <= columns:
+            fields += ("contract", "price_digest")
+        return ScreenRunReceipt.model_validate(dict(zip(fields, row, strict=True)))
+
     def query_screen_result(
         self, trade_date: str, preset_name: str
     ) -> pd.DataFrame:
@@ -3316,11 +3565,18 @@ class DuckDBStore:
         logger.info(f"DuckDB upsert {table}: {count} 行")
         return count
 
-    def replace_dataset(self, table: str, df: pd.DataFrame) -> int:
+    def replace_dataset(self, table: str, df: pd.DataFrame, *,
+                        transaction_mode: Literal['own','existing'] = 'own') -> int:
         """快照整表替换（事务内 DELETE + INSERT，成分调出即删）。
 
         空 df 拒绝替换（源抽风返回空不该清掉现有快照），调用方约定错误抛。
         """
+        if transaction_mode not in {'own','existing'}:
+            raise ValueError('invalid snapshot transaction mode')
+        if transaction_mode=='existing':
+            transaction_id=self._conn.execute('SELECT txid_current()').fetchone()[0]
+            if transaction_id!=self._conn.execute('SELECT txid_current()').fetchone()[0]:
+                raise ValueError('snapshot existing mode requires an actual outer transaction')
         if df.empty:
             raise ValueError(f"replace_dataset 拒绝空快照：{table}")
         use = self._dataset_insert_cols(table, df)
@@ -3329,15 +3585,18 @@ class DuckDBStore:
         quoted = ", ".join(f'"{c}"' for c in use)
         self._conn.register("dataset_tmp", payload)
         try:
-            self._conn.execute("BEGIN")
+            if transaction_mode=='own':
+                self._conn.execute("BEGIN")
             self._conn.execute(f'DELETE FROM "{table}"')
             self._conn.execute(
                 f'INSERT INTO "{table}" ({quoted}) '
                 f"SELECT {quoted} FROM dataset_tmp"
             )
-            self._conn.execute("COMMIT")
+            if transaction_mode=='own':
+                self._conn.execute("COMMIT")
         except Exception:
-            self._conn.execute("ROLLBACK")
+            if transaction_mode=='own':
+                self._conn.execute("ROLLBACK")
             raise
         finally:
             self._conn.unregister("dataset_tmp")
@@ -3358,7 +3617,12 @@ class DuckDBStore:
         return result[0] if result else 0
 
     def close(self) -> None:
-        self._conn.close()
+        try:
+            self._conn.close()
+        finally:
+            if self._owned_primary_lease is not None:
+                self._owned_primary_lease.close()
+                self._owned_primary_lease = None
 
     def __enter__(self) -> DuckDBStore:
         return self

@@ -94,6 +94,23 @@ def test_empty_initialized_registry_is_fresh_and_deterministic(tmp_path: Path) -
     assert first.payload == PromotionsPayload()
 
 
+def test_experiment_window_publishes_explicit_trusted_empty_projection(tmp_path: Path) -> None:
+    path = tmp_path / "experiments.sqlite3"
+    ExperimentRegistry(path, managed_trust_root=tmp_path)
+    reader = PromotionsSourceReader(
+        registry=ExperimentRegistryReadonlyReader(path, managed_trust_root=tmp_path),
+        limit=10,
+        include_experiments=True,
+    )
+
+    source = reader(NOW)
+    assert len(source.payload.projections) == 2
+    assert source.payload.projections[0].table_name == "experiment_attempt"
+    assert source.payload.projections[0].rows == ()
+    assert source.payload.projections[1].rows[0]["retained_count"] == 0
+    assert source.payload.projections[1].rows[0]["truncated"] is False
+
+
 def test_source_reader_publishes_latest_visible_decisions_in_stable_order(
     tmp_path: Path,
 ) -> None:

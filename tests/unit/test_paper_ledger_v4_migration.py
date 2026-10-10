@@ -646,6 +646,7 @@ def test_trust_inspection_rejects_coordinated_archive_and_binding_tamper(
     store = object.__new__(PaperBrokerStore)
     store.path = independent.path
     store.busy_timeout_ms = 5_000
+    store._read_only = False
     status = store.ledger_trust_status()
     assert status.state == "quarantined"
     assert status.reason == "migration_archive_digest_mismatch"

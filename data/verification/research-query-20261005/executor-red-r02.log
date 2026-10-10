@@ -1,0 +1,98 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.13.12, pytest-9.0.3, pluggy-1.6.0
+rootdir: /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk
+configfile: pyproject.toml
+plugins: mock-3.15.1, anyio-4.13.0
+collected 24 items
+
+tests/unit/test_research_query.py .F..................                   [ 83%]
+tests/unit/test_research_query_executor.py FFss                          [100%]
+
+=================================== FAILURES ===================================
+__________ test_full_original_database_and_extra_objects_are_rejected __________
+
+tmp_path = PosixPath('/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-19/test_full_original_database_an0')
+
+    def test_full_original_database_and_extra_objects_are_rejected(tmp_path: Path) -> None:
+        api = _api()
+        source = tmp_path / "original.duckdb"
+        _source(source)
+        with pytest.raises(ValueError):
+            api.VerifiedQuerySnapshot(tmp_path)
+        snapshot, manifest, _, _ = _published(tmp_path / "published")
+        os.chmod(snapshot.path, 0o600)
+        with duckdb.connect(str(snapshot.path)) as connection:
+            connection.execute("CREATE VIEW leak AS SELECT 1")
+        with pytest.raises(ValueError):
+            snapshot.verify_current()
+        payload = manifest.model_dump(mode="json")
+        payload["file_sha256"] = hashlib.sha256(snapshot.path.read_bytes()).hexdigest()
+>       snapshot.manifest_path.write_text(json.dumps(payload))
+
+tests/unit/test_research_query.py:77: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/Users/roxor/.local/share/uv/python/cpython-3.13.12-macos-aarch64-none/lib/python3.13/pathlib/_local.py:555: in write_text
+    return PathBase.write_text(self, data, encoding, errors, newline)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/Users/roxor/.local/share/uv/python/cpython-3.13.12-macos-aarch64-none/lib/python3.13/pathlib/_abc.py:651: in write_text
+    with self.open(mode='w', encoding=encoding, errors=errors, newline=newline) as f:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = PosixPath('/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-19/test_full_original_database_an0/published/public/manifest.json')
+mode = 'w', buffering = -1, encoding = 'locale', errors = None, newline = None
+
+    def open(self, mode='r', buffering=-1, encoding=None,
+             errors=None, newline=None):
+        """
+        Open the file pointed to by this path and return a file object, as
+        the built-in open() function does.
+        """
+        if "b" not in mode:
+            encoding = io.text_encoding(encoding)
+>       return io.open(self, mode, buffering, encoding, errors, newline)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       PermissionError: [Errno 13] Permission denied: '/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-19/test_full_original_database_an0/published/public/manifest.json'
+
+/Users/roxor/.local/share/uv/python/cpython-3.13.12-macos-aarch64-none/lib/python3.13/pathlib/_local.py:537: PermissionError
+__________ test_unsupported_kernel_closes_query_and_leaves_no_scratch __________
+
+tmp_path = PosixPath('/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-19/test_unsupported_kernel_closes0')
+
+    def test_unsupported_kernel_closes_query_and_leaves_no_scratch(tmp_path: Path) -> None:
+>       api = _api()
+              ^^^^^^
+
+tests/unit/test_research_query_executor.py:22: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    def _api():
+        module = importlib.import_module("rquant.research_query")
+>       assert hasattr(module, "QueryExecutor"), "restricted child executor is not implemented"
+E       AssertionError: restricted child executor is not implemented
+E       assert False
+E        +  where False = hasattr(<module 'rquant.research_query' from '/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/src/rquant/research_query/__init__.py'>, 'QueryExecutor')
+
+tests/unit/test_research_query_executor.py:17: AssertionError
+_____________ test_cannot_raise_resource_deadline_or_result_limits _____________
+
+    def test_cannot_raise_resource_deadline_or_result_limits() -> None:
+>       api = _api()
+              ^^^^^^
+
+tests/unit/test_research_query_executor.py:35: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    def _api():
+        module = importlib.import_module("rquant.research_query")
+>       assert hasattr(module, "QueryExecutor"), "restricted child executor is not implemented"
+E       AssertionError: restricted child executor is not implemented
+E       assert False
+E        +  where False = hasattr(<module 'rquant.research_query' from '/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/src/rquant/research_query/__init__.py'>, 'QueryExecutor')
+
+tests/unit/test_research_query_executor.py:17: AssertionError
+=========================== short test summary info ============================
+FAILED tests/unit/test_research_query.py::test_full_original_database_and_extra_objects_are_rejected
+FAILED tests/unit/test_research_query_executor.py::test_unsupported_kernel_closes_query_and_leaves_no_scratch
+FAILED tests/unit/test_research_query_executor.py::test_cannot_raise_resource_deadline_or_result_limits
+=================== 3 failed, 19 passed, 2 skipped in 0.59s ====================

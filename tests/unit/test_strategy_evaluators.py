@@ -149,7 +149,9 @@ def test_registry_exposes_complete_immutable_allow_list_and_specs(
     assert registry.identities == (
         ("auction_gap", 1),
         ("growth_board_surge", 1),
+        ("minute_runtime_replay", 1),
         ("n_shape", 1),
+        ("portfolio_backtest", 1),
     )
     assert isinstance(registry.definitions, MappingProxyType)
     with pytest.raises(TypeError):

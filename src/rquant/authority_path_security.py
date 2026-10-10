@@ -42,6 +42,7 @@ class SecureRegularFileLease:
     _descriptor: int
     _metadata: os.stat_result
     _closed: bool = False
+    _ancestor_owner: _SharedSecureFileLeaseAncestors | None = None
 
     @property
     def metadata(self) -> SecurePathMetadata:
@@ -56,7 +57,7 @@ class SecureRegularFileLease:
         )
 
     def require_unchanged(self) -> None:
-        if self._closed:
+        if self._closed or (self._ancestor_owner is not None and self._ancestor_owner._closed):
             raise AuthorityPathSecurityError("protected file lease is closed")
         try:
             root_named = os.stat(self._trusted_root, follow_symlinks=False)
@@ -132,7 +133,8 @@ class SecureRegularFileLease:
         if self._closed:
             return
         self._closed = True
-        for descriptor in reversed(self._descriptors):
+        owned = self._descriptors if self._ancestor_owner is None else [self._descriptor]
+        for descriptor in reversed(owned):
             with suppress(OSError):
                 os.close(descriptor)
 
@@ -143,6 +145,52 @@ class SecureRegularFileLease:
 
     def __exit__(self, *_args: object) -> None:
         self.close()
+
+
+class _SharedSecureFileLeaseAncestors:
+    """Own validated ancestor descriptors shared by one runtime capability."""
+
+    def __init__(self) -> None:
+        self._descriptors: dict[tuple[int, int], int] = {}
+        self._closed = False
+
+    def adopt(self, lease: SecureRegularFileLease) -> None:
+        if self._closed or lease._closed or lease._ancestor_owner is not None:
+            raise AuthorityPathSecurityError("protected file lease cannot share ancestors")
+        observed = [(descriptor, os.fstat(descriptor)) for descriptor in lease._descriptors[:-1]]
+        additional: dict[tuple[int, int], int] = {}
+        remapped: dict[int, int] = {}
+        for descriptor, metadata in observed:
+            identity = (metadata.st_dev, metadata.st_ino)
+            shared = self._descriptors.get(identity, additional.get(identity))
+            if shared is None:
+                shared = descriptor
+                additional[identity] = descriptor
+            remapped[descriptor] = shared
+        links = tuple(
+            (remapped[parent], name, remapped[child]) for parent, name, child in lease._links
+        )
+        descriptors = [remapped[descriptor] for descriptor, _metadata in observed]
+        descriptors.append(lease._descriptor)
+        parent = remapped[lease._parent_descriptor]
+
+        self._descriptors.update(additional)
+        lease._links = links
+        lease._descriptors = descriptors
+        lease._parent_descriptor = parent
+        lease._ancestor_owner = self
+        for descriptor, shared in remapped.items():
+            if descriptor != shared:
+                with suppress(OSError):
+                    os.close(descriptor)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for descriptor in reversed(tuple(self._descriptors.values())):
+            with suppress(OSError):
+                os.close(descriptor)
 
 
 def _canonical_relative(path: Path, trusted_root: Path) -> tuple[str, ...]:

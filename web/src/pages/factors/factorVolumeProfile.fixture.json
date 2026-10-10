@@ -1,0 +1,5492 @@
+{
+  "research": {
+    "schema_version": 2,
+    "basis_label": "历史回顾",
+    "pool_label": "全市场（沪深非 ST）",
+    "return_price_basis": "forward_adjusted",
+    "holding_sessions": 1,
+    "summary_status": "evaluated",
+    "ic_summary": {
+      "normal_ic": {
+        "status": "ok",
+        "source_day_count": 2,
+        "valid_day_count": 2,
+        "insufficient_day_count": 0,
+        "zero_variance_day_count": 0,
+        "mean": 0.6125556746921387,
+        "sample_std": 0.2547180756523103,
+        "ir": 2.404837870745679,
+        "positive_rate": 1.0,
+        "strong_signal_rate": 1.0,
+        "t_value": 3.400954332116975,
+        "p_value": 0.1820576446524328,
+        "skewness": 0.0,
+        "excess_kurtosis": -2.0
+      },
+      "rank_ic": {
+        "status": "ok",
+        "source_day_count": 2,
+        "valid_day_count": 2,
+        "insufficient_day_count": 0,
+        "zero_variance_day_count": 0,
+        "mean": 0.5530543081211876,
+        "sample_std": 0.19865018872830945,
+        "ir": 2.784061327410017,
+        "positive_rate": 1.0,
+        "strong_signal_rate": 1.0,
+        "t_value": 3.937257287701688,
+        "p_value": 0.15834305954057726,
+        "skewness": 0.0,
+        "excess_kurtosis": -2.0
+      }
+    },
+    "ic_points": [
+      {
+        "decision_date": "2026-07-03",
+        "normal_ic": {
+          "status": "ok",
+          "value": 0.7926685532766753,
+          "source_sample_count": 12,
+          "effective_sample_count": 12
+        },
+        "rank_ic": {
+          "status": "ok",
+          "value": 0.6935212036549627,
+          "source_sample_count": 12,
+          "effective_sample_count": 12
+        },
+        "normal_ic_cumulative_sum": 0.7926685532766753,
+        "rank_ic_cumulative_sum": 0.6935212036549627
+      },
+      {
+        "decision_date": "2026-07-04",
+        "normal_ic": {
+          "status": "ok",
+          "value": 0.432442796107602,
+          "source_sample_count": 12,
+          "effective_sample_count": 12
+        },
+        "rank_ic": {
+          "status": "ok",
+          "value": 0.4125874125874126,
+          "source_sample_count": 12,
+          "effective_sample_count": 12
+        },
+        "normal_ic_cumulative_sum": 1.2251113493842773,
+        "rank_ic_cumulative_sum": 1.1061086162423752
+      }
+    ],
+    "decay_periods": [
+      {
+        "lag": 1,
+        "status": "evaluated",
+        "source_day_count": 2,
+        "valid_pair_count": 24,
+        "ic_summary": {
+          "normal_ic": {
+            "status": "ok",
+            "source_day_count": 2,
+            "valid_day_count": 2,
+            "insufficient_day_count": 0,
+            "zero_variance_day_count": 0,
+            "mean": 0.6125556746921387,
+            "sample_std": 0.2547180756523103,
+            "ir": 2.404837870745679,
+            "positive_rate": 1.0,
+            "strong_signal_rate": 1.0,
+            "t_value": 3.400954332116975,
+            "p_value": 0.1820576446524328,
+            "skewness": 0.0,
+            "excess_kurtosis": -2.0
+          },
+          "rank_ic": {
+            "status": "ok",
+            "source_day_count": 2,
+            "valid_day_count": 2,
+            "insufficient_day_count": 0,
+            "zero_variance_day_count": 0,
+            "mean": 0.5530543081211876,
+            "sample_std": 0.19865018872830945,
+            "ir": 2.784061327410017,
+            "positive_rate": 1.0,
+            "strong_signal_rate": 1.0,
+            "t_value": 3.937257287701688,
+            "p_value": 0.15834305954057726,
+            "skewness": 0.0,
+            "excess_kurtosis": -2.0
+          }
+        }
+      },
+      {
+        "lag": 2,
+        "status": "evaluated",
+        "source_day_count": 1,
+        "valid_pair_count": 12,
+        "ic_summary": {
+          "normal_ic": {
+            "status": "insufficient_samples",
+            "source_day_count": 1,
+            "valid_day_count": 1,
+            "insufficient_day_count": 0,
+            "zero_variance_day_count": 0,
+            "mean": 0.7926685532766702,
+            "sample_std": null,
+            "ir": null,
+            "positive_rate": 1.0,
+            "strong_signal_rate": 1.0,
+            "t_value": null,
+            "p_value": null,
+            "skewness": null,
+            "excess_kurtosis": null
+          },
+          "rank_ic": {
+            "status": "insufficient_samples",
+            "source_day_count": 1,
+            "valid_day_count": 1,
+            "insufficient_day_count": 0,
+            "zero_variance_day_count": 0,
+            "mean": 0.6935212036549627,
+            "sample_std": null,
+            "ir": null,
+            "positive_rate": 1.0,
+            "strong_signal_rate": 1.0,
+            "t_value": null,
+            "p_value": null,
+            "skewness": null,
+            "excess_kurtosis": null
+          }
+        }
+      },
+      {
+        "lag": 3,
+        "status": "no_target_period",
+        "source_day_count": 0,
+        "valid_pair_count": 0,
+        "ic_summary": null
+      },
+      {
+        "lag": 4,
+        "status": "no_target_period",
+        "source_day_count": 0,
+        "valid_pair_count": 0,
+        "ic_summary": null
+      },
+      {
+        "lag": 5,
+        "status": "no_target_period",
+        "source_day_count": 0,
+        "valid_pair_count": 0,
+        "ic_summary": null
+      },
+      {
+        "lag": 6,
+        "status": "no_target_period",
+        "source_day_count": 0,
+        "valid_pair_count": 0,
+        "ic_summary": null
+      },
+      {
+        "lag": 7,
+        "status": "no_target_period",
+        "source_day_count": 0,
+        "valid_pair_count": 0,
+        "ic_summary": null
+      },
+      {
+        "lag": 8,
+        "status": "no_target_period",
+        "source_day_count": 0,
+        "valid_pair_count": 0,
+        "ic_summary": null
+      },
+      {
+        "lag": 9,
+        "status": "no_target_period",
+        "source_day_count": 0,
+        "valid_pair_count": 0,
+        "ic_summary": null
+      },
+      {
+        "lag": 10,
+        "status": "no_target_period",
+        "source_day_count": 0,
+        "valid_pair_count": 0,
+        "ic_summary": null
+      }
+    ],
+    "portfolio_status": "available",
+    "portfolio_days": [
+      {
+        "decision_date": "2026-07-03",
+        "groupings": [
+          {
+            "group_count": 3,
+            "status": "ok",
+            "cumulative_status": "available",
+            "source_sample_count": 12,
+            "effective_sample_count": 12,
+            "groups": [
+              {
+                "group_number": 1,
+                "member_count": 4,
+                "period_return": 0.20249999999999996,
+                "cumulative_return": 0.2024999999999999,
+                "target_weight_turnover": null
+              },
+              {
+                "group_number": 2,
+                "member_count": 4,
+                "period_return": 0.20799999999999996,
+                "cumulative_return": 0.20799999999999996,
+                "target_weight_turnover": null
+              },
+              {
+                "group_number": 3,
+                "member_count": 4,
+                "period_return": 0.20900000000000002,
+                "cumulative_return": 0.20900000000000007,
+                "target_weight_turnover": null
+              }
+            ],
+            "long_short_return": 0.006500000000000061,
+            "long_short_cumulative_spread": 0.006500000000000172
+          },
+          {
+            "group_count": 5,
+            "status": "ok",
+            "cumulative_status": "available",
+            "source_sample_count": 12,
+            "effective_sample_count": 12,
+            "groups": [
+              {
+                "group_number": 1,
+                "member_count": 3,
+                "period_return": 0.20199999999999996,
+                "cumulative_return": 0.20199999999999996,
+                "target_weight_turnover": null
+              },
+              {
+                "group_number": 2,
+                "member_count": 3,
+                "period_return": 0.20633333333333334,
+                "cumulative_return": 0.20633333333333326,
+                "target_weight_turnover": null
+              },
+              {
+                "group_number": 3,
+                "member_count": 2,
+                "period_return": 0.2084999999999999,
+                "cumulative_return": 0.2084999999999999,
+                "target_weight_turnover": null
+              },
+              {
+                "group_number": 4,
+                "member_count": 2,
+                "period_return": 0.20950000000000002,
+                "cumulative_return": 0.20950000000000002,
+                "target_weight_turnover": null
+              },
+              {
+                "group_number": 5,
+                "member_count": 2,
+                "period_return": 0.20850000000000002,
+                "cumulative_return": 0.2084999999999999,
+                "target_weight_turnover": null
+              }
+            ],
+            "long_short_return": 0.006500000000000061,
+            "long_short_cumulative_spread": 0.00649999999999995
+          },
+          {
+            "group_count": 10,
+            "status": "ok",
+            "cumulative_status": "available",
+            "source_sample_count": 12,
+            "effective_sample_count": 12,
+            "groups": [
+              {
+                "group_number": 1,
+                "member_count": 2,
+                "period_return": 0.2015,
+                "cumulative_return": 0.2015,
+                "target_weight_turnover": null
+              },
+              {
+                "group_number": 2,
+                "member_count": 2,
+                "period_return": 0.2034999999999999,
+                "cumulative_return": 0.20350000000000001,
+                "target_weight_turnover": null
+              },
+              {
+                "group_number": 3,
+                "member_count": 1,
+                "period_return": 0.20999999999999996,
+                "cumulative_return": 0.20999999999999996,
+                "target_weight_turnover": null
+              },
+              {
+                "group_number": 4,
+                "member_count": 1,
+                "period_return": 0.20500000000000007,
+                "cumulative_return": 0.20500000000000007,
+                "target_weight_turnover": null
+              },
+              {
+                "group_number": 5,
+                "member_count": 1,
+                "period_return": 0.21099999999999985,
+                "cumulative_return": 0.21099999999999985,
+                "target_weight_turnover": null
+              },
+              {
+                "group_number": 6,
+                "member_count": 1,
+                "period_return": 0.20599999999999996,
+                "cumulative_return": 0.20599999999999996,
+                "target_weight_turnover": null
+              },
+              {
+                "group_number": 7,
+                "member_count": 1,
+                "period_return": 0.21199999999999997,
+                "cumulative_return": 0.21199999999999997,
+                "target_weight_turnover": null
+              },
+              {
+                "group_number": 8,
+                "member_count": 1,
+                "period_return": 0.20700000000000007,
+                "cumulative_return": 0.20700000000000007,
+                "target_weight_turnover": null
+              },
+              {
+                "group_number": 9,
+                "member_count": 1,
+                "period_return": 0.20799999999999996,
+                "cumulative_return": 0.20799999999999996,
+                "target_weight_turnover": null
+              },
+              {
+                "group_number": 10,
+                "member_count": 1,
+                "period_return": 0.20900000000000007,
+                "cumulative_return": 0.20900000000000007,
+                "target_weight_turnover": null
+              }
+            ],
+            "long_short_return": 0.007500000000000062,
+            "long_short_cumulative_spread": 0.007500000000000062
+          }
+        ]
+      },
+      {
+        "decision_date": "2026-07-04",
+        "groupings": [
+          {
+            "group_count": 3,
+            "status": "ok",
+            "cumulative_status": "available",
+            "source_sample_count": 12,
+            "effective_sample_count": 12,
+            "groups": [
+              {
+                "group_number": 1,
+                "member_count": 4,
+                "period_return": 0.30449999999999994,
+                "cumulative_return": 0.5686612499999999,
+                "target_weight_turnover": 0.25
+              },
+              {
+                "group_number": 2,
+                "member_count": 4,
+                "period_return": 0.30675,
+                "cumulative_return": 0.578554,
+                "target_weight_turnover": 0.25
+              },
+              {
+                "group_number": 3,
+                "member_count": 4,
+                "period_return": 0.30824999999999997,
+                "cumulative_return": 0.5816742500000001,
+                "target_weight_turnover": 0.25
+              }
+            ],
+            "long_short_return": 0.003750000000000031,
+            "long_short_cumulative_spread": 0.013013000000000163
+          },
+          {
+            "group_count": 5,
+            "status": "ok",
+            "cumulative_status": "available",
+            "source_sample_count": 12,
+            "effective_sample_count": 12,
+            "groups": [
+              {
+                "group_number": 1,
+                "member_count": 3,
+                "period_return": 0.30299999999999994,
+                "cumulative_return": 0.5662059999999998,
+                "target_weight_turnover": 0.3333333333333333
+              },
+              {
+                "group_number": 2,
+                "member_count": 3,
+                "period_return": 0.30999999999999994,
+                "cumulative_return": 0.5802966666666667,
+                "target_weight_turnover": 0.6666666666666666
+              },
+              {
+                "group_number": 3,
+                "member_count": 2,
+                "period_return": 0.30300000000000005,
+                "cumulative_return": 0.5746754999999999,
+                "target_weight_turnover": 1.0
+              },
+              {
+                "group_number": 4,
+                "member_count": 2,
+                "period_return": 0.30899999999999994,
+                "cumulative_return": 0.5832355,
+                "target_weight_turnover": 0.5
+              },
+              {
+                "group_number": 5,
+                "member_count": 2,
+                "period_return": 0.3075,
+                "cumulative_return": 0.58011375,
+                "target_weight_turnover": 0.5
+              }
+            ],
+            "long_short_return": 0.0045000000000000595,
+            "long_short_cumulative_spread": 0.013907750000000219
+          },
+          {
+            "group_count": 10,
+            "status": "ok",
+            "cumulative_status": "available",
+            "source_sample_count": 12,
+            "effective_sample_count": 12,
+            "groups": [
+              {
+                "group_number": 1,
+                "member_count": 2,
+                "period_return": 0.3025,
+                "cumulative_return": 0.5649537499999999,
+                "target_weight_turnover": 0.5
+              },
+              {
+                "group_number": 2,
+                "member_count": 2,
+                "period_return": 0.3064999999999999,
+                "cumulative_return": 0.5723727499999998,
+                "target_weight_turnover": 0.5
+              },
+              {
+                "group_number": 3,
+                "member_count": 1,
+                "period_return": 0.31000000000000005,
+                "cumulative_return": 0.5851,
+                "target_weight_turnover": 0.0
+              },
+              {
+                "group_number": 4,
+                "member_count": 1,
+                "period_return": 0.31099999999999994,
+                "cumulative_return": 0.579755,
+                "target_weight_turnover": 1.0
+              },
+              {
+                "group_number": 5,
+                "member_count": 1,
+                "period_return": 0.30099999999999993,
+                "cumulative_return": 0.5755109999999997,
+                "target_weight_turnover": 1.0
+              },
+              {
+                "group_number": 6,
+                "member_count": 1,
+                "period_return": 0.30500000000000016,
+                "cumulative_return": 0.5738300000000001,
+                "target_weight_turnover": 1.0
+              },
+              {
+                "group_number": 7,
+                "member_count": 1,
+                "period_return": 0.30600000000000005,
+                "cumulative_return": 0.5828720000000001,
+                "target_weight_turnover": 1.0
+              },
+              {
+                "group_number": 8,
+                "member_count": 1,
+                "period_return": 0.31199999999999983,
+                "cumulative_return": 0.5835839999999999,
+                "target_weight_turnover": 1.0
+              },
+              {
+                "group_number": 9,
+                "member_count": 1,
+                "period_return": 0.30699999999999994,
+                "cumulative_return": 0.5788559999999998,
+                "target_weight_turnover": 1.0
+              },
+              {
+                "group_number": 10,
+                "member_count": 1,
+                "period_return": 0.30800000000000005,
+                "cumulative_return": 0.5813720000000002,
+                "target_weight_turnover": 1.0
+              }
+            ],
+            "long_short_return": 0.00550000000000006,
+            "long_short_cumulative_spread": 0.0164182500000003
+          }
+        ]
+      }
+    ],
+    "coverage_days": [
+      {
+        "decision_date": "2026-07-03",
+        "status": "complete",
+        "coverage": {
+          "expected_count": 12,
+          "valid_count": 12,
+          "factor_missing_count": 0,
+          "return_missing_count": 0,
+          "factor_missing_by_reason": [],
+          "return_missing_by_reason": []
+        }
+      },
+      {
+        "decision_date": "2026-07-04",
+        "status": "complete",
+        "coverage": {
+          "expected_count": 12,
+          "valid_count": 12,
+          "factor_missing_count": 0,
+          "return_missing_count": 0,
+          "factor_missing_by_reason": [],
+          "return_missing_by_reason": []
+        }
+      }
+    ],
+    "neutralization": "none",
+    "neutralization_label": "无",
+    "context_basis_label": null,
+    "context_note": null,
+    "mad_multiple": null,
+    "extended_statistics": {
+      "ic_method": "rank",
+      "industry_status": "unavailable",
+      "industry_reason": "缺少可核验的行业来源，未生成行业 IC。",
+      "industry_summaries": [],
+      "industry_coverage_days": [],
+      "autocorrelation_points": [
+        {
+          "trade_date": "2026-07-03",
+          "previous_trade_date": null,
+          "common_count": 0,
+          "status": "first_period",
+          "value": null
+        },
+        {
+          "trade_date": "2026-07-04",
+          "previous_trade_date": "2026-07-03",
+          "common_count": 12,
+          "status": "ok",
+          "value": 0.6164632921377446
+        }
+      ]
+    },
+    "daily_features": {
+      "source_sha256": "134d4ab1e3d2e0e5ee291c97bbd01a0fbe1ce62c093c68173448ebb12c312045",
+      "prepared_source_sha256": "513fb6e3e8c857343dbf86b6811b63984ac595f4ef40cec9f7c4099814ab69ae",
+      "prepared_snapshot_id": "697d1da983d9c35cad6833dc41277b874b9021d4fd2202ebaf6a0392718d0d9b",
+      "prepared_binding_hash": "0b01f43ab6ebcce914211f91d04639edbba1f1e621e7a8b1cea12a1f480c3667",
+      "scope_content_hash": "1c9090870002df127f774542ad9b0d9ea35cad7cc90f5cb31ba012b5e903a551",
+      "code_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "fields": [
+        {
+          "column": "vp90_above_reference_amount_pct",
+          "table": "daily_volume_profile_feature",
+          "name_zh": "参考价上方成交额占比",
+          "unit": "percent",
+          "description_zh": "高于参考价价格桶的原始成交额占比；等于参考价不计两侧，0–100百分比原值。",
+          "value_semantics": "volume_profile_derived"
+        },
+        {
+          "column": "vp90_above_reference_volume_pct",
+          "table": "daily_volume_profile_feature",
+          "name_zh": "参考价上方成交量占比",
+          "unit": "percent",
+          "description_zh": "高于参考价价格桶的可比股数占比；等于参考价不计两侧，0–100百分比原值。",
+          "value_semantics": "volume_profile_derived"
+        },
+        {
+          "column": "vp90_below_reference_amount_pct",
+          "table": "daily_volume_profile_feature",
+          "name_zh": "参考价下方成交额占比",
+          "unit": "percent",
+          "description_zh": "低于参考价价格桶的原始成交额占比；0–100百分比原值，不复权成交额。",
+          "value_semantics": "volume_profile_derived"
+        },
+        {
+          "column": "vp90_below_reference_volume_pct",
+          "table": "daily_volume_profile_feature",
+          "name_zh": "参考价下方成交量占比",
+          "unit": "percent",
+          "description_zh": "低于参考价价格桶的可比股数占比；价格复权、股数逆向换算，0–100百分比原值。",
+          "value_semantics": "volume_profile_derived"
+        },
+        {
+          "column": "vp90_concentration_top5_pct",
+          "table": "daily_volume_profile_feature",
+          "name_zh": "90日成交集中度",
+          "unit": "percent",
+          "description_zh": "成交量最大的5个价格桶占全部可比股数的百分比；0–100原值，非0–1比例。",
+          "value_semantics": "volume_profile_derived"
+        },
+        {
+          "column": "vp90_poc_price",
+          "table": "daily_volume_profile_feature",
+          "name_zh": "90日成交峰值价",
+          "unit": "session_price",
+          "description_zh": "可比成交量最大的价格桶；并列先取距参考价最近，再取较低价。分钟成交近似，价格单位元。",
+          "value_semantics": "volume_profile_derived"
+        },
+        {
+          "column": "vp90_total_amount",
+          "table": "daily_volume_profile_feature",
+          "name_zh": "90日原始成交额",
+          "unit": "CNY",
+          "description_zh": "日期窗口内原始分钟成交额总和，不复权；单位元。缺失输出不补零，实际覆盖按分钟日数另列。",
+          "value_semantics": "volume_profile_derived"
+        },
+        {
+          "column": "vp90_total_vol",
+          "table": "daily_volume_profile_feature",
+          "name_zh": "90日可比成交量",
+          "unit": "shares",
+          "description_zh": "原分钟股数按参考日价格基准逆向换算后求和；单位股。90日指日期窗口，覆盖按实际分钟日数另列。",
+          "value_semantics": "volume_profile_derived"
+        },
+        {
+          "column": "vp90_value_area_high",
+          "table": "daily_volume_profile_feature",
+          "name_zh": "90日价值区上沿",
+          "unit": "session_price",
+          "description_zh": "从成交峰值价连续扩展至70%可比成交量的区间上沿；保留原0.5%分桶口径，单位元。",
+          "value_semantics": "volume_profile_derived"
+        },
+        {
+          "column": "vp90_value_area_low",
+          "table": "daily_volume_profile_feature",
+          "name_zh": "90日价值区下沿",
+          "unit": "session_price",
+          "description_zh": "从成交峰值价连续扩展至70%可比成交量的区间下沿；保留原0.5%分桶口径，单位元。",
+          "value_semantics": "volume_profile_derived"
+        },
+        {
+          "column": "vp90_vwap",
+          "table": "daily_volume_profile_feature",
+          "name_zh": "90日成交均价",
+          "unit": "session_price",
+          "description_zh": "原分钟成交近似均价，按参考日复权基准计算；前90个实际日线日期窗口，可用分钟不足90日仍按实际计算。",
+          "value_semantics": "volume_profile_derived"
+        }
+      ],
+      "source_mode": "historical_retrospective",
+      "value_semantics": "volume_profile_derived",
+      "price_basis": "field_specific",
+      "recursive_initialization": "field_specific",
+      "volume_profile": {
+        "policy": {
+          "version": "original-volume-profile-v1",
+          "implementation_sha256": "70ca5338dff5f1818abd2c4a50e6d7375773c2d73c1f2f5ed6fe9d4c827f0c17",
+          "lookback_days": 90,
+          "frequency": "1min",
+          "bin_pct": 0.005,
+          "value_area_ratio": 0.7,
+          "evaluation_clock": "previous_complete_sse_session_at_next_day_09:25",
+          "window_selection": "previous_global_actual_daily_dates_strictly_before_reference",
+          "history_mode": "retrospective_no_row_first_observed_time",
+          "weight_basis": "adjusted_share_volume",
+          "amount_unit": "CNY_unadjusted",
+          "minute_price": "positive_amount_divided_by_positive_shares_else_close",
+          "source_priority": ["tushare", "tushare_rt", "other"]
+        },
+        "input_content_sha256": "e967eca1f9f08dc069edada1df30e61dc6967eee918f43c3f270f85be2e0b45b",
+        "output_content_sha256": "8a1e4740c46dd96d698bf351e5a5422167df93fabe60f02b240824225a733bf2",
+        "input_rows": 1429,
+        "output_rows": 96
+      }
+    },
+    "daily_feature_coverage_days": [
+      {
+        "trade_date": "2026-07-03",
+        "panel_date": "2026-07-02",
+        "computation_stock_count": 12,
+        "counts": [
+          {
+            "column": "vp90_above_reference_amount_pct",
+            "valid": 12,
+            "missing": 0,
+            "null": 0,
+            "non_finite": 0
+          },
+          {
+            "column": "vp90_above_reference_volume_pct",
+            "valid": 12,
+            "missing": 0,
+            "null": 0,
+            "non_finite": 0
+          },
+          {
+            "column": "vp90_below_reference_amount_pct",
+            "valid": 12,
+            "missing": 0,
+            "null": 0,
+            "non_finite": 0
+          },
+          {
+            "column": "vp90_below_reference_volume_pct",
+            "valid": 12,
+            "missing": 0,
+            "null": 0,
+            "non_finite": 0
+          },
+          {
+            "column": "vp90_concentration_top5_pct",
+            "valid": 12,
+            "missing": 0,
+            "null": 0,
+            "non_finite": 0
+          },
+          {
+            "column": "vp90_poc_price",
+            "valid": 12,
+            "missing": 0,
+            "null": 0,
+            "non_finite": 0
+          },
+          {
+            "column": "vp90_total_amount",
+            "valid": 12,
+            "missing": 0,
+            "null": 0,
+            "non_finite": 0
+          },
+          {
+            "column": "vp90_total_vol",
+            "valid": 12,
+            "missing": 0,
+            "null": 0,
+            "non_finite": 0
+          },
+          {
+            "column": "vp90_value_area_high",
+            "valid": 12,
+            "missing": 0,
+            "null": 0,
+            "non_finite": 0
+          },
+          {
+            "column": "vp90_value_area_low",
+            "valid": 12,
+            "missing": 0,
+            "null": 0,
+            "non_finite": 0
+          },
+          {
+            "column": "vp90_vwap",
+            "valid": 12,
+            "missing": 0,
+            "null": 0,
+            "non_finite": 0
+          }
+        ],
+        "volume_profile_values": [
+          {
+            "stock_code": "000001.SZ",
+            "values": [
+              {
+                "status": "valid",
+                "value": 40.0,
+                "column": "vp90_above_reference_amount_pct"
+              },
+              {
+                "status": "valid",
+                "value": 25.0,
+                "column": "vp90_above_reference_volume_pct"
+              },
+              {
+                "status": "valid",
+                "value": 60.0,
+                "column": "vp90_below_reference_amount_pct"
+              },
+              {
+                "status": "valid",
+                "value": 75.0,
+                "column": "vp90_below_reference_volume_pct"
+              },
+              {
+                "status": "valid",
+                "value": 100.0,
+                "column": "vp90_concentration_top5_pct"
+              },
+              {
+                "status": "valid",
+                "value": 9.97,
+                "column": "vp90_poc_price"
+              },
+              {
+                "status": "valid",
+                "value": 10000.0,
+                "column": "vp90_total_amount"
+              },
+              {
+                "status": "valid",
+                "value": 800.0,
+                "column": "vp90_total_vol"
+              },
+              {
+                "status": "valid",
+                "value": 9.97,
+                "column": "vp90_value_area_high"
+              },
+              {
+                "status": "valid",
+                "value": 9.97,
+                "column": "vp90_value_area_low"
+              },
+              {
+                "status": "valid",
+                "value": 12.5,
+                "column": "vp90_vwap"
+              }
+            ],
+            "diagnostic": {
+              "reference_date": "2026-07-02",
+              "window_start_date": "2026-04-03",
+              "window_end_date": "2026-07-01",
+              "window_days": 90,
+              "observed_days": 5,
+              "outside_window_days": 0,
+              "minute_rows": 5,
+              "reference_factor": 1.0,
+              "unavailable_factor_dates": []
+            }
+          },
+          {
+            "stock_code": "000002.SZ",
+            "values": [
+              {
+                "status": "valid",
+                "value": 40.0,
+                "column": "vp90_above_reference_amount_pct"
+              },
+              {
+                "status": "valid",
+                "value": 25.0,
+                "column": "vp90_above_reference_volume_pct"
+              },
+              {
+                "status": "valid",
+                "value": 60.0,
+                "column": "vp90_below_reference_amount_pct"
+              },
+              {
+                "status": "valid",
+                "value": 75.0,
+                "column": "vp90_below_reference_volume_pct"
+              },
+              {
+                "status": "valid",
+                "value": 100.0,
+                "column": "vp90_concentration_top5_pct"
+              },
+              {
+                "status": "valid",
+                "value": 9.97,
+                "column": "vp90_poc_price"
+              },
+              {
+                "status": "valid",
+                "value": 10000.0,
+                "column": "vp90_total_amount"
+              },
+              {
+                "status": "valid",
+                "value": 800.0,
+                "column": "vp90_total_vol"
+              },
+              {
+                "status": "valid",
+                "value": 9.97,
+                "column": "vp90_value_area_high"
+              },
+              {
+                "status": "valid",
+                "value": 9.97,
+                "column": "vp90_value_area_low"
+              },
+              {
+                "status": "valid",
+                "value": 12.5,
+                "column": "vp90_vwap"
+              }
+            ],
+            "diagnostic": {
+              "reference_date": "2026-07-02",
+              "window_start_date": "2026-04-03",
+              "window_end_date": "2026-07-01",
+              "window_days": 90,
+              "observed_days": 5,
+              "outside_window_days": 0,
+              "minute_rows": 5,
+              "reference_factor": 1.0,
+              "unavailable_factor_dates": []
+            }
+          },
+          {
+            "stock_code": "000003.SZ",
+            "values": [
+              {
+                "status": "valid",
+                "value": 40.0,
+                "column": "vp90_above_reference_amount_pct"
+              },
+              {
+                "status": "valid",
+                "value": 25.0,
+                "column": "vp90_above_reference_volume_pct"
+              },
+              {
+                "status": "valid",
+                "value": 60.0,
+                "column": "vp90_below_reference_amount_pct"
+              },
+              {
+                "status": "valid",
+                "value": 75.0,
+                "column": "vp90_below_reference_volume_pct"
+              },
+              {
+                "status": "valid",
+                "value": 100.0,
+                "column": "vp90_concentration_top5_pct"
+              },
+              {
+                "status": "valid",
+                "value": 9.97,
+                "column": "vp90_poc_price"
+              },
+              {
+                "status": "valid",
+                "value": 10000.0,
+                "column": "vp90_total_amount"
+              },
+              {
+                "status": "valid",
+                "value": 800.0,
+                "column": "vp90_total_vol"
+              },
+              {
+                "status": "valid",
+                "value": 9.97,
+                "column": "vp90_value_area_high"
+              },
+              {
+                "status": "valid",
+                "value": 9.97,
+                "column": "vp90_value_area_low"
+              },
+              {
+                "status": "valid",
+                "value": 12.5,
+                "column": "vp90_vwap"
+              }
+            ],
+            "diagnostic": {
+              "reference_date": "2026-07-02",
+              "window_start_date": "2026-04-03",
+              "window_end_date": "2026-07-01",
+              "window_days": 90,
+              "observed_days": 5,
+              "outside_window_days": 0,
+              "minute_rows": 5,
+              "reference_factor": 1.0,
+              "unavailable_factor_dates": []
+            }
+          },
+          {
+            "stock_code": "000004.SZ",
+            "values": [
+              {
+                "status": "valid",
+                "value": 40.0,
+                "column": "vp90_above_reference_amount_pct"
+              },
+              {
+                "status": "valid",
+                "value": 25.0,
+                "column": "vp90_above_reference_volume_pct"
+              },
+              {
+                "status": "valid",
+                "value": 60.0,
+                "column": "vp90_below_reference_amount_pct"
+              },
+              {
+                "status": "valid",
+                "value": 75.0,
+                "column": "vp90_below_reference_volume_pct"
+              },
+              {
+                "status": "valid",
+                "value": 100.0,
+                "column": "vp90_concentration_top5_pct"
+              },
+              {
+                "status": "valid",
+                "value": 9.99,
+                "column": "vp90_poc_price"
+              },
+              {
+                "status": "valid",
+                "value": 10000.0,
+                "column": "vp90_total_amount"
+              },
+              {
+                "status": "valid",
+                "value": 800.0,
+                "column": "vp90_total_vol"
+              },
+              {
+                "status": "valid",
+                "value": 9.99,
+                "column": "vp90_value_area_high"
+              },
+              {
+                "status": "valid",
+                "value": 9.99,
+                "column": "vp90_value_area_low"
+              },
+              {
+                "status": "valid",
+                "value": 12.5,
+                "column": "vp90_vwap"
+              }
+            ],
+            "diagnostic": {
+              "reference_date": "2026-07-02",
+              "window_start_date": "2026-04-03",
+              "window_end_date": "2026-07-01",
+              "window_days": 90,
+              "observed_days": 5,
+              "outside_window_days": 0,
+              "minute_rows": 5,
+              "reference_factor": 1.0,
+              "unavailable_factor_dates": []
+            }
+          },
+          {
+            "stock_code": "000005.SZ",
+            "values": [
+              {
+                "status": "valid",
+                "value": 40.0,
+                "column": "vp90_above_reference_amount_pct"
+              },
+              {
+                "status": "valid",
+                "value": 25.0,
+                "column": "vp90_above_reference_volume_pct"
+              },
+              {
+                "status": "valid",
+                "value": 60.0,
+                "column": "vp90_below_reference_amount_pct"
+              },
+              {
+                "status": "valid",
+                "value": 75.0,
+                "column": "vp90_below_reference_volume_pct"
+              },
+              {
+                "status": "valid",
+                "value": 100.0,
+                "column": "vp90_concentration_top5_pct"
+              },
+              {
+                "status": "valid",
+                "value": 10.01,
+                "column": "vp90_poc_price"
+              },
+              {
+                "status": "valid",
+                "value": 10000.0,
+                "column": "vp90_total_amount"
+              },
+              {
+                "status": "valid",
+                "value": 800.0,
+                "column": "vp90_total_vol"
+              },
+              {
+                "status": "valid",
+                "value": 10.01,
+                "column": "vp90_value_area_high"
+              },
+              {
+                "status": "valid",
+                "value": 10.01,
+                "column": "vp90_value_area_low"
+              },
+              {
+                "status": "valid",
+                "value": 12.5,
+                "column": "vp90_vwap"
+              }
+            ],
+            "diagnostic": {
+              "reference_date": "2026-07-02",
+              "window_start_date": "2026-04-03",
+              "window_end_date": "2026-07-01",
+              "window_days": 90,
+              "observed_days": 5,
+              "outside_window_days": 0,
+              "minute_rows": 5,
+              "reference_factor": 1.0,
+              "unavailable_factor_dates": []
+            }
+          },
+          {
+            "stock_code": "000006.SZ",
+            "values": [
+              {
+                "status": "valid",
+                "value": 40.0,
+                "column": "vp90_above_reference_amount_pct"
+              },
+              {
+                "status": "valid",
+                "value": 25.0,
+                "column": "vp90_above_reference_volume_pct"
+              },
+              {
+                "status": "valid",
+                "value": 60.0,
+                "column": "vp90_below_reference_amount_pct"
+              },
+              {
+                "status": "valid",
+                "value": 75.0,
+                "column": "vp90_below_reference_volume_pct"
+              },
+              {
+                "status": "valid",
+                "value": 100.0,
+                "column": "vp90_concentration_top5_pct"
+              },
+              {
+                "status": "valid",
+                "value": 10.01,
+                "column": "vp90_poc_price"
+              },
+              {
+                "status": "valid",
+                "value": 10000.0,
+                "column": "vp90_total_amount"
+              },
+              {
+                "status": "valid",
+                "value": 800.0,
+                "column": "vp90_total_vol"
+              },
+              {
+                "status": "valid",
+                "value": 10.01,
+                "column": "vp90_value_area_high"
+              },
+              {
+                "status": "valid",
+                "value": 10.01,
+                "column": "vp90_value_area_low"
+              },
+              {
+                "status": "valid",
+                "value": 12.5,
+                "column": "vp90_vwap"
+              }
+            ],
+            "diagnostic": {
+              "reference_date": "2026-07-02",
+              "window_start_date": "2026-04-03",
+              "window_end_date": "2026-07-01",
+              "window_days": 90,
+              "observed_days": 5,
+              "outside_window_days": 0,
+              "minute_rows": 5,
+              "reference_factor": 1.0,
+              "unavailable_factor_dates": []
+            }
+          },
+          {
+            "stock_code": "000007.SZ",
+            "values": [
+              {
+                "status": "valid",
+                "value": 40.0,
+                "column": "vp90_above_reference_amount_pct"
+              },
+              {
+                "status": "valid",
+                "value": 25.0,
+                "column": "vp90_above_reference_volume_pct"
+              },
+              {
+                "status": "valid",
+                "value": 60.0,
+                "column": "vp90_below_reference_amount_pct"
+              },
+              {
+                "status": "valid",
+                "value": 75.0,
+                "column": "vp90_below_reference_volume_pct"
+              },
+              {
+                "status": "valid",
+                "value": 100.0,
+                "column": "vp90_concentration_top5_pct"
+              },
+              {
+                "status": "valid",
+                "value": 10.03,
+                "column": "vp90_poc_price"
+              },
+              {
+                "status": "valid",
+                "value": 10000.0,
+                "column": "vp90_total_amount"
+              },
+              {
+                "status": "valid",
+                "value": 800.0,
+                "column": "vp90_total_vol"
+              },
+              {
+                "status": "valid",
+                "value": 10.03,
+                "column": "vp90_value_area_high"
+              },
+              {
+                "status": "valid",
+                "value": 10.03,
+                "column": "vp90_value_area_low"
+              },
+              {
+                "status": "valid",
+                "value": 12.5,
+                "column": "vp90_vwap"
+              }
+            ],
+            "diagnostic": {
+              "reference_date": "2026-07-02",
+              "window_start_date": "2026-04-03",
+              "window_end_date": "2026-07-01",
+              "window_days": 90,
+              "observed_days": 5,
+              "outside_window_days": 0,
+              "minute_rows": 5,
+              "reference_factor": 1.0,
+              "unavailable_factor_dates": []
+            }
+          },
+          {
+            "stock_code": "000008.SZ",
+            "values": [
+              {
+                "status": "valid",
+                "value": 40.0,
+                "column": "vp90_above_reference_amount_pct"
+              },
+              {
+                "status": "valid",
+                "value": 25.0,
+                "column": "vp90_above_reference_volume_pct"
+              },
+              {
+                "status": "valid",
+                "value": 60.0,
+                "column": "vp90_below_reference_amount_pct"
+              },
+              {
+                "status": "valid",
+                "value": 75.0,
+                "column": "vp90_below_reference_volume_pct"
+              },
+              {
+                "status": "valid",
+                "value": 100.0,
+                "column": "vp90_concentration_top5_pct"
+              },
+              {
+                "status": "valid",
+                "value": 10.03,
+                "column": "vp90_poc_price"
+              },
+              {
+                "status": "valid",
+                "value": 10000.0,
+                "column": "vp90_total_amount"
+              },
+              {
+                "status": "valid",
+                "value": 800.0,
+                "column": "vp90_total_vol"
+              },
+              {
+                "status": "valid",
+                "value": 10.03,
+                "column": "vp90_value_area_high"
+              },
+              {
+                "status": "valid",
+                "value": 10.03,
+                "column": "vp90_value_area_low"
+              },
+              {
+                "status": "valid",
+                "value": 12.5,
+                "column": "vp90_vwap"
+              }
+            ],
+            "diagnostic": {
+              "reference_date": "2026-07-02",
+              "window_start_date": "2026-04-03",
+              "window_end_date": "2026-07-01",
+              "window_days": 90,
+              "observed_days": 5,
+              "outside_window_days": 0,
+              "minute_rows": 5,
+              "reference_factor": 1.0,
+              "unavailable_factor_dates": []
+            }
+          },
+          {
+            "stock_code": "000009.SZ",
+            "values": [
+              {
+                "status": "valid",
+                "value": 40.0,
+                "column": "vp90_above_reference_amount_pct"
+              },
+              {
+                "status": "valid",
+                "value": 25.0,
+                "column": "vp90_above_reference_volume_pct"
+              },
+              {
+                "status": "valid",
+                "value": 60.0,
+                "column": "vp90_below_reference_amount_pct"
+              },
+              {
+                "status": "valid",
+                "value": 75.0,
+                "column": "vp90_below_reference_volume_pct"
+              },
+              {
+                "status": "valid",
+                "value": 100.0,
+                "column": "vp90_concentration_top5_pct"
+              },
+              {
+                "status": "valid",
+                "value": 10.03,
+                "column": "vp90_poc_price"
+              },
+              {
+                "status": "valid",
+                "value": 10000.0,
+                "column": "vp90_total_amount"
+              },
+              {
+                "status": "valid",
+                "value": 800.0,
+                "column": "vp90_total_vol"
+              },
+              {
+                "status": "valid",
+                "value": 10.03,
+                "column": "vp90_value_area_high"
+              },
+              {
+                "status": "valid",
+                "value": 10.03,
+                "column": "vp90_value_area_low"
+              },
+              {
+                "status": "valid",
+                "value": 12.5,
+                "column": "vp90_vwap"
+              }
+            ],
+            "diagnostic": {
+              "reference_date": "2026-07-02",
+              "window_start_date": "2026-04-03",
+              "window_end_date": "2026-07-01",
+              "window_days": 90,
+              "observed_days": 5,
+              "outside_window_days": 0,
+              "minute_rows": 5,
+              "reference_factor": 1.0,
+              "unavailable_factor_dates": []
+            }
+          },
+          {
+            "stock_code": "000010.SZ",
+            "values": [
+              {
+                "status": "valid",
+                "value": 40.0,
+                "column": "vp90_above_reference_amount_pct"
+              },
+              {
+                "status": "valid",
+                "value": 25.0,
+                "column": "vp90_above_reference_volume_pct"
+              },
+              {
+                "status": "valid",
+                "value": 60.0,
+                "column": "vp90_below_reference_amount_pct"
+              },
+              {
+                "status": "valid",
+                "value": 75.0,
+                "column": "vp90_below_reference_volume_pct"
+              },
+              {
+                "status": "valid",
+                "value": 100.0,
+                "column": "vp90_concentration_top5_pct"
+              },
+              {
+                "status": "valid",
+                "value": 9.99,
+                "column": "vp90_poc_price"
+              },
+              {
+                "status": "valid",
+                "value": 10000.0,
+                "column": "vp90_total_amount"
+              },
+              {
+                "status": "valid",
+                "value": 800.0,
+                "column": "vp90_total_vol"
+              },
+              {
+                "status": "valid",
+                "value": 9.99,
+                "column": "vp90_value_area_high"
+              },
+              {
+                "status": "valid",
+                "value": 9.99,
+                "column": "vp90_value_area_low"
+              },
+              {
+                "status": "valid",
+                "value": 12.5,
+                "column": "vp90_vwap"
+              }
+            ],
+            "diagnostic": {
+              "reference_date": "2026-07-02",
+              "window_start_date": "2026-04-03",
+              "window_end_date": "2026-07-01",
+              "window_days": 90,
+              "observed_days": 5,
+              "outside_window_days": 0,
+              "minute_rows": 5,
+              "reference_factor": 1.0,
+              "unavailable_factor_dates": []
+            }
+          }
+        ]
+      },
+      {
+        "trade_date": "2026-07-04",
+        "panel_date": "2026-07-03",
+        "computation_stock_count": 12,
+        "counts": [
+          {
+            "column": "vp90_above_reference_amount_pct",
+            "valid": 12,
+            "missing": 0,
+            "null": 0,
+            "non_finite": 0
+          },
+          {
+            "column": "vp90_above_reference_volume_pct",
+            "valid": 12,
+            "missing": 0,
+            "null": 0,
+            "non_finite": 0
+          },
+          {
+            "column": "vp90_below_reference_amount_pct",
+            "valid": 12,
+            "missing": 0,
+            "null": 0,
+            "non_finite": 0
+          },
+          {
+            "column": "vp90_below_reference_volume_pct",
+            "valid": 12,
+            "missing": 0,
+            "null": 0,
+            "non_finite": 0
+          },
+          {
+            "column": "vp90_concentration_top5_pct",
+            "valid": 12,
+            "missing": 0,
+            "null": 0,
+            "non_finite": 0
+          },
+          {
+            "column": "vp90_poc_price",
+            "valid": 12,
+            "missing": 0,
+            "null": 0,
+            "non_finite": 0
+          },
+          {
+            "column": "vp90_total_amount",
+            "valid": 12,
+            "missing": 0,
+            "null": 0,
+            "non_finite": 0
+          },
+          {
+            "column": "vp90_total_vol",
+            "valid": 12,
+            "missing": 0,
+            "null": 0,
+            "non_finite": 0
+          },
+          {
+            "column": "vp90_value_area_high",
+            "valid": 12,
+            "missing": 0,
+            "null": 0,
+            "non_finite": 0
+          },
+          {
+            "column": "vp90_value_area_low",
+            "valid": 12,
+            "missing": 0,
+            "null": 0,
+            "non_finite": 0
+          },
+          {
+            "column": "vp90_vwap",
+            "valid": 12,
+            "missing": 0,
+            "null": 0,
+            "non_finite": 0
+          }
+        ],
+        "volume_profile_values": [
+          {
+            "stock_code": "000001.SZ",
+            "values": [
+              {
+                "status": "valid",
+                "value": 40.0,
+                "column": "vp90_above_reference_amount_pct"
+              },
+              {
+                "status": "valid",
+                "value": 25.0,
+                "column": "vp90_above_reference_volume_pct"
+              },
+              {
+                "status": "valid",
+                "value": 60.0,
+                "column": "vp90_below_reference_amount_pct"
+              },
+              {
+                "status": "valid",
+                "value": 75.0,
+                "column": "vp90_below_reference_volume_pct"
+              },
+              {
+                "status": "valid",
+                "value": 100.0,
+                "column": "vp90_concentration_top5_pct"
+              },
+              {
+                "status": "valid",
+                "value": 10.02,
+                "column": "vp90_poc_price"
+              },
+              {
+                "status": "valid",
+                "value": 10000.0,
+                "column": "vp90_total_amount"
+              },
+              {
+                "status": "valid",
+                "value": 800.0,
+                "column": "vp90_total_vol"
+              },
+              {
+                "status": "valid",
+                "value": 10.02,
+                "column": "vp90_value_area_high"
+              },
+              {
+                "status": "valid",
+                "value": 10.02,
+                "column": "vp90_value_area_low"
+              },
+              {
+                "status": "valid",
+                "value": 12.5,
+                "column": "vp90_vwap"
+              }
+            ],
+            "diagnostic": {
+              "reference_date": "2026-07-03",
+              "window_start_date": "2026-04-04",
+              "window_end_date": "2026-07-02",
+              "window_days": 90,
+              "observed_days": 5,
+              "outside_window_days": 0,
+              "minute_rows": 5,
+              "reference_factor": 1.0,
+              "unavailable_factor_dates": []
+            }
+          },
+          {
+            "stock_code": "000002.SZ",
+            "values": [
+              {
+                "status": "valid",
+                "value": 40.0,
+                "column": "vp90_above_reference_amount_pct"
+              },
+              {
+                "status": "valid",
+                "value": 25.0,
+                "column": "vp90_above_reference_volume_pct"
+              },
+              {
+                "status": "valid",
+                "value": 60.0,
+                "column": "vp90_below_reference_amount_pct"
+              },
+              {
+                "status": "valid",
+                "value": 75.0,
+                "column": "vp90_below_reference_volume_pct"
+              },
+              {
+                "status": "valid",
+                "value": 100.0,
+                "column": "vp90_concentration_top5_pct"
+              },
+              {
+                "status": "valid",
+                "value": 9.98,
+                "column": "vp90_poc_price"
+              },
+              {
+                "status": "valid",
+                "value": 10000.0,
+                "column": "vp90_total_amount"
+              },
+              {
+                "status": "valid",
+                "value": 800.0,
+                "column": "vp90_total_vol"
+              },
+              {
+                "status": "valid",
+                "value": 9.98,
+                "column": "vp90_value_area_high"
+              },
+              {
+                "status": "valid",
+                "value": 9.98,
+                "column": "vp90_value_area_low"
+              },
+              {
+                "status": "valid",
+                "value": 12.5,
+                "column": "vp90_vwap"
+              }
+            ],
+            "diagnostic": {
+              "reference_date": "2026-07-03",
+              "window_start_date": "2026-04-04",
+              "window_end_date": "2026-07-02",
+              "window_days": 90,
+              "observed_days": 5,
+              "outside_window_days": 0,
+              "minute_rows": 5,
+              "reference_factor": 1.0,
+              "unavailable_factor_dates": []
+            }
+          },
+          {
+            "stock_code": "000003.SZ",
+            "values": [
+              {
+                "status": "valid",
+                "value": 40.0,
+                "column": "vp90_above_reference_amount_pct"
+              },
+              {
+                "status": "valid",
+                "value": 25.0,
+                "column": "vp90_above_reference_volume_pct"
+              },
+              {
+                "status": "valid",
+                "value": 60.0,
+                "column": "vp90_below_reference_amount_pct"
+              },
+              {
+                "status": "valid",
+                "value": 75.0,
+                "column": "vp90_below_reference_volume_pct"
+              },
+              {
+                "status": "valid",
+                "value": 100.0,
+                "column": "vp90_concentration_top5_pct"
+              },
+              {
+                "status": "valid",
+                "value": 9.98,
+                "column": "vp90_poc_price"
+              },
+              {
+                "status": "valid",
+                "value": 10000.0,
+                "column": "vp90_total_amount"
+              },
+              {
+                "status": "valid",
+                "value": 800.0,
+                "column": "vp90_total_vol"
+              },
+              {
+                "status": "valid",
+                "value": 9.98,
+                "column": "vp90_value_area_high"
+              },
+              {
+                "status": "valid",
+                "value": 9.98,
+                "column": "vp90_value_area_low"
+              },
+              {
+                "status": "valid",
+                "value": 12.5,
+                "column": "vp90_vwap"
+              }
+            ],
+            "diagnostic": {
+              "reference_date": "2026-07-03",
+              "window_start_date": "2026-04-04",
+              "window_end_date": "2026-07-02",
+              "window_days": 90,
+              "observed_days": 5,
+              "outside_window_days": 0,
+              "minute_rows": 5,
+              "reference_factor": 1.0,
+              "unavailable_factor_dates": []
+            }
+          },
+          {
+            "stock_code": "000004.SZ",
+            "values": [
+              {
+                "status": "valid",
+                "value": 40.0,
+                "column": "vp90_above_reference_amount_pct"
+              },
+              {
+                "status": "valid",
+                "value": 25.0,
+                "column": "vp90_above_reference_volume_pct"
+              },
+              {
+                "status": "valid",
+                "value": 60.0,
+                "column": "vp90_below_reference_amount_pct"
+              },
+              {
+                "status": "valid",
+                "value": 75.0,
+                "column": "vp90_below_reference_volume_pct"
+              },
+              {
+                "status": "valid",
+                "value": 100.0,
+                "column": "vp90_concentration_top5_pct"
+              },
+              {
+                "status": "valid",
+                "value": 9.99,
+                "column": "vp90_poc_price"
+              },
+              {
+                "status": "valid",
+                "value": 10000.0,
+                "column": "vp90_total_amount"
+              },
+              {
+                "status": "valid",
+                "value": 800.0,
+                "column": "vp90_total_vol"
+              },
+              {
+                "status": "valid",
+                "value": 9.99,
+                "column": "vp90_value_area_high"
+              },
+              {
+                "status": "valid",
+                "value": 9.99,
+                "column": "vp90_value_area_low"
+              },
+              {
+                "status": "valid",
+                "value": 12.5,
+                "column": "vp90_vwap"
+              }
+            ],
+            "diagnostic": {
+              "reference_date": "2026-07-03",
+              "window_start_date": "2026-04-04",
+              "window_end_date": "2026-07-02",
+              "window_days": 90,
+              "observed_days": 5,
+              "outside_window_days": 0,
+              "minute_rows": 5,
+              "reference_factor": 1.0,
+              "unavailable_factor_dates": []
+            }
+          },
+          {
+            "stock_code": "000005.SZ",
+            "values": [
+              {
+                "status": "valid",
+                "value": 40.0,
+                "column": "vp90_above_reference_amount_pct"
+              },
+              {
+                "status": "valid",
+                "value": 25.0,
+                "column": "vp90_above_reference_volume_pct"
+              },
+              {
+                "status": "valid",
+                "value": 60.0,
+                "column": "vp90_below_reference_amount_pct"
+              },
+              {
+                "status": "valid",
+                "value": 75.0,
+                "column": "vp90_below_reference_volume_pct"
+              },
+              {
+                "status": "valid",
+                "value": 100.0,
+                "column": "vp90_concentration_top5_pct"
+              },
+              {
+                "status": "valid",
+                "value": 10.01,
+                "column": "vp90_poc_price"
+              },
+              {
+                "status": "valid",
+                "value": 10000.0,
+                "column": "vp90_total_amount"
+              },
+              {
+                "status": "valid",
+                "value": 800.0,
+                "column": "vp90_total_vol"
+              },
+              {
+                "status": "valid",
+                "value": 10.01,
+                "column": "vp90_value_area_high"
+              },
+              {
+                "status": "valid",
+                "value": 10.01,
+                "column": "vp90_value_area_low"
+              },
+              {
+                "status": "valid",
+                "value": 12.5,
+                "column": "vp90_vwap"
+              }
+            ],
+            "diagnostic": {
+              "reference_date": "2026-07-03",
+              "window_start_date": "2026-04-04",
+              "window_end_date": "2026-07-02",
+              "window_days": 90,
+              "observed_days": 5,
+              "outside_window_days": 0,
+              "minute_rows": 5,
+              "reference_factor": 1.0,
+              "unavailable_factor_dates": []
+            }
+          },
+          {
+            "stock_code": "000006.SZ",
+            "values": [
+              {
+                "status": "valid",
+                "value": 40.0,
+                "column": "vp90_above_reference_amount_pct"
+              },
+              {
+                "status": "valid",
+                "value": 25.0,
+                "column": "vp90_above_reference_volume_pct"
+              },
+              {
+                "status": "valid",
+                "value": 60.0,
+                "column": "vp90_below_reference_amount_pct"
+              },
+              {
+                "status": "valid",
+                "value": 75.0,
+                "column": "vp90_below_reference_volume_pct"
+              },
+              {
+                "status": "valid",
+                "value": 100.0,
+                "column": "vp90_concentration_top5_pct"
+              },
+              {
+                "status": "valid",
+                "value": 10.01,
+                "column": "vp90_poc_price"
+              },
+              {
+                "status": "valid",
+                "value": 10000.0,
+                "column": "vp90_total_amount"
+              },
+              {
+                "status": "valid",
+                "value": 800.0,
+                "column": "vp90_total_vol"
+              },
+              {
+                "status": "valid",
+                "value": 10.01,
+                "column": "vp90_value_area_high"
+              },
+              {
+                "status": "valid",
+                "value": 10.01,
+                "column": "vp90_value_area_low"
+              },
+              {
+                "status": "valid",
+                "value": 12.5,
+                "column": "vp90_vwap"
+              }
+            ],
+            "diagnostic": {
+              "reference_date": "2026-07-03",
+              "window_start_date": "2026-04-04",
+              "window_end_date": "2026-07-02",
+              "window_days": 90,
+              "observed_days": 5,
+              "outside_window_days": 0,
+              "minute_rows": 5,
+              "reference_factor": 1.0,
+              "unavailable_factor_dates": []
+            }
+          },
+          {
+            "stock_code": "000007.SZ",
+            "values": [
+              {
+                "status": "valid",
+                "value": 40.0,
+                "column": "vp90_above_reference_amount_pct"
+              },
+              {
+                "status": "valid",
+                "value": 25.0,
+                "column": "vp90_above_reference_volume_pct"
+              },
+              {
+                "status": "valid",
+                "value": 60.0,
+                "column": "vp90_below_reference_amount_pct"
+              },
+              {
+                "status": "valid",
+                "value": 75.0,
+                "column": "vp90_below_reference_volume_pct"
+              },
+              {
+                "status": "valid",
+                "value": 100.0,
+                "column": "vp90_concentration_top5_pct"
+              },
+              {
+                "status": "valid",
+                "value": 10.03,
+                "column": "vp90_poc_price"
+              },
+              {
+                "status": "valid",
+                "value": 10000.0,
+                "column": "vp90_total_amount"
+              },
+              {
+                "status": "valid",
+                "value": 800.0,
+                "column": "vp90_total_vol"
+              },
+              {
+                "status": "valid",
+                "value": 10.03,
+                "column": "vp90_value_area_high"
+              },
+              {
+                "status": "valid",
+                "value": 10.03,
+                "column": "vp90_value_area_low"
+              },
+              {
+                "status": "valid",
+                "value": 12.5,
+                "column": "vp90_vwap"
+              }
+            ],
+            "diagnostic": {
+              "reference_date": "2026-07-03",
+              "window_start_date": "2026-04-04",
+              "window_end_date": "2026-07-02",
+              "window_days": 90,
+              "observed_days": 5,
+              "outside_window_days": 0,
+              "minute_rows": 5,
+              "reference_factor": 1.0,
+              "unavailable_factor_dates": []
+            }
+          },
+          {
+            "stock_code": "000008.SZ",
+            "values": [
+              {
+                "status": "valid",
+                "value": 40.0,
+                "column": "vp90_above_reference_amount_pct"
+              },
+              {
+                "status": "valid",
+                "value": 25.0,
+                "column": "vp90_above_reference_volume_pct"
+              },
+              {
+                "status": "valid",
+                "value": 60.0,
+                "column": "vp90_below_reference_amount_pct"
+              },
+              {
+                "status": "valid",
+                "value": 75.0,
+                "column": "vp90_below_reference_volume_pct"
+              },
+              {
+                "status": "valid",
+                "value": 100.0,
+                "column": "vp90_concentration_top5_pct"
+              },
+              {
+                "status": "valid",
+                "value": 10.03,
+                "column": "vp90_poc_price"
+              },
+              {
+                "status": "valid",
+                "value": 10000.0,
+                "column": "vp90_total_amount"
+              },
+              {
+                "status": "valid",
+                "value": 800.0,
+                "column": "vp90_total_vol"
+              },
+              {
+                "status": "valid",
+                "value": 10.03,
+                "column": "vp90_value_area_high"
+              },
+              {
+                "status": "valid",
+                "value": 10.03,
+                "column": "vp90_value_area_low"
+              },
+              {
+                "status": "valid",
+                "value": 12.5,
+                "column": "vp90_vwap"
+              }
+            ],
+            "diagnostic": {
+              "reference_date": "2026-07-03",
+              "window_start_date": "2026-04-04",
+              "window_end_date": "2026-07-02",
+              "window_days": 90,
+              "observed_days": 5,
+              "outside_window_days": 0,
+              "minute_rows": 5,
+              "reference_factor": 1.0,
+              "unavailable_factor_dates": []
+            }
+          },
+          {
+            "stock_code": "000009.SZ",
+            "values": [
+              {
+                "status": "valid",
+                "value": 40.0,
+                "column": "vp90_above_reference_amount_pct"
+              },
+              {
+                "status": "valid",
+                "value": 25.0,
+                "column": "vp90_above_reference_volume_pct"
+              },
+              {
+                "status": "valid",
+                "value": 60.0,
+                "column": "vp90_below_reference_amount_pct"
+              },
+              {
+                "status": "valid",
+                "value": 75.0,
+                "column": "vp90_below_reference_volume_pct"
+              },
+              {
+                "status": "valid",
+                "value": 100.0,
+                "column": "vp90_concentration_top5_pct"
+              },
+              {
+                "status": "valid",
+                "value": 9.98,
+                "column": "vp90_poc_price"
+              },
+              {
+                "status": "valid",
+                "value": 10000.0,
+                "column": "vp90_total_amount"
+              },
+              {
+                "status": "valid",
+                "value": 800.0,
+                "column": "vp90_total_vol"
+              },
+              {
+                "status": "valid",
+                "value": 9.98,
+                "column": "vp90_value_area_high"
+              },
+              {
+                "status": "valid",
+                "value": 9.98,
+                "column": "vp90_value_area_low"
+              },
+              {
+                "status": "valid",
+                "value": 12.5,
+                "column": "vp90_vwap"
+              }
+            ],
+            "diagnostic": {
+              "reference_date": "2026-07-03",
+              "window_start_date": "2026-04-04",
+              "window_end_date": "2026-07-02",
+              "window_days": 90,
+              "observed_days": 5,
+              "outside_window_days": 0,
+              "minute_rows": 5,
+              "reference_factor": 1.0,
+              "unavailable_factor_dates": []
+            }
+          },
+          {
+            "stock_code": "000010.SZ",
+            "values": [
+              {
+                "status": "valid",
+                "value": 40.0,
+                "column": "vp90_above_reference_amount_pct"
+              },
+              {
+                "status": "valid",
+                "value": 25.0,
+                "column": "vp90_above_reference_volume_pct"
+              },
+              {
+                "status": "valid",
+                "value": 60.0,
+                "column": "vp90_below_reference_amount_pct"
+              },
+              {
+                "status": "valid",
+                "value": 75.0,
+                "column": "vp90_below_reference_volume_pct"
+              },
+              {
+                "status": "valid",
+                "value": 100.0,
+                "column": "vp90_concentration_top5_pct"
+              },
+              {
+                "status": "valid",
+                "value": 9.98,
+                "column": "vp90_poc_price"
+              },
+              {
+                "status": "valid",
+                "value": 10000.0,
+                "column": "vp90_total_amount"
+              },
+              {
+                "status": "valid",
+                "value": 800.0,
+                "column": "vp90_total_vol"
+              },
+              {
+                "status": "valid",
+                "value": 9.98,
+                "column": "vp90_value_area_high"
+              },
+              {
+                "status": "valid",
+                "value": 9.98,
+                "column": "vp90_value_area_low"
+              },
+              {
+                "status": "valid",
+                "value": 12.5,
+                "column": "vp90_vwap"
+              }
+            ],
+            "diagnostic": {
+              "reference_date": "2026-07-03",
+              "window_start_date": "2026-04-04",
+              "window_end_date": "2026-07-02",
+              "window_days": 90,
+              "observed_days": 5,
+              "outside_window_days": 0,
+              "minute_rows": 5,
+              "reference_factor": 1.0,
+              "unavailable_factor_dates": []
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "capability": {
+    "version": "daily_volume_profile_v1",
+    "source_mode": "historical_retrospective",
+    "fields": [
+      {
+        "column": "open",
+        "name_zh": "开盘价",
+        "description_zh": "日线记录的开盘价。"
+      },
+      {
+        "column": "high",
+        "name_zh": "最高价",
+        "description_zh": "日线记录的最高价。"
+      },
+      {
+        "column": "low",
+        "name_zh": "最低价",
+        "description_zh": "日线记录的最低价。"
+      },
+      {
+        "column": "close",
+        "name_zh": "收盘价",
+        "description_zh": "日线记录的收盘价。"
+      },
+      {
+        "column": "vol",
+        "name_zh": "成交量",
+        "description_zh": "日线记录的成交量。"
+      },
+      {
+        "column": "amount",
+        "name_zh": "成交额",
+        "description_zh": "日线记录的成交额。"
+      },
+      {
+        "column": "vp90_above_reference_amount_pct",
+        "name_zh": "参考价上方成交额占比",
+        "description_zh": "高于参考价价格桶的原始成交额占比；等于参考价不计两侧，0–100百分比原值。",
+        "unit": "percent",
+        "value_semantics": "volume_profile_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "vp90_above_reference_volume_pct",
+        "name_zh": "参考价上方成交量占比",
+        "description_zh": "高于参考价价格桶的可比股数占比；等于参考价不计两侧，0–100百分比原值。",
+        "unit": "percent",
+        "value_semantics": "volume_profile_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "vp90_below_reference_amount_pct",
+        "name_zh": "参考价下方成交额占比",
+        "description_zh": "低于参考价价格桶的原始成交额占比；0–100百分比原值，不复权成交额。",
+        "unit": "percent",
+        "value_semantics": "volume_profile_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "vp90_below_reference_volume_pct",
+        "name_zh": "参考价下方成交量占比",
+        "description_zh": "低于参考价价格桶的可比股数占比；价格复权、股数逆向换算，0–100百分比原值。",
+        "unit": "percent",
+        "value_semantics": "volume_profile_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "vp90_concentration_top5_pct",
+        "name_zh": "90日成交集中度",
+        "description_zh": "成交量最大的5个价格桶占全部可比股数的百分比；0–100原值，非0–1比例。",
+        "unit": "percent",
+        "value_semantics": "volume_profile_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "vp90_poc_price",
+        "name_zh": "90日成交峰值价",
+        "description_zh": "可比成交量最大的价格桶；并列先取距参考价最近，再取较低价。分钟成交近似，价格单位元。",
+        "unit": "session_price",
+        "value_semantics": "volume_profile_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "vp90_total_amount",
+        "name_zh": "90日原始成交额",
+        "description_zh": "日期窗口内原始分钟成交额总和，不复权；单位元。缺失输出不补零，实际覆盖按分钟日数另列。",
+        "unit": "CNY",
+        "value_semantics": "volume_profile_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "vp90_total_vol",
+        "name_zh": "90日可比成交量",
+        "description_zh": "原分钟股数按参考日价格基准逆向换算后求和；单位股。90日指日期窗口，覆盖按实际分钟日数另列。",
+        "unit": "shares",
+        "value_semantics": "volume_profile_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "vp90_value_area_high",
+        "name_zh": "90日价值区上沿",
+        "description_zh": "从成交峰值价连续扩展至70%可比成交量的区间上沿；保留原0.5%分桶口径，单位元。",
+        "unit": "session_price",
+        "value_semantics": "volume_profile_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "vp90_value_area_low",
+        "name_zh": "90日价值区下沿",
+        "description_zh": "从成交峰值价连续扩展至70%可比成交量的区间下沿；保留原0.5%分桶口径，单位元。",
+        "unit": "session_price",
+        "value_semantics": "volume_profile_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "vp90_vwap",
+        "name_zh": "90日成交均价",
+        "description_zh": "原分钟成交近似均价，按参考日复权基准计算；前90个实际日线日期窗口，可用分钟不足90日仍按实际计算。",
+        "unit": "session_price",
+        "value_semantics": "volume_profile_derived",
+        "tracking_supported": true
+      }
+    ],
+    "runnable_operators": [
+      "+",
+      "-",
+      "*",
+      "/",
+      "<",
+      "<=",
+      ">",
+      ">=",
+      "ts_mean",
+      "ts_std",
+      "ts_delta",
+      "ts_rank",
+      "ref",
+      "ts_corr",
+      "cs_rank",
+      "cs_zscore",
+      "cs_winsorize"
+    ],
+    "unavailable_operators": [
+      {
+        "name": "industry_neutralize",
+        "reason_zh": "历史来源缺少可核验的行业归属。"
+      },
+      {
+        "name": "size_neutralize",
+        "reason_zh": "历史来源缺少可核验的市值数据。"
+      }
+    ],
+    "can_save": true,
+    "coverage_note_zh": "字段和算子支持不代表历史数据已覆盖。"
+  },
+  "null_research": {
+    "schema_version": 2,
+    "basis_label": "历史回顾",
+    "pool_label": "全市场（沪深非 ST）",
+    "return_price_basis": "forward_adjusted",
+    "holding_sessions": 1,
+    "summary_status": "no_samples",
+    "ic_summary": {
+      "normal_ic": {
+        "status": "no_valid_days",
+        "source_day_count": 2,
+        "valid_day_count": 0,
+        "insufficient_day_count": 2,
+        "zero_variance_day_count": 0,
+        "mean": null,
+        "sample_std": null,
+        "ir": null,
+        "positive_rate": null,
+        "strong_signal_rate": null,
+        "t_value": null,
+        "p_value": null,
+        "skewness": null,
+        "excess_kurtosis": null
+      },
+      "rank_ic": {
+        "status": "no_valid_days",
+        "source_day_count": 2,
+        "valid_day_count": 0,
+        "insufficient_day_count": 2,
+        "zero_variance_day_count": 0,
+        "mean": null,
+        "sample_std": null,
+        "ir": null,
+        "positive_rate": null,
+        "strong_signal_rate": null,
+        "t_value": null,
+        "p_value": null,
+        "skewness": null,
+        "excess_kurtosis": null
+      }
+    },
+    "ic_points": [
+      {
+        "decision_date": "2026-07-03",
+        "normal_ic": {
+          "status": "insufficient_samples",
+          "value": null,
+          "source_sample_count": 0,
+          "effective_sample_count": 0
+        },
+        "rank_ic": {
+          "status": "insufficient_samples",
+          "value": null,
+          "source_sample_count": 0,
+          "effective_sample_count": 0
+        },
+        "normal_ic_cumulative_sum": null,
+        "rank_ic_cumulative_sum": null
+      },
+      {
+        "decision_date": "2026-07-04",
+        "normal_ic": {
+          "status": "insufficient_samples",
+          "value": null,
+          "source_sample_count": 0,
+          "effective_sample_count": 0
+        },
+        "rank_ic": {
+          "status": "insufficient_samples",
+          "value": null,
+          "source_sample_count": 0,
+          "effective_sample_count": 0
+        },
+        "normal_ic_cumulative_sum": null,
+        "rank_ic_cumulative_sum": null
+      }
+    ],
+    "decay_periods": [
+      {
+        "lag": 1,
+        "status": "no_valid_days",
+        "source_day_count": 2,
+        "valid_pair_count": 0,
+        "ic_summary": {
+          "normal_ic": {
+            "status": "no_valid_days",
+            "source_day_count": 2,
+            "valid_day_count": 0,
+            "insufficient_day_count": 2,
+            "zero_variance_day_count": 0,
+            "mean": null,
+            "sample_std": null,
+            "ir": null,
+            "positive_rate": null,
+            "strong_signal_rate": null,
+            "t_value": null,
+            "p_value": null,
+            "skewness": null,
+            "excess_kurtosis": null
+          },
+          "rank_ic": {
+            "status": "no_valid_days",
+            "source_day_count": 2,
+            "valid_day_count": 0,
+            "insufficient_day_count": 2,
+            "zero_variance_day_count": 0,
+            "mean": null,
+            "sample_std": null,
+            "ir": null,
+            "positive_rate": null,
+            "strong_signal_rate": null,
+            "t_value": null,
+            "p_value": null,
+            "skewness": null,
+            "excess_kurtosis": null
+          }
+        }
+      },
+      {
+        "lag": 2,
+        "status": "no_valid_days",
+        "source_day_count": 1,
+        "valid_pair_count": 0,
+        "ic_summary": {
+          "normal_ic": {
+            "status": "no_valid_days",
+            "source_day_count": 1,
+            "valid_day_count": 0,
+            "insufficient_day_count": 1,
+            "zero_variance_day_count": 0,
+            "mean": null,
+            "sample_std": null,
+            "ir": null,
+            "positive_rate": null,
+            "strong_signal_rate": null,
+            "t_value": null,
+            "p_value": null,
+            "skewness": null,
+            "excess_kurtosis": null
+          },
+          "rank_ic": {
+            "status": "no_valid_days",
+            "source_day_count": 1,
+            "valid_day_count": 0,
+            "insufficient_day_count": 1,
+            "zero_variance_day_count": 0,
+            "mean": null,
+            "sample_std": null,
+            "ir": null,
+            "positive_rate": null,
+            "strong_signal_rate": null,
+            "t_value": null,
+            "p_value": null,
+            "skewness": null,
+            "excess_kurtosis": null
+          }
+        }
+      },
+      {
+        "lag": 3,
+        "status": "no_target_period",
+        "source_day_count": 0,
+        "valid_pair_count": 0,
+        "ic_summary": null
+      },
+      {
+        "lag": 4,
+        "status": "no_target_period",
+        "source_day_count": 0,
+        "valid_pair_count": 0,
+        "ic_summary": null
+      },
+      {
+        "lag": 5,
+        "status": "no_target_period",
+        "source_day_count": 0,
+        "valid_pair_count": 0,
+        "ic_summary": null
+      },
+      {
+        "lag": 6,
+        "status": "no_target_period",
+        "source_day_count": 0,
+        "valid_pair_count": 0,
+        "ic_summary": null
+      },
+      {
+        "lag": 7,
+        "status": "no_target_period",
+        "source_day_count": 0,
+        "valid_pair_count": 0,
+        "ic_summary": null
+      },
+      {
+        "lag": 8,
+        "status": "no_target_period",
+        "source_day_count": 0,
+        "valid_pair_count": 0,
+        "ic_summary": null
+      },
+      {
+        "lag": 9,
+        "status": "no_target_period",
+        "source_day_count": 0,
+        "valid_pair_count": 0,
+        "ic_summary": null
+      },
+      {
+        "lag": 10,
+        "status": "no_target_period",
+        "source_day_count": 0,
+        "valid_pair_count": 0,
+        "ic_summary": null
+      }
+    ],
+    "portfolio_status": "insufficient_data",
+    "portfolio_days": [
+      {
+        "decision_date": "2026-07-03",
+        "groupings": [
+          {
+            "group_count": 3,
+            "status": "insufficient_samples",
+            "cumulative_status": "gap",
+            "source_sample_count": 0,
+            "effective_sample_count": 0,
+            "groups": [],
+            "long_short_return": null,
+            "long_short_cumulative_spread": null
+          },
+          {
+            "group_count": 5,
+            "status": "insufficient_samples",
+            "cumulative_status": "gap",
+            "source_sample_count": 0,
+            "effective_sample_count": 0,
+            "groups": [],
+            "long_short_return": null,
+            "long_short_cumulative_spread": null
+          },
+          {
+            "group_count": 10,
+            "status": "insufficient_samples",
+            "cumulative_status": "gap",
+            "source_sample_count": 0,
+            "effective_sample_count": 0,
+            "groups": [],
+            "long_short_return": null,
+            "long_short_cumulative_spread": null
+          }
+        ]
+      },
+      {
+        "decision_date": "2026-07-04",
+        "groupings": [
+          {
+            "group_count": 3,
+            "status": "insufficient_samples",
+            "cumulative_status": "gap",
+            "source_sample_count": 0,
+            "effective_sample_count": 0,
+            "groups": [],
+            "long_short_return": null,
+            "long_short_cumulative_spread": null
+          },
+          {
+            "group_count": 5,
+            "status": "insufficient_samples",
+            "cumulative_status": "gap",
+            "source_sample_count": 0,
+            "effective_sample_count": 0,
+            "groups": [],
+            "long_short_return": null,
+            "long_short_cumulative_spread": null
+          },
+          {
+            "group_count": 10,
+            "status": "insufficient_samples",
+            "cumulative_status": "gap",
+            "source_sample_count": 0,
+            "effective_sample_count": 0,
+            "groups": [],
+            "long_short_return": null,
+            "long_short_cumulative_spread": null
+          }
+        ]
+      }
+    ],
+    "coverage_days": [
+      {
+        "decision_date": "2026-07-03",
+        "status": "no_samples",
+        "coverage": {
+          "expected_count": 12,
+          "valid_count": 0,
+          "factor_missing_count": 12,
+          "return_missing_count": 0,
+          "factor_missing_by_reason": [
+            {
+              "reason": "missing_value",
+              "count": 12
+            }
+          ],
+          "return_missing_by_reason": []
+        }
+      },
+      {
+        "decision_date": "2026-07-04",
+        "status": "no_samples",
+        "coverage": {
+          "expected_count": 12,
+          "valid_count": 0,
+          "factor_missing_count": 12,
+          "return_missing_count": 0,
+          "factor_missing_by_reason": [
+            {
+              "reason": "missing_value",
+              "count": 12
+            }
+          ],
+          "return_missing_by_reason": []
+        }
+      }
+    ],
+    "neutralization": "none",
+    "neutralization_label": "无",
+    "context_basis_label": null,
+    "context_note": null,
+    "mad_multiple": null,
+    "extended_statistics": {
+      "ic_method": "rank",
+      "industry_status": "unavailable",
+      "industry_reason": "缺少可核验的行业来源，未生成行业 IC。",
+      "industry_summaries": [],
+      "industry_coverage_days": [],
+      "autocorrelation_points": [
+        {
+          "trade_date": "2026-07-03",
+          "previous_trade_date": null,
+          "common_count": 0,
+          "status": "first_period",
+          "value": null
+        },
+        {
+          "trade_date": "2026-07-04",
+          "previous_trade_date": "2026-07-03",
+          "common_count": 0,
+          "status": "no_common_members",
+          "value": null
+        }
+      ]
+    },
+    "daily_features": {
+      "source_sha256": "16b26062b13116c2da8098b035f61e46fd1f134f8c39b03f354f847d1f11a754",
+      "prepared_source_sha256": "fc84232aea39fec7d3693092d5ca1561e88bd1e402865b5838da8e7a653a6064",
+      "prepared_snapshot_id": "60ae4c120e357d6c97d6d0866c46b545a47f628acefe30e75df35ef596ffe4ee",
+      "prepared_binding_hash": "6c79e3c4625d833fe376bb9eb86f683d093bbff205aaec8d27058e986338aa55",
+      "scope_content_hash": "1c9090870002df127f774542ad9b0d9ea35cad7cc90f5cb31ba012b5e903a551",
+      "code_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "fields": [
+        {
+          "column": "vp90_above_reference_amount_pct",
+          "table": "daily_volume_profile_feature",
+          "name_zh": "参考价上方成交额占比",
+          "unit": "percent",
+          "description_zh": "高于参考价价格桶的原始成交额占比；等于参考价不计两侧，0–100百分比原值。",
+          "value_semantics": "volume_profile_derived"
+        },
+        {
+          "column": "vp90_above_reference_volume_pct",
+          "table": "daily_volume_profile_feature",
+          "name_zh": "参考价上方成交量占比",
+          "unit": "percent",
+          "description_zh": "高于参考价价格桶的可比股数占比；等于参考价不计两侧，0–100百分比原值。",
+          "value_semantics": "volume_profile_derived"
+        },
+        {
+          "column": "vp90_below_reference_amount_pct",
+          "table": "daily_volume_profile_feature",
+          "name_zh": "参考价下方成交额占比",
+          "unit": "percent",
+          "description_zh": "低于参考价价格桶的原始成交额占比；0–100百分比原值，不复权成交额。",
+          "value_semantics": "volume_profile_derived"
+        },
+        {
+          "column": "vp90_below_reference_volume_pct",
+          "table": "daily_volume_profile_feature",
+          "name_zh": "参考价下方成交量占比",
+          "unit": "percent",
+          "description_zh": "低于参考价价格桶的可比股数占比；价格复权、股数逆向换算，0–100百分比原值。",
+          "value_semantics": "volume_profile_derived"
+        },
+        {
+          "column": "vp90_concentration_top5_pct",
+          "table": "daily_volume_profile_feature",
+          "name_zh": "90日成交集中度",
+          "unit": "percent",
+          "description_zh": "成交量最大的5个价格桶占全部可比股数的百分比；0–100原值，非0–1比例。",
+          "value_semantics": "volume_profile_derived"
+        },
+        {
+          "column": "vp90_poc_price",
+          "table": "daily_volume_profile_feature",
+          "name_zh": "90日成交峰值价",
+          "unit": "session_price",
+          "description_zh": "可比成交量最大的价格桶；并列先取距参考价最近，再取较低价。分钟成交近似，价格单位元。",
+          "value_semantics": "volume_profile_derived"
+        },
+        {
+          "column": "vp90_total_amount",
+          "table": "daily_volume_profile_feature",
+          "name_zh": "90日原始成交额",
+          "unit": "CNY",
+          "description_zh": "日期窗口内原始分钟成交额总和，不复权；单位元。缺失输出不补零，实际覆盖按分钟日数另列。",
+          "value_semantics": "volume_profile_derived"
+        },
+        {
+          "column": "vp90_total_vol",
+          "table": "daily_volume_profile_feature",
+          "name_zh": "90日可比成交量",
+          "unit": "shares",
+          "description_zh": "原分钟股数按参考日价格基准逆向换算后求和；单位股。90日指日期窗口，覆盖按实际分钟日数另列。",
+          "value_semantics": "volume_profile_derived"
+        },
+        {
+          "column": "vp90_value_area_high",
+          "table": "daily_volume_profile_feature",
+          "name_zh": "90日价值区上沿",
+          "unit": "session_price",
+          "description_zh": "从成交峰值价连续扩展至70%可比成交量的区间上沿；保留原0.5%分桶口径，单位元。",
+          "value_semantics": "volume_profile_derived"
+        },
+        {
+          "column": "vp90_value_area_low",
+          "table": "daily_volume_profile_feature",
+          "name_zh": "90日价值区下沿",
+          "unit": "session_price",
+          "description_zh": "从成交峰值价连续扩展至70%可比成交量的区间下沿；保留原0.5%分桶口径，单位元。",
+          "value_semantics": "volume_profile_derived"
+        },
+        {
+          "column": "vp90_vwap",
+          "table": "daily_volume_profile_feature",
+          "name_zh": "90日成交均价",
+          "unit": "session_price",
+          "description_zh": "原分钟成交近似均价，按参考日复权基准计算；前90个实际日线日期窗口，可用分钟不足90日仍按实际计算。",
+          "value_semantics": "volume_profile_derived"
+        }
+      ],
+      "source_mode": "historical_retrospective",
+      "value_semantics": "volume_profile_derived",
+      "price_basis": "field_specific",
+      "recursive_initialization": "field_specific",
+      "volume_profile": {
+        "policy": {
+          "version": "original-volume-profile-v1",
+          "implementation_sha256": "70ca5338dff5f1818abd2c4a50e6d7375773c2d73c1f2f5ed6fe9d4c827f0c17",
+          "lookback_days": 90,
+          "frequency": "1min",
+          "bin_pct": 0.005,
+          "value_area_ratio": 0.7,
+          "evaluation_clock": "previous_complete_sse_session_at_next_day_09:25",
+          "window_selection": "previous_global_actual_daily_dates_strictly_before_reference",
+          "history_mode": "retrospective_no_row_first_observed_time",
+          "weight_basis": "adjusted_share_volume",
+          "amount_unit": "CNY_unadjusted",
+          "minute_price": "positive_amount_divided_by_positive_shares_else_close",
+          "source_priority": ["tushare", "tushare_rt", "other"]
+        },
+        "input_content_sha256": "980e60c9554927c62eff6e53aad42fa775f9c1b0a732e4632eba2b483e0d1bc4",
+        "output_content_sha256": "4cbf35f93a298b0b4cebce9bbf2579eb5fdaffbc997a1a0bed94af69120dc349",
+        "input_rows": 1429,
+        "output_rows": 96
+      }
+    },
+    "daily_feature_coverage_days": [
+      {
+        "trade_date": "2026-07-03",
+        "panel_date": "2026-07-02",
+        "computation_stock_count": 12,
+        "counts": [
+          {
+            "column": "vp90_above_reference_amount_pct",
+            "valid": 0,
+            "missing": 0,
+            "null": 12,
+            "non_finite": 0,
+            "volume_profile_reasons": [
+              {
+                "reason": "non_positive_profile_totals",
+                "count": 12
+              }
+            ]
+          },
+          {
+            "column": "vp90_above_reference_volume_pct",
+            "valid": 0,
+            "missing": 0,
+            "null": 12,
+            "non_finite": 0,
+            "volume_profile_reasons": [
+              {
+                "reason": "non_positive_profile_totals",
+                "count": 12
+              }
+            ]
+          },
+          {
+            "column": "vp90_below_reference_amount_pct",
+            "valid": 0,
+            "missing": 0,
+            "null": 12,
+            "non_finite": 0,
+            "volume_profile_reasons": [
+              {
+                "reason": "non_positive_profile_totals",
+                "count": 12
+              }
+            ]
+          },
+          {
+            "column": "vp90_below_reference_volume_pct",
+            "valid": 0,
+            "missing": 0,
+            "null": 12,
+            "non_finite": 0,
+            "volume_profile_reasons": [
+              {
+                "reason": "non_positive_profile_totals",
+                "count": 12
+              }
+            ]
+          },
+          {
+            "column": "vp90_concentration_top5_pct",
+            "valid": 0,
+            "missing": 0,
+            "null": 12,
+            "non_finite": 0,
+            "volume_profile_reasons": [
+              {
+                "reason": "non_positive_profile_totals",
+                "count": 12
+              }
+            ]
+          },
+          {
+            "column": "vp90_poc_price",
+            "valid": 0,
+            "missing": 0,
+            "null": 12,
+            "non_finite": 0,
+            "volume_profile_reasons": [
+              {
+                "reason": "non_positive_profile_totals",
+                "count": 12
+              }
+            ]
+          },
+          {
+            "column": "vp90_total_amount",
+            "valid": 0,
+            "missing": 0,
+            "null": 12,
+            "non_finite": 0,
+            "volume_profile_reasons": [
+              {
+                "reason": "non_positive_profile_totals",
+                "count": 12
+              }
+            ]
+          },
+          {
+            "column": "vp90_total_vol",
+            "valid": 0,
+            "missing": 0,
+            "null": 12,
+            "non_finite": 0,
+            "volume_profile_reasons": [
+              {
+                "reason": "non_positive_profile_totals",
+                "count": 12
+              }
+            ]
+          },
+          {
+            "column": "vp90_value_area_high",
+            "valid": 0,
+            "missing": 0,
+            "null": 12,
+            "non_finite": 0,
+            "volume_profile_reasons": [
+              {
+                "reason": "non_positive_profile_totals",
+                "count": 12
+              }
+            ]
+          },
+          {
+            "column": "vp90_value_area_low",
+            "valid": 0,
+            "missing": 0,
+            "null": 12,
+            "non_finite": 0,
+            "volume_profile_reasons": [
+              {
+                "reason": "non_positive_profile_totals",
+                "count": 12
+              }
+            ]
+          },
+          {
+            "column": "vp90_vwap",
+            "valid": 0,
+            "missing": 0,
+            "null": 12,
+            "non_finite": 0,
+            "volume_profile_reasons": [
+              {
+                "reason": "non_positive_profile_totals",
+                "count": 12
+              }
+            ]
+          }
+        ],
+        "volume_profile_values": [
+          {
+            "stock_code": "000001.SZ",
+            "values": [
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_above_reference_amount_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_above_reference_volume_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_below_reference_amount_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_below_reference_volume_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_concentration_top5_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_poc_price"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_total_amount"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_total_vol"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_value_area_high"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_value_area_low"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_vwap"
+              }
+            ],
+            "diagnostic": {
+              "reference_date": "2026-07-02",
+              "window_start_date": "2026-04-03",
+              "window_end_date": "2026-07-01",
+              "window_days": 90,
+              "observed_days": 5,
+              "outside_window_days": 0,
+              "minute_rows": 5,
+              "reference_factor": 1.0,
+              "unavailable_factor_dates": []
+            }
+          },
+          {
+            "stock_code": "000002.SZ",
+            "values": [
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_above_reference_amount_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_above_reference_volume_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_below_reference_amount_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_below_reference_volume_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_concentration_top5_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_poc_price"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_total_amount"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_total_vol"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_value_area_high"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_value_area_low"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_vwap"
+              }
+            ],
+            "diagnostic": {
+              "reference_date": "2026-07-02",
+              "window_start_date": "2026-04-03",
+              "window_end_date": "2026-07-01",
+              "window_days": 90,
+              "observed_days": 5,
+              "outside_window_days": 0,
+              "minute_rows": 5,
+              "reference_factor": 1.0,
+              "unavailable_factor_dates": []
+            }
+          },
+          {
+            "stock_code": "000003.SZ",
+            "values": [
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_above_reference_amount_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_above_reference_volume_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_below_reference_amount_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_below_reference_volume_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_concentration_top5_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_poc_price"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_total_amount"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_total_vol"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_value_area_high"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_value_area_low"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_vwap"
+              }
+            ],
+            "diagnostic": {
+              "reference_date": "2026-07-02",
+              "window_start_date": "2026-04-03",
+              "window_end_date": "2026-07-01",
+              "window_days": 90,
+              "observed_days": 5,
+              "outside_window_days": 0,
+              "minute_rows": 5,
+              "reference_factor": 1.0,
+              "unavailable_factor_dates": []
+            }
+          },
+          {
+            "stock_code": "000004.SZ",
+            "values": [
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_above_reference_amount_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_above_reference_volume_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_below_reference_amount_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_below_reference_volume_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_concentration_top5_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_poc_price"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_total_amount"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_total_vol"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_value_area_high"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_value_area_low"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_vwap"
+              }
+            ],
+            "diagnostic": {
+              "reference_date": "2026-07-02",
+              "window_start_date": "2026-04-03",
+              "window_end_date": "2026-07-01",
+              "window_days": 90,
+              "observed_days": 5,
+              "outside_window_days": 0,
+              "minute_rows": 5,
+              "reference_factor": 1.0,
+              "unavailable_factor_dates": []
+            }
+          },
+          {
+            "stock_code": "000005.SZ",
+            "values": [
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_above_reference_amount_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_above_reference_volume_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_below_reference_amount_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_below_reference_volume_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_concentration_top5_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_poc_price"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_total_amount"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_total_vol"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_value_area_high"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_value_area_low"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_vwap"
+              }
+            ],
+            "diagnostic": {
+              "reference_date": "2026-07-02",
+              "window_start_date": "2026-04-03",
+              "window_end_date": "2026-07-01",
+              "window_days": 90,
+              "observed_days": 5,
+              "outside_window_days": 0,
+              "minute_rows": 5,
+              "reference_factor": 1.0,
+              "unavailable_factor_dates": []
+            }
+          },
+          {
+            "stock_code": "000006.SZ",
+            "values": [
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_above_reference_amount_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_above_reference_volume_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_below_reference_amount_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_below_reference_volume_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_concentration_top5_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_poc_price"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_total_amount"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_total_vol"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_value_area_high"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_value_area_low"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_vwap"
+              }
+            ],
+            "diagnostic": {
+              "reference_date": "2026-07-02",
+              "window_start_date": "2026-04-03",
+              "window_end_date": "2026-07-01",
+              "window_days": 90,
+              "observed_days": 5,
+              "outside_window_days": 0,
+              "minute_rows": 5,
+              "reference_factor": 1.0,
+              "unavailable_factor_dates": []
+            }
+          },
+          {
+            "stock_code": "000007.SZ",
+            "values": [
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_above_reference_amount_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_above_reference_volume_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_below_reference_amount_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_below_reference_volume_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_concentration_top5_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_poc_price"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_total_amount"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_total_vol"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_value_area_high"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_value_area_low"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_vwap"
+              }
+            ],
+            "diagnostic": {
+              "reference_date": "2026-07-02",
+              "window_start_date": "2026-04-03",
+              "window_end_date": "2026-07-01",
+              "window_days": 90,
+              "observed_days": 5,
+              "outside_window_days": 0,
+              "minute_rows": 5,
+              "reference_factor": 1.0,
+              "unavailable_factor_dates": []
+            }
+          },
+          {
+            "stock_code": "000008.SZ",
+            "values": [
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_above_reference_amount_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_above_reference_volume_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_below_reference_amount_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_below_reference_volume_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_concentration_top5_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_poc_price"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_total_amount"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_total_vol"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_value_area_high"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_value_area_low"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_vwap"
+              }
+            ],
+            "diagnostic": {
+              "reference_date": "2026-07-02",
+              "window_start_date": "2026-04-03",
+              "window_end_date": "2026-07-01",
+              "window_days": 90,
+              "observed_days": 5,
+              "outside_window_days": 0,
+              "minute_rows": 5,
+              "reference_factor": 1.0,
+              "unavailable_factor_dates": []
+            }
+          },
+          {
+            "stock_code": "000009.SZ",
+            "values": [
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_above_reference_amount_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_above_reference_volume_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_below_reference_amount_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_below_reference_volume_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_concentration_top5_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_poc_price"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_total_amount"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_total_vol"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_value_area_high"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_value_area_low"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_vwap"
+              }
+            ],
+            "diagnostic": {
+              "reference_date": "2026-07-02",
+              "window_start_date": "2026-04-03",
+              "window_end_date": "2026-07-01",
+              "window_days": 90,
+              "observed_days": 5,
+              "outside_window_days": 0,
+              "minute_rows": 5,
+              "reference_factor": 1.0,
+              "unavailable_factor_dates": []
+            }
+          },
+          {
+            "stock_code": "000010.SZ",
+            "values": [
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_above_reference_amount_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_above_reference_volume_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_below_reference_amount_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_below_reference_volume_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_concentration_top5_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_poc_price"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_total_amount"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_total_vol"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_value_area_high"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_value_area_low"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_vwap"
+              }
+            ],
+            "diagnostic": {
+              "reference_date": "2026-07-02",
+              "window_start_date": "2026-04-03",
+              "window_end_date": "2026-07-01",
+              "window_days": 90,
+              "observed_days": 5,
+              "outside_window_days": 0,
+              "minute_rows": 5,
+              "reference_factor": 1.0,
+              "unavailable_factor_dates": []
+            }
+          }
+        ]
+      },
+      {
+        "trade_date": "2026-07-04",
+        "panel_date": "2026-07-03",
+        "computation_stock_count": 12,
+        "counts": [
+          {
+            "column": "vp90_above_reference_amount_pct",
+            "valid": 0,
+            "missing": 0,
+            "null": 12,
+            "non_finite": 0,
+            "volume_profile_reasons": [
+              {
+                "reason": "non_positive_profile_totals",
+                "count": 12
+              }
+            ]
+          },
+          {
+            "column": "vp90_above_reference_volume_pct",
+            "valid": 0,
+            "missing": 0,
+            "null": 12,
+            "non_finite": 0,
+            "volume_profile_reasons": [
+              {
+                "reason": "non_positive_profile_totals",
+                "count": 12
+              }
+            ]
+          },
+          {
+            "column": "vp90_below_reference_amount_pct",
+            "valid": 0,
+            "missing": 0,
+            "null": 12,
+            "non_finite": 0,
+            "volume_profile_reasons": [
+              {
+                "reason": "non_positive_profile_totals",
+                "count": 12
+              }
+            ]
+          },
+          {
+            "column": "vp90_below_reference_volume_pct",
+            "valid": 0,
+            "missing": 0,
+            "null": 12,
+            "non_finite": 0,
+            "volume_profile_reasons": [
+              {
+                "reason": "non_positive_profile_totals",
+                "count": 12
+              }
+            ]
+          },
+          {
+            "column": "vp90_concentration_top5_pct",
+            "valid": 0,
+            "missing": 0,
+            "null": 12,
+            "non_finite": 0,
+            "volume_profile_reasons": [
+              {
+                "reason": "non_positive_profile_totals",
+                "count": 12
+              }
+            ]
+          },
+          {
+            "column": "vp90_poc_price",
+            "valid": 0,
+            "missing": 0,
+            "null": 12,
+            "non_finite": 0,
+            "volume_profile_reasons": [
+              {
+                "reason": "non_positive_profile_totals",
+                "count": 12
+              }
+            ]
+          },
+          {
+            "column": "vp90_total_amount",
+            "valid": 0,
+            "missing": 0,
+            "null": 12,
+            "non_finite": 0,
+            "volume_profile_reasons": [
+              {
+                "reason": "non_positive_profile_totals",
+                "count": 12
+              }
+            ]
+          },
+          {
+            "column": "vp90_total_vol",
+            "valid": 0,
+            "missing": 0,
+            "null": 12,
+            "non_finite": 0,
+            "volume_profile_reasons": [
+              {
+                "reason": "non_positive_profile_totals",
+                "count": 12
+              }
+            ]
+          },
+          {
+            "column": "vp90_value_area_high",
+            "valid": 0,
+            "missing": 0,
+            "null": 12,
+            "non_finite": 0,
+            "volume_profile_reasons": [
+              {
+                "reason": "non_positive_profile_totals",
+                "count": 12
+              }
+            ]
+          },
+          {
+            "column": "vp90_value_area_low",
+            "valid": 0,
+            "missing": 0,
+            "null": 12,
+            "non_finite": 0,
+            "volume_profile_reasons": [
+              {
+                "reason": "non_positive_profile_totals",
+                "count": 12
+              }
+            ]
+          },
+          {
+            "column": "vp90_vwap",
+            "valid": 0,
+            "missing": 0,
+            "null": 12,
+            "non_finite": 0,
+            "volume_profile_reasons": [
+              {
+                "reason": "non_positive_profile_totals",
+                "count": 12
+              }
+            ]
+          }
+        ],
+        "volume_profile_values": [
+          {
+            "stock_code": "000001.SZ",
+            "values": [
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_above_reference_amount_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_above_reference_volume_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_below_reference_amount_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_below_reference_volume_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_concentration_top5_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_poc_price"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_total_amount"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_total_vol"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_value_area_high"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_value_area_low"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_vwap"
+              }
+            ],
+            "diagnostic": {
+              "reference_date": "2026-07-03",
+              "window_start_date": "2026-04-04",
+              "window_end_date": "2026-07-02",
+              "window_days": 90,
+              "observed_days": 5,
+              "outside_window_days": 0,
+              "minute_rows": 5,
+              "reference_factor": 1.0,
+              "unavailable_factor_dates": []
+            }
+          },
+          {
+            "stock_code": "000002.SZ",
+            "values": [
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_above_reference_amount_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_above_reference_volume_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_below_reference_amount_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_below_reference_volume_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_concentration_top5_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_poc_price"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_total_amount"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_total_vol"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_value_area_high"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_value_area_low"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_vwap"
+              }
+            ],
+            "diagnostic": {
+              "reference_date": "2026-07-03",
+              "window_start_date": "2026-04-04",
+              "window_end_date": "2026-07-02",
+              "window_days": 90,
+              "observed_days": 5,
+              "outside_window_days": 0,
+              "minute_rows": 5,
+              "reference_factor": 1.0,
+              "unavailable_factor_dates": []
+            }
+          },
+          {
+            "stock_code": "000003.SZ",
+            "values": [
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_above_reference_amount_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_above_reference_volume_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_below_reference_amount_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_below_reference_volume_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_concentration_top5_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_poc_price"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_total_amount"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_total_vol"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_value_area_high"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_value_area_low"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_vwap"
+              }
+            ],
+            "diagnostic": {
+              "reference_date": "2026-07-03",
+              "window_start_date": "2026-04-04",
+              "window_end_date": "2026-07-02",
+              "window_days": 90,
+              "observed_days": 5,
+              "outside_window_days": 0,
+              "minute_rows": 5,
+              "reference_factor": 1.0,
+              "unavailable_factor_dates": []
+            }
+          },
+          {
+            "stock_code": "000004.SZ",
+            "values": [
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_above_reference_amount_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_above_reference_volume_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_below_reference_amount_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_below_reference_volume_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_concentration_top5_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_poc_price"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_total_amount"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_total_vol"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_value_area_high"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_value_area_low"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_vwap"
+              }
+            ],
+            "diagnostic": {
+              "reference_date": "2026-07-03",
+              "window_start_date": "2026-04-04",
+              "window_end_date": "2026-07-02",
+              "window_days": 90,
+              "observed_days": 5,
+              "outside_window_days": 0,
+              "minute_rows": 5,
+              "reference_factor": 1.0,
+              "unavailable_factor_dates": []
+            }
+          },
+          {
+            "stock_code": "000005.SZ",
+            "values": [
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_above_reference_amount_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_above_reference_volume_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_below_reference_amount_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_below_reference_volume_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_concentration_top5_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_poc_price"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_total_amount"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_total_vol"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_value_area_high"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_value_area_low"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_vwap"
+              }
+            ],
+            "diagnostic": {
+              "reference_date": "2026-07-03",
+              "window_start_date": "2026-04-04",
+              "window_end_date": "2026-07-02",
+              "window_days": 90,
+              "observed_days": 5,
+              "outside_window_days": 0,
+              "minute_rows": 5,
+              "reference_factor": 1.0,
+              "unavailable_factor_dates": []
+            }
+          },
+          {
+            "stock_code": "000006.SZ",
+            "values": [
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_above_reference_amount_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_above_reference_volume_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_below_reference_amount_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_below_reference_volume_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_concentration_top5_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_poc_price"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_total_amount"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_total_vol"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_value_area_high"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_value_area_low"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_vwap"
+              }
+            ],
+            "diagnostic": {
+              "reference_date": "2026-07-03",
+              "window_start_date": "2026-04-04",
+              "window_end_date": "2026-07-02",
+              "window_days": 90,
+              "observed_days": 5,
+              "outside_window_days": 0,
+              "minute_rows": 5,
+              "reference_factor": 1.0,
+              "unavailable_factor_dates": []
+            }
+          },
+          {
+            "stock_code": "000007.SZ",
+            "values": [
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_above_reference_amount_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_above_reference_volume_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_below_reference_amount_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_below_reference_volume_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_concentration_top5_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_poc_price"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_total_amount"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_total_vol"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_value_area_high"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_value_area_low"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_vwap"
+              }
+            ],
+            "diagnostic": {
+              "reference_date": "2026-07-03",
+              "window_start_date": "2026-04-04",
+              "window_end_date": "2026-07-02",
+              "window_days": 90,
+              "observed_days": 5,
+              "outside_window_days": 0,
+              "minute_rows": 5,
+              "reference_factor": 1.0,
+              "unavailable_factor_dates": []
+            }
+          },
+          {
+            "stock_code": "000008.SZ",
+            "values": [
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_above_reference_amount_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_above_reference_volume_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_below_reference_amount_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_below_reference_volume_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_concentration_top5_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_poc_price"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_total_amount"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_total_vol"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_value_area_high"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_value_area_low"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_vwap"
+              }
+            ],
+            "diagnostic": {
+              "reference_date": "2026-07-03",
+              "window_start_date": "2026-04-04",
+              "window_end_date": "2026-07-02",
+              "window_days": 90,
+              "observed_days": 5,
+              "outside_window_days": 0,
+              "minute_rows": 5,
+              "reference_factor": 1.0,
+              "unavailable_factor_dates": []
+            }
+          },
+          {
+            "stock_code": "000009.SZ",
+            "values": [
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_above_reference_amount_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_above_reference_volume_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_below_reference_amount_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_below_reference_volume_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_concentration_top5_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_poc_price"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_total_amount"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_total_vol"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_value_area_high"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_value_area_low"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_vwap"
+              }
+            ],
+            "diagnostic": {
+              "reference_date": "2026-07-03",
+              "window_start_date": "2026-04-04",
+              "window_end_date": "2026-07-02",
+              "window_days": 90,
+              "observed_days": 5,
+              "outside_window_days": 0,
+              "minute_rows": 5,
+              "reference_factor": 1.0,
+              "unavailable_factor_dates": []
+            }
+          },
+          {
+            "stock_code": "000010.SZ",
+            "values": [
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_above_reference_amount_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_above_reference_volume_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_below_reference_amount_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_below_reference_volume_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_concentration_top5_pct"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_poc_price"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_total_amount"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_total_vol"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_value_area_high"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_value_area_low"
+              },
+              {
+                "status": "null",
+                "value": null,
+                "reason": "non_positive_profile_totals",
+                "column": "vp90_vwap"
+              }
+            ],
+            "diagnostic": {
+              "reference_date": "2026-07-03",
+              "window_start_date": "2026-04-04",
+              "window_end_date": "2026-07-02",
+              "window_days": 90,
+              "observed_days": 5,
+              "outside_window_days": 0,
+              "minute_rows": 5,
+              "reference_factor": 1.0,
+              "unavailable_factor_dates": []
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "mixed_capability": {
+    "version": "daily_volume_profile_v1",
+    "source_mode": "historical_retrospective",
+    "fields": [
+      {
+        "column": "open",
+        "name_zh": "开盘价",
+        "description_zh": "日线记录的开盘价。"
+      },
+      {
+        "column": "high",
+        "name_zh": "最高价",
+        "description_zh": "日线记录的最高价。"
+      },
+      {
+        "column": "low",
+        "name_zh": "最低价",
+        "description_zh": "日线记录的最低价。"
+      },
+      {
+        "column": "close",
+        "name_zh": "收盘价",
+        "description_zh": "日线记录的收盘价。"
+      },
+      {
+        "column": "vol",
+        "name_zh": "成交量",
+        "description_zh": "日线记录的成交量。"
+      },
+      {
+        "column": "amount",
+        "name_zh": "成交额",
+        "description_zh": "日线记录的成交额。"
+      },
+      {
+        "column": "circ_mv",
+        "name_zh": "流通市值",
+        "description_zh": "当日流通市值原值，单位万元。",
+        "unit": "CNY_10000",
+        "value_semantics": "stored_not_recomputed",
+        "tracking_supported": true
+      },
+      {
+        "column": "kdj_d",
+        "name_zh": "KDJ D",
+        "description_zh": "从首个有效历史观察推导；历史断裂不重置。",
+        "unit": "indicator",
+        "value_semantics": "history_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "kdj_j",
+        "name_zh": "KDJ J",
+        "description_zh": "从首个有效历史观察推导；历史断裂不重置，KDJ J保留原值。",
+        "unit": "indicator",
+        "value_semantics": "history_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "kdj_k",
+        "name_zh": "KDJ K",
+        "description_zh": "从首个有效历史观察推导；历史断裂不重置。",
+        "unit": "indicator",
+        "value_semantics": "history_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "ma10",
+        "name_zh": "10日均线",
+        "description_zh": "从首个有效历史观察推导，按观察日复权因子计算、当日因子还原价格。",
+        "unit": "session_price",
+        "value_semantics": "history_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "ma20",
+        "name_zh": "20日均线",
+        "description_zh": "从首个有效历史观察推导，按观察日复权因子计算、当日因子还原价格。",
+        "unit": "session_price",
+        "value_semantics": "history_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "ma5",
+        "name_zh": "5日均线",
+        "description_zh": "从首个有效历史观察推导，按观察日复权因子计算、当日因子还原价格。",
+        "unit": "session_price",
+        "value_semantics": "history_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "ma60",
+        "name_zh": "60日均线",
+        "description_zh": "从首个有效历史观察推导，按观察日复权因子计算、当日因子还原价格。",
+        "unit": "session_price",
+        "value_semantics": "history_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "macd",
+        "name_zh": "MACD DIF",
+        "description_zh": "从首个有效历史观察推导，按观察日复权因子计算、当日因子还原价格。",
+        "unit": "session_price",
+        "value_semantics": "history_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "macd_hist",
+        "name_zh": "MACD柱差值",
+        "description_zh": "从首个有效历史观察推导，按观察日复权因子计算、当日因子还原价格。",
+        "unit": "session_price",
+        "value_semantics": "history_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "macd_signal",
+        "name_zh": "MACD信号线",
+        "description_zh": "从首个有效历史观察推导，按观察日复权因子计算、当日因子还原价格。",
+        "unit": "session_price",
+        "value_semantics": "history_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "rsi14",
+        "name_zh": "14日RSI",
+        "description_zh": "从首个有效历史观察推导；历史断裂不重置。",
+        "unit": "indicator",
+        "value_semantics": "history_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "rsi6",
+        "name_zh": "6日RSI",
+        "description_zh": "从首个有效历史观察推导；历史断裂不重置。",
+        "unit": "indicator",
+        "value_semantics": "history_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "total_mv",
+        "name_zh": "总市值",
+        "description_zh": "当日总市值原值，单位万元。",
+        "unit": "CNY_10000",
+        "value_semantics": "stored_not_recomputed",
+        "tracking_supported": true
+      },
+      {
+        "column": "turnover_rate",
+        "name_zh": "换手率",
+        "description_zh": "百分数原值；0.5387表示0.5387%，不乘100。",
+        "unit": "percent",
+        "value_semantics": "stored_not_recomputed",
+        "tracking_supported": true
+      },
+      {
+        "column": "volume_ratio",
+        "name_zh": "量比",
+        "description_zh": "供应方当日量比原值，不由日线重算。",
+        "unit": "ratio",
+        "value_semantics": "stored_not_recomputed",
+        "tracking_supported": true
+      },
+      {
+        "column": "accum_ad_flow_20d_pct",
+        "name_zh": "20日资金流代理",
+        "description_zh": "排除参考日；原日线价格尺度不变的资金流乘数×成交量/绝对成交量，不依赖复权。",
+        "unit": "percent",
+        "value_semantics": "stock_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "accum_close_position_avg_20d_pct",
+        "name_zh": "20日收盘位置均值",
+        "description_zh": "排除参考日；原日线(收盘−最低)/(最高−最低)裁到0–1后均值百分数。",
+        "unit": "percent",
+        "value_semantics": "stock_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "accum_heavy_no_drop_days_20d",
+        "name_zh": "20日放量不跌观察数",
+        "description_zh": "排除参考日；成交额≥窗口中位数1.5倍且涨跌幅≥−1%的观察数。",
+        "unit": "observations",
+        "value_semantics": "stock_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "accum_obv_change_20d_pct",
+        "name_zh": "20日能量潮变化",
+        "description_zh": "排除参考日，完整窗口及参考日复权基准；收盘涨跌方向量变化/绝对成交量的百分数。",
+        "unit": "percent",
+        "value_semantics": "stock_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "accum_up_down_amount_ratio_20d",
+        "name_zh": "20日涨跌成交额比",
+        "description_zh": "排除参考日；按原涨跌幅正负累积成交额，跌日成交额为零时无值。",
+        "unit": "ratio",
+        "value_semantics": "stock_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "accum_window_days_20d",
+        "name_zh": "吸筹实际观察数",
+        "description_zh": "参考日之前最近最多20观察，不含参考日。",
+        "unit": "observations",
+        "value_semantics": "stock_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "distance_to_high_120d_pct",
+        "name_zh": "距120日最高价",
+        "description_zh": "窗口最高价/参考收盘价−1的百分数；按参考日复权，不二次乘100。",
+        "unit": "percent",
+        "value_semantics": "stock_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "distance_to_high_250d_pct",
+        "name_zh": "距250日最高价",
+        "description_zh": "窗口最高价/参考收盘价−1的百分数；按参考日复权，不二次乘100。",
+        "unit": "percent",
+        "value_semantics": "stock_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "distance_to_high_90d_pct",
+        "name_zh": "距90日最高价",
+        "description_zh": "窗口最高价/参考收盘价−1的百分数；按参考日复权，不二次乘100。",
+        "unit": "percent",
+        "value_semantics": "stock_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "distance_to_low_120d_pct",
+        "name_zh": "距120日最低价",
+        "description_zh": "参考收盘价/窗口最低价−1的百分数；按参考日复权，不二次乘100。",
+        "unit": "percent",
+        "value_semantics": "stock_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "distance_to_low_250d_pct",
+        "name_zh": "距250日最低价",
+        "description_zh": "参考收盘价/窗口最低价−1的百分数；按参考日复权，不二次乘100。",
+        "unit": "percent",
+        "value_semantics": "stock_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "distance_to_low_90d_pct",
+        "name_zh": "距90日最低价",
+        "description_zh": "参考收盘价/窗口最低价−1的百分数；按参考日复权，不二次乘100。",
+        "unit": "percent",
+        "value_semantics": "stock_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "ma_alignment",
+        "name_zh": "均线多头排列",
+        "description_zh": "满60个日线观察，按参考日复权，5日>10日>20日>60日均线时为1，否则为0。",
+        "unit": "binary",
+        "value_semantics": "stock_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "price_percentile_250d",
+        "name_zh": "250日收盘百分位",
+        "description_zh": "满250个日线观察，含参考日及并列；小于或等于参考价的比例，取值0–1。",
+        "unit": "ratio",
+        "value_semantics": "stock_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "price_position_120d_pct",
+        "name_zh": "120日价格位置",
+        "description_zh": "含参考日的实际观察，完整复权到参考日；平价为50%，短窗口仍计算。",
+        "unit": "percent",
+        "value_semantics": "stock_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "price_position_250d_pct",
+        "name_zh": "250日价格位置",
+        "description_zh": "含参考日的实际观察，完整复权到参考日；平价为50%，短窗口仍计算。",
+        "unit": "percent",
+        "value_semantics": "stock_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "price_position_90d_pct",
+        "name_zh": "90日价格位置",
+        "description_zh": "含参考日的实际观察，完整复权到参考日；平价为50%，短窗口仍计算。",
+        "unit": "percent",
+        "value_semantics": "stock_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "price_rank_120d_pct",
+        "name_zh": "120日价格排名",
+        "description_zh": "含参考日的最近最多120观察，复权收盘价小于或等于参考价的百分数，包含并列。",
+        "unit": "percent",
+        "value_semantics": "stock_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "price_rank_250d_pct",
+        "name_zh": "250日价格排名",
+        "description_zh": "含参考日的最近最多250观察，复权收盘价小于或等于参考价的百分数，包含并列。",
+        "unit": "percent",
+        "value_semantics": "stock_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "price_rank_90d_pct",
+        "name_zh": "90日价格排名",
+        "description_zh": "含参考日的最近最多90观察，复权收盘价小于或等于参考价的百分数，包含并列。",
+        "unit": "percent",
+        "value_semantics": "stock_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "price_window_days_120d",
+        "name_zh": "120日实际观察数",
+        "description_zh": "含参考日，最近最多120个日线观察；短窗口保留实际观察数。",
+        "unit": "observations",
+        "value_semantics": "stock_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "price_window_days_250d",
+        "name_zh": "250日实际观察数",
+        "description_zh": "含参考日，最近最多250个日线观察；短窗口保留实际观察数。",
+        "unit": "observations",
+        "value_semantics": "stock_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "price_window_days_90d",
+        "name_zh": "90日实际观察数",
+        "description_zh": "含参考日，最近最多90个日线观察；短窗口保留实际观察数。",
+        "unit": "observations",
+        "value_semantics": "stock_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "hist_cum_amount_asof_median_20d",
+        "name_zh": "历史累计成交额中位数",
+        "description_zh": "原核前最多20个实际观察日截至15:00累计成交额中位数，单位元。",
+        "unit": "CNY",
+        "value_semantics": "minute_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "hist_intraday_days_20d",
+        "name_zh": "历史分钟观察日数",
+        "description_zh": "原核截至15:00实际有分钟记录的历史日数，0有效。",
+        "unit": "observations",
+        "value_semantics": "minute_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "hist_same_minute_amount_median_20d",
+        "name_zh": "历史同分钟成交额中位数",
+        "description_zh": "前最多20个实际观察日的15:00分钟成交额中位数，单位元。",
+        "unit": "CNY",
+        "value_semantics": "minute_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "signal_amount_accel_10m",
+        "name_zh": "10观察成交额加速",
+        "description_zh": "15:00成交额/此前最近最多10个正成交额分钟中位数；短窗口仍计算。",
+        "unit": "ratio",
+        "value_semantics": "minute_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "signal_amount_accel_5m",
+        "name_zh": "5观察成交额加速",
+        "description_zh": "15:00成交额/此前最近最多5个正成交额分钟中位数；短窗口仍计算。",
+        "unit": "ratio",
+        "value_semantics": "minute_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "signal_cum_amount_asof",
+        "name_zh": "15:00累计成交额",
+        "description_zh": "目标分钟存在时，当日截至15:00实际分钟成交额累计，单位元。",
+        "unit": "CNY",
+        "value_semantics": "minute_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "signal_minute_amount",
+        "name_zh": "15:00分钟成交额",
+        "description_zh": "精确15:00分钟成交额，单位元；缺该分钟不回退。",
+        "unit": "CNY",
+        "value_semantics": "minute_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "signal_opening_segment",
+        "name_zh": "开盘段标记",
+        "description_zh": "实际15:00观察存在时为0；缺目标分钟无值。",
+        "unit": "binary",
+        "value_semantics": "minute_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "signal_opening_segment_amount",
+        "name_zh": "开盘段成交额",
+        "description_zh": "固定15:00观察不适用，保留原核无值。",
+        "unit": "CNY",
+        "value_semantics": "minute_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "signal_rel_amount_same_minute_20d",
+        "name_zh": "同分钟相对成交额",
+        "description_zh": "目标成交额/历史同分钟成交额中位数；零基准无值。",
+        "unit": "ratio",
+        "value_semantics": "minute_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "signal_rel_cum_amount_asof_20d",
+        "name_zh": "累计相对成交额",
+        "description_zh": "当日累计成交额/历史累计成交额中位数；零基准无值。",
+        "unit": "ratio",
+        "value_semantics": "minute_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "market_above_ma20_ratio_pct",
+        "name_zh": "20日均线上方占比",
+        "description_zh": "全市场20日均线上方股票占比，百分比原值；前一完整SSE交易日，历史回顾。",
+        "unit": "percent",
+        "value_semantics": "market_temperature_stored",
+        "tracking_supported": true
+      },
+      {
+        "column": "market_high_60d_ratio_pct",
+        "name_zh": "60日新高占比",
+        "description_zh": "全市场60日新高股票占比，百分比原值；前一完整SSE交易日，历史回顾。",
+        "unit": "percent",
+        "value_semantics": "market_temperature_stored",
+        "tracking_supported": true
+      },
+      {
+        "column": "board_auction_amount_ratio",
+        "name_zh": "题材竞价金额比",
+        "description_zh": "题材竞价总额/当前成员前最多20个实际竞价日总额中位数；倍数原值，前一完整SSE开市日。",
+        "unit": "ratio",
+        "value_semantics": "auction_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "board_gap_up_ratio",
+        "name_zh": "题材竞价高开占比",
+        "description_zh": "题材内有效竞价价高于昨收的成员占比；0–1比例原值，前一完整SSE开市日。",
+        "unit": "ratio",
+        "value_semantics": "auction_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "board_member_count",
+        "name_zh": "题材成员数",
+        "description_zh": "原题材完整成员数，不按所选股票池重算；前一完整SSE开市日。",
+        "unit": "observations",
+        "value_semantics": "auction_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "vp90_above_reference_amount_pct",
+        "name_zh": "参考价上方成交额占比",
+        "description_zh": "高于参考价价格桶的原始成交额占比；等于参考价不计两侧，0–100百分比原值。",
+        "unit": "percent",
+        "value_semantics": "volume_profile_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "vp90_above_reference_volume_pct",
+        "name_zh": "参考价上方成交量占比",
+        "description_zh": "高于参考价价格桶的可比股数占比；等于参考价不计两侧，0–100百分比原值。",
+        "unit": "percent",
+        "value_semantics": "volume_profile_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "vp90_below_reference_amount_pct",
+        "name_zh": "参考价下方成交额占比",
+        "description_zh": "低于参考价价格桶的原始成交额占比；0–100百分比原值，不复权成交额。",
+        "unit": "percent",
+        "value_semantics": "volume_profile_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "vp90_below_reference_volume_pct",
+        "name_zh": "参考价下方成交量占比",
+        "description_zh": "低于参考价价格桶的可比股数占比；价格复权、股数逆向换算，0–100百分比原值。",
+        "unit": "percent",
+        "value_semantics": "volume_profile_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "vp90_concentration_top5_pct",
+        "name_zh": "90日成交集中度",
+        "description_zh": "成交量最大的5个价格桶占全部可比股数的百分比；0–100原值，非0–1比例。",
+        "unit": "percent",
+        "value_semantics": "volume_profile_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "vp90_poc_price",
+        "name_zh": "90日成交峰值价",
+        "description_zh": "可比成交量最大的价格桶；并列先取距参考价最近，再取较低价。分钟成交近似，价格单位元。",
+        "unit": "session_price",
+        "value_semantics": "volume_profile_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "vp90_total_amount",
+        "name_zh": "90日原始成交额",
+        "description_zh": "日期窗口内原始分钟成交额总和，不复权；单位元。缺失输出不补零，实际覆盖按分钟日数另列。",
+        "unit": "CNY",
+        "value_semantics": "volume_profile_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "vp90_total_vol",
+        "name_zh": "90日可比成交量",
+        "description_zh": "原分钟股数按参考日价格基准逆向换算后求和；单位股。90日指日期窗口，覆盖按实际分钟日数另列。",
+        "unit": "shares",
+        "value_semantics": "volume_profile_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "vp90_value_area_high",
+        "name_zh": "90日价值区上沿",
+        "description_zh": "从成交峰值价连续扩展至70%可比成交量的区间上沿；保留原0.5%分桶口径，单位元。",
+        "unit": "session_price",
+        "value_semantics": "volume_profile_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "vp90_value_area_low",
+        "name_zh": "90日价值区下沿",
+        "description_zh": "从成交峰值价连续扩展至70%可比成交量的区间下沿；保留原0.5%分桶口径，单位元。",
+        "unit": "session_price",
+        "value_semantics": "volume_profile_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "vp90_vwap",
+        "name_zh": "90日成交均价",
+        "description_zh": "原分钟成交近似均价，按参考日复权基准计算；前90个实际日线日期窗口，可用分钟不足90日仍按实际计算。",
+        "unit": "session_price",
+        "value_semantics": "volume_profile_derived",
+        "tracking_supported": true
+      }
+    ],
+    "runnable_operators": [
+      "+",
+      "-",
+      "*",
+      "/",
+      "<",
+      "<=",
+      ">",
+      ">=",
+      "ts_mean",
+      "ts_std",
+      "ts_delta",
+      "ts_rank",
+      "ref",
+      "ts_corr",
+      "cs_rank",
+      "cs_zscore",
+      "cs_winsorize"
+    ],
+    "unavailable_operators": [
+      {
+        "name": "industry_neutralize",
+        "reason_zh": "历史来源缺少可核验的行业归属。"
+      },
+      {
+        "name": "size_neutralize",
+        "reason_zh": "历史来源缺少可核验的市值数据。"
+      }
+    ],
+    "can_save": true,
+    "coverage_note_zh": "字段和算子支持不代表历史数据已覆盖。"
+  }
+}

@@ -26,7 +26,7 @@ from multiprocessing.context import AuthenticationError
 from multiprocessing.process import BaseProcess
 from pathlib import Path
 from types import FrameType
-from typing import Literal, TypeVar
+from typing import TYPE_CHECKING, Literal, TypeVar
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import pandas as pd
@@ -128,6 +128,15 @@ from rquant.strict_json import (
     strict_canonical_json_loads,
     strict_model_validate_canonical_json,
 )
+
+if TYPE_CHECKING:
+    from rquant.minute_backtest_producer import MinuteReplayCatalog
+    from rquant.minute_backtest_parameter_producer import MinuteParameterReplayCatalog
+    from rquant.paper_research import PaperResearchAdapterCatalog
+    from rquant.paper_research_runtime import PaperResearchRuntimeDirectory
+    from rquant.strategy_template_adapter import StrategyTemplateAdapterCatalog
+    from rquant.strategy_template_runtime import StrategyTemplateRuntimeDirectory
+    from rquant.experiment_platform_templates import ExperimentTemplateRuntimeBinding
 
 LAB_WORKER_MAX_SHARDS_PER_TICK = 1
 _HASH_PATTERN = r"^[0-9a-f]{64}$"
@@ -492,6 +501,11 @@ def build_builtin_shard_runtime_manifest(
     forbidden_paths: tuple[Path, ...],
     snapshot_root: Path,
     research_lake_root: Path,
+    template_catalog: StrategyTemplateAdapterCatalog | None = None,
+    paper_catalog: PaperResearchAdapterCatalog | None = None,
+    minute_catalog: MinuteReplayCatalog | None = None,
+    minute_registry_mode: Literal["isolated", "installed"] = "isolated",
+    parameter_catalog: MinuteParameterReplayCatalog | None = None,
 ) -> LabShardRuntimeManifest:
     from rquant.lab_worker_registry import builtin_lab_shard_configuration
 
@@ -500,6 +514,11 @@ def build_builtin_shard_runtime_manifest(
         forbidden_paths=forbidden_paths,
         snapshot_root=snapshot_root,
         research_lake_root=research_lake_root,
+        template_catalog=template_catalog,
+        paper_catalog=paper_catalog,
+        minute_catalog=minute_catalog,
+        minute_registry_mode=minute_registry_mode,
+        parameter_catalog=parameter_catalog,
     )
     return LabShardRuntimeManifest(
         registry=LabClosedRegistryBinding(
@@ -2748,6 +2767,9 @@ class LabWorker:
         report_spool: LabReportSpool,
         artifact_root: Path,
         adapter_registry: StrategyJobAdapterRegistry | None = None,
+        template_directory: StrategyTemplateRuntimeDirectory | None = None,
+        experiment_template_binding: ExperimentTemplateRuntimeBinding | None = None,
+        paper_directory: PaperResearchRuntimeDirectory | None = None,
         exploratory_store_factory: StoreFactory | None = None,
         metadata_store_factory: StoreFactory | None = None,
         research_lake_root: Path | None = None,
@@ -2822,6 +2844,19 @@ class LabWorker:
                 "V2 claim publication requires a published-claim verifier"
             )
         closed_adapter_registry = default_strategy_job_adapter_registry()
+        if (
+            shard_runtime_manifest is not None
+            and shard_runtime_manifest.registry.registry_id == _BUILTIN_SHARD_REGISTRY_ID
+        ):
+            from rquant.lab_worker_registry import (
+                BuiltinLabShardRuntimeConfig,
+                resolve_builtin_adapter_registry,
+            )
+
+            shard_configuration = BuiltinLabShardRuntimeConfig.model_validate_json(
+                shard_runtime_manifest.registry.configuration_json, strict=True
+            )
+            closed_adapter_registry = resolve_builtin_adapter_registry(shard_configuration)
         if adapter_registry is not None and adapter_registry is not closed_adapter_registry:
             raise LabDaemonConfigurationError(
                 "legacy or third-party adapter registry is not registered"
@@ -2923,6 +2958,12 @@ class LabWorker:
         self.report_spool = report_spool
         self.artifact_root = Path(artifact_root).resolve()
         self.adapter_registry = closed_adapter_registry
+        from rquant.strategy_template_runtime import require_template_runtime_directory
+        self.template_directory = require_template_runtime_directory(template_directory)
+        from rquant.experiment_platform_templates import require_experiment_template_runtime_binding
+        self.experiment_template_binding = require_experiment_template_runtime_binding(experiment_template_binding)
+        from rquant.paper_research_runtime import require_paper_runtime_directory
+        self.paper_directory = require_paper_runtime_directory(paper_directory)
         self.heartbeat_interval_microseconds = heartbeat_interval_microseconds
         self.resource_recheck_interval_microseconds = resource_recheck_interval_microseconds
         self.resource_probe_timeout_microseconds = resource_probe_timeout_microseconds
@@ -5191,7 +5232,22 @@ class LabWorker:
                     spec=payload.spec,
                     shard=payload.shard,
                 )
-        return self.adapter_registry.validate_claim(claim)
+        registry = self.adapter_registry
+        if (
+            self.paper_directory is not None
+            or self.template_directory is not None
+            or self.experiment_template_binding is not None
+        ):
+            payload = StrategyShardPayload.model_validate_json(claim.definition.payload_json)
+            if self.paper_directory is not None and payload.spec.parameters.strategy_name in {"paper_reconcile", "paper_backtest_band"}:
+                registry = self.paper_directory.registry_for_spec(payload.spec)
+            else:
+                directory = self.template_directory
+                if self.experiment_template_binding is not None:
+                    directory = self.experiment_template_binding.directory_for_job(claim.job_id, payload.spec) or directory
+                if directory is not None:
+                    registry = directory.registry_for_spec(payload.spec)
+        return registry.validate_claim(claim)
 
     def _heartbeat_loop(
         self,
@@ -5473,8 +5529,17 @@ class LabWorker:
         ack_live_limit_microseconds = (
             hard_limit_microseconds if initial_session in _LIVE_TRADING_SESSIONS else None
         )
+        manifest = self.shard_runtime_manifest
+        if self.paper_directory is not None and validated.spec.parameters.strategy_name in {"paper_reconcile", "paper_backtest_band"}:
+            manifest = self.paper_directory.manifest_for_spec(validated.spec, manifest)
+        else:
+            directory = self.template_directory
+            if self.experiment_template_binding is not None:
+                directory = self.experiment_template_binding.directory_for_job(claim.job_id, validated.spec) or directory
+            if directory is not None:
+                manifest = directory.manifest_for_spec(validated.spec, manifest)
         request = _ShardWireRequest(
-            manifest=self.shard_runtime_manifest,
+            manifest=manifest,
             validated=validated,
             runtime_code_sha=runtime_code_sha,
         )
@@ -5744,16 +5809,17 @@ class LabWorker:
                         # requests serialize on this same gate, so they observe either
                         # a pre-ACK stop or an already committed post-ACK execution.
                         try:
-                            _send_wire(
-                                child.connection,
-                                _IsolationStartAck(
-                                    accepted=True,
-                                    not_after_monotonic_microseconds=spec_child_deadline,
-                                    execution_limit_microseconds=ack_live_limit_microseconds,
-                                ),
-                                deadline_microseconds=spec_child_deadline,
-                                cancel_requested=self._stop.is_set,
-                            )
+                            with self.claim_spool.scheduling_execution_start(claim, now=_utc(self.clock())):
+                                _send_wire(
+                                    child.connection,
+                                    _IsolationStartAck(
+                                        accepted=True,
+                                        not_after_monotonic_microseconds=spec_child_deadline,
+                                        execution_limit_microseconds=ack_live_limit_microseconds,
+                                    ),
+                                    deadline_microseconds=spec_child_deadline,
+                                    cancel_requested=self._stop.is_set,
+                                )
                         except (InterruptedError, TimeoutError):
                             raise
                         except Exception as exc:
@@ -5918,6 +5984,12 @@ class LabWorker:
                         label="isolated shard",
                         allow_graceful_termination=(stop_reason is None and preemption is None),
                     )
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
+
+            if not cleanup_errors:
+                try:
+                    self.claim_spool.close_scheduling_execution(claim, now=_utc(self.clock()))
                 except BaseException as exc:
                     cleanup_errors.append(exc)
 

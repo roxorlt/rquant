@@ -1,0 +1,15 @@
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/pages/query/query.test.tsx > RQ-R03：保存 A 的延迟回执不替换当前目标：另存为
+AssertionError: expected 'query-a' not to be 'query-a' // Object.is equality
+ ❯ src/pages/query/query.test.tsx:148:40
+    146|     expect(submitted[1]?.name).toBe("查询 B");
+    147|   } else {
+    148|     expect(submitted[1]?.query_id).not.toBe("query-a");
+       |                                        ^
+    149|     expect(submitted[1]?.query_id).not.toBe("query-b");
+    150|     expect(submitted[1]?.expected_version).toBeNull();
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+

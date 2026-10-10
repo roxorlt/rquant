@@ -1,0 +1,425 @@
+{
+  "catalog": {
+    "data": {
+      "availability": "populated",
+      "available_at": "2026-07-31T01:32:00Z",
+      "accounts": [
+        {
+          "configuration": {
+            "weight_rule": {
+              "method": "equal",
+              "max_positions": 1,
+              "max_stock_weight": "1",
+              "max_industry_weight": null,
+              "cash_reserve": "0.1",
+              "min_target_amount": "0"
+            },
+            "drawdown_rule": null,
+            "account_id": "paper-main",
+            "strategy_id": "n-shape",
+            "strategy_version": "1",
+            "strategy_name": "自选策略",
+            "fingerprint": "d9ff551eaaeb604b2db8de49aa02a05eb1e4dc49b4aeb8f20b3f08384cfa04c5",
+            "version": 1,
+            "configured_at": "2026-07-30T01:32:00Z",
+            "execution_cost_spec": {
+              "schema_version": 3,
+              "cost_engine_version": "test-paper-cost-engine-v3",
+              "instrument_selectors": [
+                {
+                  "selector_id": "cn-sse-a-share",
+                  "market": "CN",
+                  "exchange": "SSE",
+                  "instrument_class": "EQUITY",
+                  "security_class": "A_SHARE"
+                },
+                {
+                  "selector_id": "cn-szse-a-share",
+                  "market": "CN",
+                  "exchange": "SZSE",
+                  "instrument_class": "EQUITY",
+                  "security_class": "A_SHARE"
+                }
+              ],
+              "commission_rules": [
+                {
+                  "rule_id": "commission-cn-sse-a-share",
+                  "selector_id": "cn-sse-a-share",
+                  "rate_bps": "3",
+                  "minimum_amount": "5",
+                  "applies_to": "BOTH"
+                },
+                {
+                  "rule_id": "commission-cn-szse-a-share",
+                  "selector_id": "cn-szse-a-share",
+                  "rate_bps": "3",
+                  "minimum_amount": "5",
+                  "applies_to": "BOTH"
+                }
+              ],
+              "transfer_fee_rules": [
+                {
+                  "rule_id": "transfer-cn-sse-a-share",
+                  "selector_id": "cn-sse-a-share",
+                  "rate_bps": "0",
+                  "minimum_amount": "0",
+                  "applies_to": "BOTH"
+                },
+                {
+                  "rule_id": "transfer-cn-szse-a-share",
+                  "selector_id": "cn-szse-a-share",
+                  "rate_bps": "0",
+                  "minimum_amount": "0",
+                  "applies_to": "BOTH"
+                }
+              ],
+              "stamp_duty_rules": [
+                {
+                  "rule_id": "stamp-cn-sse-a-share",
+                  "selector_id": "cn-sse-a-share",
+                  "rate_bps": "10",
+                  "minimum_amount": "0",
+                  "applies_to": "SELL"
+                },
+                {
+                  "rule_id": "stamp-cn-szse-a-share",
+                  "selector_id": "cn-szse-a-share",
+                  "rate_bps": "10",
+                  "minimum_amount": "0",
+                  "applies_to": "SELL"
+                }
+              ],
+              "fee_notional_basis": "EXECUTED_NOTIONAL",
+              "assessment_unit": "FILL",
+              "slippage": {
+                "owner": "shared_cost_engine",
+                "buy_bps": "0",
+                "sell_bps": "0",
+                "price_tick": "0.0001",
+                "price_rounding": "HALF_UP"
+              },
+              "money": {
+                "quantum": "0.01",
+                "rounding": "HALF_UP"
+              },
+              "cost_spec_id": "ed1ac04e70d685aa7d53fb34c5367b1f97b748f8bfbdc3602fe4c6dc44030ad2",
+              "research_notional_per_trade": null
+            }
+          },
+          "status": "complete",
+          "reason": null,
+          "account": {
+            "snapshot_id": "eabac40431285e287d0d15bb62706f5a94c19d8041ae5beded4b84510ac3e95f",
+            "account_id": "paper-main",
+            "as_of_time": "2026-07-31T01:32:00Z",
+            "cash": "195.0000",
+            "available_cash": "195.0000",
+            "frozen_cash": "0",
+            "holdings": [
+              {
+                "code": "600000.SH",
+                "quantity": 800,
+                "available_quantity": 0,
+                "frozen_quantity": 800,
+                "average_cost": "1.00625",
+                "market_price": "1"
+              }
+            ],
+            "realized_pnl": "0",
+            "unrealized_pnl": "-5.00000",
+            "nav": "995.0000"
+          },
+          "operator": {
+            "account_id": "paper-main",
+            "configuration_fingerprint": "d9ff551eaaeb604b2db8de49aa02a05eb1e4dc49b4aeb8f20b3f08384cfa04c5",
+            "sequence": 1,
+            "control_fingerprint": "46d762e72463de0e70790b5506853459af45e14430620e3bbcb900ed8ee2ae25",
+            "paused": false,
+            "status": "applied",
+            "observed_at": "2026-07-31T01:32:00Z",
+            "reason": null
+          },
+          "metrics": {
+            "status": "unavailable",
+            "running_days": 0,
+            "verified_days": 0,
+            "total_return": null,
+            "max_drawdown": null,
+            "reason": "逐日净值尚未完整发布。"
+          },
+          "can_configure": true,
+          "can_pause": true,
+          "can_reconcile": false,
+          "can_band": false
+        }
+      ]
+    },
+    "serving": {
+      "generation_id": "5a045f2af9e08644749e2df5dda8ca75a993342cfe4ceda53a984a740ec1410b",
+      "built_at": "2026-07-31T01:32:00Z",
+      "age_seconds": 0.0,
+      "state": "ready",
+      "message": null,
+      "detail": ""
+    }
+  },
+  "detail": {
+    "data": {
+      "configuration": {
+        "weight_rule": {
+          "method": "equal",
+          "max_positions": 1,
+          "max_stock_weight": "1",
+          "max_industry_weight": null,
+          "cash_reserve": "0.1",
+          "min_target_amount": "0"
+        },
+        "drawdown_rule": null,
+        "account_id": "paper-main",
+        "strategy_id": "n-shape",
+        "strategy_version": "1",
+        "strategy_name": "自选策略",
+        "fingerprint": "d9ff551eaaeb604b2db8de49aa02a05eb1e4dc49b4aeb8f20b3f08384cfa04c5",
+        "version": 1,
+        "configured_at": "2026-07-30T01:32:00Z",
+        "execution_cost_spec": {
+          "schema_version": 3,
+          "cost_engine_version": "test-paper-cost-engine-v3",
+          "instrument_selectors": [
+            {
+              "selector_id": "cn-sse-a-share",
+              "market": "CN",
+              "exchange": "SSE",
+              "instrument_class": "EQUITY",
+              "security_class": "A_SHARE"
+            },
+            {
+              "selector_id": "cn-szse-a-share",
+              "market": "CN",
+              "exchange": "SZSE",
+              "instrument_class": "EQUITY",
+              "security_class": "A_SHARE"
+            }
+          ],
+          "commission_rules": [
+            {
+              "rule_id": "commission-cn-sse-a-share",
+              "selector_id": "cn-sse-a-share",
+              "rate_bps": "3",
+              "minimum_amount": "5",
+              "applies_to": "BOTH"
+            },
+            {
+              "rule_id": "commission-cn-szse-a-share",
+              "selector_id": "cn-szse-a-share",
+              "rate_bps": "3",
+              "minimum_amount": "5",
+              "applies_to": "BOTH"
+            }
+          ],
+          "transfer_fee_rules": [
+            {
+              "rule_id": "transfer-cn-sse-a-share",
+              "selector_id": "cn-sse-a-share",
+              "rate_bps": "0",
+              "minimum_amount": "0",
+              "applies_to": "BOTH"
+            },
+            {
+              "rule_id": "transfer-cn-szse-a-share",
+              "selector_id": "cn-szse-a-share",
+              "rate_bps": "0",
+              "minimum_amount": "0",
+              "applies_to": "BOTH"
+            }
+          ],
+          "stamp_duty_rules": [
+            {
+              "rule_id": "stamp-cn-sse-a-share",
+              "selector_id": "cn-sse-a-share",
+              "rate_bps": "10",
+              "minimum_amount": "0",
+              "applies_to": "SELL"
+            },
+            {
+              "rule_id": "stamp-cn-szse-a-share",
+              "selector_id": "cn-szse-a-share",
+              "rate_bps": "10",
+              "minimum_amount": "0",
+              "applies_to": "SELL"
+            }
+          ],
+          "fee_notional_basis": "EXECUTED_NOTIONAL",
+          "assessment_unit": "FILL",
+          "slippage": {
+            "owner": "shared_cost_engine",
+            "buy_bps": "0",
+            "sell_bps": "0",
+            "price_tick": "0.0001",
+            "price_rounding": "HALF_UP"
+          },
+          "money": {
+            "quantum": "0.01",
+            "rounding": "HALF_UP"
+          },
+          "cost_spec_id": "ed1ac04e70d685aa7d53fb34c5367b1f97b748f8bfbdc3602fe4c6dc44030ad2",
+          "research_notional_per_trade": null
+        }
+      },
+      "status": "complete",
+      "reason": null,
+      "account": {
+        "snapshot_id": "eabac40431285e287d0d15bb62706f5a94c19d8041ae5beded4b84510ac3e95f",
+        "account_id": "paper-main",
+        "as_of_time": "2026-07-31T01:32:00Z",
+        "cash": "195.0000",
+        "available_cash": "195.0000",
+        "frozen_cash": "0",
+        "holdings": [
+          {
+            "code": "600000.SH",
+            "quantity": 800,
+            "available_quantity": 0,
+            "frozen_quantity": 800,
+            "average_cost": "1.00625",
+            "market_price": "1"
+          }
+        ],
+        "realized_pnl": "0",
+        "unrealized_pnl": "-5.00000",
+        "nav": "995.0000"
+      },
+      "operator": {
+        "account_id": "paper-main",
+        "configuration_fingerprint": "d9ff551eaaeb604b2db8de49aa02a05eb1e4dc49b4aeb8f20b3f08384cfa04c5",
+        "sequence": 1,
+        "control_fingerprint": "46d762e72463de0e70790b5506853459af45e14430620e3bbcb900ed8ee2ae25",
+        "paused": false,
+        "status": "applied",
+        "observed_at": "2026-07-31T01:32:00Z",
+        "reason": null
+      },
+      "metrics": {
+        "status": "unavailable",
+        "running_days": 0,
+        "verified_days": 0,
+        "total_return": null,
+        "max_drawdown": null,
+        "reason": "逐日净值尚未完整发布。"
+      },
+      "can_configure": true,
+      "can_pause": true,
+      "can_reconcile": true,
+      "can_band": false,
+      "nav": [],
+      "risk": null,
+      "exposure": null,
+      "exposure_reason": "缺少同期基准行业权重",
+      "attribution": null,
+      "reduction": {
+        "configuration_fingerprint": "d9ff551eaaeb604b2db8de49aa02a05eb1e4dc49b4aeb8f20b3f08384cfa04c5",
+        "ledger_frame_fingerprint": "bf0c3a31c31462c31be59767bae765a1c3c2a304169a018bbe2aae66d5d44dbe",
+        "plan_fingerprint": null,
+        "as_of": "2026-07-31T01:32:00Z",
+        "status": "not_required",
+        "risk_weight": "0.804020100502512562",
+        "target_risk_weight": null,
+        "signal_ids": [],
+        "reason": null
+      },
+      "band": null,
+      "band_position": "unavailable",
+      "recent_research": [],
+      "history_available": true,
+      "backtests": []
+    },
+    "serving": {
+      "generation_id": "5a045f2af9e08644749e2df5dda8ca75a993342cfe4ceda53a984a740ec1410b",
+      "built_at": "2026-07-31T01:32:00Z",
+      "age_seconds": 0.0,
+      "state": "ready",
+      "message": null,
+      "detail": ""
+    }
+  },
+  "history": {
+    "data": {
+      "account_id": "paper-main",
+      "generation_id": "5a045f2af9e08644749e2df5dda8ca75a993342cfe4ceda53a984a740ec1410b",
+      "ledger_revision": 4,
+      "total_orders": 1,
+      "coverage": "complete",
+      "records": [
+        {
+          "sequence": 4,
+          "order": {
+            "order_id": "35848973b218d53cc085bc96eb88d8b151fb33051c927404130a92ad9ea72266",
+            "intent_id": "2a2875f9d78369b4e62cee8aa328d0cc33d6ceec15dbea19811138a42d3c0430",
+            "account_id": "paper-main",
+            "ts_code": "600000.SH",
+            "side": "BUY",
+            "order_type": "MARKET",
+            "quantity": 800,
+            "filled_quantity": 800,
+            "average_fill_price": "1.0000",
+            "status": "FILLED",
+            "reject_reason": null,
+            "created_at": "2026-07-31T01:32:00Z",
+            "updated_at": "2026-07-31T01:32:00Z"
+          },
+          "intent": {
+            "intent_id": "2a2875f9d78369b4e62cee8aa328d0cc33d6ceec15dbea19811138a42d3c0430",
+            "signal_id": "bac2ac9d4881079528dd906d27f0c28398dc2541f9a3d39ff8557efc347b22e8",
+            "entry_signal_id": null,
+            "sell_quantity_authority": null,
+            "account_id": "paper-main",
+            "ts_code": "600000.SH",
+            "side": "BUY",
+            "order_type": "MARKET",
+            "quantity": 800,
+            "limit_price": null,
+            "event_time": "2026-07-31T01:31:00Z",
+            "available_at": "2026-07-31T01:31:05Z",
+            "expires_at": "2026-07-31T01:36:00Z",
+            "earliest_execution_at": "2026-07-31T01:32:00Z",
+            "price_snapshot_id": "33e303b52f43147b1f66881a64d7d1d00ee9ebc515a53c41d1b8814cb523d796",
+            "producer_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "fills": [
+            {
+              "fill_id": "2e4b8a2b6d34a8e3bba3499a38497df4e50ae80ce935273eb7a0df978a95495f",
+              "execution_id": "b640156b717e9b6db16a52b137c429000605db5c79311b4fb2504a9561ba11d8",
+              "order_id": "35848973b218d53cc085bc96eb88d8b151fb33051c927404130a92ad9ea72266",
+              "sequence": 1,
+              "quantity": 800,
+              "price": "1.0000",
+              "commission": "5.00",
+              "transfer_fee": "0.00",
+              "tax": "0.00",
+              "total_fees": "5.00",
+              "cost_spec_id": "ed1ac04e70d685aa7d53fb34c5367b1f97b748f8bfbdc3602fe4c6dc44030ad2",
+              "cost_spec_schema_version": 3,
+              "cost_context_fingerprint": "deb223809868d332f22b6014b161d2b1d4b6c200bb01abd758a4f172217ab0bf",
+              "cost_provenance_state": "KNOWN_V3",
+              "executed_at": "2026-07-31T01:32:00Z",
+              "price_snapshot_id": "33e303b52f43147b1f66881a64d7d1d00ee9ebc515a53c41d1b8814cb523d796",
+              "persisted_at": "2026-07-31T01:32:00Z"
+            }
+          ],
+          "side_label": "买入",
+          "status_label": "已成交",
+          "reject_message": null
+        }
+      ],
+      "next_cursor": null
+    },
+    "serving": {
+      "generation_id": "5a045f2af9e08644749e2df5dda8ca75a993342cfe4ceda53a984a740ec1410b",
+      "built_at": "2026-07-31T01:32:00Z",
+      "age_seconds": 0.0,
+      "state": "ready",
+      "message": null,
+      "detail": ""
+    }
+  }
+}

@@ -139,6 +139,7 @@ def test_suspension_coverage_is_a_required_production_daily_contract() -> None:
 def test_auction_freshness_belongs_to_research_not_production() -> None:
     assert "auction_bar" not in PRODUCTION_FRESHNESS_DATASET_IDS
     assert "auction_bar" in RESEARCH_FRESHNESS_DATASET_IDS
+    assert "financial_observation" not in RESEARCH_FRESHNESS_DATASET_IDS
 
 
 def test_trading_session_lag_ignores_weekend_calendar_days(monkeypatch: Any) -> None:

@@ -1,0 +1,148 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.13.12, pytest-9.0.3, pluggy-1.6.0
+rootdir: /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk
+configfile: pyproject.toml
+plugins: mock-3.15.1, anyio-4.13.0
+collected 2 items
+
+tests/unit/test_research_query.py F                                      [ 50%]
+tests/unit/test_research_query_service.py F                              [100%]
+
+=================================== FAILURES ===================================
+_ test_public_snapshot_contains_only_exact_public_columns_and_source_is_unchanged _
+
+tmp_path = PosixPath('/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-36/test_public_snapshot_contains_0')
+
+    def test_public_snapshot_contains_only_exact_public_columns_and_source_is_unchanged(
+        tmp_path: Path,
+    ) -> None:
+        api = _api()
+        snapshot, manifest, source, digest = _published(tmp_path)
+        assert hashlib.sha256(source.read_bytes()).hexdigest() == digest
+        assert manifest.source_sha256 == digest
+        info = source.stat()
+>       assert manifest.source_identity == (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+               ^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/unit/test_research_query.py:64: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = QuerySnapshotManifest(contract='research-query-public-v1', filename='query-d97f6238bc68d763e63dc78249ca69bf5c760e73ee5...026-09-30', '2026-09-30'), 'adj_factor': ('2026-09-30', '2026-09-30'), 'trade_calendar': ('2026-09-30', '2026-09-30')})
+item = 'source_identity'
+
+    def __getattr__(self, item: str) -> Any:
+        private_attributes = object.__getattribute__(self, '__private_attributes__')
+        if item in private_attributes:
+            attribute = private_attributes[item]
+            if hasattr(attribute, '__get__'):
+                return attribute.__get__(self, type(self))  # type: ignore
+    
+            try:
+                # Note: self.__pydantic_private__ cannot be None if self.__private_attributes__ has items
+                return self.__pydantic_private__[item]  # type: ignore
+            except KeyError as exc:
+                raise AttributeError(f'{type(self).__name__!r} object has no attribute {item!r}') from exc
+        else:
+            # `__pydantic_extra__` can fail to be set if the model is not yet fully initialized.
+            # See `BaseModel.__repr_args__` for more details
+            try:
+                pydantic_extra = object.__getattribute__(self, '__pydantic_extra__')
+            except AttributeError:
+                pydantic_extra = None
+    
+            if pydantic_extra and item in pydantic_extra:
+                return pydantic_extra[item]
+            else:
+                if hasattr(self.__class__, item):
+                    return super().__getattribute__(item)  # Raises AttributeError if appropriate
+                else:
+                    # this is the current error
+>                   raise AttributeError(f'{type(self).__name__!r} object has no attribute {item!r}')
+E                   AttributeError: 'QuerySnapshotManifest' object has no attribute 'source_identity'
+
+../cdx-factor-source-integration/.venv/lib/python3.13/site-packages/pydantic/main.py:1042: AttributeError
+_________ test_actual_uds_catalog_save_recovery_and_endpoint_identity __________
+
+tmp_path = PosixPath('/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-36/test_actual_uds_catalog_save_r0')
+
+    def test_actual_uds_catalog_save_recovery_and_endpoint_identity(tmp_path: Path) -> None:
+        api = _api()
+        snapshot, _, _, _ = _published(tmp_path)
+        executor = api.QueryExecutor(snapshot, tmp_path / "scratch")
+        control = _service(tmp_path / "control")
+        with TemporaryDirectory(
+            prefix="rq-uds-", dir="/private/tmp" if Path("/private/tmp").is_dir() else "/tmp"
+        ) as directory:
+            parent = Path(directory)
+            os.chown(parent, os.geteuid(), os.getegid())
+            os.chmod(parent, 0o710)
+            path = parent / "query.sock"
+            server = api.QueryPrivateServer(
+                path,
+                executor=executor,
+                allowed_users=frozenset({"alice"}),
+                trusted_web_uid=os.geteuid(),
+                shared_gid=os.getegid(),
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            client = api.QueryPrivateClient(
+                path,
+                expected_service_uid=os.geteuid(),
+                shared_gid=os.getegid(),
+                client_uid=lambda: os.geteuid() + 1,
+            )
+            try:
+                catalog = client.catalog(authenticated_actor_id="alice")
+                assert [item.name for item in catalog.tables] == [
+                    "daily_bar",
+                    "adj_factor",
+                    "trade_calendar",
+                ]
+>               assert all(column.description for item in catalog.tables for column in item.columns)
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/unit/test_research_query_service.py:58: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/test_research_query_service.py:58: in <genexpr>
+    assert all(column.description for item in catalog.tables for column in item.columns)
+               ^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = QueryColumn(name='ts_code', data_type='VARCHAR'), item = 'description'
+
+    def __getattr__(self, item: str) -> Any:
+        private_attributes = object.__getattribute__(self, '__private_attributes__')
+        if item in private_attributes:
+            attribute = private_attributes[item]
+            if hasattr(attribute, '__get__'):
+                return attribute.__get__(self, type(self))  # type: ignore
+    
+            try:
+                # Note: self.__pydantic_private__ cannot be None if self.__private_attributes__ has items
+                return self.__pydantic_private__[item]  # type: ignore
+            except KeyError as exc:
+                raise AttributeError(f'{type(self).__name__!r} object has no attribute {item!r}') from exc
+        else:
+            # `__pydantic_extra__` can fail to be set if the model is not yet fully initialized.
+            # See `BaseModel.__repr_args__` for more details
+            try:
+                pydantic_extra = object.__getattribute__(self, '__pydantic_extra__')
+            except AttributeError:
+                pydantic_extra = None
+    
+            if pydantic_extra and item in pydantic_extra:
+                return pydantic_extra[item]
+            else:
+                if hasattr(self.__class__, item):
+                    return super().__getattribute__(item)  # Raises AttributeError if appropriate
+                else:
+                    # this is the current error
+>                   raise AttributeError(f'{type(self).__name__!r} object has no attribute {item!r}')
+E                   AttributeError: 'QueryColumn' object has no attribute 'description'
+
+../cdx-factor-source-integration/.venv/lib/python3.13/site-packages/pydantic/main.py:1042: AttributeError
+=========================== short test summary info ============================
+FAILED tests/unit/test_research_query.py::test_public_snapshot_contains_only_exact_public_columns_and_source_is_unchanged
+FAILED tests/unit/test_research_query_service.py::test_actual_uds_catalog_save_recovery_and_endpoint_identity
+============================== 2 failed in 1.42s ===============================

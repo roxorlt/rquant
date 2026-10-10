@@ -11,6 +11,11 @@ import stat
 from collections.abc import Callable
 from datetime import UTC, date, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:
+    from rquant.collaboration_commands import PageControlRoleAuthority
+    from rquant.serving_page_projection_source import _ReadonlyPageControlAuditReader
 from urllib.parse import quote
 from uuid import UUID
 from zoneinfo import ZoneInfo
@@ -37,6 +42,8 @@ from rquant.lab_jobs import (
     LabJobReader,
     LabJobRecord,
     LabJobSummary,
+    LabPublishedEventIntegrityError,
+    LabPublishedJobsEventSnapshot,
     LabResultState,
 )
 from rquant.lab_worker import LabShardResultManifest
@@ -48,17 +55,33 @@ from rquant.runtime_serving_authority import (
 )
 from rquant.runtime_serving_snapshot import (
     LAB_JOBS_DATASET_ID,
+    UNAVAILABLE_EVIDENCE_INSTANT,
     LabJobsPayload,
     SourceReadResult,
 )
 from rquant.serving_contracts import FreshnessStatus
-from rquant.serving_read_models import ServingLabJobRecord, ServingProjectionPayload
+from rquant.serving_read_models import (
+    LAB_EVENT_LABEL_BY_TYPE,
+    UNKNOWN_LAB_EVENT_LABEL,
+    ServingLabJobRecord,
+    ServingProjectionPayload,
+)
 
 StrategyProjectionReader = Callable[
     [tuple[LabJobSummary, ...], datetime],
     tuple[ServingProjectionPayload, ...],
 ]
 PageProjectionReader = Callable[[datetime], tuple[ServingProjectionPayload, ...]]
+
+
+class FactorResultProjectionReader(Protocol):
+    def __call__(
+        self,
+        observed_at: datetime,
+        *,
+        other_projections: tuple[ServingProjectionPayload, ...],
+    ) -> tuple[ServingProjectionPayload, ...]: ...
+
 
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _MAX_PROJECTED_PARQUET_BYTES = 64 * 1024 * 1024
@@ -791,6 +814,9 @@ class LabJobsServingSourceReader:
         eta_completed_limit: int = LAB_ETA_COMPLETED_LIMIT_MAX,
         strategy_projection_reader: StrategyProjectionReader | None = None,
         page_projection_reader: PageProjectionReader | None = None,
+        factor_result_projection_reader: FactorResultProjectionReader | None = None,
+        collaboration_audit_reader: _ReadonlyPageControlAuditReader | None = None,
+        collaboration: PageControlRoleAuthority | None = None,
     ) -> None:
         if not isinstance(reader, LabJobReader):
             raise TypeError("reader must be LabJobReader")
@@ -805,10 +831,86 @@ class LabJobsServingSourceReader:
         self.eta_completed_limit = eta_completed_limit
         self.strategy_projection_reader = strategy_projection_reader
         self.page_projection_reader = page_projection_reader
+        self.factor_result_projection_reader = factor_result_projection_reader
+        if collaboration_audit_reader is not None or collaboration is not None:
+            from rquant.collaboration_commands import PageControlRoleAuthority
+            from rquant.serving_page_projection_source import _ReadonlyPageControlAuditReader
+            if (type(collaboration_audit_reader) is not _ReadonlyPageControlAuditReader
+                    or type(collaboration) is not PageControlRoleAuthority):
+                raise PermissionError("collaboration source requires the original bound journal and roles")
+            collaboration.require_outbox_path(collaboration_audit_reader.path)
+            if factor_result_projection_reader is not None:
+                from rquant.factor.result_serving import FactorResultProjectionReader as OriginalFactorReader
+                if (type(factor_result_projection_reader) is not OriginalFactorReader
+                        or factor_result_projection_reader.collaboration is not collaboration
+                        or factor_result_projection_reader.collaboration_audit_reader is None
+                        or factor_result_projection_reader.collaboration_audit_reader.path != collaboration_audit_reader.path):
+                    raise PermissionError("factor and Lab publication must use the same original role/journal source")
+        self.collaboration_audit_reader = collaboration_audit_reader
+        self.collaboration = collaboration
+
+    def _collaboration_projections(
+        self, summaries: tuple[LabJobSummary, ...], *, observed_at: datetime,
+        factor_projections: tuple[ServingProjectionPayload, ...] = (),
+    ) -> tuple[ServingProjectionPayload, ...]:
+        audit, authority = self.collaboration_audit_reader, self.collaboration
+        if audit is None or authority is None:
+            return ()
+        with audit.snapshot():
+            roles = audit.collaboration_projections(authority, observed_at=observed_at)
+            bindings = (*audit.result_submission_bindings(authority, domain="portfolio"),
+                *audit.result_submission_bindings(authority, domain="strategy"))
+            factor_bindings = ()
+            factor_snapshot = None
+            if factor_projections:
+                from rquant.factor.result_serving import validate_factor_result_projections
+                factor_snapshot = validate_factor_result_projections({item.table_name: item for item in factor_projections})
+                if factor_snapshot is None or self.factor_result_projection_reader is None:
+                    raise LabJobsServingAuthorityIntegrityError("original factor publication is unavailable")
+                identity = self.factor_result_projection_reader.identity
+                if factor_snapshot.state.ledger_instance_id != identity.instance_id:
+                    raise LabJobsServingAuthorityIntegrityError("original factor publication ledger differs")
+                factor_bindings = audit.result_submission_bindings(authority, domain="factor", factor_ledger_identity=identity)
+        by_job = {str(UUID(proof.job_id)): proof for proof in bindings}
+        rows = []
+        for summary in summaries:
+            proof = by_job.get(str(summary.job_id))
+            if proof is None:
+                continue
+            sealed = self.reader.get_artifact_preview_authority(summary.job_id)
+            if sealed is None:
+                continue
+            if (sealed.job.spec_hash != proof.spec_hash or sealed.job.updated_at > observed_at
+                    or sealed.evidence.job_id != summary.job_id):
+                raise LabJobsServingAuthorityIntegrityError("sealed result differs from original owned submission")
+            rows.append({**proof.model_dump(mode="json"),
+                "manifest_sha256": sealed.evidence.manifest_hash,
+                "complete_result_sha256": sealed.evidence.complete_result_hash})
+            if self.reader.get_artifact_preview_authority(summary.job_id) != sealed:
+                raise LabJobsServingAuthorityIntegrityError("sealed result changed during owner projection")
+        if factor_snapshot is not None:
+            proven = {(proof.job_id, proof.spec_hash): proof for proof in factor_bindings}
+            for result in factor_snapshot.index:
+                if result.status != "succeeded" or result.display_status != "available":
+                    continue
+                proof = proven.get((result.job_id, result.spec_sha256))
+                if proof is None:
+                    raise LabJobsServingAuthorityIntegrityError("original complete factor result owner is unavailable")
+                rows.append({**proof.model_dump(mode="json"), "manifest_sha256": result.completion_sha256,
+                    "complete_result_sha256": result.full_artifact_sha256})
+        rows.sort(key=lambda row: (row["domain"], row["job_id"]))
+        return (*roles, ServingProjectionPayload(table_name="sealed_result_owner",
+            available_at=observed_at, rows=tuple(rows)))
 
     def __call__(self, observed_at: datetime, /) -> SourceReadResult:
         observed = normalize_aware_utc(observed_at)
-        first_page = self.reader.list_jobs(limit=self.max_jobs)
+        from rquant.experiment_platform_projection import legacy_job_snapshot
+        from rquant.task_center_projection import scheduling_projection
+
+        first_control = self.reader.scheduling_state()
+        control_projections = () if first_control is None else (scheduling_projection(first_control, cutoff=observed),)
+        first = legacy_job_snapshot(self.reader, limit=self.max_jobs)
+        first_page = first.page
         self._validate_summaries(first_page, observed_at=observed)
 
         records = tuple(
@@ -831,12 +933,40 @@ class LabJobsServingSourceReader:
         page_projections = (
             self.page_projection_reader(observed) if self.page_projection_reader is not None else ()
         )
-        projections = strategy_projections + page_projections
+        collaboration_projections = self._collaboration_projections(first_page.items, observed_at=observed)
+        base_projections = (
+            *control_projections,
+            *_event_projections(first, observed_at=observed),
+            *strategy_projections,
+            *page_projections,
+            *collaboration_projections,
+        )
+        factor_result_projections = (
+            self.factor_result_projection_reader(observed, other_projections=base_projections)
+            if self.factor_result_projection_reader is not None
+            else ()
+        )
+        complete_collaboration = self._collaboration_projections(first_page.items, observed_at=observed,
+            factor_projections=factor_result_projections) if collaboration_projections else ()
+        if complete_collaboration:
+            base_owners = collaboration_projections[-1].rows
+            if (complete_collaboration[:-1] != collaboration_projections[:-1]
+                    or tuple(row for row in complete_collaboration[-1].rows if row["domain"] != "factor") != base_owners):
+                raise LabJobsServingAuthorityIntegrityError("original role or Lab owner changed during factor publication")
+        projections = (*control_projections, *_event_projections(first, observed_at=observed),
+            *strategy_projections, *page_projections, *complete_collaboration, *factor_result_projections)
 
-        second_page = self.reader.list_jobs(limit=self.max_jobs)
-        if second_page != first_page:
+        second = legacy_job_snapshot(self.reader, limit=self.max_jobs)
+        if self.reader.scheduling_state() != first_control:
+            raise LabJobsServingAuthorityIntegrityError("scheduler state changed while building serving source")
+        second_page = second.page
+        if second.page != first.page:
             raise LabJobsServingAuthorityIntegrityError(
                 "lab jobs changed while building serving source"
+            )
+        if second.windows != first.windows:
+            raise LabPublishedEventIntegrityError(
+                "lab events changed while building serving source"
             )
         repeated_strategy_projections = (
             self.strategy_projection_reader(second_page.items, observed)
@@ -854,6 +984,27 @@ class LabJobsServingSourceReader:
             raise LabJobsServingAuthorityIntegrityError(
                 "page projection authority changed while building serving source"
             )
+        repeated_collaboration = self._collaboration_projections(second_page.items, observed_at=observed)
+        if repeated_collaboration != collaboration_projections:
+            raise LabJobsServingAuthorityIntegrityError("role, audit or owned result generation changed during serving read")
+        if self.factor_result_projection_reader is not None:
+            repeated_factor_results = self.factor_result_projection_reader(
+                observed,
+                other_projections=(
+                    *control_projections,
+                    *_event_projections(second, observed_at=observed),
+                    *repeated_strategy_projections,
+                    *repeated_page_projections,
+                    *repeated_collaboration,
+                ),
+            )
+            if repeated_factor_results != factor_result_projections:
+                raise LabJobsServingAuthorityIntegrityError(
+                    "factor result projection authority changed while building serving source"
+                )
+            if complete_collaboration and self._collaboration_projections(second_page.items, observed_at=observed,
+                    factor_projections=repeated_factor_results) != complete_collaboration:
+                raise LabJobsServingAuthorityIntegrityError("original complete factor owner changed during serving read")
 
         payload = LabJobsPayload(
             lab_jobs=tuple(
@@ -909,6 +1060,58 @@ class LabJobsServingSourceReader:
             raise LabJobsServingAuthorityIntegrityError("lab job ETA contains future evidence")
 
 
+def _event_projections(
+    snapshot: LabPublishedJobsEventSnapshot,
+    *,
+    observed_at: datetime,
+) -> tuple[ServingProjectionPayload, ServingProjectionPayload]:
+    if any(
+        event.created_at > observed_at for window in snapshot.windows for event in window.events
+    ):
+        raise LabPublishedEventIntegrityError("lab event contains future evidence")
+    window_rows = tuple(
+        {
+            "job_id": str(window.job_id),
+            "job_version": summary.version,
+            "state": (
+                "truncated" if window.truncated else "available" if window.events else "empty"
+            ),
+            "retained_count": len(window.events),
+            "truncated": window.truncated,
+        }
+        for summary, window in zip(snapshot.page.items, snapshot.windows, strict=True)
+    )
+    event_rows = tuple(
+        {
+            "job_id": str(window.job_id),
+            "event_id": event.event_id,
+            "job_version": event.job_version,
+            "occurred_at": event.created_at.isoformat(),
+            "new_status": event.new_status.value,
+            "label": LAB_EVENT_LABEL_BY_TYPE.get(event.event_type, UNKNOWN_LAB_EVENT_LABEL),
+        }
+        for window in snapshot.windows
+        for event in window.events
+    )
+    try:
+        return (
+            ServingProjectionPayload(
+                table_name="lab_job_event_window",
+                available_at=observed_at,
+                rows=window_rows,
+            ),
+            ServingProjectionPayload(
+                table_name="lab_job_event",
+                available_at=observed_at,
+                rows=event_rows,
+            ),
+        )
+    except ValueError:
+        raise LabPublishedEventIntegrityError(
+            "bounded lab event projection cannot be published"
+        ) from None
+
+
 #: What a Lab Jobs read says about *when* it was asked rather than about the jobs. The
 #: top four are the reader's own clock; the two ETA fields are the estimate restated
 #: against it -- `as_of` is the question's timestamp and `finish_at` is `as_of` plus the
@@ -929,6 +1132,9 @@ def lab_jobs_state_identity(result: SourceReadResult) -> str:
     code published.
     """
 
+    if not isinstance(result.payload, LabJobsPayload):
+        raise TypeError("lab_jobs state identity requires LabJobsPayload")
+    LabJobsPayload.model_validate(result.payload)
     state = result.model_dump(mode="json")
     for name in _LAB_JOBS_OBSERVATION_FIELDS:
         state.pop(name, None)
@@ -941,6 +1147,27 @@ def lab_jobs_state_identity(result: SourceReadResult) -> str:
             if isinstance(eta, dict):
                 for name in _LAB_JOBS_ETA_OBSERVATION_FIELDS:
                     eta.pop(name, None)
+        for projection in payload.get("projections") or ():
+            if isinstance(projection, dict) and projection.get("table_name") in {
+                "lab_job_event_window",
+                "lab_job_event",
+            }:
+                projection.pop("available_at", None)
+            if isinstance(projection, dict) and projection.get("table_name") in {
+                "factor_definition_state",
+                "factor_definition",
+            }:
+                projection.pop("available_at", None)
+                if projection["table_name"] == "factor_definition_state":
+                    projection["rows"][0].pop("snapshot_sha256")
+            if isinstance(projection, dict) and projection.get("table_name") in {
+                "factor_result_state",
+                "factor_result_index",
+                "factor_result_display",
+            }:
+                projection.pop("available_at", None)
+                if projection["table_name"] == "factor_result_state":
+                    projection["rows"][0].pop("snapshot_sha256")
     return canonical_sha256({"contract": "lab-jobs-state/v1", "state": state})
 
 
@@ -965,8 +1192,23 @@ class LabJobsServingAuthorityPublisher:
         self.publisher = publisher
 
     def publish(self, observed_at: datetime) -> ServingSourceAuthorityPublication:
+        observed = normalize_aware_utc(observed_at)
+        try:
+            result = self.reader(observed)
+        except LabPublishedEventIntegrityError:
+            values: dict[str, object] = {
+                "dataset_id": LAB_JOBS_DATASET_ID,
+                "sequence": _sequence_for(observed),
+                "event_time": UNAVAILABLE_EVIDENCE_INSTANT,
+                "published_at": observed,
+                "status": FreshnessStatus.UNAVAILABLE,
+                "reason": "lab_event_snapshot_invalid",
+                "payload": LabJobsPayload(),
+            }
+            values["generation_id"] = canonical_sha256(values)
+            result = SourceReadResult.model_validate(values)
         return self.publisher.publish_if_changed(
-            self.reader(observed_at),
+            result,
             unchanged_identity=lab_jobs_state_identity,
         )
 

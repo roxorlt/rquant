@@ -1,7 +1,7 @@
 ---
-title: rQuant - 个人版 A 股量化选股与监控平台
+title: rQuant - 个人版 A 股投研平台
 created_at: 2026-04-15
-updated_at: 2026-07-18
+updated_at: 2026-09-26
 status: active
 owner: roxor
 tags: [quant, a-shares, personal-tool, python, macOS]
@@ -9,8 +9,14 @@ tags: [quant, a-shares, personal-tool, python, macOS]
 
 # rQuant
 
-rQuant 是个人自用的 A 股条件筛选、分钟监控与告警平台。它包含历史回放、策略研究和自动
-模拟盘，但**不做实盘下单**，也不把回测收益当作未来收益承诺。
+rQuant 正在建设为个人自用的 A 股投研平台，目标覆盖数据、选股、因子、策略、回测、实验、模拟盘和盯盘告警，
+但**不做实盘下单**，也不把回测收益当作未来收益承诺。
+
+## 网页方向与旧页面迁移
+
+新网页使用 React + TypeScript + Vite，入口规划为 `/app/`，以 CC 的可点击原型为最终体验目标。线上旧 Streamlit 页面资源负担高，界面体验也不符合目标；不再投入旧页面的新功能、界面打磨或扩容，过渡期仅保留必要的故障与安全维护。
+
+新网页每完成一项功能，都要接通并验证真实能力，再迁移对应入口、停用被替代的 Streamlit 单元。最终完成原型全部功能和按钮、差距表全部「部分」「缺」以及 M4、M12 列出的未完项；M11 实盘交易不做。当前仍在分批开发和迁移，不能把本地代码完成等同于线上切流或旧服务已停。生产切流与停服按项目规则单独授权。详细决策与验收条件见 [React 投研平台交付决策](docs/plans/2026-09-26-react-platform-decision.md)。
 
 ## 当前能力
 
@@ -160,7 +166,7 @@ rquant backfill-run \
 | 存储 | DuckDB + Parquet + JSON/JSONL |
 | 指标/计算 | pandas、ta、MyTT |
 | 调度 | 云端 systemd + 本地 launchd/APScheduler |
-| UI | Streamlit |
+| UI | React + TypeScript + Vite（`web/`，`/app/`）；旧 Streamlit 页面逐项停用 |
 | 通知 | PushDeer + PushPlus |
 | 测试 | pytest + ruff + GitHub Actions |
 
@@ -218,13 +224,13 @@ bash scripts/check-core-quality.sh
 .venv/bin/rquant daily-indicator-backfill \
   --start-date 2026-03-31 --end-date 2026-07-16 --apply
 
-# 健康看板
+# 旧 Streamlit 健康看板（仅供过渡期维护；新功能和界面开发转到 /app/）
 .venv/bin/streamlit run src/rquant/dashboard/app.py --server.port 8501
 
-# Strategy Lab（提交到持久 Job Center；关闭页面或切换页签不影响后台任务）
+# 旧 Streamlit Strategy Lab（仅供过渡期维护；后台 Job Center 能力按需复用）
 .venv/bin/streamlit run src/rquant/dashboard/strategy_lab.py --server.port 8504
 
-# 盘中全景
+# 旧 Streamlit 盘中全景（仅供过渡期维护）
 .venv/bin/streamlit run src/rquant/dashboard/market_panorama.py --server.port 8506
 
 # 生成可恢复的策略分钟回补计划（只读副本；截止日自动移动到完整 B/S 窗口可观测上限）

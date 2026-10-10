@@ -8,15 +8,19 @@ from contextlib import contextmanager
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Protocol, Self
+from typing import Annotated, Literal, Protocol, Self
 
 from pydantic import Field, StringConstraints, model_validator
 
+from rquant.condition_alert_route import ConditionAlertBusEventRecord
+from rquant.condition_alert_runtime_contracts import ConditionRuntimeModel
 from rquant.paper_signal_worker import (
     PaperSignalQueueRecord,
     PaperSignalQueueStatus,
     PaperSignalQueueStore,
 )
+from rquant.price_alert_route import PriceAlertBusEventRecord
+from rquant.price_alert_runtime_contracts import PriceRuntimeModel
 from rquant.runtime_contracts import (
     AwareUtcDatetime,
     RuntimeContractModel,
@@ -33,6 +37,23 @@ from rquant.signal_bus import (
 from rquant.signal_contracts import SignalEnvelopeFamily
 
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+_MIXED_HISTORY_SQL = (
+    "CREATE TABLE paper_notification_history(singleton INTEGER PRIMARY KEY "
+    "CHECK(singleton=1), protocol TEXT NOT NULL, consumer_fingerprint TEXT NOT NULL)",
+    "CREATE TABLE paper_price_non_trading_receipt(global_sequence INTEGER PRIMARY KEY, "
+    "event_id TEXT NOT NULL UNIQUE, body_json BLOB NOT NULL)",
+)
+_MIXED_HISTORY_TABLES = ("paper_notification_history", "paper_price_non_trading_receipt")
+_CONDITION_HISTORY_SQL = (
+    "CREATE TABLE paper_condition_notification_history(singleton INTEGER PRIMARY KEY "
+    "CHECK(singleton=1),protocol TEXT NOT NULL,consumer_fingerprint TEXT NOT NULL)",
+    "CREATE TABLE paper_condition_non_trading_receipt(global_sequence INTEGER PRIMARY KEY,"
+    "event_id TEXT NOT NULL UNIQUE,body_json BLOB NOT NULL)",
+)
+_CONDITION_HISTORY_TABLES = (
+    "paper_condition_notification_history",
+    "paper_condition_non_trading_receipt",
+)
 
 
 class PaperSignalConsumerSourceError(RuntimeError):
@@ -121,6 +142,50 @@ class PaperSourceObservation(RuntimeContractModel):
 
     cursor: PaperSignalConsumerCursor
     watermark_advanced: bool
+
+
+class PaperNotificationConsumerSummary(PaperSignalConsumerSummary):
+    ignored_non_trading_count: int = Field(ge=0)
+
+
+class PaperPriceNonTradingReceipt(PriceRuntimeModel):
+    receipt_schema: Literal["paper-price-non-trading/v1"] = "paper-price-non-trading/v1"
+    status: Literal["ignored_non_trading"] = "ignored_non_trading"
+    consumer_fingerprint: Sha256
+    source_id: str = Field(min_length=1)
+    source_generation_id: Sha256
+    record: PriceAlertBusEventRecord
+    completed_at: AwareUtcDatetime
+
+    @model_validator(mode="after")
+    def source_and_visibility(self) -> Self:
+        if (
+            type(self.record) is not PriceAlertBusEventRecord
+            or self.record.bus_generation_id != self.source_generation_id
+            or max(self.record.received_at, self.record.event.available_at) > self.completed_at
+        ):
+            raise ValueError("paper price receipt has an invalid source or visibility")
+        return self
+
+
+class PaperConditionNonTradingReceipt(ConditionRuntimeModel):
+    receipt_schema: Literal["paper-condition-non-trading/v1"] = "paper-condition-non-trading/v1"
+    status: Literal["ignored_non_trading"] = "ignored_non_trading"
+    consumer_fingerprint: Sha256
+    source_id: str = Field(min_length=1)
+    source_generation_id: Sha256
+    record: ConditionAlertBusEventRecord
+    completed_at: AwareUtcDatetime
+
+    @model_validator(mode="after")
+    def source_and_visibility(self) -> Self:
+        if (
+            type(self.record) is not ConditionAlertBusEventRecord
+            or self.record.bus_generation_id != self.source_generation_id
+            or max(self.record.received_at, self.record.event.available_at) > self.completed_at
+        ):
+            raise ValueError("paper condition receipt has an invalid source or visibility")
+        return self
 
 
 class _BindResult(RuntimeContractModel):
@@ -360,6 +425,22 @@ class PaperSignalConsumerStateStore:
         with self._write_transaction() as connection:
             source = self._required_source(connection)
             self._verify_source_row(source, descriptor)
+            if (
+                connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name"
+                    "='paper_price_non_trading_receipt'"
+                ).fetchone()
+                is not None
+                and connection.execute(
+                    "SELECT 1 FROM paper_price_non_trading_receipt WHERE "
+                    "global_sequence=? OR event_id=?",
+                    (record.global_sequence, record.signal_id),
+                ).fetchone()
+                is not None
+            ):
+                raise PaperSignalConsumerSourceError(
+                    "paper legacy receipt conflicts with a non-trading receipt"
+                )
             existing = connection.execute(
                 "SELECT * FROM paper_consumer_receipt WHERE global_sequence = ?",
                 (record.global_sequence,),
@@ -560,6 +641,275 @@ class PaperSignalConsumerStateStore:
             raise PaperSignalConsumerSourceError("signal record does not match its stored payload")
         return signal
 
+    def install_mixed_notification_history(self) -> None:
+        from rquant.price_alert_runtime_store import _private_parent
+
+        _private_parent(self.path)
+        with self._write_transaction() as connection:
+            tables = {
+                row[0]
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+            expected = {"paper_notification_history", "paper_price_non_trading_receipt"}
+            if tables & expected:
+                self._require_mixed_history(connection)
+                return
+            for statement in _MIXED_HISTORY_SQL:
+                connection.execute(statement)
+            connection.execute(
+                "INSERT INTO paper_notification_history VALUES(1,?,?)",
+                ("mixed-notification-history/v1", self.consumer_fingerprint),
+            )
+
+    def _require_mixed_history(self, connection: sqlite3.Connection) -> None:
+        actual = {
+            row[0]
+            for row in connection.execute(
+                "SELECT sql FROM sqlite_master WHERE tbl_name IN (?,?) AND sql IS NOT NULL",
+                _MIXED_HISTORY_TABLES,
+            )
+        }
+        if actual != set(_MIXED_HISTORY_SQL):
+            raise ValueError("paper mixed history installed schema differs")
+        marker = connection.execute(
+            "SELECT protocol,consumer_fingerprint FROM paper_notification_history WHERE singleton=1"
+        ).fetchone()
+        if marker is None or tuple(marker) != (
+            "mixed-notification-history/v1",
+            self.consumer_fingerprint,
+        ):
+            raise ValueError("paper mixed history marker conflicts with the original consumer")
+
+    def install_condition_notification_history(self) -> None:
+        self.install_mixed_notification_history()
+        with self._write_transaction() as connection:
+            self._require_mixed_history(connection)
+            tables = {
+                row[0]
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+            if tables & set(_CONDITION_HISTORY_TABLES):
+                self._require_condition_history(connection)
+                return
+            for statement in _CONDITION_HISTORY_SQL:
+                connection.execute(statement)
+            connection.execute(
+                "INSERT INTO paper_condition_notification_history VALUES(1,?,?)",
+                ("condition-notification-history/v1", self.consumer_fingerprint),
+            )
+
+    def _require_condition_history(self, connection: sqlite3.Connection) -> None:
+        self._require_mixed_history(connection)
+        actual = {
+            row[0]
+            for row in connection.execute(
+                "SELECT sql FROM sqlite_master WHERE tbl_name IN (?,?) AND sql IS NOT NULL",
+                _CONDITION_HISTORY_TABLES,
+            )
+        }
+        if actual != set(_CONDITION_HISTORY_SQL):
+            raise ValueError("paper condition installed schema differs")
+        marker = connection.execute(
+            "SELECT protocol,consumer_fingerprint FROM paper_condition_notification_history "
+            "WHERE singleton=1"
+        ).fetchone()
+        if marker is None or tuple(marker) != (
+            "condition-notification-history/v1",
+            self.consumer_fingerprint,
+        ):
+            raise ValueError("paper condition marker conflicts with the original consumer")
+
+    def condition_non_trading_receipt(
+        self, sequence: int
+    ) -> PaperConditionNonTradingReceipt | None:
+        with self._connect() as connection:
+            self._require_condition_history(connection)
+            row = connection.execute(
+                "SELECT body_json FROM paper_condition_non_trading_receipt WHERE global_sequence=?",
+                (sequence,),
+            ).fetchone()
+            return (
+                None if row is None else PaperConditionNonTradingReceipt.model_validate_json(row[0])
+            )
+
+    def complete_condition_non_trading(
+        self,
+        record: ConditionAlertBusEventRecord,
+        descriptor: SignalBusSourceDescriptor,
+        *,
+        completed_at: datetime,
+    ) -> PaperConditionNonTradingReceipt:
+        if (
+            type(record) is not ConditionAlertBusEventRecord
+            or type(descriptor) is not SignalBusSourceDescriptor
+        ):
+            raise TypeError(
+                "condition non-trading completion requires exact event and original source"
+            )
+        record = ConditionAlertBusEventRecord.model_validate_json(record.wire_bytes())
+        receipt = PaperConditionNonTradingReceipt(
+            consumer_fingerprint=self.consumer_fingerprint,
+            source_id=descriptor.source_id,
+            source_generation_id=descriptor.generation_id,
+            record=record,
+            completed_at=completed_at,
+        )
+        with self._write_transaction() as connection:
+            self._require_condition_history(connection)
+            source = self._required_source(connection)
+            self._verify_source_row(source, descriptor)
+            for table, key in (
+                ("paper_consumer_receipt", "signal_id"),
+                ("paper_price_non_trading_receipt", "event_id"),
+            ):
+                if (
+                    connection.execute(
+                        f"SELECT 1 FROM {table} WHERE global_sequence=? OR {key}=?",
+                        (record.global_sequence, record.event_id),
+                    ).fetchone()
+                    is not None
+                ):
+                    raise PaperSignalConsumerSourceError(
+                        "condition non-trading receipt conflicts with another family"
+                    )
+            row = connection.execute(
+                "SELECT body_json FROM paper_condition_non_trading_receipt "
+                "WHERE global_sequence=? OR event_id=?",
+                (record.global_sequence, record.event_id),
+            ).fetchone()
+            if row is not None:
+                original = PaperConditionNonTradingReceipt.model_validate_json(row[0])
+                if (
+                    original.record != record
+                    or original.source_id != descriptor.source_id
+                    or original.source_generation_id != descriptor.generation_id
+                ):
+                    raise PaperSignalConsumerSourceError(
+                        "condition non-trading replay differs from its original bytes"
+                    )
+                return original
+            last = int(source["last_global_sequence"])
+            if record.global_sequence != last + 1 or record.global_sequence > int(
+                source["observed_high_watermark"]
+            ):
+                raise PaperSignalConsumerSourceError(
+                    "condition non-trading cursor cannot skip a sequence"
+                )
+            connection.execute(
+                "INSERT INTO paper_condition_non_trading_receipt VALUES(?,?,?)",
+                (record.global_sequence, record.event_id, receipt.wire_bytes()),
+            )
+            updated = connection.execute(
+                "UPDATE paper_consumer_source "
+                "SET last_global_sequence=?,last_signal_id=?,updated_at=? "
+                "WHERE singleton=1 AND last_global_sequence=?",
+                (
+                    record.global_sequence,
+                    record.event_id,
+                    normalize_aware_utc(completed_at).isoformat(),
+                    last,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise PaperSignalConsumerSourceError(
+                    "condition non-trading cursor moved during commit"
+                )
+            self._before_non_trading_commit()
+        return receipt
+
+    def non_trading_receipt(self, sequence: int) -> PaperPriceNonTradingReceipt | None:
+        with self._connect() as connection:
+            self._require_mixed_history(connection)
+            row = connection.execute(
+                "SELECT body_json FROM paper_price_non_trading_receipt WHERE global_sequence=?",
+                (sequence,),
+            ).fetchone()
+            return None if row is None else PaperPriceNonTradingReceipt.model_validate_json(row[0])
+
+    def complete_non_trading(
+        self,
+        record: PriceAlertBusEventRecord,
+        descriptor: SignalBusSourceDescriptor,
+        *,
+        completed_at: datetime,
+    ) -> PaperPriceNonTradingReceipt:
+        if (
+            type(record) is not PriceAlertBusEventRecord
+            or type(descriptor) is not SignalBusSourceDescriptor
+        ):
+            raise TypeError(
+                "non-trading completion requires the exact price event and original source"
+            )
+        record = PriceAlertBusEventRecord.model_validate_json(record.wire_bytes())
+        receipt = PaperPriceNonTradingReceipt(
+            consumer_fingerprint=self.consumer_fingerprint,
+            source_id=descriptor.source_id,
+            source_generation_id=descriptor.generation_id,
+            record=record,
+            completed_at=completed_at,
+        )
+        with self._write_transaction() as connection:
+            self._require_mixed_history(connection)
+            source = self._required_source(connection)
+            self._verify_source_row(source, descriptor)
+            if (
+                connection.execute(
+                    "SELECT 1 FROM paper_consumer_receipt WHERE global_sequence=? OR signal_id=?",
+                    (record.global_sequence, record.event_id),
+                ).fetchone()
+                is not None
+            ):
+                raise PaperSignalConsumerSourceError(
+                    "price non-trading receipt conflicts with a legacy receipt"
+                )
+            row = connection.execute(
+                (
+                    "SELECT body_json FROM paper_price_non_trading_receipt W"
+                    "HERE global_sequence=? OR event_id=?"
+                ),
+                (record.global_sequence, record.event_id),
+            ).fetchone()
+            if row is not None:
+                original = PaperPriceNonTradingReceipt.model_validate_json(row[0])
+                if (
+                    original.record != record
+                    or original.source_id != descriptor.source_id
+                    or original.source_generation_id != descriptor.generation_id
+                ):
+                    raise PaperSignalConsumerSourceError(
+                        "paper non-trading replay differs from its original bytes"
+                    )
+                return original
+            last = int(source["last_global_sequence"])
+            if record.global_sequence != last + 1 or record.global_sequence > int(
+                source["observed_high_watermark"]
+            ):
+                raise PaperSignalConsumerSourceError(
+                    "paper non-trading cursor cannot skip a sequence"
+                )
+            connection.execute(
+                "INSERT INTO paper_price_non_trading_receipt VALUES(?,?,?)",
+                (record.global_sequence, record.event_id, receipt.wire_bytes()),
+            )
+            connection.execute(
+                (
+                    "UPDATE paper_consumer_source SET "
+                    "last_global_sequence=?,last_signal_id=?,updated_at=? WHERE "
+                    "singleton=1 AND last_global_sequence=?"
+                ),
+                (
+                    record.global_sequence,
+                    record.event_id,
+                    normalize_aware_utc(completed_at).isoformat(),
+                    last,
+                ),
+            )
+            self._before_non_trading_commit()
+        return receipt
+
+    def _before_non_trading_commit(self) -> None:
+        """Fault injection before the single cursor/non-trading receipt COMMIT."""
+
     def _after_paper_ingest(
         self,
         _record: SignalBusSignalRecord,
@@ -633,5 +983,112 @@ def consume_signal_bus_to_paper(
         delegated_count=delegated_count,
         replayed_count=replayed_count,
         has_deferred_signals=(ending_cursor.last_global_sequence < descriptor.high_watermark),
+        watermark_advanced=observation.watermark_advanced,
+    )
+
+
+def consume_notification_events_to_paper(
+    bus: object,
+    queue: PaperSignalQueueStore,
+    state: PaperSignalConsumerStateStore,
+    *,
+    observed_at: datetime,
+    limit: int,
+) -> PaperNotificationConsumerSummary:
+    from rquant.signal_bus import SignalBusStore
+    from rquant.signal_route_spool import ReadonlyNotificationEventRouteSpool
+
+    if type(bus) not in {SignalBusStore, ReadonlyNotificationEventRouteSpool}:
+        raise TypeError(
+            "mixed paper source must be the actual original bus or verified immutable spool"
+        )
+    if type(limit) is not int or not 1 <= limit <= 100:
+        raise ValueError("mixed paper consumption exceeds 100 records")
+    observed = normalize_aware_utc(observed_at)
+    descriptor = bus.source_descriptor()
+    starting = state.validate_source(descriptor)
+    records = bus.notification_events_after_global_sequence(
+        after_sequence=starting.last_global_sequence,
+        through_sequence=descriptor.high_watermark,
+        observed_at=observed,
+        limit=limit,
+    )
+    sequence = starting.last_global_sequence
+    verified = []
+    for record in records:
+        sequence += 1
+        if (
+            record.global_sequence != sequence
+            or sequence > descriptor.high_watermark
+            or record.received_at > observed
+        ):
+            raise PaperSignalConsumerSourceError("mixed paper batch has a gap or future row")
+        if type(record) is ConditionAlertBusEventRecord:
+            value = ConditionAlertBusEventRecord.model_validate_json(record.wire_bytes())
+            if (
+                value.bus_generation_id != descriptor.generation_id
+                or value.event.available_at > observed
+            ):
+                raise PaperSignalConsumerSourceError(
+                    "mixed paper condition source or visibility differs"
+                )
+            with state._connect() as connection:
+                state._require_condition_history(connection)
+            verified.append(None)
+        elif type(record) is PriceAlertBusEventRecord:
+            value = PriceAlertBusEventRecord.model_validate_json(record.wire_bytes())
+            if (
+                value.bus_generation_id != descriptor.generation_id
+                or value.event.available_at > observed
+            ):
+                raise PaperSignalConsumerSourceError(
+                    "mixed paper price source or visibility differs"
+                )
+            with state._connect() as connection:
+                state._require_mixed_history(connection)
+            verified.append(None)
+        elif type(record) is SignalBusSignalRecord:
+            signal = state._verified_record_signal(record)
+            require_legacy_signal_write(signal, operation="consume_notification_events_to_paper")
+            if signal.available_at > observed:
+                raise PaperSignalConsumerSourceError("mixed paper legacy event is in the future")
+            verified.append(signal)
+        else:
+            raise TypeError("mixed paper batch contains an unsupported event family")
+    observation = state.observe_source(descriptor, observed_at=observed)
+    delegated = replayed = ignored = 0
+    for record, signal in zip(records, verified, strict=True):
+        if signal is None:
+            if type(record) is ConditionAlertBusEventRecord:
+                state.complete_condition_non_trading(record, descriptor, completed_at=observed)
+            else:
+                state.complete_non_trading(record, descriptor, completed_at=observed)
+            ignored += 1
+            continue
+        binding = state.bind(record, descriptor, bound_at=observed)
+        replayed += binding.replayed
+        if binding.receipt.status is PaperSignalReceiptStatus.DELEGATED:
+            continue
+        queue_record = queue.ingest(
+            signal,
+            received_at=observed,
+            payload_json=record.payload_json,
+            payload_hash=record.payload_hash,
+            payload_size=len(record.payload_json.encode("utf-8")),
+        )
+        state._after_paper_ingest(record, queue_record)
+        state.complete(record, descriptor, queue_record, delegated_at=observed)
+        delegated += 1
+    ending = state.cursor()
+    return PaperNotificationConsumerSummary(
+        observed_at=observed,
+        source_generation_id=descriptor.generation_id,
+        source_high_watermark=descriptor.high_watermark,
+        started_after_sequence=starting.last_global_sequence,
+        ended_at_sequence=ending.last_global_sequence,
+        delegated_count=delegated,
+        replayed_count=replayed,
+        ignored_non_trading_count=ignored,
+        has_deferred_signals=ending.last_global_sequence < descriptor.high_watermark,
         watermark_advanced=observation.watermark_advanced,
     )

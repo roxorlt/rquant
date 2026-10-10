@@ -36,6 +36,7 @@ SNAPSHOT_PATH = (
     Path(__file__).resolve().parents[1] / "fixtures" / "runtime-schema-contracts" / "v0.33.1.json"
 )
 HEALTH_CHANNEL_ID = "runtime.serving.runtime-health"
+LAB_JOBS_CHANNEL_ID = "runtime.serving.lab-jobs"
 HARNESS_COMMIT = "c" * 40
 
 _SERVING_KINDS = frozenset(
@@ -167,6 +168,22 @@ def test_every_channel_transitions_from_the_released_snapshot(
         # a developer should do about it. The nine-hash test above carries that guidance
         # for the one channel it watches -- the other twenty get it here.
         pytest.fail(f"{exc}\n{_REFRESH_HINT}")
+
+
+def test_head_serving_lab_fields_match_the_released_snapshot(
+    released_bundle: RuntimeSchemaContractBundle,
+    head_bundle: RuntimeSchemaContractBundle,
+) -> None:
+    released = {
+        field.name: field.model_dump(mode="json")
+        for field in released_bundle.channel(LAB_JOBS_CHANNEL_ID).declaration.fields
+    }
+    current = {
+        field.name: field.model_dump(mode="json")
+        for field in head_bundle.channel(LAB_JOBS_CHANNEL_ID).declaration.fields
+    }
+    assert set(current) == {"payload_kind", "lab_jobs", "projections"}
+    assert current == released
 
 
 def test_released_snapshot_covers_the_whole_channel_catalog(

@@ -1,0 +1,11 @@
+
+ RUN  v5.0.2 /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/web
+
+ ❯ src/pages/query/query.test.tsx (11 tests | 1 failed | 10 skipped) 665ms
+   × RQ-R03：保存 A 的延迟回执不替换当前目标：另存为 663ms
+
+ Test Files  1 failed (1)
+      Tests  1 failed | 10 skipped (11)
+   Start at  06:25:16
+   Duration  1.81s (tests 39%, import 29%, environment 15%, transform 10%, setup 6%)
+

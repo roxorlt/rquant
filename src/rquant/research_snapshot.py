@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import tempfile
 import uuid
@@ -10,10 +11,11 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Annotated, Literal, Protocol, cast
 
 import duckdb
 import pandas as pd
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from rquant.data_contracts import research_dataset_contract, research_export_schema
 from rquant.data_metadata import (
@@ -43,9 +45,11 @@ from rquant.research_lake import (
     verify_research_partition,
 )
 from rquant.strategy_dependencies import (
+    FACTOR_EVAL_CONTRACT_VERSION,
     SUSPENSION_SESSION_EVIDENCE_DATASET,
     StrategyExecutionDependencies,
     StrategyTableDependency,
+    factor_execution_dependencies,
     strategy_execution_dependencies,
 )
 from rquant.suspension_evidence import suspension_session_evidence_sql
@@ -53,6 +57,24 @@ from rquant.suspension_evidence import suspension_session_evidence_sql
 if TYPE_CHECKING:
     from rquant.backfill_manifest import EligibilityResolution
     from rquant.storage.duckdb import DuckDBStore
+
+
+FACTOR_SNAPSHOT_BUILDER_VERSION = "factor-single-snapshot-v1"
+_FACTOR_STOCK_PATTERN = re.compile(r"[0-9]{6}\.(?:SZ|SH|BJ)\Z")
+_FACTOR_MAX_STOCKS = 500
+_FACTOR_MAX_DAYS = 1_024
+_FACTOR_MAX_QUERY_DAYS = 366
+_FACTOR_MAX_QUERY_ROWS = 100_000
+_FACTOR_TABLE_COLUMNS = {
+    "daily_bar": {"ts_code", "trade_date", "open", "high", "low", "close", "vol", "amount"},
+    "adj_factor": {"ts_code", "trade_date", "adj_factor"},
+    "trade_calendar": {"exchange", "cal_date", "is_open", "pretrade_date"},
+}
+_FACTOR_TABLE_KEYS = {
+    "daily_bar": ("ts_code", "trade_date"),
+    "adj_factor": ("ts_code", "trade_date"),
+    "trade_calendar": ("exchange", "cal_date"),
+}
 
 
 class SnapshotMetadataStore(Protocol):
@@ -80,18 +102,14 @@ def _source_table_schema(
     table_name: str,
 ) -> tuple[tuple[tuple[str, str], ...], tuple[str, ...]]:
     try:
-        rows = connection.execute(
-            f"PRAGMA table_info({_quoted_literal(table_name)})"
-        ).fetchall()
+        rows = connection.execute(f"PRAGMA table_info({_quoted_literal(table_name)})").fetchall()
     except duckdb.CatalogException as exc:
         raise ValueError(f"source table missing: {table_name}") from exc
     if not rows:
         raise ValueError(f"source table missing: {table_name}")
     columns = tuple((str(row[1]), str(row[2])) for row in rows)
     primary_key = tuple(
-        str(row[1])
-        for row in sorted(rows, key=lambda item: int(item[5]))
-        if int(row[5]) > 0
+        str(row[1]) for row in sorted(rows, key=lambda item: int(item[5])) if int(row[5]) > 0
     )
     if not primary_key:
         raise ValueError(f"source table requires a primary key: {table_name}")
@@ -144,9 +162,7 @@ def materialize_table_dependency(
     if dependency.code_column is not None and selected_codes is not None:
         if selected_codes:
             placeholders = ",".join("?" for _ in selected_codes)
-            predicates.append(
-                f"{_quoted_identifier(dependency.code_column)} IN ({placeholders})"
-            )
+            predicates.append(f"{_quoted_identifier(dependency.code_column)} IN ({placeholders})")
             parameters.extend(selected_codes)
         else:
             predicates.append("FALSE")
@@ -154,19 +170,11 @@ def materialize_table_dependency(
     selected = ", ".join(_quoted_identifier(name) for name, _ in columns)
     ordered = ", ".join(_quoted_identifier(name) for name in primary_key)
     where = "" if not predicates else " WHERE " + " AND ".join(predicates)
-    query = (
-        f"SELECT {selected} FROM {_quoted_identifier(source_table)}"
-        f"{where} ORDER BY {ordered}"
-    )
+    query = f"SELECT {selected} FROM {_quoted_identifier(source_table)}{where} ORDER BY {ordered}"
     row = connection.execute(f"SELECT COUNT(*) FROM ({query})", parameters).fetchone()
     row_count = 0 if row is None else int(row[0])
 
-    versions_root = (
-        Path(artifact_root)
-        / "tables"
-        / dependency.table_name
-        / "versions"
-    )
+    versions_root = Path(artifact_root) / "tables" / dependency.table_name / "versions"
     versions_root.mkdir(parents=True, exist_ok=True)
     temp_path = versions_root / f".data.parquet.tmp-{uuid.uuid4().hex}"
     try:
@@ -179,12 +187,7 @@ def materialize_table_dependency(
         )
         _fsync_file(temp_path)
         file_hash = _file_sha256(temp_path)
-        relative_path = (
-            Path("tables")
-            / dependency.table_name
-            / "versions"
-            / f"{file_hash}.parquet"
-        )
+        relative_path = Path("tables") / dependency.table_name / "versions" / f"{file_hash}.parquet"
         final_path = Path(artifact_root) / relative_path
         if final_path.is_file():
             if _file_sha256(final_path) != file_hash:
@@ -209,8 +212,7 @@ def materialize_table_dependency(
             date_column = _quoted_identifier(dependency.date_column)
             with duckdb.connect() as validation:
                 bounds = validation.execute(
-                    f"SELECT MIN({date_column}), MAX({date_column}) "
-                    "FROM read_parquet(?)",
+                    f"SELECT MIN({date_column}), MAX({date_column}) FROM read_parquet(?)",
                     [str(final_path)],
                 ).fetchone()
             if bounds is not None and bounds[0] is not None:
@@ -221,8 +223,7 @@ def materialize_table_dependency(
             dataset_id=dependency.dataset_id,
             table_name=dependency.table_name,
             artifact_key=(
-                f"{dependency.dataset_id}:{start_date.isoformat()}:"
-                f"{end_date.isoformat()}"
+                f"{dependency.dataset_id}:{start_date.isoformat()}:{end_date.isoformat()}"
             ),
             relative_path=relative_path.as_posix(),
             row_count=row_count,
@@ -308,9 +309,7 @@ def materialize_suspension_session_evidence(
             as_of_time=as_of_time,
         )
     finally:
-        connection.execute(
-            f"DROP TABLE IF EXISTS {_quoted_identifier(temp_table)}"
-        )
+        connection.execute(f"DROP TABLE IF EXISTS {_quoted_identifier(temp_table)}")
 
 
 def materialize_eligibility_resolution(
@@ -374,16 +373,10 @@ def materialize_eligibility_resolution(
             as_of_time=as_of_time,
         )
         return artifact.model_copy(
-            update={
-                "artifact_key": (
-                    f"strategy_eligibility:{resolution.resolution_hash}"
-                )
-            }
+            update={"artifact_key": (f"strategy_eligibility:{resolution.resolution_hash}")}
         )
     finally:
-        connection.execute(
-            f"DROP TABLE IF EXISTS {_quoted_identifier(temp_table)}"
-        )
+        connection.execute(f"DROP TABLE IF EXISTS {_quoted_identifier(temp_table)}")
 
 
 def verify_materialized_table_artifact(
@@ -393,42 +386,26 @@ def verify_materialized_table_artifact(
     as_of_time: datetime,
 ) -> Path:
     if artifact.artifact_type != "materialized_table":
-        raise ValueError(
-            "verify_materialized_table_artifact requires materialized_table"
-        )
+        raise ValueError("verify_materialized_table_artifact requires materialized_table")
     expected_relative = (
-        Path("tables")
-        / artifact.table_name
-        / "versions"
-        / f"{artifact.file_hash}.parquet"
+        Path("tables") / artifact.table_name / "versions" / f"{artifact.file_hash}.parquet"
     )
     if Path(artifact.relative_path) != expected_relative:
         raise ValueError(
-            f"materialized artifact path is not content-addressed: "
-            f"{artifact.artifact_key}"
+            f"materialized artifact path is not content-addressed: {artifact.artifact_key}"
         )
     root = Path(lake_root).resolve()
     path = (root / expected_relative).resolve()
     if not path.is_relative_to(root):
-        raise ValueError(
-            f"materialized artifact escapes lake root: {artifact.artifact_key}"
-        )
+        raise ValueError(f"materialized artifact escapes lake root: {artifact.artifact_key}")
     if not path.is_file():
-        raise ValueError(
-            f"materialized artifact file missing: {artifact.artifact_key}"
-        )
+        raise ValueError(f"materialized artifact file missing: {artifact.artifact_key}")
     if artifact.file_size is not None and path.stat().st_size != artifact.file_size:
-        raise ValueError(
-            f"materialized artifact file size mismatch: {artifact.artifact_key}"
-        )
+        raise ValueError(f"materialized artifact file size mismatch: {artifact.artifact_key}")
     if _file_sha256(path) != artifact.file_hash:
-        raise ValueError(
-            f"materialized artifact file hash mismatch: {artifact.artifact_key}"
-        )
+        raise ValueError(f"materialized artifact file hash mismatch: {artifact.artifact_key}")
     if not artifact.primary_key:
-        raise ValueError(
-            f"materialized artifact primary key missing: {artifact.artifact_key}"
-        )
+        raise ValueError(f"materialized artifact primary key missing: {artifact.artifact_key}")
 
     parquet = _quoted_literal(str(path))
     reader = f"read_parquet({parquet}, hive_partitioning = false)"
@@ -436,20 +413,12 @@ def verify_materialized_table_artifact(
         described = validation.execute(f"DESCRIBE SELECT * FROM {reader}").fetchall()
         columns = tuple((str(row[0]), str(row[1])) for row in described)
         if _schema_hash(columns) != artifact.schema_hash:
-            raise ValueError(
-                f"materialized artifact schema hash mismatch: "
-                f"{artifact.artifact_key}"
-            )
+            raise ValueError(f"materialized artifact schema hash mismatch: {artifact.artifact_key}")
         row = validation.execute(f"SELECT COUNT(*) FROM {reader}").fetchone()
         row_count = 0 if row is None else int(row[0])
         if row_count != artifact.row_count:
-            raise ValueError(
-                f"materialized artifact row count mismatch: "
-                f"{artifact.artifact_key}"
-            )
-        keys = ", ".join(
-            _quoted_identifier(column) for column in artifact.primary_key
-        )
+            raise ValueError(f"materialized artifact row count mismatch: {artifact.artifact_key}")
+        keys = ", ".join(_quoted_identifier(column) for column in artifact.primary_key)
         duplicate = validation.execute(
             f"""
             SELECT COUNT(*) FROM (
@@ -460,8 +429,7 @@ def verify_materialized_table_artifact(
         ).fetchone()
         if duplicate is not None and int(duplicate[0]) > 0:
             raise ValueError(
-                f"materialized artifact duplicate primary key: "
-                f"{artifact.artifact_key}"
+                f"materialized artifact duplicate primary key: {artifact.artifact_key}"
             )
         bounds: tuple[object, object] | None = None
         if artifact.event_column is not None:
@@ -478,33 +446,18 @@ def verify_materialized_table_artifact(
         )
         != artifact.content_hash
     ):
-        raise ValueError(
-            f"materialized artifact content hash mismatch: {artifact.artifact_key}"
-        )
+        raise ValueError(f"materialized artifact content hash mismatch: {artifact.artifact_key}")
     if bounds is not None and bounds[0] is not None:
         earliest = cast(date | datetime, bounds[0])
         latest = cast(date | datetime, bounds[1])
-        if (
-            artifact.earliest_time is not None
-            and earliest.isoformat() != artifact.earliest_time
-        ):
+        if artifact.earliest_time is not None and earliest.isoformat() != artifact.earliest_time:
             raise ValueError(
-                f"materialized artifact earliest_time mismatch: "
-                f"{artifact.artifact_key}"
+                f"materialized artifact earliest_time mismatch: {artifact.artifact_key}"
             )
-        if (
-            artifact.latest_time is not None
-            and latest.isoformat() != artifact.latest_time
-        ):
-            raise ValueError(
-                f"materialized artifact latest_time mismatch: "
-                f"{artifact.artifact_key}"
-            )
+        if artifact.latest_time is not None and latest.isoformat() != artifact.latest_time:
+            raise ValueError(f"materialized artifact latest_time mismatch: {artifact.artifact_key}")
         if _event_is_after_as_of(latest, normalize_utc_datetime(as_of_time)):
-            raise ValueError(
-                f"materialized artifact contains future data: "
-                f"{artifact.artifact_key}"
-            )
+            raise ValueError(f"materialized artifact contains future data: {artifact.artifact_key}")
     return path
 
 
@@ -535,9 +488,7 @@ def _manifest_from_record(
         manifest.schema_hash,
     )
     if record_payload != manifest_payload:
-        raise ValueError(
-            f"research catalog manifest mismatch: {record.partition_id}"
-        )
+        raise ValueError(f"research catalog manifest mismatch: {record.partition_id}")
     return manifest
 
 
@@ -545,9 +496,7 @@ def _partition_key_from_artifact(
     artifact: DatasetSnapshotArtifact,
 ) -> ResearchPartitionKey:
     if artifact.partition_id is None:
-        raise ValueError(
-            f"lake artifact is missing partition_id: {artifact.artifact_key}"
-        )
+        raise ValueError(f"lake artifact is missing partition_id: {artifact.artifact_key}")
     parts = artifact.partition_id.split(":")
     if len(parts) not in {2, 3}:
         raise ValueError(f"invalid research partition id: {artifact.partition_id}")
@@ -569,19 +518,13 @@ def verify_snapshot_artifact(
 ) -> Path:
     """Verify a bound lake artifact using only immutable manifest evidence."""
     if artifact.artifact_type != "lake_partition":
-        raise ValueError(
-            "verify_snapshot_artifact currently requires a lake_partition"
-        )
+        raise ValueError("verify_snapshot_artifact currently requires a lake_partition")
     key = _partition_key_from_artifact(artifact)
     if key.dataset != artifact.dataset_id:
-        raise ValueError(
-            f"artifact dataset disagrees with partition: {artifact.artifact_key}"
-        )
+        raise ValueError(f"artifact dataset disagrees with partition: {artifact.artifact_key}")
     expected_relative = partition_version_relative_path(key, artifact.file_hash)
     if Path(artifact.relative_path) != expected_relative:
-        raise ValueError(
-            f"artifact path is not content-addressed: {artifact.artifact_key}"
-        )
+        raise ValueError(f"artifact path is not content-addressed: {artifact.artifact_key}")
     root = lake_root.resolve()
     path = (root / expected_relative).resolve()
     if not path.is_relative_to(root):
@@ -606,10 +549,7 @@ def verify_snapshot_artifact(
         expected_columns=columns,
         contract=contract,
     )
-    if (
-        artifact.earliest_time is not None
-        and earliest.isoformat() != artifact.earliest_time
-    ):
+    if artifact.earliest_time is not None and earliest.isoformat() != artifact.earliest_time:
         raise ValueError(f"artifact earliest_time mismatch: {artifact.artifact_key}")
     if artifact.latest_time is not None and latest.isoformat() != artifact.latest_time:
         raise ValueError(f"artifact latest_time mismatch: {artifact.artifact_key}")
@@ -623,9 +563,7 @@ def verify_snapshot_artifact(
     ):
         raise ValueError(f"artifact content hash mismatch: {artifact.artifact_key}")
     if _event_is_after_as_of(latest, as_of_time):
-        raise ValueError(
-            f"artifact contains future data after as_of_time: {artifact.artifact_key}"
-        )
+        raise ValueError(f"artifact contains future data after as_of_time: {artifact.artifact_key}")
     return path
 
 
@@ -703,13 +641,10 @@ def _shadow_lake_table(
     selected = tuple(
         artifact
         for artifact in artifacts
-        if artifact.dataset_id == table_name
-        and artifact.table_name == table_name
+        if artifact.dataset_id == table_name and artifact.table_name == table_name
     )
     if not selected or len(selected) != len(artifacts):
-        raise ValueError(
-            f"eligibility input must contain only {table_name} artifacts"
-        )
+        raise ValueError(f"eligibility input must contain only {table_name} artifacts")
     paths = tuple(
         verify_snapshot_artifact(
             artifact,
@@ -730,9 +665,7 @@ def _shadow_lake_table(
     try:
         yield
     finally:
-        connection.execute(
-            f"DROP VIEW IF EXISTS {_quoted_identifier(table_name)}"
-        )
+        connection.execute(f"DROP VIEW IF EXISTS {_quoted_identifier(table_name)}")
 
 
 def resolve_strategy_eligibility_from_artifacts(
@@ -753,9 +686,7 @@ def resolve_strategy_eligibility_from_artifacts(
 
     if strategy_id != "auction_gap":
         if input_artifacts:
-            raise ValueError(
-                "non-auction eligibility cannot use auction lake artifacts"
-            )
+            raise ValueError("non-auction eligibility cannot use auction lake artifacts")
         return resolve_strategy_eligibility(
             store,
             strategy_id=strategy_id,
@@ -809,9 +740,7 @@ def _publish_binding_manifest(
             path.read_text(encoding="utf-8")
         )
         if existing != binding.manifest:
-            raise ValueError(
-                f"immutable binding manifest conflict: {binding.snapshot_id}"
-            )
+            raise ValueError(f"immutable binding manifest conflict: {binding.snapshot_id}")
         return path
 
     temp_path = path.parent / f".manifest.json.tmp-{uuid.uuid4().hex}"
@@ -825,13 +754,9 @@ def _publish_binding_manifest(
     finally:
         if temp_path.exists():
             temp_path.unlink()
-    published = DatasetSnapshotBindingManifest.model_validate_json(
-        path.read_text(encoding="utf-8")
-    )
+    published = DatasetSnapshotBindingManifest.model_validate_json(path.read_text(encoding="utf-8"))
     if published != binding.manifest:
-        raise ValueError(
-            f"published binding manifest verification failed: {binding.snapshot_id}"
-        )
+        raise ValueError(f"published binding manifest verification failed: {binding.snapshot_id}")
     return path
 
 
@@ -856,25 +781,73 @@ def build_dataset_snapshot_binding(
         raise KeyError(f"dataset snapshot not found: {snapshot_id}")
     if snapshot.status != "ready":
         raise ValueError(f"dataset snapshot is not ready: {snapshot_id}")
-    selected_dependencies = dependencies or strategy_execution_dependencies(
-        snapshot.strategy_name
-    )
+    if snapshot.strategy_name == "factor_eval":
+        raise ValueError("factor_eval requires the dedicated single-transaction builder")
+    selected_dependencies = dependencies or strategy_execution_dependencies(snapshot.strategy_name)
     if selected_dependencies.strategy_id != snapshot.strategy_name:
         raise ValueError("dependency contract does not match snapshot strategy")
 
+    if snapshot.strategy_name in {"paper_reconcile", "paper_backtest_band"}:
+        from rquant.paper_research_source import verify_paper_snapshot_source
+
+        if selected_dependencies != strategy_execution_dependencies(snapshot.strategy_name):
+            raise ValueError("paper requires its exact source contract")
+        if eligibility_resolution is not None or lake_artifacts or ts_codes is not None:
+            raise ValueError("paper source cannot include unrelated artifacts or filters")
+        verify_paper_snapshot_source(source_connection, task_name=snapshot.strategy_name, code_sha=snapshot.code_commit,
+                                     start_date=start_date, end_date=end_date,
+                                     input_hash=snapshot.table_watermarks.get("paper_input_hash", ""), as_of=snapshot.as_of_time)
+
+    if selected_dependencies.template_definition is not None:
+        from rquant.strategy_template_source import verify_template_snapshot_source
+
+        if eligibility_resolution is not None or lake_artifacts or ts_codes is not None:
+            raise ValueError("template source cannot include unrelated artifacts or filters")
+        verify_template_snapshot_source(source_connection, version=selected_dependencies.template_definition, code_sha=snapshot.code_commit, start_date=start_date, end_date=end_date, input_hash=snapshot.table_watermarks.get("template_input_hash", ""), as_of=snapshot.as_of_time)
+
+    if snapshot.strategy_name == "portfolio_backtest":
+        from rquant.portfolio_backtest_adapter import verify_portfolio_snapshot_source
+
+        if selected_dependencies != strategy_execution_dependencies("portfolio_backtest"):
+            raise ValueError("portfolio requires its exact source contract")
+        if eligibility_resolution is not None or lake_artifacts:
+            raise ValueError("portfolio cannot include unrelated source artifacts")
+        verify_portfolio_snapshot_source(
+            source_connection,
+            code_sha=snapshot.code_commit,
+            start_date=start_date,
+            end_date=end_date,
+            input_hash=snapshot.table_watermarks.get("portfolio_input_hash", ""),
+        )
+    if snapshot.strategy_name == "minute_runtime_replay":
+        from rquant.minute_backtest_producer import verify_minute_snapshot_source
+
+        if selected_dependencies != strategy_execution_dependencies("minute_runtime_replay"):
+            raise ValueError("minute requires its exact single-table source contract")
+        if eligibility_resolution is not None or lake_artifacts is not None or ts_codes is not None:
+            raise ValueError("minute source cannot include filters or unrelated source artifacts")
+        verify_minute_snapshot_source(source_connection, code_sha=snapshot.code_commit,
+            start_date=start_date, end_date=end_date, full_input_hash=snapshot.table_watermarks.get("minute_full_input_hash", ""),
+            seed_hash=snapshot.table_watermarks.get("minute_seed_hash", ""),
+            core_input_hash=snapshot.table_watermarks.get("minute_core_input_hash", ""), as_of=snapshot.as_of_time)
+    if snapshot.strategy_name == "minute_parameter_replay":
+        from rquant.minute_backtest_parameter_producer import verify_minute_parameter_snapshot_source
+
+        if selected_dependencies != strategy_execution_dependencies("minute_parameter_replay"):
+            raise ValueError("parameter minute requires its exact single-table source contract")
+        if eligibility_resolution is not None or lake_artifacts is not None or ts_codes is not None:
+            raise ValueError("parameter minute source cannot include filters or unrelated artifacts")
+        verify_minute_parameter_snapshot_source(source_connection, code_sha=snapshot.code_commit,
+            start_date=start_date, end_date=end_date, full_input_hash=snapshot.table_watermarks.get("minute_full_input_hash", ""),
+            seed_hash=snapshot.table_watermarks.get("minute_seed_hash", ""),
+            core_input_hash=snapshot.table_watermarks.get("minute_core_input_hash", ""), as_of=snapshot.as_of_time)
     artifacts: list[DatasetSnapshotArtifact] = []
     if eligibility_resolution is not None:
         if eligibility_resolution.strategy_id != snapshot.strategy_name:
-            raise ValueError(
-                "eligibility resolution does not match snapshot strategy"
-            )
-        expected_resolution_hash = snapshot.table_watermarks.get(
-            "eligibility_resolution_hash"
-        )
+            raise ValueError("eligibility resolution does not match snapshot strategy")
+        expected_resolution_hash = snapshot.table_watermarks.get("eligibility_resolution_hash")
         if expected_resolution_hash != eligibility_resolution.resolution_hash:
-            raise ValueError(
-                "eligibility resolution does not match snapshot watermark"
-            )
+            raise ValueError("eligibility resolution does not match snapshot watermark")
         if not eligibility_resolution.requested_dates:
             raise ValueError("eligibility resolution has no requested dates")
         artifacts.append(
@@ -899,15 +872,11 @@ def build_dataset_snapshot_binding(
                 as_of_time=snapshot.as_of_time,
             )
             if not resolved:
-                raise ValueError(
-                    f"research lake has no {dataset} partitions in requested range"
-                )
+                raise ValueError(f"research lake has no {dataset} partitions in requested range")
             artifacts.extend(resolved)
     else:
         required_datasets = set(selected_dependencies.lake_datasets)
-        observed_datasets = {
-            artifact.dataset_id for artifact in lake_artifacts
-        }
+        observed_datasets = {artifact.dataset_id for artifact in lake_artifacts}
         if observed_datasets != required_datasets:
             raise ValueError(
                 "pinned lake artifacts do not match strategy dependencies: "
@@ -917,20 +886,16 @@ def build_dataset_snapshot_binding(
         keys: set[str] = set()
         for artifact in lake_artifacts:
             if artifact.artifact_key in keys:
-                raise ValueError(
-                    f"duplicate pinned lake artifact: {artifact.artifact_key}"
-                )
+                raise ValueError(f"duplicate pinned lake artifact: {artifact.artifact_key}")
             keys.add(artifact.artifact_key)
             key = _partition_key_from_artifact(artifact)
             if not start_date <= key.trade_date <= end_date:
                 raise ValueError(
-                    "pinned lake artifact is outside binding range: "
-                    f"{artifact.artifact_key}"
+                    f"pinned lake artifact is outside binding range: {artifact.artifact_key}"
                 )
             if key.dataset == "minute_bar" and key.freq != "1min":
                 raise ValueError(
-                    "pinned minute artifact has unexpected frequency: "
-                    f"{artifact.artifact_key}"
+                    f"pinned minute artifact has unexpected frequency: {artifact.artifact_key}"
                 )
             verify_snapshot_artifact(
                 artifact,
@@ -972,23 +937,15 @@ def build_dataset_snapshot_binding(
         dependency_contract_version=selected_dependencies.contract_version,
         builder_version="snapshot-builder-v2",
         eligibility_resolution_hash=(
-            None
-            if eligibility_resolution is None
-            else eligibility_resolution.resolution_hash
+            None if eligibility_resolution is None else eligibility_resolution.resolution_hash
         ),
         eligibility_expected_dates=(
-            None
-            if eligibility_resolution is None
-            else eligibility_resolution.expected_count
+            None if eligibility_resolution is None else eligibility_resolution.expected_count
         ),
         eligibility_complete_dates=(
-            None
-            if eligibility_resolution is None
-            else eligibility_resolution.available_count
+            None if eligibility_resolution is None else eligibility_resolution.available_count
         ),
-        artifacts=tuple(
-            sorted(artifacts, key=lambda artifact: artifact.artifact_key)
-        ),
+        artifacts=tuple(sorted(artifacts, key=lambda artifact: artifact.artifact_key)),
     )
     built_at = normalize_utc_datetime(now())
     provisional = DatasetSnapshotBinding.create(
@@ -998,10 +955,7 @@ def build_dataset_snapshot_binding(
         created_at=built_at,
     )
     manifest_relative_path = (
-        Path("snapshots")
-        / snapshot.snapshot_id
-        / provisional.binding_hash
-        / "manifest.json"
+        Path("snapshots") / snapshot.snapshot_id / provisional.binding_hash / "manifest.json"
     ).as_posix()
     binding = DatasetSnapshotBinding.create(
         manifest=manifest,
@@ -1017,10 +971,253 @@ def build_dataset_snapshot_binding(
         return stored
     return metadata_store.finalize_dataset_snapshot_binding(
         snapshot.snapshot_id,
-        DatasetSnapshotBindingFinalization(
-            completed_at=normalize_utc_datetime(now())
-        ),
+        DatasetSnapshotBindingFinalization(completed_at=normalize_utc_datetime(now())),
     )
+
+
+def build_factor_snapshot_binding(
+    *,
+    metadata_store: SnapshotMetadataStore,
+    source_connection: duckdb.DuckDBPyConnection,
+    lake_root: Path,
+    snapshot_id: str,
+    start_date: date,
+    end_date: date,
+    ts_codes: tuple[str, ...],
+    now: Callable[[], datetime] = utc_now,
+) -> DatasetSnapshotBinding:
+    """Freeze three factor tables from one builder-controlled DuckDB read view."""
+    snapshot = metadata_store.get_dataset_snapshot(snapshot_id)
+    if snapshot is None:
+        raise KeyError(f"dataset snapshot not found: {snapshot_id}")
+    if snapshot.status != "ready" or snapshot.strategy_name != "factor_eval":
+        raise ValueError("factor builder requires a ready factor_eval snapshot")
+    if source_connection is getattr(metadata_store, "_conn", None):
+        raise ValueError("factor source connection must differ from metadata writer")
+    if start_date > end_date or (end_date - start_date).days >= _FACTOR_MAX_DAYS:
+        raise ValueError("factor binding date range is invalid or too large")
+    if snapshot.as_of_time.date() < end_date:
+        raise ValueError("factor snapshot as_of_time precedes binding end_date")
+    first = snapshot.table_watermarks.get("manifest_start_date")
+    last = snapshot.table_watermarks.get("manifest_end_date")
+    if (
+        first is None
+        or last is None
+        or first > start_date.isoformat()
+        or last < end_date.isoformat()
+    ):
+        raise ValueError("factor snapshot does not cover requested binding range")
+    if (
+        not ts_codes
+        or len(ts_codes) > _FACTOR_MAX_STOCKS
+        or len(set(ts_codes)) != len(ts_codes)
+        or any(_FACTOR_STOCK_PATTERN.fullmatch(code) is None for code in ts_codes)
+    ):
+        raise ValueError("factor binding stock pool is invalid, duplicate or too large")
+
+    dependencies = factor_execution_dependencies()
+    artifacts: list[DatasetSnapshotArtifact] = []
+    try:
+        source_connection.execute("BEGIN TRANSACTION")
+    except duckdb.Error as exc:
+        raise ValueError("factor builder could not start its own source transaction") from exc
+    try:
+        for dependency in dependencies.materialized_tables:
+            columns, primary_key = _source_table_schema(source_connection, dependency.table_name)
+            if primary_key != _FACTOR_TABLE_KEYS[dependency.table_name]:
+                raise ValueError(f"factor source business key mismatch: {dependency.table_name}")
+            if not _FACTOR_TABLE_COLUMNS[dependency.table_name] <= {name for name, _ in columns}:
+                raise ValueError(f"factor source required columns missing: {dependency.table_name}")
+            artifact = materialize_table_dependency(
+                source_connection,
+                dependency=dependency,
+                artifact_root=lake_root,
+                start_date=start_date,
+                end_date=end_date,
+                as_of_time=snapshot.as_of_time,
+                ts_codes=tuple(sorted(ts_codes)),
+            )
+            if artifact.primary_key != primary_key:
+                raise ValueError(f"factor materialized key mismatch: {dependency.table_name}")
+            artifacts.append(artifact)
+        source_connection.execute("COMMIT")
+    except Exception:
+        source_connection.execute("ROLLBACK")
+        raise
+
+    manifest = DatasetSnapshotBindingManifest(
+        snapshot_id=snapshot.snapshot_id,
+        strategy_name="factor_eval",
+        start_date=start_date,
+        end_date=end_date,
+        as_of_time=snapshot.as_of_time,
+        code_commit=snapshot.code_commit,
+        dependency_contract_version=FACTOR_EVAL_CONTRACT_VERSION,
+        builder_version=FACTOR_SNAPSHOT_BUILDER_VERSION,
+        artifacts=tuple(sorted(artifacts, key=lambda item: item.artifact_key)),
+    )
+    built_at = normalize_utc_datetime(now())
+    provisional = DatasetSnapshotBinding.create(
+        manifest=manifest,
+        artifact_root="research_lake",
+        manifest_relative_path="pending/manifest.json",
+        created_at=built_at,
+    )
+    binding = DatasetSnapshotBinding.create(
+        manifest=manifest,
+        artifact_root="research_lake",
+        manifest_relative_path=(
+            Path("snapshots") / snapshot.snapshot_id / provisional.binding_hash / "manifest.json"
+        ).as_posix(),
+        created_at=built_at,
+    )
+    if binding.binding_hash != provisional.binding_hash:
+        raise RuntimeError("factor binding hash unexpectedly depends on artifact location")
+    _publish_binding_manifest(lake_root=lake_root, binding=binding)
+    stored = metadata_store.begin_dataset_snapshot_binding(binding)
+    if stored.status == "ready":
+        return stored
+    return metadata_store.finalize_dataset_snapshot_binding(
+        snapshot.snapshot_id,
+        DatasetSnapshotBindingFinalization(completed_at=normalize_utc_datetime(now())),
+    )
+
+
+_FACTOR_READ_MODEL = ConfigDict(
+    extra="forbid", frozen=True, strict=True, revalidate_instances="always"
+)
+_FiniteFact = Annotated[float, Field(allow_inf_nan=False)]
+FACTOR_STREAM_SNAPSHOT_BUILDER_VERSION = "factor-stream-snapshot-v2"
+FACTOR_STREAM_SOURCE_CONTRACT_VERSION = "factor-stream-source-v2"
+
+
+class FactorComputationScope(BaseModel):
+    """Fixed calculation codes, without a market membership or PIT claim."""
+
+    model_config = _FACTOR_READ_MODEL
+
+    stock_codes: tuple[str, ...] = Field(min_length=1, max_length=7_000)
+    start_date: date
+    end_date: date
+    as_of_time: AwareDatetime
+    source_mode: Literal["historical_retrospective"] = "historical_retrospective"
+
+    @field_validator("stock_codes")
+    @classmethod
+    def _valid_codes(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) != len(set(value)):
+            raise ValueError("computation scope contains duplicate codes")
+        if any(_FACTOR_STOCK_PATTERN.fullmatch(code) is None for code in value):
+            raise ValueError("computation scope contains invalid codes")
+        return tuple(sorted(value))
+
+    @field_validator("as_of_time")
+    @classmethod
+    def _utc_cutoff(cls, value: datetime) -> datetime:
+        return normalize_utc_datetime(value)
+
+    @model_validator(mode="after")
+    def _valid_range(self) -> FactorComputationScope:
+        if self.start_date > self.end_date or (self.end_date - self.start_date).days >= 4_096:
+            raise ValueError("computation scope exceeds its natural day range")
+        if self.as_of_time.date() < self.end_date:
+            raise ValueError("computation scope cutoff precedes end_date")
+        return self
+
+
+class FactorReadQuery(BaseModel):
+    """A bounded, generation-pinned range; absent source rows remain absent."""
+
+    model_config = _FACTOR_READ_MODEL
+
+    binding_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    stock_codes: tuple[str, ...] = Field(min_length=1, max_length=_FACTOR_MAX_STOCKS)
+    start_date: date
+    end_date: date
+    row_limit: int = Field(ge=1, le=_FACTOR_MAX_QUERY_ROWS)
+
+    @field_validator("stock_codes")
+    @classmethod
+    def _valid_stock_codes(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(set(value)) != len(value):
+            raise ValueError("factor query stock_codes contain duplicates")
+        if any(_FACTOR_STOCK_PATTERN.fullmatch(code) is None for code in value):
+            raise ValueError("factor query stock_codes contain invalid codes")
+        return tuple(sorted(value))
+
+    @model_validator(mode="after")
+    def _valid_range(self) -> FactorReadQuery:
+        if self.start_date > self.end_date:
+            raise ValueError("factor query start_date follows end_date")
+        if (self.end_date - self.start_date).days >= _FACTOR_MAX_QUERY_DAYS:
+            raise ValueError("factor query date range exceeds its bound")
+        return self
+
+
+class FactorSourceBoundaryReceipt(BaseModel):
+    """Historical frozen-source identity, without any observed PIT claim."""
+
+    model_config = _FACTOR_READ_MODEL
+
+    snapshot_id: str
+    binding_hash: str
+    as_of_time: AwareDatetime
+    source_mode: Literal["historical_retrospective"]
+    source_read_boundary: Literal["single_snapshot_transaction"]
+    dataset_id: Literal["daily_bar", "adj_factor", "trade_calendar"]
+    stock_codes: tuple[str, ...]
+    start_date: date
+    end_date: date
+
+
+class FactorDailyBarRow(BaseModel):
+    model_config = _FACTOR_READ_MODEL
+
+    ts_code: str
+    trade_date: date
+    open: _FiniteFact | None
+    high: _FiniteFact | None
+    low: _FiniteFact | None
+    close: _FiniteFact | None
+    vol: _FiniteFact | None
+    amount: _FiniteFact | None
+
+
+class FactorAdjFactorRow(BaseModel):
+    model_config = _FACTOR_READ_MODEL
+
+    ts_code: str
+    trade_date: date
+    adj_factor: _FiniteFact
+
+
+class FactorSSECalendarRow(BaseModel):
+    model_config = _FACTOR_READ_MODEL
+
+    cal_date: date
+    is_open: bool
+    pretrade_date: date | None
+
+
+class FactorDailyBarBatch(BaseModel):
+    model_config = _FACTOR_READ_MODEL
+
+    receipt: FactorSourceBoundaryReceipt
+    rows: tuple[FactorDailyBarRow, ...]
+
+
+class FactorAdjFactorBatch(BaseModel):
+    model_config = _FACTOR_READ_MODEL
+
+    receipt: FactorSourceBoundaryReceipt
+    rows: tuple[FactorAdjFactorRow, ...]
+
+
+class FactorSSECalendarBatch(BaseModel):
+    model_config = _FACTOR_READ_MODEL
+
+    receipt: FactorSourceBoundaryReceipt
+    rows: tuple[FactorSSECalendarRow, ...]
 
 
 class ResearchExecutionSession:
@@ -1093,18 +1290,15 @@ class ResearchExecutionSession:
                     as_of_time=published.as_of_time,
                 )
             )
-            session_path = (
-                self._session_dir
-                / f"{index:06d}-{artifact.file_hash}.parquet"
-            )
-            os.link(path, session_path)
+            session_path = self._session_dir / f"{index:06d}-{artifact.file_hash}.parquet"
+            if published.strategy_name in {"factor_eval", "portfolio_backtest", "paper_reconcile", "paper_backtest_band", "minute_runtime_replay", "minute_parameter_replay"}:
+                # Factor reads need an independent inode throughout one lease.
+                shutil.copyfile(path, session_path)
+            else:
+                os.link(path, session_path)
             if (
-                (
-                    artifact.file_size is not None
-                    and session_path.stat().st_size != artifact.file_size
-                )
-                or _file_sha256(session_path) != artifact.file_hash
-            ):
+                artifact.file_size is not None and session_path.stat().st_size != artifact.file_size
+            ) or _file_sha256(session_path) != artifact.file_hash:
                 raise ValueError(
                     "bound artifact changed while opening execution session: "
                     f"{artifact.artifact_key}"
@@ -1113,6 +1307,42 @@ class ResearchExecutionSession:
 
         for table_name, paths in by_table.items():
             readers = ", ".join(_quoted_literal(str(path)) for path in paths)
+            if published.strategy_name == "minute_runtime_replay":
+                from rquant.minute_backtest_producer import read_minute_formal_input_table
+                from rquant.minute_backtest_publication_contracts import MINUTE_FORMAL_CONTRACT, MINUTE_FORMAL_TABLE
+
+                if (published.dependency_contract_version != MINUTE_FORMAL_CONTRACT or len(published.artifacts) != 1
+                    or table_name != MINUTE_FORMAL_TABLE or len(paths) != 1
+                    or published.artifacts[0].primary_key != ("input_hash",)
+                    or published.artifacts[0].row_count != 1
+                    or published.eligibility_resolution_hash is not None):
+                    raise ValueError("minute execution session requires its exact verified single artifact")
+                columns = tuple((row[0], row[1]) for row in self._conn.execute(
+                    f"DESCRIBE SELECT * FROM read_parquet([{readers}], hive_partitioning=false)").fetchall())
+                if columns != (("input_hash", "VARCHAR"), ("payload", "VARCHAR")):
+                    raise ValueError("minute verified artifact requires exact typed columns")
+                self._conn.execute("CREATE TABLE minute_runtime_replay_input (input_hash VARCHAR PRIMARY KEY, payload VARCHAR NOT NULL)")
+                self._conn.execute(f"INSERT INTO minute_runtime_replay_input SELECT * FROM read_parquet([{readers}], hive_partitioning=false)")
+                read_minute_formal_input_table(self._conn)
+                continue
+            if published.strategy_name == "minute_parameter_replay":
+                from rquant.minute_backtest_parameter_contracts import PARAMETER_SOURCE_CONTRACT, PARAMETER_SOURCE_TABLE
+                from rquant.minute_backtest_parameter_source import read_minute_parameter_input_table
+
+                if (published.dependency_contract_version != PARAMETER_SOURCE_CONTRACT or len(published.artifacts) != 1
+                    or table_name != PARAMETER_SOURCE_TABLE or len(paths) != 1
+                    or published.artifacts[0].primary_key != ("input_hash",)
+                    or published.artifacts[0].row_count != 1
+                    or published.eligibility_resolution_hash is not None):
+                    raise ValueError("parameter minute session requires its exact verified single artifact")
+                columns = tuple((row[0], row[1]) for row in self._conn.execute(
+                    f"DESCRIBE SELECT * FROM read_parquet([{readers}], hive_partitioning=false)").fetchall())
+                if columns != (("input_hash", "VARCHAR"), ("payload", "VARCHAR")):
+                    raise ValueError("parameter minute artifact requires exact typed columns")
+                self._conn.execute("CREATE TABLE minute_parameter_replay_input (input_hash VARCHAR PRIMARY KEY, payload VARCHAR NOT NULL)")
+                self._conn.execute(f"INSERT INTO minute_parameter_replay_input SELECT * FROM read_parquet([{readers}], hive_partitioning=false)")
+                read_minute_parameter_input_table(self._conn)
+                continue
             self._conn.execute(
                 f"""
                 CREATE VIEW {_quoted_identifier(table_name)} AS
@@ -1193,6 +1423,229 @@ class ResearchExecutionSession:
 
     def __exit__(self, *_: object) -> None:
         self.close()
+
+
+class _FactorTableReadLease:
+    """Only the fixed factor tables and columns of one verified execution session."""
+
+    __slots__ = ("__session", "__start_date", "__end_date")
+
+    def __init__(
+        self,
+        session: ResearchExecutionSession,
+        *,
+        start_date: date,
+        end_date: date,
+    ) -> None:
+        self.__session = session
+        self.__start_date = start_date
+        self.__end_date = end_date
+
+    def _checked(self, query: FactorReadQuery) -> FactorReadQuery:
+        checked = FactorReadQuery.model_validate(query)
+        if self.__session._closed:
+            raise RuntimeError("factor read lease session is closed")
+        if checked.binding_hash != self.__session.binding_hash:
+            raise ValueError("factor read binding_hash differs from verified session")
+        if checked.start_date < self.__start_date or checked.end_date > self.__end_date:
+            raise ValueError("factor read range exceeds admitted dates")
+        return checked
+
+    def _receipt(
+        self,
+        query: FactorReadQuery,
+        dataset_id: Literal["daily_bar", "adj_factor", "trade_calendar"],
+    ) -> FactorSourceBoundaryReceipt:
+        return FactorSourceBoundaryReceipt(
+            snapshot_id=self.__session.snapshot_id,
+            binding_hash=self.__session.binding_hash,
+            as_of_time=self.__session.binding.manifest.as_of_time,
+            source_mode="historical_retrospective",
+            source_read_boundary="single_snapshot_transaction",
+            dataset_id=dataset_id,
+            stock_codes=query.stock_codes,
+            start_date=query.start_date,
+            end_date=query.end_date,
+        )
+
+    def _stock_rows(
+        self,
+        query: FactorReadQuery,
+        *,
+        dataset_id: Literal["daily_bar", "adj_factor"],
+    ) -> list[tuple[object, ...]]:
+        placeholders = ", ".join("?" for _ in query.stock_codes)
+        if dataset_id == "daily_bar":
+            sql = (
+                "SELECT ts_code, trade_date, open, high, low, close, vol, amount "
+                f"FROM daily_bar WHERE ts_code IN ({placeholders}) "
+                "AND trade_date BETWEEN ? AND ? ORDER BY trade_date, ts_code LIMIT ?"
+            )
+        else:
+            sql = (
+                "SELECT ts_code, trade_date, adj_factor "
+                f"FROM adj_factor WHERE ts_code IN ({placeholders}) "
+                "AND trade_date BETWEEN ? AND ? ORDER BY trade_date, ts_code LIMIT ?"
+            )
+        try:
+            rows = self.__session._conn.execute(
+                sql,
+                [*query.stock_codes, query.start_date, query.end_date, query.row_limit + 1],
+            ).fetchall()
+        except duckdb.CatalogException as exc:
+            raise ValueError(f"bound factor table missing: {dataset_id}") from exc
+        if len(rows) > query.row_limit:
+            raise ValueError("factor read row limit exceeded")
+        keys = [(row[0], row[1]) for row in rows]
+        if len(keys) != len(set(keys)):
+            raise ValueError(f"duplicate factor business key: {dataset_id}")
+        return rows
+
+    def query_daily_bars(self, query: FactorReadQuery) -> FactorDailyBarBatch:
+        checked = self._checked(query)
+        rows = self._stock_rows(checked, dataset_id="daily_bar")
+        return FactorDailyBarBatch(
+            receipt=self._receipt(checked, "daily_bar"),
+            rows=tuple(
+                FactorDailyBarRow(
+                    ts_code=row[0],
+                    trade_date=row[1],
+                    open=row[2],
+                    high=row[3],
+                    low=row[4],
+                    close=row[5],
+                    vol=row[6],
+                    amount=row[7],
+                )
+                for row in rows
+            ),
+        )
+
+    def query_adj_factors(self, query: FactorReadQuery) -> FactorAdjFactorBatch:
+        checked = self._checked(query)
+        rows = self._stock_rows(checked, dataset_id="adj_factor")
+        return FactorAdjFactorBatch(
+            receipt=self._receipt(checked, "adj_factor"),
+            rows=tuple(
+                FactorAdjFactorRow(ts_code=row[0], trade_date=row[1], adj_factor=row[2])
+                for row in rows
+            ),
+        )
+
+    def query_sse_calendar(self, query: FactorReadQuery) -> FactorSSECalendarBatch:
+        checked = self._checked(query)
+        try:
+            rows = self.__session._conn.execute(
+                """SELECT cal_date, is_open, pretrade_date FROM trade_calendar
+                WHERE exchange = 'SSE' AND cal_date BETWEEN ? AND ?
+                ORDER BY cal_date LIMIT ?""",
+                [checked.start_date, checked.end_date, checked.row_limit + 1],
+            ).fetchall()
+        except duckdb.CatalogException as exc:
+            raise ValueError("bound factor table missing: trade_calendar") from exc
+        if len(rows) > checked.row_limit:
+            raise ValueError("factor read row limit exceeded")
+        keys = [row[0] for row in rows]
+        if len(keys) != len(set(keys)):
+            raise ValueError("duplicate or conflicting SSE calendar date")
+        return FactorSSECalendarBatch(
+            receipt=self._receipt(checked, "trade_calendar"),
+            rows=tuple(
+                FactorSSECalendarRow(cal_date=row[0], is_open=row[1], pretrade_date=row[2])
+                for row in rows
+            ),
+        )
+
+
+class FactorReadLease(_FactorTableReadLease):
+    """The unchanged v1-only, fixed-table read boundary."""
+
+    __slots__ = ()
+
+    def __init__(
+        self, session: ResearchExecutionSession, *, start_date: date, end_date: date
+    ) -> None:
+        if (
+            session.binding.manifest.strategy_name != "factor_eval"
+            or session.binding.manifest.builder_version != FACTOR_SNAPSHOT_BUILDER_VERSION
+            or session.binding.manifest.dependency_contract_version != FACTOR_EVAL_CONTRACT_VERSION
+        ):
+            raise ValueError("factor lease requires verified dedicated binding")
+        super().__init__(session, start_date=start_date, end_date=end_date)
+
+
+class FactorStreamReadLease(_FactorTableReadLease):
+    """V2 public bridge; all reads use this session's verified private copies."""
+
+    __slots__ = ("__scope", "__codes")
+
+    def __init__(
+        self, session: ResearchExecutionSession, *, start_date: date, end_date: date
+    ) -> None:
+        manifest = session.binding.manifest
+        if (
+            manifest.strategy_name != "factor_eval"
+            or manifest.builder_version != FACTOR_STREAM_SNAPSHOT_BUILDER_VERSION
+            or manifest.dependency_contract_version != FACTOR_STREAM_SOURCE_CONTRACT_VERSION
+            or len(manifest.artifacts) != 4
+            or {a.table_name for a in manifest.artifacts}
+            != {"daily_bar", "adj_factor", "trade_calendar", "factor_computation_scope"}
+        ):
+            raise ValueError("stream lease requires verified v2 dedicated binding")
+        if session._closed:
+            raise RuntimeError("factor read lease session is closed")
+        rows = session._conn.execute(
+            """SELECT ts_code, start_date, end_date, as_of_time
+            FROM factor_computation_scope ORDER BY ts_code LIMIT 7001"""
+        ).fetchall()
+        if not rows or len(rows) > 7_000:
+            raise ValueError("bound computation scope is empty or too large")
+        if any(
+            row[1:] != (manifest.start_date, manifest.end_date, manifest.as_of_time) for row in rows
+        ):
+            raise ValueError("bound computation scope dates or cutoff differ from manifest")
+        self.__scope = FactorComputationScope(
+            stock_codes=tuple(row[0] for row in rows),
+            start_date=manifest.start_date,
+            end_date=manifest.end_date,
+            as_of_time=manifest.as_of_time,
+        )
+        self.__codes = frozenset(self.__scope.stock_codes)
+        if (
+            start_date < manifest.start_date
+            or end_date > manifest.end_date
+            or start_date > end_date
+        ):
+            raise ValueError("stream lease dates exceed bound computation scope")
+        for table, columns in _FACTOR_TABLE_COLUMNS.items():
+            selected = ", ".join(_quoted_identifier(column) for column in sorted(columns))
+            session._conn.execute(f"SELECT {selected} FROM {_quoted_identifier(table)} LIMIT 0")
+            if table == "trade_calendar":
+                invalid = session._conn.execute(
+                    """SELECT count(*) FROM trade_calendar
+                    WHERE exchange != 'SSE' OR cal_date NOT BETWEEN ? AND ?""",
+                    [manifest.start_date, manifest.end_date],
+                ).fetchone()
+            else:
+                invalid = session._conn.execute(
+                    f"""SELECT count(*) FROM {_quoted_identifier(table)} AS facts
+                    LEFT JOIN factor_computation_scope AS scope USING (ts_code)
+                    WHERE scope.ts_code IS NULL OR facts.trade_date NOT BETWEEN ? AND ?""",
+                    [manifest.start_date, manifest.end_date],
+                ).fetchone()
+            if invalid is not None and invalid[0]:
+                raise ValueError(f"bound {table} rows exceed computation scope")
+        super().__init__(session, start_date=start_date, end_date=end_date)
+
+    @property
+    def scope(self) -> FactorComputationScope:
+        return self.__scope
+
+    def _checked(self, query: FactorReadQuery) -> FactorReadQuery:
+        checked = super()._checked(query)
+        if not self.__codes.issuperset(checked.stock_codes):
+            raise ValueError("factor read codes exceed bound computation scope")
+        return checked
 
 
 def open_research_execution_session(

@@ -1,0 +1,76 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.13.12, pytest-9.0.3, pluggy-1.6.0
+rootdir: /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk
+configfile: pyproject.toml
+plugins: mock-3.15.1, anyio-4.13.0
+collected 4 items
+
+tests/unit/test_research_query_service.py FF                             [ 50%]
+tests/unit/test_web_research_query.py FF                                 [100%]
+
+=================================== FAILURES ===================================
+_________ test_actual_uds_catalog_save_recovery_and_endpoint_identity __________
+
+tmp_path = PosixPath('/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-25/test_actual_uds_catalog_save_r0')
+
+    def test_actual_uds_catalog_save_recovery_and_endpoint_identity(tmp_path: Path) -> None:
+>       api = _api()
+              ^^^^^^
+
+tests/unit/test_research_query_service.py:25: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    def _api():
+        api = importlib.import_module("rquant.research_query")
+>       assert hasattr(api, "QueryPrivateServer"), "private query socket is not implemented"
+E       AssertionError: private query socket is not implemented
+E       assert False
+E        +  where False = hasattr(<module 'rquant.research_query' from '/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/src/rquant/research_query/__init__.py'>, 'QueryPrivateServer')
+
+tests/unit/test_research_query_service.py:20: AssertionError
+____________ test_wrong_peer_is_rejected_before_any_request_is_read ____________
+
+tmp_path = PosixPath('/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-25/test_wrong_peer_is_rejected_be0')
+
+    def test_wrong_peer_is_rejected_before_any_request_is_read(tmp_path: Path) -> None:
+>       api = _api()
+              ^^^^^^
+
+tests/unit/test_research_query_service.py:78: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    def _api():
+        api = importlib.import_module("rquant.research_query")
+>       assert hasattr(api, "QueryPrivateServer"), "private query socket is not implemented"
+E       AssertionError: private query socket is not implemented
+E       assert False
+E        +  where False = hasattr(<module 'rquant.research_query' from '/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/src/rquant/research_query/__init__.py'>, 'QueryPrivateServer')
+
+tests/unit/test_research_query_service.py:20: AssertionError
+____________ test_query_routes_require_verified_user_role_and_csrf _____________
+
+tmp_path = PosixPath('/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-25/test_query_routes_require_veri0')
+
+    def test_query_routes_require_verified_user_role_and_csrf(tmp_path: Path) -> None:
+>       assert "research_query_users" in WebSettings.model_fields, "query API settings are not implemented"
+E       AssertionError: query API settings are not implemented
+E       assert 'research_query_users' in {'ack_admission_socket_path': FieldInfo(annotation=Union[Path, NoneType], required=False, default=None), 'background_c...7.0.0.1:8768'), 'catalog_samples_file': FieldInfo(annotation=Union[Path, NoneType], required=False, default=None), ...}
+E        +  where {'ack_admission_socket_path': FieldInfo(annotation=Union[Path, NoneType], required=False, default=None), 'background_c...7.0.0.1:8768'), 'catalog_samples_file': FieldInfo(annotation=Union[Path, NoneType], required=False, default=None), ...} = WebSettings.model_fields
+
+tests/unit/test_web_research_query.py:15: AssertionError
+_________ test_settings_private_socket_and_exact_user_list_fail_closed _________
+
+tmp_path = PosixPath('/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-25/test_settings_private_socket_a0')
+
+    def test_settings_private_socket_and_exact_user_list_fail_closed(tmp_path: Path) -> None:
+>       assert "research_query_users" in WebSettings.model_fields
+E       AssertionError: assert 'research_query_users' in {'ack_admission_socket_path': FieldInfo(annotation=Union[Path, NoneType], required=False, default=None), 'background_c...7.0.0.1:8768'), 'catalog_samples_file': FieldInfo(annotation=Union[Path, NoneType], required=False, default=None), ...}
+E        +  where {'ack_admission_socket_path': FieldInfo(annotation=Union[Path, NoneType], required=False, default=None), 'background_c...7.0.0.1:8768'), 'catalog_samples_file': FieldInfo(annotation=Union[Path, NoneType], required=False, default=None), ...} = WebSettings.model_fields
+
+tests/unit/test_web_research_query.py:35: AssertionError
+=========================== short test summary info ============================
+FAILED tests/unit/test_research_query_service.py::test_actual_uds_catalog_save_recovery_and_endpoint_identity
+FAILED tests/unit/test_research_query_service.py::test_wrong_peer_is_rejected_before_any_request_is_read
+FAILED tests/unit/test_web_research_query.py::test_query_routes_require_verified_user_role_and_csrf
+FAILED tests/unit/test_web_research_query.py::test_settings_private_socket_and_exact_user_list_fail_closed
+============================== 4 failed in 1.85s ===============================

@@ -4,9 +4,9 @@ The host layout the script reads is built here the way the host holds it, at fix
 a sealed reference-slow batch and an auction-match batch written by their real writers
 (`tests/unit/test_reference_slow_publish_rehearsal_script._runtime_root`), the calendar
 generation the batch names, an auction universe, a read-only replica with `daily_bar`,
-`screen_result` and the day's `minute_bar`, and the runtime-inputs document with the three
-frozen inputs it points at (the routing policy and the PIT calendar from the production
-generator, the minute history from `scripts/export_intraday_snapshot.py`).
+`screen_result`, `monitor_event` and the day's `minute_bar`, and the runtime-inputs document
+with the three frozen inputs it points at (the routing policy and the PIT calendar from the
+production generator, the minute history from `scripts/export_intraday_snapshot.py`).
 
 The script then runs as its own process, as it will on the host, and three claims are
 checked against what it left: it wrote nothing outside its replay root (every file of the
@@ -62,6 +62,8 @@ def _replica(
 
     import duckdb
 
+    from rquant.storage.schema import MONITOR_EVENT_DDL
+
     prior = [day for day in OPEN_DATES if day < TARGET_DATE]
     sessions = prior_sessions or {}
     minutes_until = day_minutes if day_minutes is not None else {MINUTE_CODE: time(15, 0)}
@@ -81,6 +83,7 @@ def _replica(
             );
             """
         )
+        connection.execute(MONITOR_EVENT_DDL)
         #: 200 lots a day against the 20,000-share auction: an auction ratio of 1.0, inside
         #: auction_gap's 0.15..5 band. The host's replica already carries the day's own
         #: close; the extract must drop it
@@ -333,7 +336,15 @@ def test_the_replayed_day_reaches_a_same_day_serving_generation_inside_the_sandb
     output = result.stdout + result.stderr
     (sandbox,) = replay_root.iterdir()
     summary = json.loads((sandbox / "summary.json").read_text(encoding="utf-8"))
-    assert result.returncode == 0, output[-6000:]
+    assert result.returncode == 0, (
+        output[-6000:]
+        + "\n".join(
+            f"\n{name} at {crash['at']}:\n{crash['traceback']}"
+            for name, role in summary.get("roles", {}).items()
+            if name.startswith("notifier.")
+            for crash in role.get("crashes", [])
+        )
+    )
 
     #: sandbox-only writes: the fake host is untouched, and the replay root is the only
     #: new thing next to it
@@ -379,6 +390,8 @@ def test_the_replayed_day_reaches_a_same_day_serving_generation_inside_the_sandb
     ), summary["roles"]
     #: the replica extract dropped the trade date's own daily row
     assert summary["world"]["replica"]["rows"]["daily_bar"] == 2 * 5
+    assert summary["world"]["replica"]["rows"]["monitor_event"] == 0
+    assert "monitor_event" in summary["world"]["replica"]["tables_on_host"]
 
 
 #: 120 auction codes: the two the other cases use (one SZSE, one SSE), and 118 that open
@@ -434,7 +447,15 @@ def test_six_short_codes_and_a_stale_candidate_still_reach_a_same_day_generation
     output = result.stdout + result.stderr
     (sandbox,) = (tmp_path / "replay").iterdir()
     summary = json.loads((sandbox / "summary.json").read_text(encoding="utf-8"))
-    assert result.returncode == 0, output[-6000:]
+    assert result.returncode == 0, (
+        output[-6000:]
+        + "\n".join(
+            f"\n{name} at {crash['at']}:\n{crash['traceback']}"
+            for name, role in summary.get("roles", {}).items()
+            if name.startswith("notifier.")
+            for crash in role.get("crashes", [])
+        )
+    )
     assert _tree(host["data"]) == before
     assert summary["stubs"]["listing_classification"] == "off"
     roles = summary["roles"]
@@ -514,7 +535,15 @@ def test_two_generations_reach_a_same_day_generation_with_signals_past_the_rollo
     output = result.stdout + result.stderr
     (sandbox,) = (tmp_path / "replay").iterdir()
     summary = json.loads((sandbox / "summary.json").read_text(encoding="utf-8"))
-    assert result.returncode == 0, output[-6000:]
+    assert result.returncode == 0, (
+        output[-6000:]
+        + "\n".join(
+            f"\n{name} at {crash['at']}:\n{crash['traceback']}"
+            for name, role in summary.get("roles", {}).items()
+            if name.startswith("notifier.")
+            for crash in role.get("crashes", [])
+        )
+    )
     assert _tree(host["data"]) == before
     assert summary["stubs"]["listing_classification"] == "off"
     assert len(summary["world"]["generations"]) == 2

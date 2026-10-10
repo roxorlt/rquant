@@ -1,0 +1,15 @@
+{
+  "argv": [
+    "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/.venv/bin/python",
+    "-I",
+    "-B",
+    "data/verification/research-query-20261005/review-fix-01/freeze_backend.py"
+  ],
+  "cwd": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk",
+  "started_utc": "2026-10-04T22:18:36.883974+00:00",
+  "elapsed_seconds": 0.11155970800245996,
+  "exit_code": 0,
+  "stdout_sha256": "b8144d9472f3fbf1fe8c7056c1d09149862d55306469bd161c50046318e1ca31",
+  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "starting_candidate": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb"
+}

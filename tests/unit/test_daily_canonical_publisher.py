@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import duckdb
+import pandas as pd
 import pytest
 
 from rquant.daily_canonical_publisher import (
@@ -20,6 +21,7 @@ from rquant.live_contracts import LiveChannel
 from rquant.storage.duckdb import DuckDBStore
 from tests.unit.test_daily_close_candidate import _publish_candidate, _signer
 from tests.unit.test_daily_close_validation import (
+    AVAILABLE_AT,
     OBSERVED_AT,
     TRADE_DATE,
     _calendar,
@@ -179,6 +181,38 @@ def test_publisher_uses_only_verified_current_candidate_and_preserves_pit(
     )
 
 
+def test_publisher_records_actual_completion_time_and_preserves_old_writer(
+    tmp_path: Path,
+) -> None:
+    snapshot = _snapshot()
+    basic_row = snapshot["daily_basic"][0]
+    assert isinstance(basic_row, dict)
+    basic_row.update(pe_ttm=None, pb=1.25, dv_ttm=2.5, valuation_observed=True)
+    gateway, candidate_store, candidate = _candidate(tmp_path, snapshots=[snapshot])
+    db_path = tmp_path / "canonical.duckdb"
+    _seed_database(db_path)
+    _publisher(candidate_store, db_path, gateway.spool).publish(
+        candidate.generation_id,
+        attempt=_attempt(),
+        ledger_input_identity=LEDGER_INPUT,
+        committed_at=COMMITTED_AT,
+    )
+    with DuckDBStore(db_path) as writer:
+        writer.upsert_daily_basic(
+            pd.DataFrame(
+                [{"ts_code": "600000.SH", "trade_date": TRADE_DATE,
+                  "turnover_rate": 0.5, "volume_ratio": 1.2,
+                  "total_mv": 200_000.0, "circ_mv": 180_000.0}]
+            )
+        )
+        writer._conn.execute("DELETE FROM daily_state WHERE trade_date = ?", [TRADE_DATE])
+        row = writer._conn.execute(
+            "SELECT observed_at, first_observed_at, pe_ttm, pb, dv_ttm "
+            "FROM daily_basic_valuation_observation"
+        ).fetchone()
+    assert row == (AVAILABLE_AT, AVAILABLE_AT, None, 1.25, 2.5)
+
+
 def test_publisher_rechecks_raw_authoritative_current_after_business_writes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -224,6 +258,12 @@ def test_publisher_rechecks_raw_authoritative_current_after_business_writes(
 
     with DuckDBStore(db_path, read_only=True) as reader:
         assert reader._conn.execute("SELECT count(*) FROM daily_bar").fetchone()[0] == 0
+        assert reader._conn.execute(
+            "SELECT count(*) FROM daily_basic_valuation_batch"
+        ).fetchone()[0] == 0
+        assert reader._conn.execute(
+            "SELECT count(*) FROM daily_basic_valuation_observation"
+        ).fetchone()[0] == 0
 
 
 def test_publisher_rolls_back_when_raw_revision_arrives_at_transaction_start(

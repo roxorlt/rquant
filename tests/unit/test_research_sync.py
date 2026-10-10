@@ -39,6 +39,75 @@ from rquant.suspension import (
     persist_suspension_snapshot,
 )
 
+FINANCIAL_LOCAL_ONLY_TABLES = (
+    "financial_observation",
+    "financial_import_batch",
+    "financial_import_cursor",
+    "daily_basic_valuation_observation",
+    "daily_basic_valuation_batch",
+    "fundamental_daily_version",
+    "fundamental_daily_head",
+)
+
+
+def _seed_financial_evidence(path: Path, *, origin: str) -> None:
+    observed_at = datetime(2026, 7, 1, 9 if origin == "local" else 10, tzinfo=UTC)
+    trade_date = date(2026, 7, 1)
+    revision = 1 if origin == "local" else 2
+    version_id = f"version-{origin}"
+    digest = ("a" if origin == "local" else "b") * 64
+    conn = duckdb.connect(str(path))
+    try:
+        conn.execute(
+            "INSERT INTO financial_import_batch VALUES (?, 'request-1', ?, ?, "
+            "'observed', 1, ?, ?, 100)",
+            ["archive-1", json.dumps({"origin": origin}), observed_at, f"{origin}.json", digest],
+        )
+        conn.execute(
+            "INSERT INTO financial_observation VALUES "
+            "('archive-1', 'request-1', 0, 'income', '600000.SH', ?, "
+            "DATE '2026-03-31', '1', DATE '2026-04-30', DATE '2026-04-30', "
+            "?, ?, TRUE, FALSE)",
+            [observed_at, json.dumps({"origin": origin}), digest],
+        )
+        conn.execute(
+            "INSERT INTO financial_import_cursor VALUES (1, 'archive-1', ?, ?, ?)",
+            [observed_at, revision, digest],
+        )
+        conn.execute(
+            "INSERT INTO daily_basic_valuation_batch VALUES "
+            "('candidate-1', ?, 1, ?, 1, ?, ?, TRUE)",
+            [f"source-{origin}", f"batch-{origin}", trade_date, observed_at],
+        )
+        conn.execute(
+            "INSERT INTO daily_basic_valuation_observation VALUES "
+            "('candidate-1', '600000.SH', ?, ?, ?, ?, ?, 1.0, 0.5)",
+            [trade_date, observed_at, observed_at, digest, 10.0 * revision],
+        )
+        conn.execute(
+            "INSERT INTO fundamental_daily_version VALUES "
+            "(?, '600000.SH', ?, ?, ?, DATE '2026-03-31', 'latest', "
+            "'{}', '{}', ?, 10.0, 1.0, 0.5, NULL, NULL, NULL)",
+            [version_id, trade_date, revision, observed_at, json.dumps({"origin": origin})],
+        )
+        conn.execute(
+            "INSERT INTO fundamental_daily_head VALUES ('600000.SH', ?, ?, ?)",
+            [trade_date, version_id, revision],
+        )
+    finally:
+        conn.close()
+
+
+def _financial_evidence_rows(path: Path) -> dict[str, list[tuple[Any, ...]]]:
+    conn = duckdb.connect(str(path), read_only=True)
+    try:
+        return {
+            table: conn.execute(f"SELECT * FROM {table} ORDER BY ALL").fetchall()
+            for table in FINANCIAL_LOCAL_ONLY_TABLES
+        }
+    finally:
+        conn.close()
+
 
 def _make_local_db(path: Path) -> None:
     """本地研究库：旧 daily_bar 1 行 + 研究表 minute_bar 2 行 + monitor_event 1 行。"""
@@ -1805,6 +1874,9 @@ class TestRestoreResearchTables:
         assert metadata_tables.isdisjoint(
             result.table for result in report.tables
         )
+        assert set(FINANCIAL_LOCAL_ONLY_TABLES).isdisjoint(
+            result.table for result in report.tables
+        )
 
     def test_restore_keeps_local_row_on_pk_conflict(
         self, tmp_path: Path, local_db: Path
@@ -2212,6 +2284,41 @@ def test_table_classification_complete(tmp_path: Path) -> None:
     assert not replace & local_only
     assert not merge & local_only
     assert replace | merge | local_only == schema_tables
+
+
+def test_financial_evidence_tables_are_local_only() -> None:
+    financial = set(FINANCIAL_LOCAL_ONLY_TABLES)
+    assert financial <= set(LOCAL_ONLY_TABLES)
+    assert financial.isdisjoint(REPLACE_TABLES)
+    assert financial.isdisjoint(MERGE_TABLES)
+
+
+@pytest.mark.parametrize("backup_has_tables", [True, False])
+def test_financial_evidence_remains_local_across_cloud_sync(
+    local_db: Path,
+    backup_db: Path,
+    backup_has_tables: bool,
+) -> None:
+    _seed_financial_evidence(local_db, origin="local")
+    before = _financial_evidence_rows(local_db)
+    if backup_has_tables:
+        _seed_financial_evidence(backup_db, origin="cloud")
+        assert _financial_evidence_rows(backup_db) != before
+    else:
+        conn = duckdb.connect(str(backup_db))
+        try:
+            for table in FINANCIAL_LOCAL_ONLY_TABLES:
+                conn.execute(f"DROP TABLE {table}")
+        finally:
+            conn.close()
+
+    report = sync_from_backup(backup_db, local_db, refresh_replica=False)
+
+    assert not report.has_errors
+    assert set(FINANCIAL_LOCAL_ONLY_TABLES).isdisjoint(
+        result.table for result in report.tables
+    )
+    assert _financial_evidence_rows(local_db) == before
 
 
 def test_schema_migration_is_local_only() -> None:

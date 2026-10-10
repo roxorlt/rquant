@@ -28,13 +28,24 @@ from pydantic import (
     model_validator,
 )
 
+from rquant.data_audit_contracts import MAX_INDEXED_ISSUES
 from rquant.delivery_contracts import OutboxRecord
 from rquant.experiment_registry import PromotionDecision
 from rquant.lab_eta import LabEtaEstimate
 from rquant.lab_jobs import LabJobSummary
 from rquant.paper_contracts import PaperAccountSnapshot
+from rquant.paper_portfolio_projection_contract import PAPER_PORTFOLIO_PROJECTION_LAYOUTS
 from rquant.runtime_contracts import AwareUtcDatetime, RuntimeContractModel, canonical_sha256
+from rquant.runtime_health_details import (
+    RuntimeHealthOwnerProjection,
+    RuntimeHealthServiceView,
+    RuntimeHealthValidatedDetails,
+    RuntimeHealthValidatedServiceDetail,
+    runtime_health_graph_from_projections,
+    validate_runtime_health_detail_graph,
+)
 from rquant.runtime_service_control import RuntimeServiceHealth
+from rquant.screen.ranking import RankingCondition, rank_screen_results
 from rquant.serving_publisher import (
     DuckDBColumnType,
     ServingTableSpec,
@@ -47,7 +58,10 @@ from rquant.signal_contracts import (
     SignalEnvelopeFamily,
     parse_signal_envelope,
 )
+from rquant.strategy_authoring_projection_contract import STRATEGY_TEMPLATE_PROJECTION_LAYOUTS
+from rquant.strategy_promotion_projection_contract import STRATEGY_PROMOTION_PROJECTION_LAYOUTS
 from rquant.strict_json import canonical_json_bytes, strict_canonical_json_loads
+from rquant.task_center_projection import CPU_COLUMNS, RUN_COLUMNS, SCHEDULING_COLUMNS
 
 GenerationId = Annotated[StrictStr, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 ProjectionScalar = StrictStr | StrictInt | StrictFloat | StrictBool | None
@@ -55,8 +69,13 @@ ProjectionColumnKind = Literal["string", "int", "float", "bool", "date", "timest
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _MAX_PROJECTION_CELL_BYTES = 64 * 1024
 _MAX_OWNER_PROJECTION_BYTES = 7 * 1024 * 1024
+_PRIVATE_EXPERIMENT_TABLES = frozenset(
+    {"experiment_private_attempt", "experiment_private_family", "experiment_private_window"}
+)
+_MAX_PRIVATE_EXPERIMENT_BYTES = 8 * 1024 * 1024
 _NL_SCREEN_CURSOR_TYPE = "nl_screen_page"
 _NL_SCREEN_ORDER_VERSION = "trade_date_ts_code_v1"
+_RANKED_NL_SCREEN_ORDER_VERSION = "rank_ts_code_v1"
 _NL_SCREEN_CURSOR_SIGNING_KEY_BYTES = 32
 _NL_SCREEN_CURSOR_SIGNATURE_BYTES = 32
 _NL_SCREEN_CURSOR_SIGNATURE_ENCODED_BYTES = 43
@@ -71,6 +90,33 @@ _DUCKDB_PROJECTION_TYPES: Mapping[ProjectionColumnKind, DuckDBColumnType] = Mapp
         "date": "DATE",
         "timestamp": "TIMESTAMPTZ",
     }
+)
+
+LAB_EVENT_LABEL_BY_TYPE: Mapping[str, str] = MappingProxyType(
+    {
+        "job_submitted": "任务已创建",
+        "job_started": "任务已开始",
+        "job_transitioned": "状态已更新",
+        "job_checkpointed": "任务已暂停",
+        "job_resumed": "任务已继续",
+        "job_cancelled": "任务已取消",
+        "job_cancel_confirmed": "任务已取消",
+        "job_failed": "任务未完成",
+        "job_plan_failed": "任务未完成",
+        "job_deadline_exceeded": "任务未完成",
+        "job_failed_legacy_result_contract": "任务未完成",
+        "job_result_ready": "结果待确认",
+        "job_result_ready_recovered": "结果待确认",
+        "job_result_sealed": "任务已完成",
+        "control_intent_changed": "操作请求已记录",
+        "job_retry_rejected": "重试未执行",
+        "job_retried": "任务已重试",
+        "lease_recovered": "状态已恢复",
+    }
+)
+UNKNOWN_LAB_EVENT_LABEL = "状态已更新"
+LAB_EVENT_ALLOWED_LABELS: frozenset[str] = frozenset(
+    (*LAB_EVENT_LABEL_BY_TYPE.values(), UNKNOWN_LAB_EVENT_LABEL)
 )
 
 
@@ -133,6 +179,428 @@ def _contract(
 
 PAGE_PROJECTION_CONTRACTS: Mapping[str, ServingProjectionContract] = MappingProxyType(
     {
+        "notification_runtime_state": _contract("signals",
+            (("owner_id", "string"), ("channel", "string"), ("body_json", "string")),
+            ("owner_id", "channel"), max_rows=64, max_bytes=64 * 1024),
+        "notification_runtime_delivery": _contract("signals",
+            (("group_id", "string"), ("owner_id", "string"), ("channel", "string"), ("body_json", "string")),
+            ("group_id",), max_rows=512, max_bytes=256 * 1024),
+        "monitor_builtin_state": _contract("signals",
+            (("owner_id", "string"), ("builtin_id", "string"), ("body_json", "string")),
+            ("owner_id", "builtin_id"), max_rows=160, max_bytes=64 * 1024),
+        "monitor_builtin_event": _contract("signals",
+            (("event_id", "string"), ("sequence", "int"), ("owner_id", "string"), ("builtin_id", "string"), ("body_json", "string")),
+            ("event_id",), max_rows=1000, max_bytes=512 * 1024),
+        "collaboration_role": _contract(
+            "lab_jobs",
+            (("username", "string"), ("role", "string"), ("ordinal", "int"), ("revision", "int"), ("state_sha256", "string")),
+            ("username",), max_rows=256, max_bytes=64 * 1024,
+        ),
+        "command_audit_window": _contract(
+            "lab_jobs",
+            (("window_key", "string"), ("source_generation", "string"), ("journal_identity", "string"),
+             ("role_revision", "int"), ("role_state_sha256", "string"),
+             ("row_count", "int"), ("has_more", "bool")),
+            ("window_key",), max_rows=1, max_bytes=4096,
+        ),
+        "command_audit": _contract(
+            "lab_jobs",
+            (("command_id", "string"), ("command_kind", "string"), ("command_hash", "string"),
+             ("actor_id", "string"), ("actor_label", "string"), ("command_status", "string"),
+             ("effect_status", "string"), ("enqueued_at", "timestamp"), ("completed_at", "timestamp"),
+             ("effect_started_at", "timestamp"), ("effect_completed_at", "timestamp"),
+             ("outcome", "string"), ("summary", "string")),
+            ("command_id",), max_rows=512, max_bytes=1024 * 1024,
+            event_time_columns=("enqueued_at", "completed_at", "effect_started_at", "effect_completed_at"),
+        ),
+        "sealed_result_owner": _contract(
+            "lab_jobs",
+            (("domain", "string"), ("job_id", "string"), ("spec_hash", "string"), ("owner_id", "string"),
+             ("command_id", "string"), ("command_sha256", "string"), ("effect_sha256", "string"),
+             ("worker_owner_id", "string"), ("manifest_sha256", "string"),
+             ("complete_result_sha256", "string")),
+            ("domain", "job_id"), max_rows=256, max_bytes=512 * 1024,
+        ),
+        "ai_news_digest": _contract(
+            "signals",
+            (
+                ("owner_uid", "string"),
+                ("stock_code", "string"),
+                ("model_id", "string"),
+                ("template_version", "string"),
+                ("context_sha256", "string"),
+                ("content_sha256", "string"),
+                ("payload_json", "string"),
+                ("collected_at", "timestamp"),
+            ),
+            ("owner_uid", "stock_code", "model_id", "template_version"),
+            max_rows=8192,
+            max_bytes=4 * 1024 * 1024,
+            event_time_columns=("collected_at",),
+        ),
+        "ai_interpretation": _contract(
+            "signals",
+            (
+                ("owner_uid", "string"),
+                ("job_id", "string"),
+                ("cache_key", "string"),
+                ("source_kind", "string"),
+                ("result_sha256", "string"),
+                ("payload_json", "string"),
+            ),
+            ("owner_uid", "cache_key"),
+            max_rows=256,
+            max_bytes=1024 * 1024,
+        ),
+        "ai_usage_day": _contract(
+            "signals",
+            (
+                ("owner_uid", "string"),
+                ("account_id", "string"),
+                ("day", "date"),
+                ("payload_json", "string"),
+            ),
+            ("owner_uid", "account_id", "day"),
+            max_rows=8192,
+            max_bytes=1024 * 1024,
+            event_date_columns=("day",),
+        ),
+        "experiment_private_attempt": _contract(
+            "promotions",
+            (
+                ("owner", "string"),
+                ("experiment_id", "string"),
+                ("family_id", "string"),
+                ("registered_at", "timestamp"),
+                ("payload_json", "string"),
+            ),
+            ("owner", "experiment_id"),
+            max_rows=32_000,
+            max_bytes=6 * 1024 * 1024,
+            event_time_columns=("registered_at",),
+        ),
+        "experiment_private_family": _contract(
+            "promotions",
+            (("owner", "string"), ("family_id", "string"), ("payload_json", "string")),
+            ("owner", "family_id"),
+            max_rows=32_000,
+            max_bytes=3 * 1024 * 1024,
+        ),
+        "experiment_private_window": _contract(
+            "promotions",
+            (
+                ("owner", "string"),
+                ("retained_count", "int"),
+                ("truncated", "bool"),
+                ("oldest_registered_at", "timestamp"),
+                ("policy_json", "string"),
+            ),
+            ("owner",),
+            max_rows=64,
+            max_bytes=64 * 1024,
+            event_time_columns=("oldest_registered_at",),
+        ),
+        **{
+            name: _contract("promotions",columns,keys,max_rows=max_rows,max_bytes=max_bytes,
+                event_time_columns=times)
+            for name,(columns,keys,max_rows,max_bytes,times) in STRATEGY_PROMOTION_PROJECTION_LAYOUTS.items()
+        },
+        **{
+            name: _contract(
+                "paper_accounts",
+                columns,
+                keys,
+                max_rows=max_rows,
+                max_bytes=max_bytes,
+                event_time_columns=times,
+            )
+            for name, (
+                columns,
+                keys,
+                max_rows,
+                max_bytes,
+                times,
+            ) in PAPER_PORTFOLIO_PROJECTION_LAYOUTS.items()
+        },
+        **{
+            name: _contract(
+                "lab_jobs",
+                columns,
+                keys,
+                max_rows=max_rows,
+                max_bytes=max_bytes,
+                event_time_columns=times,
+            )
+            for name, (
+                columns,
+                keys,
+                max_rows,
+                max_bytes,
+                times,
+            ) in STRATEGY_TEMPLATE_PROJECTION_LAYOUTS.items()
+        },
+        "experiment_attempt": _contract(
+            "promotions",
+            (
+                ("experiment_id", "string"),
+                ("hypothesis_family", "string"),
+                ("registered_at", "timestamp"),
+                ("status", "string"),
+                ("completed_at", "timestamp"),
+                ("trade_count", "int"),
+                ("net_return_pct", "float"),
+                ("max_drawdown_pct", "float"),
+                ("win_rate_pct", "float"),
+            ),
+            ("registered_at", "experiment_id"),
+            max_rows=500,
+            max_bytes=256 * 1024,
+            event_time_columns=("registered_at", "completed_at"),
+        ),
+        "experiment_attempt_window": _contract(
+            "promotions",
+            (
+                ("snapshot_key", "string"),
+                ("retained_count", "int"),
+                ("truncated", "bool"),
+                ("oldest_registered_at", "timestamp"),
+            ),
+            ("snapshot_key",),
+            max_rows=1,
+            max_bytes=2 * 1024,
+            event_time_columns=("oldest_registered_at",),
+        ),
+        "strategy_catalog": _contract(
+            "strategy_catalog",
+            (
+                ("strategy_id", "string"),
+                ("name", "string"),
+                ("version", "int"),
+                ("registered_at", "timestamp"),
+            ),
+            ("strategy_id",),
+            max_rows=3,
+            max_bytes=4 * 1024,
+            event_time_columns=("registered_at",),
+        ),
+        "strategy_catalog_parameter": _contract(
+            "strategy_catalog",
+            (
+                ("strategy_id", "string"),
+                ("parameter_key", "string"),
+                ("label", "string"),
+                ("display_value", "string"),
+            ),
+            ("strategy_id", "parameter_key"),
+            max_rows=32,
+            max_bytes=16 * 1024,
+        ),
+        "paper_order_window": _contract(
+            "paper_accounts",
+            (
+                ("snapshot_key", "string"),
+                ("account_id", "string"),
+                ("as_of_time", "timestamp"),
+                ("price_tick", "string"),
+                ("total_orders", "int"),
+                ("retained_orders", "int"),
+                ("retained_fills", "int"),
+                ("has_more", "bool"),
+                ("newest_updated_at", "timestamp"),
+                ("oldest_updated_at", "timestamp"),
+            ),
+            ("snapshot_key",),
+            max_rows=1,
+            max_bytes=4 * 1024,
+            event_time_columns=("as_of_time", "newest_updated_at", "oldest_updated_at"),
+        ),
+        "paper_order_history": _contract(
+            "paper_accounts",
+            (
+                ("order_id", "string"),
+                ("intent_id", "string"),
+                ("account_id", "string"),
+                ("ts_code", "string"),
+                ("side", "string"),
+                ("order_type", "string"),
+                ("quantity", "int"),
+                ("filled_quantity", "int"),
+                ("average_fill_price", "string"),
+                ("status", "string"),
+                ("reject_reason", "string"),
+                ("created_at", "timestamp"),
+                ("updated_at", "timestamp"),
+            ),
+            ("order_id",),
+            max_rows=200,
+            max_bytes=256 * 1024,
+            event_time_columns=("created_at", "updated_at"),
+        ),
+        "paper_fill_history": _contract(
+            "paper_accounts",
+            (
+                ("fill_id", "string"),
+                ("execution_id", "string"),
+                ("order_id", "string"),
+                ("sequence", "int"),
+                ("quantity", "int"),
+                ("price", "string"),
+                ("commission", "string"),
+                ("transfer_fee", "string"),
+                ("tax", "string"),
+                ("total_fees", "string"),
+                ("cost_spec_id", "string"),
+                ("cost_spec_schema_version", "int"),
+                ("cost_context_fingerprint", "string"),
+                ("cost_provenance_state", "string"),
+                ("executed_at", "timestamp"),
+                ("price_snapshot_id", "string"),
+                ("persisted_at", "timestamp"),
+            ),
+            ("fill_id",),
+            max_rows=1_000,
+            max_bytes=1024 * 1024,
+            event_time_columns=("executed_at", "persisted_at"),
+        ),
+        "lab_job_event_window": _contract(
+            "lab_jobs",
+            (
+                ("job_id", "string"),
+                ("job_version", "int"),
+                ("state", "string"),
+                ("retained_count", "int"),
+                ("truncated", "bool"),
+            ),
+            ("job_id",),
+            max_rows=100,
+            max_bytes=32 * 1024,
+        ),
+        "lab_job_event": _contract(
+            "lab_jobs",
+            (
+                ("job_id", "string"),
+                ("event_id", "int"),
+                ("job_version", "int"),
+                ("occurred_at", "timestamp"),
+                ("new_status", "string"),
+                ("label", "string"),
+            ),
+            ("job_id", "event_id"),
+            max_rows=4_096,
+            max_bytes=2 * 1024 * 1024,
+            event_time_columns=("occurred_at",),
+        ),
+        "ops_host_status": _contract(
+            "ops_status",
+            (
+                ("host_name", "string"),
+                ("boot_id", "string"),
+                ("manifest_digest", "string"),
+                ("sampled_at", "timestamp"),
+                ("memory_total_bytes", "int"),
+                ("memory_available_bytes", "int"),
+            ),
+            ("host_name",),
+            max_rows=1,
+            max_bytes=4 * 1024,
+            event_time_columns=("sampled_at",),
+        ),
+        "ops_unit_status": _contract(
+            "ops_status",
+            (
+                ("timer", "string"),
+                ("service", "string"),
+                ("label", "string"),
+                ("expected_enabled", "bool"),
+                ("session", "string"),
+                ("resource_group", "string"),
+                ("timer_load_state", "string"),
+                ("timer_unit_file_state", "string"),
+                ("timer_active_state", "string"),
+                ("timer_sub_state", "string"),
+                ("last_trigger_at", "timestamp"),
+                ("next_at", "timestamp"),
+                ("service_load_state", "string"),
+                ("service_active_state", "string"),
+                ("service_sub_state", "string"),
+                ("service_result", "string"),
+                ("service_invocation_id", "string"),
+                ("service_exec_status", "string"),
+                ("service_start_at", "timestamp"),
+                ("service_exit_at", "timestamp"),
+                ("last_result", "string"),
+            ),
+            ("timer",),
+            max_rows=32,
+            max_bytes=96 * 1024,
+            event_time_columns=("last_trigger_at", "service_start_at", "service_exit_at"),
+        ),
+        "ops_resource_status": _contract(
+            "ops_status",
+            (
+                ("slice_name", "string"),
+                ("load_state", "string"),
+                ("active_state", "string"),
+                ("memory_current_bytes", "int"),
+                ("memory_peak_bytes", "int"),
+            ),
+            ("slice_name",),
+            max_rows=5,
+            max_bytes=8 * 1024,
+        ),
+        "ops_task_cpu": _contract(
+            "ops_status",
+            CPU_COLUMNS,
+            ("slice_name",),
+            max_rows=5,
+            max_bytes=32 * 1024,
+            event_time_columns=("observed_at",),
+        ),
+        "ops_task_runs": _contract(
+            "ops_status",
+            RUN_COLUMNS,
+            ("service",),
+            max_rows=32,
+            max_bytes=64 * 1024,
+            event_time_columns=("started_at", "ended_at", "observed_at"),
+        ),
+        "lab_scheduler_control": _contract(
+            "lab_jobs",
+            SCHEDULING_COLUMNS,
+            ("control_key",),
+            max_rows=1,
+            max_bytes=16 * 1024,
+            event_time_columns=("observed_at",),
+        ),
+        "runtime_health_detail_context": _contract(
+            "runtime_health",
+            (
+                ("host_name", "string"),
+                ("boot_id", "string"),
+                ("sampled_at", "timestamp"),
+                ("context_source_identity", "string"),
+                ("ops_source_generation_id", "string"),
+                ("observed_at", "timestamp"),
+            ),
+            ("host_name",),
+            max_rows=1,
+            max_bytes=4 * 1024,
+            event_time_columns=("sampled_at", "observed_at"),
+        ),
+        "runtime_service_detail": _contract(
+            "runtime_health",
+            (
+                ("service_id", "string"),
+                ("source_receipt", "string"),
+                ("source_material_json", "string"),
+                ("context_source_identity", "string"),
+                ("observed_at", "timestamp"),
+            ),
+            ("service_id",),
+            max_rows=500,
+            max_bytes=7 * 1024 * 1024,
+            event_time_columns=("observed_at",),
+        ),
         "dashboard_summary": _contract(
             "runtime_health",
             (
@@ -265,6 +733,273 @@ PAGE_PROJECTION_CONTRACTS: Mapping[str, ServingProjectionContract] = MappingProx
             max_rows=10_000,
             max_bytes=2 * 1024 * 1024,
             event_date_columns=("trade_date",),
+        ),
+        "alert_ack_state": _contract(
+            "signals",
+            (
+                ("snapshot_key", "string"),
+                ("state", "string"),
+                ("activated_at", "timestamp"),
+                ("row_count", "int"),
+                ("rows_sha256", "string"),
+            ),
+            ("snapshot_key",),
+            max_rows=1,
+            max_bytes=4096,
+            event_time_columns=("activated_at",),
+        ),
+        "alert_ack": _contract(
+            "signals",
+            (
+                ("alert_id", "string"),
+                ("confirmation_id", "string"),
+                ("actor_id", "string"),
+                ("confirmed_at", "timestamp"),
+                ("generation_id", "string"),
+            ),
+            ("alert_id",),
+            max_rows=10_000,
+            max_bytes=2 * 1024 * 1024,
+            event_time_columns=("confirmed_at",),
+        ),
+        "manual_watchlist_state": _contract(
+            "signals",
+            (
+                ("snapshot_key", "string"),
+                ("state", "string"),
+                ("activated_at", "timestamp"),
+                ("row_count", "int"),
+                ("rows_sha256", "string"),
+            ),
+            ("snapshot_key",),
+            max_rows=1,
+            max_bytes=4096,
+            event_time_columns=("activated_at",),
+        ),
+        "manual_watchlist": _contract(
+            "signals",
+            (
+                ("owner_id", "string"),
+                ("ts_code", "string"),
+                ("version", "int"),
+                ("deleted", "bool"),
+                ("source", "string"),
+                ("price_levels_json", "string"),
+                ("expires_at", "timestamp"),
+                ("updated_at", "timestamp"),
+            ),
+            ("owner_id", "ts_code"),
+            max_rows=10_000,
+            max_bytes=2 * 1024 * 1024,
+            event_time_columns=("updated_at",),
+        ),
+        "price_alert_rule_state": _contract(
+            "signals",
+            (
+                ("snapshot_key", "string"),
+                ("state", "string"),
+                ("activated_at", "timestamp"),
+                ("row_count", "int"),
+                ("rows_sha256", "string"),
+            ),
+            ("snapshot_key",),
+            max_rows=1,
+            max_bytes=4096,
+            event_time_columns=("activated_at",),
+        ),
+        "condition_alert_rule_state": _contract(
+            "signals",
+            (("snapshot_key", "string"), ("state", "string"), ("body_json", "string")),
+            ("snapshot_key",),
+            max_rows=1,
+            max_bytes=4096,
+        ),
+        "condition_alert_rule": _contract(
+            "signals",
+            (
+                ("owner_id", "string"),
+                ("rule_id", "string"),
+                ("version", "int"),
+                ("body_json", "string"),
+            ),
+            ("owner_id", "rule_id"),
+            max_rows=10000,
+            max_bytes=7 * 1024 * 1024,
+        ),
+        "condition_alert_runtime_state": _contract(
+            "signals",
+            (("snapshot_key", "string"), ("body_json", "string")),
+            ("snapshot_key",),
+            max_rows=1,
+            max_bytes=4096,
+        ),
+        "condition_alert_runtime": _contract(
+            "signals",
+            (("owner_id", "string"), ("rule_id", "string"), ("body_json", "string")),
+            ("owner_id", "rule_id"),
+            max_rows=3200,
+            max_bytes=2 * 1024 * 1024,
+        ),
+        "condition_alert_runtime_event": _contract(
+            "signals",
+            (
+                ("owner_id", "string"),
+                ("event_id", "string"),
+                ("global_sequence", "int"),
+                ("body_json", "string"),
+            ),
+            ("owner_id", "global_sequence"),
+            max_rows=100,
+            max_bytes=2 * 1024 * 1024,
+        ),
+        "price_alert_runtime_state": _contract(
+            "signals",
+            (("snapshot_key", "string"), ("body_json", "string")),
+            ("snapshot_key",),
+            max_rows=1,
+            max_bytes=64 * 1024,
+        ),
+        "price_alert_runtime": _contract(
+            "signals",
+            (("owner_id", "string"), ("rule_id", "string"), ("body_json", "string")),
+            ("owner_id", "rule_id"),
+            max_rows=3200,
+            max_bytes=2 * 1024 * 1024,
+        ),
+        "price_alert_runtime_event": _contract(
+            "signals",
+            (
+                ("owner_id", "string"),
+                ("event_id", "string"),
+                ("global_sequence", "int"),
+                ("body_json", "string"),
+            ),
+            ("owner_id", "global_sequence"),
+            max_rows=640,
+            max_bytes=2 * 1024 * 1024,
+        ),
+        "price_alert_runtime_attempt": _contract(
+            "signals",
+            (
+                ("owner_id", "string"),
+                ("event_id", "string"),
+                ("outbox_id", "string"),
+                ("body_json", "string"),
+            ),
+            ("owner_id", "outbox_id"),
+            max_rows=6400,
+            max_bytes=2 * 1024 * 1024,
+        ),
+        "price_alert_rule": _contract(
+            "signals",
+            (
+                ("owner_id", "string"),
+                ("rule_id", "string"),
+                ("version", "int"),
+                ("deleted", "bool"),
+                ("ts_code", "string"),
+                ("membership_version", "int"),
+                ("name", "string"),
+                ("priority", "string"),
+                ("enabled", "bool"),
+                ("comparison", "string"),
+                ("threshold", "string"),
+                ("valid_from", "string"),
+                ("valid_until", "string"),
+                ("updated_at", "timestamp"),
+            ),
+            ("owner_id", "rule_id"),
+            max_rows=10_000,
+            max_bytes=2 * 1024 * 1024,
+            event_time_columns=("updated_at",),
+        ),
+        "signal_observed_prefix": _contract(
+            "signals",
+            (
+                ("source_generation_id", "string"),
+                ("first_global_sequence", "int"),
+                ("source_high_watermark", "int"),
+                ("source_inspected_at", "timestamp"),
+                ("window_start", "timestamp"),
+                ("window_end", "timestamp"),
+                ("window_row_count", "int"),
+                ("window_rows_sha256", "string"),
+                ("prefix_row_count", "int"),
+                ("prefix_rows_sha256", "string"),
+            ),
+            ("source_generation_id",),
+            max_rows=1,
+            max_bytes=4096,
+            event_time_columns=("source_inspected_at", "window_start", "window_end"),
+        ),
+        "alert_event": _contract(
+            "signals",
+            (
+                ("source", "string"),
+                ("alert_id", "string"),
+                ("occurred_at", "timestamp"),
+                ("confirmation_id", "string"),
+                ("confirmed_at", "timestamp"),
+                ("eligible", "bool"),
+            ),
+            ("source", "alert_id"),
+            max_rows=20_000,
+            max_bytes=4 * 1024 * 1024,
+            event_time_columns=("occurred_at", "confirmed_at"),
+        ),
+        "alert_source_coverage": _contract(
+            "signals",
+            (
+                ("source", "string"),
+                ("state", "string"),
+                ("reason", "string"),
+                ("window_start", "timestamp"),
+                ("window_end", "timestamp"),
+                ("count_as_of", "timestamp"),
+                ("source_generation_id", "string"),
+                ("high_watermark", "string"),
+                ("row_count", "int"),
+                ("row_digest", "string"),
+            ),
+            ("source",),
+            max_rows=3,
+            max_bytes=8192,
+            event_time_columns=("window_start", "window_end", "count_as_of"),
+        ),
+        "alert_overview": _contract(
+            "signals",
+            (
+                ("snapshot_key", "string"),
+                ("state", "string"),
+                ("unacknowledged_count", "int"),
+                ("count_as_of", "timestamp"),
+                ("activated_at", "timestamp"),
+            ),
+            ("snapshot_key",),
+            max_rows=1,
+            max_bytes=4096,
+            event_time_columns=("count_as_of", "activated_at"),
+        ),
+        "legacy_notification": _contract(
+            "signals",
+            (
+                ("record_key", "string"),
+                ("sent_at", "timestamp"),
+                ("scene_label", "string"),
+                ("channel_label", "string"),
+                ("submitted", "bool"),
+            ),
+            ("record_key",),
+            max_rows=10_000,
+            max_bytes=2 * 1024 * 1024,
+            event_time_columns=("sent_at",),
+        ),
+        "legacy_notification_status": _contract(
+            "signals",
+            (("snapshot_key", "string"), ("state", "string"), ("skipped", "int")),
+            ("snapshot_key",),
+            max_rows=1,
+            max_bytes=512,
         ),
         "pulse_history": _contract(
             "signals",
@@ -420,6 +1155,27 @@ PAGE_PROJECTION_CONTRACTS: Mapping[str, ServingProjectionContract] = MappingProx
             max_bytes=3 * 1024 * 1024,
             event_time_columns=("as_of",),
         ),
+        "intraday_screen_source": _contract(
+            "signals",
+            (
+                ("source_identity", "string"),
+                ("trade_date", "date"),
+                ("cutoff", "timestamp"),
+                ("payload_json", "string"),
+            ),
+            ("source_identity",),
+            max_rows=1,
+            max_bytes=2 * 1024 * 1024,
+            event_date_columns=("trade_date",),
+            event_time_columns=("cutoff",),
+        ),
+        "intraday_feature_snapshot": _contract(
+            "signals",
+            (("source_identity", "string"), ("ts_code", "string"), ("payload_json", "string")),
+            ("source_identity", "ts_code"),
+            max_rows=8_000,
+            max_bytes=32 * 1024 * 1024,
+        ),
         "intraday_kline": _contract(
             "signals",
             (
@@ -549,6 +1305,536 @@ PAGE_PROJECTION_CONTRACTS: Mapping[str, ServingProjectionContract] = MappingProx
             event_date_columns=("range_start", "range_end"),
             event_time_columns=("as_of_time", "completed_at"),
         ),
+        "factor_tracking_state": _contract(
+            "lab_jobs",
+            (
+                ("status_key", "string"),
+                ("status", "string"),
+                ("row_count", "int"),
+                ("tracking_instance_id", "string"),
+                ("registry_instance_id", "string"),
+                ("snapshot_sha256", "string"),
+            ),
+            ("status_key",),
+            max_rows=1,
+            max_bytes=2048,
+        ),
+        "factor_tracking": _contract(
+            "lab_jobs",
+            (("factor_id", "string"), ("panel_json", "string")),
+            ("factor_id",),
+            max_rows=512,
+            max_bytes=2 * 1024 * 1024,
+        ),
+        "factor_definition_state": _contract(
+            "lab_jobs",
+            (
+                ("status_key", "string"),
+                ("status", "string"),
+                ("definition_count", "int"),
+                ("registry_instance_id", "string"),
+                ("snapshot_sha256", "string"),
+            ),
+            ("status_key",),
+            max_rows=1,
+            max_bytes=2 * 1024,
+        ),
+        "factor_result_state": _contract(
+            "lab_jobs",
+            (
+                ("status_key", "string"),
+                ("status", "string"),
+                ("job_count", "int"),
+                ("ledger_instance_id", "string"),
+                ("snapshot_sha256", "string"),
+            ),
+            ("status_key",),
+            max_rows=1,
+            max_bytes=2 * 1024,
+        ),
+        "factor_result_index": _contract(
+            "lab_jobs",
+            (
+                ("job_id", "string"),
+                ("spec_sha256", "string"),
+                ("factor_id", "string"),
+                ("factor_version", "int"),
+                ("definition_content_sha256", "string"),
+                ("status", "string"),
+                ("failure_code", "string"),
+                ("updated_at", "timestamp"),
+                ("as_of_time", "timestamp"),
+                ("code_revision", "string"),
+                ("source_sha256", "string"),
+                ("result_sha256", "string"),
+                ("full_artifact_sha256", "string"),
+                ("display_artifact_sha256", "string"),
+                ("display_byte_count", "int"),
+                ("completion_sha256", "string"),
+                ("display_status", "string"),
+            ),
+            ("job_id",),
+            max_rows=50,
+            max_bytes=256 * 1024,
+            event_time_columns=("updated_at", "as_of_time"),
+        ),
+        "factor_result_display": _contract(
+            "lab_jobs",
+            (
+                ("job_id", "string"),
+                ("chunk_index", "int"),
+                ("chunk_count", "int"),
+                ("file_sha256", "string"),
+                ("data_b64", "string"),
+            ),
+            ("job_id", "chunk_index"),
+            max_rows=512,
+            max_bytes=6 * 1024 * 1024,
+        ),
+        "factor_definition": _contract(
+            "lab_jobs",
+            (
+                ("factor_id", "string"),
+                ("version", "int"),
+                ("content_sha256", "string"),
+                ("name_zh", "string"),
+                ("category", "string"),
+                ("direction", "string"),
+                ("expression", "string"),
+                ("earliest_available_date", "date"),
+                ("dependency_columns_json", "string"),
+                ("max_history_window", "int"),
+                ("archived", "bool"),
+            ),
+            ("factor_id",),
+            max_rows=512,
+            max_bytes=2 * 1024 * 1024,
+        ),
+        "data_audit_status": _contract(
+            "lab_jobs",
+            (
+                ("status_key", "string"),
+                ("latest_status", "string"),
+                ("latest_observed_at", "timestamp"),
+                ("latest_completed_at", "timestamp"),
+                ("successful_audit_id", "string"),
+                ("successful_as_of_date", "date"),
+                ("successful_range_start", "date"),
+                ("successful_range_end", "date"),
+                ("successful_completed_at", "timestamp"),
+                ("finding_count", "int"),
+                ("p0_count", "int"),
+            ),
+            ("status_key",),
+            max_rows=1,
+            max_bytes=16 * 1024,
+            event_date_columns=(
+                "successful_as_of_date",
+                "successful_range_start",
+                "successful_range_end",
+            ),
+            event_time_columns=(
+                "latest_observed_at",
+                "latest_completed_at",
+                "successful_completed_at",
+            ),
+        ),
+        "data_audit_issue": _contract(
+            "lab_jobs",
+            (
+                ("audit_run_id", "string"),
+                ("issue_id", "string"),
+                ("dataset_id", "string"),
+                ("rule_id", "string"),
+                ("severity", "string"),
+                ("status", "string"),
+            ),
+            ("audit_run_id", "issue_id"),
+            max_rows=256,
+            max_bytes=128 * 1024,
+        ),
+        "data_center_execution": _contract(
+            "lab_jobs",
+            (("execution_id", "string"), ("owner", "string"), ("status_json", "string")),
+            ("execution_id",),
+            max_rows=50,
+            max_bytes=416 * 1024,
+        ),
+        "data_center_execution_event": _contract(
+            "lab_jobs",
+            (
+                ("event_id", "string"),
+                ("execution_id", "string"),
+                ("owner", "string"),
+                ("event_type", "string"),
+                ("occurred_at", "timestamp"),
+                ("task_id", "string"),
+                ("task_status", "string"),
+                ("attempts", "int"),
+                ("control_sequence", "int"),
+                ("failure_code", "string"),
+            ),
+            ("event_id",),
+            max_rows=20,
+            max_bytes=32 * 1024,
+            event_time_columns=("occurred_at",),
+        ),
+        "data_center_execution_state": _contract(
+            "lab_jobs",
+            (
+                ("configured", "bool"),
+                ("backfill_enabled", "bool"),
+                ("financial_enabled", "bool"),
+                ("may_start", "bool"),
+                ("observed_at", "timestamp"),
+            ),
+            ("observed_at",),
+            max_rows=1,
+            max_bytes=1024,
+        ),
+        "data_center_financial_source": _contract(
+            "lab_jobs",
+            (
+                ("api_name", "string"),
+                ("permission_status", "string"),
+                ("evidence_source", "string"),
+                ("scope_start", "string"),
+                ("scope_end", "string"),
+                ("expires_at", "string"),
+                ("remaining_units", "int"),
+                ("total_units", "int"),
+                ("resets_at", "string"),
+            ),
+            ("api_name",),
+            max_rows=7,
+            max_bytes=32 * 1024,
+        ),
+        "audit_report_overview": _contract(
+            "lab_jobs",
+            (
+                ("report_hash", "string"),
+                ("schema_version", "int"),
+                ("rule_version", "string"),
+                ("run_status", "string"),
+                ("collection_status", "string"),
+                ("collection_completed_through", "date"),
+                ("coverage_conclusion", "string"),
+                ("quality_conclusion", "string"),
+                ("current", "bool"),
+                ("source_mode", "string"),
+                ("source_namespace", "string"),
+                ("replica_generation_id", "string"),
+                ("audit_start", "date"),
+                ("observed_through", "date"),
+                ("expected_open_days", "int"),
+                ("covered_open_days", "int"),
+                ("missing_open_days", "int"),
+                ("gap_count", "int"),
+                ("longest_gap_open_days", "int"),
+                ("closed_day_count", "int"),
+                ("monthly_count", "int"),
+                ("rule_count", "int"),
+                ("quality_issue_count", "int"),
+                ("indexed_issue_count", "int"),
+                ("omitted_issue_count", "int"),
+                ("unassessed_rule_days", "int"),
+            ),
+            ("report_hash",),
+            max_rows=1,
+            max_bytes=16 * 1024,
+            event_date_columns=("audit_start", "observed_through"),
+        ),
+        "audit_report_month": _contract(
+            "lab_jobs",
+            (
+                ("report_hash", "string"),
+                ("month", "date"),
+                ("expected_open_days", "int"),
+                ("covered_open_days", "int"),
+                ("coverage_ratio", "float"),
+                ("status", "string"),
+            ),
+            ("report_hash", "month"),
+            max_rows=122,
+            max_bytes=64 * 1024,
+            event_date_columns=("month",),
+        ),
+        "audit_report_rule": _contract(
+            "lab_jobs",
+            (
+                ("report_hash", "string"),
+                ("rule_id", "string"),
+                ("field_name", "string"),
+                ("expected_days", "int"),
+                ("checked_days", "int"),
+                ("assessed_days", "int"),
+                ("unassessed_days", "int"),
+                ("first_assessed_date", "date"),
+                ("last_assessed_date", "date"),
+                ("assessment_complete", "bool"),
+                ("unassessed_reasons_json", "string"),
+                ("issue_count", "int"),
+            ),
+            ("report_hash", "rule_id", "field_name"),
+            max_rows=11,
+            max_bytes=64 * 1024,
+            event_date_columns=("first_assessed_date", "last_assessed_date"),
+        ),
+        "audit_report_issue": _contract(
+            "lab_jobs",
+            (
+                ("report_hash", "string"),
+                ("issue_index", "int"),
+                ("trade_date", "date"),
+                ("rule_id", "string"),
+                ("ts_code", "string"),
+                ("field_name", "string"),
+                ("observed_value", "string"),
+                ("reference_value", "string"),
+                ("null_rows", "int"),
+                ("observed_rows", "int"),
+            ),
+            ("report_hash", "issue_index"),
+            max_rows=MAX_INDEXED_ISSUES,
+            max_bytes=256 * 1024,
+            event_date_columns=("trade_date",),
+        ),
+        "audit_report_dataset": _contract(
+            "lab_jobs",
+            (("report_hash", "string"), ("dataset_id", "string"), ("result_json", "string")),
+            ("report_hash", "dataset_id"),
+            max_rows=24,
+            max_bytes=2 * 1024 * 1024,
+        ),
+        "data_collection_dataset": _contract(
+            "lab_jobs",
+            (
+                ("report_hash", "string"),
+                ("dataset_id", "string"),
+                ("source_binding_sha256", "string"),
+                ("evidence_json", "string"),
+            ),
+            ("report_hash", "dataset_id"),
+            max_rows=24,
+            max_bytes=192 * 1024,
+        ),
+        "audit_report_job": _contract(
+            "lab_jobs",
+            (
+                ("status_key", "string"),
+                ("availability", "string"),
+                ("latest_task_id", "string"),
+                ("latest_status", "string"),
+                ("latest_attempts", "int"),
+                ("latest_created_at", "timestamp"),
+                ("latest_updated_at", "timestamp"),
+                ("latest_error_code", "string"),
+                ("successful_task_id", "string"),
+                ("successful_report_hash", "string"),
+                ("successful_created_at", "timestamp"),
+                ("successful_updated_at", "timestamp"),
+            ),
+            ("status_key",),
+            max_rows=1,
+            max_bytes=4096,
+            event_time_columns=(
+                "latest_created_at",
+                "latest_updated_at",
+                "successful_created_at",
+                "successful_updated_at",
+            ),
+        ),
+        "audit_report_job_event": _contract(
+            "lab_jobs",
+            (
+                ("event_id", "int"),
+                ("task_id", "string"),
+                ("event_type", "string"),
+                ("attempts", "int"),
+                ("occurred_at", "timestamp"),
+                ("error_code", "string"),
+            ),
+            ("event_id",),
+            max_rows=20,
+            max_bytes=16 * 1024,
+            event_time_columns=("occurred_at",),
+        ),
+        "formula_market_job_state": _contract(
+            "lab_jobs",
+            (
+                ("status_key", "string"),
+                ("availability", "string"),
+                ("total_task_count", "int"),
+                ("retained_task_count", "int"),
+                ("has_older_tasks", "bool"),
+            ),
+            ("status_key",),
+            max_rows=1,
+            max_bytes=2048,
+        ),
+        "formula_market_job": _contract(
+            "lab_jobs",
+            (
+                ("rank", "int"),
+                ("task_id", "string"),
+                ("status", "string"),
+                ("attempts", "int"),
+                ("created_at", "timestamp"),
+                ("updated_at", "timestamp"),
+                ("error_code", "string"),
+                ("result_sha256", "string"),
+                ("request_sha256", "string"),
+                ("formula_sha256", "string"),
+                ("formula", "string"),
+                ("trade_date", "date"),
+                ("decision_at", "timestamp"),
+                ("universe_identity", "string"),
+                ("projection_identity", "string"),
+            ),
+            ("rank",),
+            max_rows=100,
+            max_bytes=2 * 1024 * 1024,
+            event_date_columns=("trade_date",),
+            event_time_columns=("created_at", "updated_at"),
+        ),
+        "research_artifact_index": _contract(
+            "lab_jobs",
+            (
+                ("artifact_type", "string"),
+                ("artifact_version", "int"),
+                ("rank", "int"),
+                ("task_id", "string"),
+                ("relative_path", "string"),
+                ("content_sha256", "string"),
+                ("byte_count", "int"),
+                ("request_sha256", "string"),
+                ("formula_sha256", "string"),
+                ("universe_identity", "string"),
+                ("projection_identity", "string"),
+                ("trade_date", "date"),
+                ("decision_at", "timestamp"),
+                ("market_total", "int"),
+                ("listed_count", "int"),
+                ("paused_count", "int"),
+                ("match_count", "int"),
+                ("no_match_count", "int"),
+                ("unknown_count", "int"),
+            ),
+            ("rank",),
+            max_rows=100,
+            max_bytes=256 * 1024,
+            event_date_columns=("trade_date",),
+        ),
+        "backfill_plan_catalog": _contract(
+            "lab_jobs",
+            (
+                ("catalog_key", "string"),
+                ("total_plan_count", "int"),
+                ("indexed_plan_count", "int"),
+                ("preview_plan_count", "int"),
+                ("has_older_plans", "bool"),
+                ("oldest_indexed_hash", "string"),
+            ),
+            ("catalog_key",),
+            max_rows=1,
+            max_bytes=4 * 1024,
+        ),
+        "backfill_plan_index": _contract(
+            "lab_jobs",
+            (
+                ("rank", "int"),
+                ("plan_hash", "string"),
+                ("published_at", "timestamp"),
+                ("audit_start", "date"),
+                ("completed_through", "date"),
+                ("cutoff_observed_at", "timestamp"),
+                ("missing_day_count", "int"),
+                ("estimated_seconds", "string"),
+                ("source_mode", "string"),
+                ("snapshot_label", "string"),
+                ("identity_verified", "bool"),
+                ("collection_complete_verified", "bool"),
+                ("quota_status", "string"),
+                ("executable", "bool"),
+            ),
+            ("rank",),
+            max_rows=4096,
+            max_bytes=2 * 1024 * 1024,
+            event_date_columns=("audit_start", "completed_through"),
+            event_time_columns=("published_at", "cutoff_observed_at"),
+        ),
+        "backfill_plan_preview": _contract(
+            "lab_jobs",
+            (
+                ("plan_hash", "string"),
+                ("missing_dates_json", "string"),
+                ("monthly_json", "string"),
+                ("estimate_json", "string"),
+                ("source_json", "string"),
+                ("gap_count", "int"),
+                ("coverage_scope", "string"),
+            ),
+            ("plan_hash",),
+            max_rows=8,
+            max_bytes=1 * 1024 * 1024,
+        ),
+        "backfill_plan_archive": _contract(
+            "lab_jobs",
+            (
+                ("plan_hash", "string"),
+                ("encoding", "string"),
+                ("detail_sha256", "string"),
+                ("payload_base64", "string"),
+            ),
+            ("plan_hash",),
+            max_rows=4096,
+            max_bytes=4 * 1024 * 1024,
+        ),
+        "backfill_plan_progress": _contract(
+            "lab_jobs",
+            (
+                ("status_key", "string"),
+                ("availability", "string"),
+                ("task_id", "string"),
+            ),
+            ("status_key",),
+            max_rows=1,
+            max_bytes=4 * 1024,
+        ),
+        "backfill_plan_job": _contract(
+            "lab_jobs",
+            (
+                ("status_key", "string"),
+                ("availability", "string"),
+                ("event_history", "string"),
+                ("task_id", "string"),
+                ("status", "string"),
+                ("attempts", "int"),
+                ("created_at", "timestamp"),
+                ("updated_at", "timestamp"),
+                ("plan_hash", "string"),
+                ("error_code", "string"),
+            ),
+            ("status_key",),
+            max_rows=1,
+            max_bytes=4 * 1024,
+            event_time_columns=("created_at", "updated_at"),
+        ),
+        "backfill_plan_event": _contract(
+            "lab_jobs",
+            (
+                ("event_id", "int"),
+                ("task_id", "string"),
+                ("event_type", "string"),
+                ("attempts", "int"),
+                ("occurred_at", "timestamp"),
+                ("error_code", "string"),
+            ),
+            ("event_id",),
+            max_rows=20,
+            max_bytes=16 * 1024,
+            event_time_columns=("occurred_at",),
+        ),
         "canvas_diagnostic": _contract(
             "signals",
             (
@@ -603,6 +1889,176 @@ PAGE_PROJECTION_CONTRACTS: Mapping[str, ServingProjectionContract] = MappingProx
             max_rows=512,
             max_bytes=2 * 1024 * 1024,
             event_time_columns=("created_at", "updated_at"),
+        ),
+        "pool_definition": _contract(
+            "signals",
+            (
+                ("pool_name", "string"),
+                ("display_name", "string"),
+                ("description", "string"),
+                ("source_kind", "string"),
+                ("state", "string"),
+                ("reason", "string"),
+                ("version", "string"),
+                ("command_id", "string"),
+                ("command_hash", "string"),
+                ("depends_on", "string"),
+                ("delay_mode", "string"),
+                ("delay_days", "int"),
+                ("rules_json", "string"),
+                ("include_columns_json", "string"),
+                ("ranking_json", "string"),
+                ("can_edit", "bool"),
+            ),
+            ("pool_name",),
+            max_rows=512,
+            max_bytes=2 * 1024 * 1024,
+        ),
+        "formula_pool_state": _contract(
+            "signals",
+            (
+                ("status_key", "string"),
+                ("availability", "string"),
+                ("pool_count", "int"),
+                ("run_count", "int"),
+            ),
+            ("status_key",),
+            max_rows=1,
+            max_bytes=2048,
+        ),
+        "formula_pool_definition": _contract(
+            "signals",
+            (
+                ("pool_name", "string"),
+                ("display_name", "string"),
+                ("formula", "string"),
+                ("syntax_version", "string"),
+                ("version", "string"),
+                ("command_id", "string"),
+                ("command_hash", "string"),
+                ("created_at", "timestamp"),
+                ("creation_task_id", "string"),
+                ("creation_result_sha256", "string"),
+                ("creation_trade_date", "date"),
+            ),
+            ("pool_name",),
+            max_rows=512,
+            max_bytes=3 * 1024 * 1024,
+            event_date_columns=("creation_trade_date",),
+            event_time_columns=("created_at",),
+        ),
+        "formula_pool_latest_result": _contract(
+            "signals",
+            (
+                ("pool_name", "string"),
+                ("definition_version", "string"),
+                ("trade_date", "date"),
+                ("task_id", "string"),
+                ("request_sha256", "string"),
+                ("result_sha256", "string"),
+                ("universe_identity", "string"),
+                ("projection_identity", "string"),
+                ("market_total", "int"),
+                ("match_count", "int"),
+                ("no_match_count", "int"),
+                ("unknown_count", "int"),
+                ("unknown_reasons_json", "string"),
+                ("member_sha256", "string"),
+                ("relative_path", "string"),
+                ("content_sha256", "string"),
+                ("byte_count", "int"),
+            ),
+            ("pool_name",),
+            max_rows=512,
+            max_bytes=512 * 1024,
+            event_date_columns=("trade_date",),
+        ),
+        "screen_run_evidence": _contract(
+            "signals",
+            (
+                ("trade_date", "date"),
+                ("preset_name", "string"),
+                ("definition_version", "string"),
+                ("result_version", "string"),
+                ("source_kind", "string"),
+                ("source_identity", "string"),
+                ("content_digest", "string"),
+                ("decision_at", "timestamp"),
+                ("universe_count", "int"),
+                ("hit_count", "int"),
+                ("unknown_count", "int"),
+                ("ranking_plan_digest", "string"),
+                ("member_rank_digest", "string"),
+                ("persisted_extra_digest", "string"),
+                ("writer_contract_fingerprint", "string"),
+                ("evidence_version", "string"),
+                ("completed_at", "timestamp"),
+                ("canonical_receipt_id", "string"),
+                ("canonical_generation_id", "string"),
+                ("source_generation_id", "string"),
+            ),
+            ("preset_name",),
+            max_rows=512,
+            max_bytes=1024 * 1024,
+            event_date_columns=("trade_date",),
+            event_time_columns=("decision_at", "completed_at"),
+        ),
+        "screen_run_receipt": _contract(
+            "signals",
+            (
+                ("trade_date", "date"),
+                ("preset_name", "string"),
+                ("definition_version", "string"),
+                ("result_version", "string"),
+                ("parent_trade_date", "date"),
+                ("parent_result_version", "string"),
+                ("hit_count", "int"),
+                ("member_digest", "string"),
+                ("lineage_complete", "bool"),
+                ("current_definition", "bool"),
+                ("completed_at", "timestamp"),
+            ),
+            ("preset_name",),
+            max_rows=512,
+            max_bytes=256 * 1024,
+            event_date_columns=("trade_date", "parent_trade_date"),
+            event_time_columns=("completed_at",),
+        ),
+        "pool_membership": _contract(
+            "signals",
+            (
+                ("pool_name", "string"),
+                ("trade_date", "date"),
+                ("result_version", "string"),
+                ("row_kind", "string"),
+                ("ts_code", "string"),
+                ("status", "string"),
+                ("entry_trade_date", "date"),
+                ("entry_close", "float"),
+                ("entry_result_version", "string"),
+                ("unknown_reason", "string"),
+            ),
+            ("pool_name", "row_kind", "ts_code"),
+            max_rows=4_608,
+            max_bytes=2 * 1024 * 1024,
+            event_date_columns=("trade_date", "entry_trade_date"),
+        ),
+        "pool_member_return": _contract(
+            "signals",
+            (
+                ("pool_name", "string"),
+                ("trade_date", "date"),
+                ("result_version", "string"),
+                ("ts_code", "string"),
+                ("entry_trade_date", "date"),
+                ("entry_result_version", "string"),
+                ("gain_pct", "float"),
+                ("entry_line_price", "float"),
+            ),
+            ("pool_name", "ts_code"),
+            max_rows=4_096,
+            max_bytes=2 * 1024 * 1024,
+            event_date_columns=("trade_date", "entry_trade_date"),
         ),
         "nl_screen_universe": _contract(
             "reference_slow_authority",
@@ -772,6 +2228,91 @@ class ServingProjectionInput(ServingProjectionPayload):
         )
 
 
+class ServingOwnerProjectionCapacityError(ValueError):
+    def __init__(self, owners: tuple[str, ...]) -> None:
+        self.owners = owners
+        super().__init__(
+            "serving owner projections exceed their authority byte budget: " + ", ".join(owners)
+        )
+
+
+def validate_collaboration_projections(
+    projections: Mapping[str, ServingProjectionPayload],
+) -> None:
+    from rquant.collaboration_roles import RoleEntry, RoleState
+    from rquant.command_audit_projection import CommandAuditItem, CommandAuditSourceWindow
+    from rquant.web.models.collaboration import ResultOwnerProof
+
+    required = {"collaboration_role", "command_audit", "command_audit_window"}
+    present = required.intersection(projections)
+    if not present:
+        if "sealed_result_owner" in projections:
+            raise ValueError("sealed owner projection lacks original role and audit graph")
+        return
+    if present != required:
+        raise ValueError("collaboration projection is partial")
+    role_rows = tuple(sorted(projections["collaboration_role"].rows, key=lambda row: row["ordinal"]))
+    if not role_rows or tuple(row["ordinal"] for row in role_rows) != tuple(range(len(role_rows))):
+        raise ValueError("original role order is incomplete")
+    revision = role_rows[0]["revision"]
+    state = RoleState.create(revision=revision, users=tuple(
+        RoleEntry(username=row["username"], role=row["role"]) for row in role_rows))
+    if any(row["revision"] != revision or row["state_sha256"] != state.content_sha256 for row in role_rows):
+        raise ValueError("original role projection state differs")
+    window_rows = projections["command_audit_window"].rows
+    if len(window_rows) != 1:
+        raise ValueError("original audit window is unavailable")
+    window = window_rows[0]
+    rows = projections["command_audit"].rows
+    items = tuple(CommandAuditItem.model_validate_json(json.dumps(dict(row))) for row in rows)
+    source = CommandAuditSourceWindow(items=tuple(sorted(items,
+        key=lambda item: (item.enqueued_at, item.command_id), reverse=True)), has_more=window["has_more"])
+    if (window["window_key"] != "current" or window["row_count"] != len(items)
+            or window["role_revision"] != revision or window["role_state_sha256"] != state.content_sha256
+            or TypeAdapter(GenerationId).validate_python(window["journal_identity"]) != window["journal_identity"]
+            or canonical_sha256({"journal_identity": window["journal_identity"],
+                "role_state_sha256": state.content_sha256, "window": source}) != window["source_generation"]):
+        raise ValueError("original audit window and role state differ")
+    owners = projections.get("sealed_result_owner")
+    if owners is not None:
+        users = {entry.username for entry in state.users}
+        for row in owners.rows:
+            proof = ResultOwnerProof.model_validate_json(json.dumps({key: value for key, value in row.items()
+                if key not in {"manifest_sha256", "complete_result_sha256"}}))
+            if proof.owner_id not in users:
+                raise ValueError("sealed owner has no current registered role")
+            for key in ("manifest_sha256", "complete_result_sha256"):
+                TypeAdapter(GenerationId).validate_python(row[key])
+
+
+def require_projection_owner_budget(projections: tuple[ServingProjectionInput, ...]) -> None:
+    owner_sizes: dict[str, int] = {}
+    for projection in projections:
+        owner_sizes[projection.owner_dataset_id] = owner_sizes.get(
+            projection.owner_dataset_id, 0
+        ) + _projection_json_bytes(projection)
+    private_projections = tuple(
+        p for p in projections if p.table_name in _PRIVATE_EXPERIMENT_TABLES
+    )
+    private_bytes = sum(_projection_json_bytes(p) for p in private_projections)
+    if (
+        private_projections
+        and {p.table_name for p in private_projections} != _PRIVATE_EXPERIMENT_TABLES
+    ):
+        raise ValueError("private experiment projection is partial")
+    if private_bytes > _MAX_PRIVATE_EXPERIMENT_BYTES:
+        raise ValueError("private experiment projections exceed their authority byte budget")
+    if private_projections:
+        # The explicit private collection has its own accepted 8 MiB budget.
+        # The original shared projections retain their original 7 MiB budget.
+        owner_sizes["promotions"] -= private_bytes
+    oversized = tuple(
+        sorted(owner for owner, size in owner_sizes.items() if size > _MAX_OWNER_PROJECTION_BYTES)
+    )
+    if oversized:
+        raise ServingOwnerProjectionCapacityError(oversized)
+
+
 class ServingSignalRecord(RuntimeContractModel):
     global_sequence: int = Field(ge=1)
     signal: SignalEnvelope
@@ -806,6 +2347,20 @@ class ServingLabJobRecord(RuntimeContractModel):
         return self
 
 
+def _health_view_cells(
+    item: RuntimeHealthValidatedServiceDetail, detail: RuntimeHealthValidatedDetails
+) -> dict[str, str | None]:
+    view = RuntimeHealthServiceView.from_verified(item, detail.context)
+    heartbeat = item.heartbeat
+    return {
+        "observations_json": None
+        if view.observations is None
+        else canonical_json_bytes(dict(view.observations)).decode(),
+        "degraded_detail": None if heartbeat is None else heartbeat.degraded_detail,
+        "detail_json": canonical_json_bytes(view.model_dump(mode="json")).decode(),
+    }
+
+
 class ServingReadModelInput(RuntimeContractModel):
     observed_at: AwareUtcDatetime
     signals: tuple[ServingSignalRecord, ...] = ()
@@ -813,12 +2368,58 @@ class ServingReadModelInput(RuntimeContractModel):
     deliveries: tuple[OutboxRecord, ...] = ()
     paper_accounts: tuple[PaperAccountSnapshot, ...] = ()
     runtime_services: tuple[RuntimeServiceHealth, ...] = ()
+    runtime_health_details: RuntimeHealthValidatedDetails | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     lab_jobs: tuple[ServingLabJobRecord, ...] = ()
     promotions: tuple[PromotionDecision, ...] = ()
     projections: tuple[ServingProjectionInput, ...] = ()
 
     @model_validator(mode="after")
     def validate_snapshot(self) -> ServingReadModelInput:
+        validate_collaboration_projections({p.table_name: p for p in self.projections})
+        health_projections = tuple(
+            p for p in self.projections if p.owner_dataset_id == "runtime_health"
+        )
+        detail = self.runtime_health_details
+        has_details = any(
+            p.table_name in {"runtime_service_detail", "runtime_health_detail_context"}
+            for p in health_projections
+        )
+        if has_details != (detail is not None):
+            raise ValueError("present health extension requires its verified complete graph")
+        if detail is not None:
+            graph = runtime_health_graph_from_projections(
+                health_projections, owner_generation_id=detail.owner_generation_id
+            )
+            receipts = {item.service_id: item.source_receipt for item in detail.services}
+            checked = validate_runtime_health_detail_graph(
+                graph,
+                legacy_services=self.runtime_services,
+                source_receipts=receipts,
+                context=detail.context,
+                owner_generation_id=detail.owner_generation_id,
+                observed_at=detail.observed_at,
+                existing_projections=tuple(
+                    RuntimeHealthOwnerProjection(**p.model_dump(mode="python"))
+                    for p in health_projections
+                    if p.table_name
+                    not in {"runtime_health_detail_context", "runtime_service_detail"}
+                ),
+            )
+            if checked != detail or detail.observed_at > self.observed_at:
+                raise ValueError("health verified view differs from original bound material")
+            health_bytes = sum(_projection_json_bytes(p) for p in health_projections)
+            for item in detail.services:
+                cells = _health_view_cells(item, detail)
+                if any(
+                    _projection_json_bytes(cell) > _MAX_PROJECTION_CELL_BYTES
+                    for cell in cells.values()
+                ):
+                    raise ValueError("health view exceeds its original 64 KiB cell budget")
+                health_bytes += _projection_json_bytes({"service_id": item.service_id, **cells})
+            if health_bytes > _MAX_OWNER_PROJECTION_BYTES:
+                raise ValueError("health projections and views exceed the original 7 MiB budget")
         self._require_unique(
             (record.global_sequence for record in self.signals),
             "signal global_sequence",
@@ -865,24 +2466,108 @@ class ServingReadModelInput(RuntimeContractModel):
         if any(value > self.observed_at for value in times):
             raise ValueError("serving snapshot contains future evidence")
 
-        owner_sizes: dict[str, int] = {}
+        price_size = 0
         for projection in self.projections:
-            owner_sizes[projection.owner_dataset_id] = owner_sizes.get(
-                projection.owner_dataset_id,
-                0,
-            ) + _projection_json_bytes(projection)
-        oversized_owners = tuple(
-            sorted(
-                owner for owner, size in owner_sizes.items() if size > _MAX_OWNER_PROJECTION_BYTES
+            if projection.table_name in {
+                "price_alert_runtime_state",
+                "price_alert_runtime",
+                "price_alert_runtime_event",
+                "price_alert_runtime_attempt",
+            }:
+                price_size += _projection_json_bytes(projection)
+        if price_size > 2 * 1024 * 1024:
+            raise ValueError("price runtime projections exceed their 2 MiB domain")
+        if price_size:
+            from rquant.price_alert_runtime_projection import validate_price_runtime_projections
+
+            validate_price_runtime_projections(
+                {projection.table_name: projection for projection in self.projections}
             )
-        )
-        if oversized_owners:
-            raise ValueError(
-                "serving owner projections exceed their authority byte budget: "
-                + ", ".join(oversized_owners)
+        require_projection_owner_budget(self.projections)
+
+        if any(
+            projection.table_name
+            in {"formula_market_job_state", "formula_market_job", "research_artifact_index"}
+            for projection in self.projections
+        ):
+            from rquant.formula_market_job_projection import validate_formula_market_projections
+
+            validate_formula_market_projections(
+                {projection.table_name: projection for projection in self.projections}
             )
 
+        if any(
+            projection.table_name.startswith("formula_pool_") for projection in self.projections
+        ):
+            from rquant.formula_pool_serving_projection import validate_formula_pool_projections
+
+            validate_formula_pool_projections(
+                {projection.table_name: projection for projection in self.projections}
+            )
+
+        if any(
+            projection.table_name in {"price_alert_rule_state", "price_alert_rule"}
+            for projection in self.projections
+        ):
+            from rquant.serving_price_alert_rule_projection import (
+                validate_price_alert_rule_projections,
+            )
+
+            validate_price_alert_rule_projections(
+                {projection.table_name: projection for projection in self.projections}
+            )
+
+        from rquant.condition_alert_runtime_projection import (
+            validate_condition_rule_projections,
+            validate_condition_runtime_projections,
+            validate_monitor_runtime_projections,
+        )
+
+        validate_condition_rule_projections({p.table_name: p for p in self.projections})
+        validate_condition_runtime_projections({p.table_name: p for p in self.projections})
+        validate_monitor_runtime_projections({p.table_name: p for p in self.projections})
+
+        if any(
+            projection.table_name in {"factor_definition_state", "factor_definition"}
+            for projection in self.projections
+        ):
+            from rquant.factor.serving_projection import validate_factor_definition_projections
+
+            validate_factor_definition_projections(
+                {projection.table_name: projection for projection in self.projections}
+            )
+
+        if any(
+            projection.table_name
+            in {"factor_result_state", "factor_result_index", "factor_result_display"}
+            for projection in self.projections
+        ):
+            from rquant.factor.result_serving import validate_factor_result_projections
+
+            validate_factor_result_projections(
+                {projection.table_name: projection for projection in self.projections}
+            )
+
+        if any(
+            p.table_name in {"factor_tracking_state", "factor_tracking"} for p in self.projections
+        ):
+            from rquant.factor.tracking_serving import validate_factor_tracking_projections
+
+            validate_factor_tracking_projections({p.table_name: p for p in self.projections})
+
+        if any(p.table_name in PAPER_PORTFOLIO_PROJECTION_LAYOUTS for p in self.projections):
+            from rquant.paper_portfolio_projection import validate_paper_portfolio_projections
+
+            validate_paper_portfolio_projections({p.table_name: p for p in self.projections})
         signal_ids = {record.signal.signal_id for record in self.signals}
+        if any(p.table_name in STRATEGY_TEMPLATE_PROJECTION_LAYOUTS for p in self.projections):
+            from rquant.strategy_authoring_projection import validate_strategy_authoring_projections
+
+            validate_strategy_authoring_projections({p.table_name: p for p in self.projections})
+        if any(p.table_name in STRATEGY_PROMOTION_PROJECTION_LAYOUTS for p in self.projections):
+            from rquant.strategy_promotion_projection import validate_strategy_promotion_projections
+
+            validate_strategy_promotion_projections({p.table_name:p for p in self.projections})
         if any(record.signal_id not in signal_ids for record in self.routes):
             raise ValueError("route references a signal outside the serving snapshot")
         routes = {record.signal_id: record for record in self.routes}
@@ -1174,11 +2859,16 @@ def build_serving_read_models(
                 "status": record.summary.status.value,
                 "control_intent": record.summary.control_intent.value,
                 "result_state": record.summary.result_state.value,
+                "job_version": record.summary.version,
+                "can_pause": record.summary.command_availability.pause,
+                "can_resume": record.summary.command_availability.resume,
+                "can_cancel": record.summary.command_availability.cancel,
+                "can_retry": record.summary.command_availability.retry,
                 "progress_fraction": record.summary.progress.fraction,
                 "phase": record.summary.progress.phase,
                 "terminal_shards": record.summary.progress.terminal_shards,
                 "total_shards": record.summary.progress.total_shards,
-                "eta_status": record.eta.status.value if record.eta is not None else None,
+                "eta_status": record.eta.status if record.eta is not None else None,
                 "eta_finish_low": (
                     record.eta.finish_at.low
                     if record.eta is not None and record.eta.finish_at is not None
@@ -1208,6 +2898,11 @@ def build_serving_read_models(
             "status",
             "control_intent",
             "result_state",
+            "job_version",
+            "can_pause",
+            "can_resume",
+            "can_cancel",
+            "can_retry",
             "progress_fraction",
             "phase",
             "terminal_shards",
@@ -1246,10 +2941,21 @@ def build_serving_read_models(
             "decided_at",
         ),
     )
+    health_views = (
+        {}
+        if source.runtime_health_details is None
+        else {
+            item.service_id: _health_view_cells(item, source.runtime_health_details)
+            for item in source.runtime_health_details.services
+        }
+    )
     runtime_services = _frame(
         [
             {
                 "service_id": record.service_id,
+                **health_views.get(record.service_id, {
+                    "observations_json": None, "degraded_detail": None, "detail_json": None
+                }),
                 "plane": record.plane.value,
                 "status": record.status.value,
                 "stale": record.stale,
@@ -1280,6 +2986,9 @@ def build_serving_read_models(
         ],
         (
             "service_id",
+            "observations_json",
+            "degraded_detail",
+            "detail_json",
             "plane",
             "status",
             "stale",
@@ -1383,13 +3092,17 @@ class NlScreenPageError(ValueError):
     """A cursor or bounded NL candidate read cannot safely continue."""
 
 
+class NlScreenProjectionFeatureError(ValueError):
+    """A registered screening rule needs a field absent from this generation."""
+
+
 class NlScreenCursor(RuntimeContractModel):
     cursor_type: Literal["nl_screen_page"]
     generation_id: GenerationId
     query_digest: GenerationId
     last_trade_date: date | None
     last_ts_code: StrictStr | None
-    order_version: Literal["trade_date_ts_code_v1"]
+    order_version: Literal["trade_date_ts_code_v1", "rank_ts_code_v1"]
 
     @model_validator(mode="after")
     def validate_last_key(self) -> Self:
@@ -1492,12 +3205,13 @@ def validate_nl_screen_cursor(
     *,
     generation_id: str,
     query_digest: str,
+    order_version: str = _NL_SCREEN_ORDER_VERSION,
 ) -> None:
     if cursor.generation_id != generation_id:
         raise NlScreenPageError("nl screen cursor requires rerun: generation changed")
     if cursor.query_digest != query_digest:
         raise NlScreenPageError("nl screen cursor requires rerun: query changed")
-    if cursor.order_version != _NL_SCREEN_ORDER_VERSION:
+    if cursor.order_version != order_version:
         raise NlScreenPageError("nl screen cursor requires rerun: ordering changed")
 
 
@@ -1507,6 +3221,7 @@ def _nl_screen_cursor(
     query_digest: str,
     last_trade_date: date | None,
     last_ts_code: str | None,
+    order_version: Literal["trade_date_ts_code_v1", "rank_ts_code_v1"] = _NL_SCREEN_ORDER_VERSION,
 ) -> NlScreenCursor:
     return NlScreenCursor(
         cursor_type=_NL_SCREEN_CURSOR_TYPE,
@@ -1514,7 +3229,7 @@ def _nl_screen_cursor(
         query_digest=query_digest,
         last_trade_date=last_trade_date,
         last_ts_code=last_ts_code,
-        order_version=_NL_SCREEN_ORDER_VERSION,
+        order_version=order_version,
     )
 
 
@@ -1534,7 +3249,9 @@ def screen_nl_projection(
     required_columns = ("trade_date", *base_columns, *include_columns)
     missing = tuple(column for column in required_columns if column not in universe.columns)
     if missing:
-        raise ValueError("nl serving projection is missing required columns: " + ", ".join(missing))
+        raise NlScreenProjectionFeatureError(
+            "nl serving projection is missing required columns: " + ", ".join(missing)
+        )
 
     normalized_dates = pd.to_datetime(universe["trade_date"], errors="coerce").dt.date
     requested_date = date.fromisoformat(trade_date)
@@ -1549,7 +3266,7 @@ def screen_nl_projection(
             rule_mask = rule(frame)
         except KeyError as error:
             missing_feature = str(error.args[0]) if error.args else "unknown"
-            raise ValueError(
+            raise NlScreenProjectionFeatureError(
                 f"nl serving projection is missing required feature {missing_feature}"
             ) from error
         if not isinstance(rule_mask, pd.Series) or not rule_mask.index.equals(frame.index):
@@ -1648,6 +3365,100 @@ def paginate_nl_screen_projection(
     )
 
 
+def paginate_ranked_nl_screen_projection(
+    universe: pd.DataFrame,
+    *,
+    generation_id: str,
+    trade_date: str,
+    rules: Sequence[Callable[[pd.DataFrame], pd.Series]],
+    rule_labels: Sequence[str],
+    normalized_plan: Mapping[str, object],
+    ranking: Sequence[RankingCondition],
+    top_n: int,
+    page_size: int,
+    signing_key: bytes,
+    cursor: str | None = None,
+) -> NlScreenPage:
+    """Screen once, rank all hits, then page the stable score order."""
+
+    if type(page_size) is not int or not 1 <= page_size <= 1_000:
+        raise ValueError("nl screen page_size must be an integer between 1 and 1000")
+    rank_columns = tuple(condition.column for condition in ranking)
+    rank_plan = {
+        **normalized_plan,
+        "ranking": {
+            "conditions": [
+                {
+                    "metric": condition.column,
+                    "ascending": condition.ascending,
+                    "weight": condition.weight,
+                }
+                for condition in ranking
+            ],
+            "top_n": top_n,
+        },
+    }
+    query_digest = nl_screen_query_digest(rank_plan, rank_columns)
+    decoded = None if cursor is None else decode_nl_screen_cursor(cursor, signing_key=signing_key)
+    if decoded is not None:
+        validate_nl_screen_cursor(
+            decoded,
+            generation_id=generation_id,
+            query_digest=query_digest,
+            order_version=_RANKED_NL_SCREEN_ORDER_VERSION,
+        )
+    start_cursor = encode_nl_screen_cursor(
+        decoded
+        if decoded is not None
+        else _nl_screen_cursor(
+            generation_id=generation_id,
+            query_digest=query_digest,
+            last_trade_date=None,
+            last_ts_code=None,
+            order_version=_RANKED_NL_SCREEN_ORDER_VERSION,
+        ),
+        signing_key=signing_key,
+    )
+    screened, diagnostics = screen_nl_projection(
+        universe,
+        trade_date=trade_date,
+        rules=rules,
+        rule_labels=rule_labels,
+        include_columns=rank_columns,
+    )
+    ranked = rank_screen_results(screened, ranking, top_n=top_n)
+    ranked["rank_position"] = range(1, len(ranked) + 1)
+    after = 0
+    if decoded is not None and decoded.last_trade_date is not None:
+        if decoded.last_trade_date != date.fromisoformat(trade_date):
+            raise NlScreenPageError("nl screen cursor requires rerun: date changed")
+        codes = ranked["ts_code"].tolist()
+        if decoded.last_ts_code not in codes:
+            raise NlScreenPageError("nl screen cursor requires rerun: snapshot key is missing")
+        after = codes.index(decoded.last_ts_code) + 1
+    rows = ranked.iloc[after : after + page_size].reset_index(drop=True)
+    next_cursor = None
+    if after + len(rows) < len(ranked):
+        next_cursor = encode_nl_screen_cursor(
+            _nl_screen_cursor(
+                generation_id=generation_id,
+                query_digest=query_digest,
+                last_trade_date=date.fromisoformat(trade_date),
+                last_ts_code=str(rows.iloc[-1]["ts_code"]),
+                order_version=_RANKED_NL_SCREEN_ORDER_VERSION,
+            ),
+            signing_key=signing_key,
+        )
+    return NlScreenPage(
+        rows=rows,
+        diagnostics=diagnostics,
+        start_cursor=start_cursor,
+        next_cursor=next_cursor,
+        generation_id=generation_id,
+        query_digest=query_digest,
+    )
+
+
 __all__ = [
     "SERVING_TABLE_SPECS",
     "PAGE_PROJECTION_CONTRACTS",
@@ -1657,6 +3468,7 @@ __all__ = [
     "NlScreenCursor",
     "NlScreenPage",
     "NlScreenPageError",
+    "NlScreenProjectionFeatureError",
     "ServingReadModelInput",
     "ServingLabJobRecord",
     "ServingSignalRecord",
@@ -1666,6 +3478,7 @@ __all__ = [
     "encode_nl_screen_cursor",
     "nl_screen_query_digest",
     "paginate_nl_screen_projection",
+    "paginate_ranked_nl_screen_projection",
     "screen_nl_projection",
     "serving_physical_table_specs_fingerprint",
 ]

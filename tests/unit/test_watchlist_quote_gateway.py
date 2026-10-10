@@ -123,6 +123,40 @@ def _gateway(
     )
 
 
+def test_v3_preserves_observed_optional_reference_and_units_without_upgrading_legacy_bytes(tmp_path: Path) -> None:
+    from rquant.watchlist_quote_gateway import decode_watchlist_quote_payload,encode_watchlist_quote_payload
+    raw=_quotes()
+    raw["pre_close"]=10.0
+    raw["turnover_rate"]=1.5
+    raw["up_limit"]=11.0
+    raw["float_shares"]=100_000.0
+    raw["vendor_time_text"]="09:26:04"
+    old=_gateway(tmp_path/"old",lambda codes,timeout_seconds:raw)
+    prior=old._normalize_frame(raw,codes=("600000.SH",),response_received_at=NOW,trade_date=NOW.date())
+    old_attached=old._attach_provenance(prior,scheduled_at=NOW,universe_as_of=NOW,requested_at=NOW,response_received_at=NOW,trade_date=NOW.date())
+    legacy_bytes=encode_watchlist_quote_payload(old_attached)
+    gateway=_gateway(tmp_path/"new",lambda codes,timeout_seconds:raw,schema_version=3,
+        units_contract_id="f"*64,volume_unit="shares",amount_unit="CNY")
+    normalized=gateway._normalize_frame(raw,codes=("600000.SH",),response_received_at=NOW,trade_date=NOW.date())
+    attached=gateway._attach_provenance(normalized,scheduled_at=NOW,universe_as_of=NOW,requested_at=NOW,response_received_at=NOW,trade_date=NOW.date(),codes=("600000.SH",))
+    restored=decode_watchlist_quote_payload(encode_watchlist_quote_payload(attached))
+    assert restored.pre_close.tolist()==[10.0] and restored.up_limit.tolist()==[11.0]
+    assert restored.turnover_rate.tolist()==[1.5] and restored.float_shares.tolist()==[100_000.0]
+    assert restored.units_contract_id.tolist()==["f"*64]
+    assert restored.source_timestamp_provenance.tolist()==["provider_source_timestamp"]
+    assert "pre_close" not in decode_watchlist_quote_payload(legacy_bytes)
+    assert encode_watchlist_quote_payload(old_attached)==legacy_bytes
+
+
+def test_v3_does_not_invent_a_date_for_vendor_clock_text(tmp_path: Path) -> None:
+    raw=_quotes(source_observed_at=None)
+    raw["source_observed_at"]="09:26:04"
+    gateway=_gateway(tmp_path,lambda codes,timeout_seconds:raw,schema_version=3,
+        units_contract_id="f"*64,volume_unit="shares",amount_unit="CNY")
+    normalized=gateway._normalize_frame(raw,codes=("600000.SH",),response_received_at=NOW,trade_date=NOW.date())
+    assert normalized.source_timestamp_provenance.tolist()==["response_received_at_fallback"]
+
+
 def test_gateway_separates_request_response_and_true_source_observation_times(
     tmp_path: Path,
 ) -> None:

@@ -1,0 +1,3372 @@
+{
+  "backend_sources_frozen": true,
+  "base_commit": "380e20919a7b85237b63743669d3c801995d1092",
+  "bundle_binding_sha256": "974ce9b49c3b20353e1b1aca3c822f71bcaf7732f5babc99c568cd2722d69e3a",
+  "changes_from_r06": [
+    "src/rquant/research_query/child.py",
+    "src/rquant/research_query/contracts.py",
+    "src/rquant/research_query/snapshot.py",
+    "src/rquant/web/routes/research_query.py"
+  ],
+  "kind": "research_query_linux_backend_freeze_r07",
+  "linux_execution": "pending root execution; syntax check is not Linux proof",
+  "previous_bundle_binding_sha256": "87367891743b973bc866c888dfd91b7e13f729d6603bb54cd690a19401a3e65a",
+  "product_candidate_frozen": false,
+  "production_write": false,
+  "proof": {
+    "bytes": 14350,
+    "path": "data/verification/research-query-20261005/linux-review-boundaries-r07.py",
+    "sha256": "c5305d5c51bef2e45a615ddfb43064e75accb6255880577af2274af128c32ebb"
+  },
+  "provider_http": 0,
+  "review_start_commit": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb",
+  "scope": "RQ-R02/R04/R05 actual restricted-child boundaries plus r06 zero-spill/capacity/source/cleanup; RQ-R01 HTTP and RQ-R03 React verified locally",
+  "spec_commit": "f62bd685bb91199070a96c25ffc328c9c485e64a",
+  "src_files": [
+    {
+      "byte_count": 90,
+      "path": "src/rquant/__init__.py",
+      "sha256": "7a3e3e1062a21e8cb36694e41b4d390d3bf7809f421aedfda03f0a03a5ebfd07"
+    },
+    {
+      "byte_count": 6751,
+      "path": "src/rquant/_paper_sqlite_image.py",
+      "sha256": "d0503c026ab69651a0796d4ae626a9f4df28583858f78d57c622e885dda2c8ce"
+    },
+    {
+      "byte_count": 80,
+      "path": "src/rquant/adapter/__init__.py",
+      "sha256": "bc096fa62e3b7b6999e33c9e682bb20070b81434cb1d2678344aab56445d00a4"
+    },
+    {
+      "byte_count": 51879,
+      "path": "src/rquant/adapter/tushare.py",
+      "sha256": "beebb361631ff2f36c7dd92347a48376ee32cd13f7de5fa1750e5e4211c9d0f5"
+    },
+    {
+      "byte_count": 22565,
+      "path": "src/rquant/adapter_manifest.py",
+      "sha256": "2c9491fc6f7b2fe3aa4e51a9753b8815c8606bfebf6d50c09567afd86e400bff"
+    },
+    {
+      "byte_count": 8429,
+      "path": "src/rquant/alert_ack.py",
+      "sha256": "94dd1a0b851d303414a416ae390c2bf50a1e1bbe87ecf1c2e37d1ed7f5be7681"
+    },
+    {
+      "byte_count": 16374,
+      "path": "src/rquant/alert_ack_admission.py",
+      "sha256": "31d7ae69bcfcff77296553d37152fe9ca0a9e116b24b0aa330656f5a66952a22"
+    },
+    {
+      "byte_count": 984,
+      "path": "src/rquant/alert_ack_models.py",
+      "sha256": "fa738d811adb705cadd9f7714b44da42ca14ef7493f2c7fcd1d93f121a0ce0a4"
+    },
+    {
+      "byte_count": 18417,
+      "path": "src/rquant/alert_ack_read.py",
+      "sha256": "c34e1dd5c9c82b7cea8a3ae9abd11f5906a434228ea8b340dc101877384a622a"
+    },
+    {
+      "byte_count": 5955,
+      "path": "src/rquant/alert_price_rule.py",
+      "sha256": "d5363a5c7f35d1607a84423c36fcf6787dd821349f09c9060672cd6be6960da6"
+    },
+    {
+      "byte_count": 15298,
+      "path": "src/rquant/artifact_catalog_registration_outbox.py",
+      "sha256": "2e25ddad092df74bd85ef4a20ba3de086d1276e876902f5870a386a0a748395a"
+    },
+    {
+      "byte_count": 161915,
+      "path": "src/rquant/artifact_retention.py",
+      "sha256": "3471b11677ff9d9588e7167e4818b712fbf1e1183e3438a702913d31fc7bb59f"
+    },
+    {
+      "byte_count": 15695,
+      "path": "src/rquant/artifact_retention_catalog_authority.py",
+      "sha256": "7b5e811419a0c2e9324bc1a0caca02a339e863af39651e24f791c7c5d07ebf79"
+    },
+    {
+      "byte_count": 11238,
+      "path": "src/rquant/artifact_terminal_owners.py",
+      "sha256": "13d7633d39821056a92b20a3e8f28eee98c7bea29bc3c5117cfdf3446ff1ff6b"
+    },
+    {
+      "byte_count": 5837,
+      "path": "src/rquant/auction_backfill.py",
+      "sha256": "fb35019ebb49ed9058d69e5c0d91a263e2a6f4bc66772a6a2b9b3c6c3f860495"
+    },
+    {
+      "byte_count": 26842,
+      "path": "src/rquant/auction_gap_candidate_input.py",
+      "sha256": "3bb9ac89ea7564863ac4ee49d1c52eb1337583eefe8e7ab3af54100dd1e2713e"
+    },
+    {
+      "byte_count": 58672,
+      "path": "src/rquant/auction_gap_strategy.py",
+      "sha256": "fa8f38b3f5ab6a1d46354675bcfdad2c1f50641d02e1fee677c64d5cbb81c11e"
+    },
+    {
+      "byte_count": 30669,
+      "path": "src/rquant/auction_match_gateway.py",
+      "sha256": "f5dc37d0f131372ef69477b636ab328ffb9107bfa7ae65987652f917c0cc37dd"
+    },
+    {
+      "byte_count": 2020,
+      "path": "src/rquant/auction_match_source_service.py",
+      "sha256": "4d0d97b2f9ed4edef9cb061794cc79fe5a2ae93f28bed50499d00570129d8891"
+    },
+    {
+      "byte_count": 9198,
+      "path": "src/rquant/auction_universe_authority.py",
+      "sha256": "af17e56319097c18897857492ab4ea9bb8ee2aaccd2cee23186f93cf6ef5afc7"
+    },
+    {
+      "byte_count": 11842,
+      "path": "src/rquant/auction_universe_publisher.py",
+      "sha256": "1d1b91a812e90f550865231307b9a167dac46e0d59dd3297c59b79d247eb9d87"
+    },
+    {
+      "byte_count": 9457,
+      "path": "src/rquant/auction_universe_source.py",
+      "sha256": "3163603cd6cc2cebb8dde719f456af549f2d220869938bfa5a3e682fab729cc9"
+    },
+    {
+      "byte_count": 24209,
+      "path": "src/rquant/authority_path_security.py",
+      "sha256": "076998a5876df2df1cba58b9fe523927eb918e2ca025f5c2702b2f7748648eb3"
+    },
+    {
+      "byte_count": 15472,
+      "path": "src/rquant/authority_runtime_release.py",
+      "sha256": "12482b27fda05dab2c66968d462e884bcaf25a05633b35b75a88ad00edd1ea28"
+    },
+    {
+      "byte_count": 78308,
+      "path": "src/rquant/backfill_manifest.py",
+      "sha256": "7007e3cbbb0b2ef59213100f0afc506cd9ec2964aa7949abeba62a1a830fac57"
+    },
+    {
+      "byte_count": 12973,
+      "path": "src/rquant/backfill_plan_artifact.py",
+      "sha256": "f84ebdc8fa300c9788901ac87d5149e8553fea808406bf5467f4206aebf34f55"
+    },
+    {
+      "byte_count": 14240,
+      "path": "src/rquant/backfill_plan_core.py",
+      "sha256": "fa11c28ecd9c0a29f23d06e7cbf255028cb50a15fe3c387112be024390c2bb50"
+    },
+    {
+      "byte_count": 13245,
+      "path": "src/rquant/backfill_plan_job_projection.py",
+      "sha256": "2d13c9ec0377843d4cf07b0fcd95286265af68a027e8b36ad45afe362895fbd8"
+    },
+    {
+      "byte_count": 29798,
+      "path": "src/rquant/backfill_plan_jobs.py",
+      "sha256": "0ce4eead595021652338c0188fff8710910dae9949879d8d7598f6bce05e8c15"
+    },
+    {
+      "byte_count": 5083,
+      "path": "src/rquant/backfill_plan_page_backend.py",
+      "sha256": "67b13a76632149314a449c58547820b25e0da89a9c048d51920c28b55afc5048"
+    },
+    {
+      "byte_count": 12881,
+      "path": "src/rquant/backfill_plan_projection.py",
+      "sha256": "fda1dec487a1287e76d8c5fa5213d5f606c3e236aecd8b753a54c2fa91fb792a"
+    },
+    {
+      "byte_count": 3838,
+      "path": "src/rquant/backfill_plan_runner.py",
+      "sha256": "6e373737caff499bfd1aeb216705fb18a86c2f80c02de86e4a0edfa7f52c9fa6"
+    },
+    {
+      "byte_count": 56014,
+      "path": "src/rquant/backfill_state.py",
+      "sha256": "d5743888ff4a50695f122357adb42b410631f2fbdcb3c9f82d8fa697db4a7406"
+    },
+    {
+      "byte_count": 1232,
+      "path": "src/rquant/backtest/__init__.py",
+      "sha256": "a5816343546d039a0308037ba0cd5bbe3fbf3ae479ab6562e0bde55236a8a4c0"
+    },
+    {
+      "byte_count": 9846,
+      "path": "src/rquant/backtest/benchmark.py",
+      "sha256": "d61aef3cd094ca2159842260a3e5160917db88cec72dad1d8739bd15a3a83a4b"
+    },
+    {
+      "byte_count": 8619,
+      "path": "src/rquant/backtest/calendar_source.py",
+      "sha256": "dc08f5bcb907cd2347fe7fa381e44323052b6424982ddaa76f07f8bc060a9f15"
+    },
+    {
+      "byte_count": 14085,
+      "path": "src/rquant/backtest/contracts.py",
+      "sha256": "77a193fc278a6c5786d93999cab975b2e88781dd3efe0f711e60dcf6d968f62a"
+    },
+    {
+      "byte_count": 9323,
+      "path": "src/rquant/backtest/daily_price_source.py",
+      "sha256": "356e551d68914cb08e00911c73a102bae11e9bece4e12f1f454d6b279413dd03"
+    },
+    {
+      "byte_count": 3261,
+      "path": "src/rquant/backtest/equal_candidates.py",
+      "sha256": "212bba5ddbb18a23fd28d10fec15b078303701fbca55e86f8c80a9ea455279c2"
+    },
+    {
+      "byte_count": 5561,
+      "path": "src/rquant/backtest/frozen_market_source.py",
+      "sha256": "85fc95fa6572c857e59b2bf8016a00cf87dcd18b9472a14ca9e0d469d72c8d04"
+    },
+    {
+      "byte_count": 13957,
+      "path": "src/rquant/backtest/reference_source.py",
+      "sha256": "cec09b33b2777c58ff09c2a50aea15bb2e5985693ce2b7a850d040ca55417fff"
+    },
+    {
+      "byte_count": 25249,
+      "path": "src/rquant/backtest/report.py",
+      "sha256": "ae4bcb4d3d7643a6fb5f449a8a61b97a48cd6a9116b7270903ab40d6fb05d0a9"
+    },
+    {
+      "byte_count": 17340,
+      "path": "src/rquant/backtest/runner.py",
+      "sha256": "93131f7a8fd09aa982a89d524f31f37b41a86412913661f1c9d9e25c5d5e8c38"
+    },
+    {
+      "byte_count": 5212,
+      "path": "src/rquant/backtest/screen_calendar_source.py",
+      "sha256": "6400fc5d44b86b7452d20e718cfac92a48491d8700f559c7d9ac41c0c2f4c8ca"
+    },
+    {
+      "byte_count": 7594,
+      "path": "src/rquant/backtest/screen_source.py",
+      "sha256": "b7fcbc8ffb18e85167c6a815fd68874cf1b74128de369897b93363e74e9075cb"
+    },
+    {
+      "byte_count": 8912,
+      "path": "src/rquant/board_auction_strength.py",
+      "sha256": "b78dff84339a1ab916b60a15a0da1e280e84e95772c68e6b5261994eef40bc4e"
+    },
+    {
+      "byte_count": 4078,
+      "path": "src/rquant/builtin_presets.py",
+      "sha256": "4a877dd7a8a3f4406884a270e7b0b716ea3c5c508f10116942558870fde1a197"
+    },
+    {
+      "byte_count": 29117,
+      "path": "src/rquant/canonical_json_stream.py",
+      "sha256": "83890af3018e8b4d0fbdb47ff1d43590c81a4f330fcd06ef9f2966c957cf94d4"
+    },
+    {
+      "byte_count": 34637,
+      "path": "src/rquant/canvas_publication_receipt.py",
+      "sha256": "36e0da557de51539dece84cd3403453e93a9458af999a5c2b5a68408b6743e95"
+    },
+    {
+      "byte_count": 340801,
+      "path": "src/rquant/cli.py",
+      "sha256": "74a75da993954ec42766111645b86971a800d14e99f3c96c8a9d93d9eba38807"
+    },
+    {
+      "byte_count": 33619,
+      "path": "src/rquant/config.py",
+      "sha256": "907936e6e1eb0e9bd3dc3247f9eb698b088842b319c5516e45ac944bf003da69"
+    },
+    {
+      "byte_count": 121011,
+      "path": "src/rquant/contained_subprocess.py",
+      "sha256": "0201663f293a85d2dee9aa4f63135c16606c0d51e3b77c362e05163359f3db6d"
+    },
+    {
+      "byte_count": 116107,
+      "path": "src/rquant/current_claim_authority.py",
+      "sha256": "fc490ce02c99d3bd182b35599187efd07f2ca872db37a6ec324a5b051a1385da"
+    },
+    {
+      "byte_count": 42462,
+      "path": "src/rquant/daily_canonical_publisher.py",
+      "sha256": "b6093cdbc384e49ff3a75f27f533657b2893e8d4e417052149b0d42b924638b4"
+    },
+    {
+      "byte_count": 25513,
+      "path": "src/rquant/daily_close_candidate.py",
+      "sha256": "88f27bee77891df0c41950f7312a53477f16510ab7de7655cc30cb00c7c84818"
+    },
+    {
+      "byte_count": 68152,
+      "path": "src/rquant/daily_close_gateway.py",
+      "sha256": "b05ee51cee5c23fb795b1000e0ab65fc6be7d93de14e0336a081ebc9e5deeeaf"
+    },
+    {
+      "byte_count": 1388,
+      "path": "src/rquant/daily_close_source_service.py",
+      "sha256": "89a1918724c686ef236029e513d0ac1c3f3993fc84d64114a91b9d675daeaa72"
+    },
+    {
+      "byte_count": 14717,
+      "path": "src/rquant/daily_close_validation.py",
+      "sha256": "a518f08eac41de4a914ff17e29c6de8f2c955d33fb5638ddf8e896f1f672611e"
+    },
+    {
+      "byte_count": 965,
+      "path": "src/rquant/daily_ledger_fence.py",
+      "sha256": "0c2ed5a48adea19219a52cf590bb86a4b582e4cdc7f4d0b8d0f3b29a5a54ead1"
+    },
+    {
+      "byte_count": 5686,
+      "path": "src/rquant/daily_notification_producer.py",
+      "sha256": "40efd04422d0bd787741afb6c2ae4b04ec831d30e378ffe54fdc2ceaab3c603a"
+    },
+    {
+      "byte_count": 27025,
+      "path": "src/rquant/daily_pipeline_command_manifest.py",
+      "sha256": "d3c72fe8678436cc39fa7dafe3863ea22fbbf63a2bac5013bf4b8749621c2e33"
+    },
+    {
+      "byte_count": 15984,
+      "path": "src/rquant/daily_pipeline_control.py",
+      "sha256": "db65bfda1fcbc6d96179b65e6030d9824ceced345db4ab8df78df1efb99346b0"
+    },
+    {
+      "byte_count": 122835,
+      "path": "src/rquant/daily_pipeline_ledger.py",
+      "sha256": "c123c91266efcd395591dc749f74342deb51ac244ad357618f093fe0d77a033c"
+    },
+    {
+      "byte_count": 44925,
+      "path": "src/rquant/daily_pipeline_orchestrator.py",
+      "sha256": "c70f6d5ac19c88e07bfec7c2abae0576d3043849548a9ef5f7494adbbc64bd08"
+    },
+    {
+      "byte_count": 14817,
+      "path": "src/rquant/daily_pipeline_report_authority.py",
+      "sha256": "de4bfb8a25f180b3f5fe12360f04db2df3b96c793ed1bdce18f541a0b1279278"
+    },
+    {
+      "byte_count": 21777,
+      "path": "src/rquant/daily_pool_stage.py",
+      "sha256": "c52f304dd810c36a3e09f91afd8e6bd363b31195dea63cb0e7f513ad43bd0468"
+    },
+    {
+      "byte_count": 45703,
+      "path": "src/rquant/daily_receipt_socket_authority.py",
+      "sha256": "4a0383beaed02970c334a678abd6db6267214fa275976bc8e78049fd2e43b0b7"
+    },
+    {
+      "byte_count": 23363,
+      "path": "src/rquant/daily_shadow_validation.py",
+      "sha256": "4cf1b790158dfd327f22a2fb16490a963340689e608501fd3d2c1edabd01f823"
+    },
+    {
+      "byte_count": 14504,
+      "path": "src/rquant/daily_summary_stage.py",
+      "sha256": "db47364f2ab61b098c2e2de7ca35e7f1c957442c8d3e701495a83815df01ea51"
+    },
+    {
+      "byte_count": 11071,
+      "path": "src/rquant/daily_valuation_pit.py",
+      "sha256": "780a43d39615e54fc75321ded5faf4ca15a3cb6ac5c189c4b81f6b1764c704d8"
+    },
+    {
+      "byte_count": 43,
+      "path": "src/rquant/dashboard/__init__.py",
+      "sha256": "a478da0659c3d3f85c7adf9e711037264278d92088c6994a43063ea08f5a88b6"
+    },
+    {
+      "byte_count": 61845,
+      "path": "src/rquant/dashboard/app.py",
+      "sha256": "54fc61038c5073fc3d9f772950a25b313cfabab18b99d9335ab53c8f986f3ff1"
+    },
+    {
+      "byte_count": 4858,
+      "path": "src/rquant/dashboard/canvas_diagnostic.py",
+      "sha256": "2d806eb5629f77588fe4f9846e78ba6e8fb1e954ba9f29ed7d604ff2122f941a"
+    },
+    {
+      "byte_count": 7787,
+      "path": "src/rquant/dashboard/canvas_files.py",
+      "sha256": "2b492ef8de3cacfeb33a6e2f2d0a6ef7a75b5a8f53dd421cfcdca859e13ca1f5"
+    },
+    {
+      "byte_count": 2508,
+      "path": "src/rquant/dashboard/canvas_nl_edit.py",
+      "sha256": "a7cb2a5db98464d17738ea33d13f592909f463679d7af13d1f8559843dfe74e2"
+    },
+    {
+      "byte_count": 3936,
+      "path": "src/rquant/dashboard/canvas_persistence.py",
+      "sha256": "330348e826bfe54ce71073bfd7f8551dbf737f9e31d89d1afbc3a74a132b815c"
+    },
+    {
+      "byte_count": 3065,
+      "path": "src/rquant/dashboard/canvas_rule_editor.py",
+      "sha256": "80ff3eca45d142bf9c7844a0f7f2de65fcf575f568e63db956119f93815de012"
+    },
+    {
+      "byte_count": 686,
+      "path": "src/rquant/dashboard/lab/__init__.py",
+      "sha256": "31b01fd62842b6c6f846628c78f7a511f99cdcfa3a7895019770d7a4c1167de3"
+    },
+    {
+      "byte_count": 60608,
+      "path": "src/rquant/dashboard/lab/app.py",
+      "sha256": "4d06b3e7165eff23b26acd81fd2fd860d94c7e5e2cc5ef9c67db6e30fb7fce75"
+    },
+    {
+      "byte_count": 20358,
+      "path": "src/rquant/dashboard/lab/job_center.py",
+      "sha256": "43c12b3089b051dc782b407ef79b7fa845113a900e399ac0a51a6566213d54ca"
+    },
+    {
+      "byte_count": 44665,
+      "path": "src/rquant/dashboard/market_panorama.py",
+      "sha256": "a107985b4601ed265440f3d85c6ff614426b6eb4fdd2854d38517b693a399d0b"
+    },
+    {
+      "byte_count": 6005,
+      "path": "src/rquant/dashboard/nl_canvas.py",
+      "sha256": "a4e8974b7f8cff1f60a9a9ba7de78ffb6ddf9bf0f40651869ae20f7255e9691c"
+    },
+    {
+      "byte_count": 19585,
+      "path": "src/rquant/dashboard/nl_screen.py",
+      "sha256": "8ba6cf9a9cbbe0c5aa47a8cccbd5221f417c26304efaf5e1fd4ac5918d67311e"
+    },
+    {
+      "byte_count": 15035,
+      "path": "src/rquant/dashboard/runtime_console_data.py",
+      "sha256": "5e18b6f57f4323e0bc63e825bfb9a92e0d76ade2460def3639c5b462bdafcf6c"
+    },
+    {
+      "byte_count": 15451,
+      "path": "src/rquant/dashboard/serving_only_page_data.py",
+      "sha256": "f9387813c5cda4b3d0c1ad9886d2251ea0c0de8fc0a9687d0d28baa501972420"
+    },
+    {
+      "byte_count": 20578,
+      "path": "src/rquant/dashboard/serving_page_data.py",
+      "sha256": "68e406792e8afda2c91b97244d635a3310aaf66f65c74705cf866168bd136b45"
+    },
+    {
+      "byte_count": 1781,
+      "path": "src/rquant/dashboard/serving_page_ui.py",
+      "sha256": "083c368a75221c49727ad476074142a83848087f39a3636a4ab9a5a9856f99f3"
+    },
+    {
+      "byte_count": 232,
+      "path": "src/rquant/dashboard/strategy_lab.py",
+      "sha256": "cd10d63ed6016849aee83a2f7e6697dbaf71765a6680f4e56b84cf66e25739fa"
+    },
+    {
+      "byte_count": 25695,
+      "path": "src/rquant/dashboard/strategy_lab_data.py",
+      "sha256": "6e643588e7e13de031e501036db8e72463489440a463d3c791cfc82988d41381"
+    },
+    {
+      "byte_count": 15433,
+      "path": "src/rquant/dashboard/strategy_lab_runs.py",
+      "sha256": "c01816c29675adbb1988aa0e0e48f4ce67f38230bd930534e5d779fbdea2f39f"
+    },
+    {
+      "byte_count": 18564,
+      "path": "src/rquant/dashboard/strategy_lab_worker.py",
+      "sha256": "bea96b88af61fa61bb1264a62bc51c13725c8b7698944cc14e95733f8bb41608"
+    },
+    {
+      "byte_count": 340,
+      "path": "src/rquant/data/__init__.py",
+      "sha256": "09fbadd6c9b5356bb97459bbd6fa5c8d4d0c1620f24652edbc34dbba2f57fe81"
+    },
+    {
+      "byte_count": 424,
+      "path": "src/rquant/data_audit_contracts.py",
+      "sha256": "fad962c4b8b40180832590c600b7ac53f51b84b34b2abab2274968385e5f3057"
+    },
+    {
+      "byte_count": 5736,
+      "path": "src/rquant/data_audit_coverage.py",
+      "sha256": "4996732df74ce7673b575d5141ad60f90021be06c2903bc0fb82fd6412dd2534"
+    },
+    {
+      "byte_count": 13798,
+      "path": "src/rquant/data_audit_evidence.py",
+      "sha256": "bdb3564e35dcdd7cfe8c5352e11a692cbb0d4f18f8786d6a778b9cb799772e5a"
+    },
+    {
+      "byte_count": 3023,
+      "path": "src/rquant/data_audit_projection.py",
+      "sha256": "4c90beb426d774563e6145ebd189559eb11707e0f87a4317c218a483c650d682"
+    },
+    {
+      "byte_count": 7272,
+      "path": "src/rquant/data_audit_quality.py",
+      "sha256": "3965bd7b568e71799dd6c6a1440fc34843833f167b8eb67aaeba1d7a7eacdbef"
+    },
+    {
+      "byte_count": 32793,
+      "path": "src/rquant/data_audit_report.py",
+      "sha256": "6c22056adfa5be81e4f8645ea5bad2b841225055fcff49f99881a971f84eb964"
+    },
+    {
+      "byte_count": 16982,
+      "path": "src/rquant/data_audit_report_job_projection.py",
+      "sha256": "0d8a2d81d35dbf5a2807ae137836faaa9777abab807cb2a9615079fdc04837c2"
+    },
+    {
+      "byte_count": 28421,
+      "path": "src/rquant/data_audit_report_jobs.py",
+      "sha256": "395c6e0a7f0cad93c5601d89dc29e6048a6e2f6d27e1801b7c5b27919d02c7d3"
+    },
+    {
+      "byte_count": 7444,
+      "path": "src/rquant/data_audit_report_page_backend.py",
+      "sha256": "68b4064c04cb39f6975ea46dc5b879e167d8ba98521e59c9adcd5ddb0e7d5ad1"
+    },
+    {
+      "byte_count": 5050,
+      "path": "src/rquant/data_audit_report_projection.py",
+      "sha256": "b0e0d6dba25d7665b0a5eb0774e79ea23e6685f53223b056b0f68d4e837a06c9"
+    },
+    {
+      "byte_count": 5050,
+      "path": "src/rquant/data_audit_report_runner.py",
+      "sha256": "272517b9771b1167225483751616dc6ca2cc7eea0d6d0e1284c43b3aff1e16f6"
+    },
+    {
+      "byte_count": 90,
+      "path": "src/rquant/data_catalog/__init__.py",
+      "sha256": "381a4f79d57a226f3a2f5d55eea3dba6d014f83d6cfb56f955c96a1c1c0d126c"
+    },
+    {
+      "byte_count": 7925,
+      "path": "src/rquant/data_catalog/build.py",
+      "sha256": "8cf52b847b5b71c1cfc378b3b8ab35d44a8549473f99ec0af951faba024ae23f"
+    },
+    {
+      "byte_count": 13861,
+      "path": "src/rquant/data_catalog/descriptions.py",
+      "sha256": "b03157e05b7fe82af9a7a1d138a7e22a621541bb9163c3ea44fa3254a52a2800"
+    },
+    {
+      "byte_count": 2029,
+      "path": "src/rquant/data_catalog/models.py",
+      "sha256": "7b5c408e2ad5cad80720e35f87796e5bab973f11598301267f791e342c57b391"
+    },
+    {
+      "byte_count": 6171,
+      "path": "src/rquant/data_catalog/sample_policy.py",
+      "sha256": "8d3e18c12994a24aa58d6d8f88983164b3e280b076831feda3509b9dfdc0daba"
+    },
+    {
+      "byte_count": 5486,
+      "path": "src/rquant/data_catalog/samples.py",
+      "sha256": "bbe1e5cb2b34f751a170d208927c6c85c4bb0c5a4bb708b775a55b6fbbe08441"
+    },
+    {
+      "byte_count": 32667,
+      "path": "src/rquant/data_contracts.py",
+      "sha256": "2de701a3d3e65a5ee9a82a4aab79625c19b42fc6d70a8ec8b3c5b6bcbe34d974"
+    },
+    {
+      "byte_count": 21952,
+      "path": "src/rquant/data_metadata.py",
+      "sha256": "f23a7a752f6f915f499edce2032a112b006a8f1abd95aded229a710c16c956f3"
+    },
+    {
+      "byte_count": 67321,
+      "path": "src/rquant/data_quality.py",
+      "sha256": "fd710b82e47900aadcb0cb5fb47098bce2133909a270af079fa4b5718846e7af"
+    },
+    {
+      "byte_count": 19628,
+      "path": "src/rquant/dataset_backfill.py",
+      "sha256": "0b9875c41cd2fbbad781779fa8e0bfeed21b5e17ce836aba4a2e3c1647bd7f3d"
+    },
+    {
+      "byte_count": 148595,
+      "path": "src/rquant/definition_registry.py",
+      "sha256": "d7e5eb2e1d4f9988c972f8f1a277faa3569f8b640358387e5166f0bd312c708e"
+    },
+    {
+      "byte_count": 6478,
+      "path": "src/rquant/delivery_contracts.py",
+      "sha256": "256d79b39fe5912ababc05118882d02a00a9087c15cd085339088006f54e3d07"
+    },
+    {
+      "byte_count": 5000,
+      "path": "src/rquant/ed25519_verify.py",
+      "sha256": "342967f745677b008935c2dfb22ac9fb4a1bdbc2710d170b2775776901136f88"
+    },
+    {
+      "byte_count": 53620,
+      "path": "src/rquant/executable_dependencies.py",
+      "sha256": "0c6792e3ac94d1188b7ad6d66c8650bda18c0dff955143a4ba938b0dff91684b"
+    },
+    {
+      "byte_count": 113473,
+      "path": "src/rquant/experiment_registry.py",
+      "sha256": "12893cf95527ea7019afa7c2bad350165084f3644165e4f4078097047d375508"
+    },
+    {
+      "byte_count": 22133,
+      "path": "src/rquant/external_monotonic_root.py",
+      "sha256": "5659b36d2ba709cb2139c65be40113cc5d2b0221de78e330ceda8b50f14c85f7"
+    },
+    {
+      "byte_count": 39542,
+      "path": "src/rquant/external_monotonic_root_service.py",
+      "sha256": "d53a097cdcd73e185080048d60d117972816804b007bca67d5b3f8c88941759a"
+    },
+    {
+      "byte_count": 3153,
+      "path": "src/rquant/factor/__init__.py",
+      "sha256": "45e3e83c36d3017ede0834e66e457c1b4b440aab323ace21f72cd494c4bd1e21"
+    },
+    {
+      "byte_count": 10195,
+      "path": "src/rquant/factor/capability.py",
+      "sha256": "a8c6a3b20be385f1e23d595ae10f3531d8607cb1a244fc95a442d478a8c0e6da"
+    },
+    {
+      "byte_count": 99959,
+      "path": "src/rquant/factor/daily_feature_source.py",
+      "sha256": "f338b9aba550e58575857f581a0b3947fc63cb6ecb504561ab9d50a74b2ec007"
+    },
+    {
+      "byte_count": 23759,
+      "path": "src/rquant/factor/daily_stream.py",
+      "sha256": "eab159e392bd89d207992c47a31a01d9cac372543771b950cdc7ea3bc875c879"
+    },
+    {
+      "byte_count": 7158,
+      "path": "src/rquant/factor/decay.py",
+      "sha256": "5d4b0ec065e287d452013f87f10ded0ea801053830abbabe539318a9ba9711ae"
+    },
+    {
+      "byte_count": 14021,
+      "path": "src/rquant/factor/decay_stream.py",
+      "sha256": "c495d19ec7141a4e85106904fbd5817d60423e6ee44089caf07adb8f8d53daa5"
+    },
+    {
+      "byte_count": 4058,
+      "path": "src/rquant/factor/definition.py",
+      "sha256": "469d87ae9ed939942c518f5b6ee1564a9478b3d95bdf002f28ad6e5f3dabaa5a"
+    },
+    {
+      "byte_count": 4632,
+      "path": "src/rquant/factor/definition_serving.py",
+      "sha256": "b77f0c8cffde2ac6b7becd493f6961e04308c1e1f85e7ed18d0a2f827ed94d52"
+    },
+    {
+      "byte_count": 15321,
+      "path": "src/rquant/factor/display_artifact.py",
+      "sha256": "874811d72834b0841e4a3e1e37bba5ee6771b5c3ee3259d72f5f1eceb8078c04"
+    },
+    {
+      "byte_count": 3702,
+      "path": "src/rquant/factor/draft.py",
+      "sha256": "f115a70f9fe314d603ba35fc7ccb826350f54fd1c95c3d9cc40f84c84522ae95"
+    },
+    {
+      "byte_count": 9838,
+      "path": "src/rquant/factor/evaluate.py",
+      "sha256": "f4679f03a28ec3fb7af61de26c67f86215d890ca0a3d8812e14bde2642e27455"
+    },
+    {
+      "byte_count": 8694,
+      "path": "src/rquant/factor/expression.py",
+      "sha256": "111351fab4e39d00d3723a7d7c585a22259d9b1d9b105c9b04efff4192ef7482"
+    },
+    {
+      "byte_count": 10560,
+      "path": "src/rquant/factor/extended_statistics.py",
+      "sha256": "1286fef781caba963f348a54fa441cf7bc1d99ed55eaa4406078f49df26f3c25"
+    },
+    {
+      "byte_count": 29443,
+      "path": "src/rquant/factor/formula_stream.py",
+      "sha256": "277da45375a3ce8a64e460dab85e66f821249b5a162a40b6ac9c83c1a944222f"
+    },
+    {
+      "byte_count": 24177,
+      "path": "src/rquant/factor/historical_adapter.py",
+      "sha256": "a1f458787b43cf8ed9b458174cdb581bb25c83bd445c5b803139243771ac968c"
+    },
+    {
+      "byte_count": 14671,
+      "path": "src/rquant/factor/history_assemble.py",
+      "sha256": "0303bfe87448d2681b263c0531f1fe4301997bd88c40bf6618bffdd1e1329f54"
+    },
+    {
+      "byte_count": 36611,
+      "path": "src/rquant/factor/index_collect.py",
+      "sha256": "dc2151902666f13171f0d0bc20e8bd80d607c38184685991b97e3cbaadb16ab2"
+    },
+    {
+      "byte_count": 38228,
+      "path": "src/rquant/factor/industry_source.py",
+      "sha256": "ba1ec66c17bb5d2b28a50711863feced9e37df61f65f080d3ec0d069a5caaa87"
+    },
+    {
+      "byte_count": 56489,
+      "path": "src/rquant/factor/job_ledger.py",
+      "sha256": "00f557b85c23c304d5c9c50fda1442bd2a2e96213fbdb48623b6ed8ca7f47123"
+    },
+    {
+      "byte_count": 8685,
+      "path": "src/rquant/factor/job_runner.py",
+      "sha256": "3d5c62198e0b04a3bdd9dda25d21c62e2d307032dc0c17cfcddeb3accf4c83c1"
+    },
+    {
+      "byte_count": 3316,
+      "path": "src/rquant/factor/job_spec.py",
+      "sha256": "635cce4bd6b6671c14f88aad0b0efa40fac862b5d83b77a7f49a233006fc449e"
+    },
+    {
+      "byte_count": 8687,
+      "path": "src/rquant/factor/job_worker.py",
+      "sha256": "482715100e504eea048a7301447c485e4581a7281303f38653fb8fe534199d99"
+    },
+    {
+      "byte_count": 21662,
+      "path": "src/rquant/factor/market_cap_source.py",
+      "sha256": "7c1f136448347f57cb5b1a8472e57dc739abe44527626b7793b21df2a53a6a07"
+    },
+    {
+      "byte_count": 13246,
+      "path": "src/rquant/factor/market_temperature_source.py",
+      "sha256": "a1d6140c4d53e7e0c58683269e13cfce38d71d43733a67933257246743f318f4"
+    },
+    {
+      "byte_count": 16547,
+      "path": "src/rquant/factor/member_archive.py",
+      "sha256": "6a77c71886e3cbca70e4aff62a4a6b5c3b7699abab97848c5bfd68848baf5e7a"
+    },
+    {
+      "byte_count": 10454,
+      "path": "src/rquant/factor/member_stream.py",
+      "sha256": "69bfb6c43e5d4c91ed766658b36f0156cfaa97d9d49e5b388772e9c1dd378acd"
+    },
+    {
+      "byte_count": 33920,
+      "path": "src/rquant/factor/minute_feature_source.py",
+      "sha256": "e1201fee90c2eb6ec277974c65310a37663518566cf99138c00abd3be69b07f8"
+    },
+    {
+      "byte_count": 19455,
+      "path": "src/rquant/factor/name_collect.py",
+      "sha256": "5a606b314e1b342da549df59521991dc5851e85b3f7d1d5cc03899d9c479584e"
+    },
+    {
+      "byte_count": 16205,
+      "path": "src/rquant/factor/neutralization_context.py",
+      "sha256": "6aa423cc232137da60c6bd47c9785008cb30392139ba37e6a7d76cbeb01a71c2"
+    },
+    {
+      "byte_count": 2243,
+      "path": "src/rquant/factor/page_control_backend.py",
+      "sha256": "458724442a63292ca219613916dd397cef47f68cf3f8d35a641367522a333eb5"
+    },
+    {
+      "byte_count": 7842,
+      "path": "src/rquant/factor/portfolio.py",
+      "sha256": "5988d26a15f7e65091a95d6d003a3630fad7edb830ff972ae9235c6952dfc584"
+    },
+    {
+      "byte_count": 32015,
+      "path": "src/rquant/factor/registry.py",
+      "sha256": "df8e14aed98d070290c4ef539e1f834b8ffd524d3b8334f5ac5156764964a2f6"
+    },
+    {
+      "byte_count": 17470,
+      "path": "src/rquant/factor/result.py",
+      "sha256": "b4f27874f4eed92a37460953de72a903fd46e57bc8877651784bf0b3124befcd"
+    },
+    {
+      "byte_count": 13251,
+      "path": "src/rquant/factor/result_artifact.py",
+      "sha256": "7a4b63f5002370755e0277d32f9d325bf5e4d18d0fe69e8eb2549cf0cbee9b79"
+    },
+    {
+      "byte_count": 25020,
+      "path": "src/rquant/factor/result_serving.py",
+      "sha256": "ff868bba0aa788c988af2530c2317e06b56a9c36b8d991c5a75cef3b4b09288b"
+    },
+    {
+      "byte_count": 11589,
+      "path": "src/rquant/factor/run_backend.py",
+      "sha256": "7541535360bf08c3639bad99b815d96ff85af60408f65a499d23107716b9bf21"
+    },
+    {
+      "byte_count": 11343,
+      "path": "src/rquant/factor/run_configuration.py",
+      "sha256": "e6d2cf14af5ddb10e935f63d5cedea09221014ca313e5e414f59f4003055f611"
+    },
+    {
+      "byte_count": 13553,
+      "path": "src/rquant/factor/run_entry.py",
+      "sha256": "7827b8eda9233f8e493e06cc4df6dc4ead2dbf60c8fe7fc1f89a6b83acbfe740"
+    },
+    {
+      "byte_count": 14002,
+      "path": "src/rquant/factor/run_plan.py",
+      "sha256": "7b3aedccbd9a5c9a56908f95d0f0005d75c8e961863d02cdacd27967756c3a6c"
+    },
+    {
+      "byte_count": 4975,
+      "path": "src/rquant/factor/run_request.py",
+      "sha256": "f2ec8f013b62a2ba813393d53741d9cc4e9ad174fd712bd6e583a2e282127f9c"
+    },
+    {
+      "byte_count": 46897,
+      "path": "src/rquant/factor/security_collect.py",
+      "sha256": "6bc385f66e23e3ef8aa3c38bbe342e5dd353822fb68902da2e97b6f9ae686145"
+    },
+    {
+      "byte_count": 5797,
+      "path": "src/rquant/factor/serving_projection.py",
+      "sha256": "7468cca430780939f0507651b89d5cfc0d19602996d3892c5e3b22542df87686"
+    },
+    {
+      "byte_count": 24172,
+      "path": "src/rquant/factor/source_prepare.py",
+      "sha256": "b9d04c80b83d8256dfc310c3038e8d034617c9f6e8ae85cb2851d660649775e1"
+    },
+    {
+      "byte_count": 30384,
+      "path": "src/rquant/factor/stock_feature_source.py",
+      "sha256": "7469e1999ff907b2bc97889f00004b37b0344f7815e29552b3d8c74ff3e6a928"
+    },
+    {
+      "byte_count": 38067,
+      "path": "src/rquant/factor/stream_adapter.py",
+      "sha256": "0f622531c1b241242e0b0aaecc7d907c3918b0331b552523113e3ec1363cec5f"
+    },
+    {
+      "byte_count": 34006,
+      "path": "src/rquant/factor/stream_job_artifact.py",
+      "sha256": "19d51d4adbfd0e40ad2eb1419e2f44bd9ecfa0c7162c8b7e51bae40fa0c6043a"
+    },
+    {
+      "byte_count": 6120,
+      "path": "src/rquant/factor/stream_job_runner.py",
+      "sha256": "19b479897dda8d8f3cc31321e8350635c21445c4ac58af010aa5458ab8e77315"
+    },
+    {
+      "byte_count": 3760,
+      "path": "src/rquant/factor/stream_job_spec.py",
+      "sha256": "0dc469ce5da93c73149c82be008768f4963a9034cba7410b86a5b3aa9c782f34"
+    },
+    {
+      "byte_count": 11829,
+      "path": "src/rquant/factor/stream_runner.py",
+      "sha256": "da7156c7f28594a7e6b1716e0797022012ce65b03563e0bc6a63447488b0769c"
+    },
+    {
+      "byte_count": 16383,
+      "path": "src/rquant/factor/stream_snapshot.py",
+      "sha256": "68107354a4e91032ba2b93e75875b7967fb2c2160d73c7191cd69127acd6ece8"
+    },
+    {
+      "byte_count": 8583,
+      "path": "src/rquant/factor/summary.py",
+      "sha256": "b5acc0c0410dffec42bdb364578c0439a8f65216c249c9289de3cdf7259042d4"
+    },
+    {
+      "byte_count": 30288,
+      "path": "src/rquant/factor/technical_history_source.py",
+      "sha256": "8cf258b00c28ba6d5418639827b7d4c93ed65119bc4281e73d5e2a46aadbde7f"
+    },
+    {
+      "byte_count": 36504,
+      "path": "src/rquant/factor/time_series.py",
+      "sha256": "a6fa7aa5ba1edeefb796bfe0e641017e9059f3344c1d49bf3091de1fb48991e1"
+    },
+    {
+      "byte_count": 26460,
+      "path": "src/rquant/factor/tracking.py",
+      "sha256": "9277ec8f15aa4721e056b7da10be61d5650e6ff7f343c66e0f81a7fe5c592341"
+    },
+    {
+      "byte_count": 6707,
+      "path": "src/rquant/factor/tracking_backend.py",
+      "sha256": "1ce18c8c366317f2dcf27e6387d1e4274576fef43ae0563be342cc912cdf45bc"
+    },
+    {
+      "byte_count": 5771,
+      "path": "src/rquant/factor/tracking_entry.py",
+      "sha256": "61ad0c1101f0dd8ad90d993c6afdef20cff86ec494f50c04de2743f3a3836fef"
+    },
+    {
+      "byte_count": 34050,
+      "path": "src/rquant/factor/tracking_runner.py",
+      "sha256": "f83ac0cdfefddeda7ebc3a454186814d46189f7aed4493a6ff658ced490702c1"
+    },
+    {
+      "byte_count": 10495,
+      "path": "src/rquant/factor/tracking_serving.py",
+      "sha256": "c6136b8ed9d60524b59989c063e478df2675b1973489d1419c8cc689ca691ae9"
+    },
+    {
+      "byte_count": 10535,
+      "path": "src/rquant/factor/universe.py",
+      "sha256": "e0ffbbe4101c0c6387a3001621b524ab6783cc5e4ee7b4c3cc78ebca1156012c"
+    },
+    {
+      "byte_count": 38171,
+      "path": "src/rquant/factor_definition_admission.py",
+      "sha256": "e4d2fde50b716955415428019eca0c88f326db8d806d280ad87aefb94e812e3c"
+    },
+    {
+      "byte_count": 15205,
+      "path": "src/rquant/factor_run_admission.py",
+      "sha256": "c2f5b44734fe3bf29a4251e6b066e0f907a1c5895b8f339d43afb6b4695c6cc1"
+    },
+    {
+      "byte_count": 11168,
+      "path": "src/rquant/factor_snapshot_admission.py",
+      "sha256": "52301ba19766dc6098784f38e06ad1bd0eee21477ebcf8b98f630ae08426b371"
+    },
+    {
+      "byte_count": 13138,
+      "path": "src/rquant/factor_tracking_admission.py",
+      "sha256": "f60953dc2c5ae45cca9e5527a9d007aac03bc291fda10ad7d8d5a341467fe64d"
+    },
+    {
+      "byte_count": 711,
+      "path": "src/rquant/fd_exec.py",
+      "sha256": "1f1aacc2ed2bfadf69db68d6cdcfe844f4e954a7676fe1f115be333e50bc28c4"
+    },
+    {
+      "byte_count": 10467,
+      "path": "src/rquant/feature_contracts.py",
+      "sha256": "be8bbfa1c063d6b3b6ab62d8fe97d3b9b609e69c4c8c7fd11d5d7c420d03a805"
+    },
+    {
+      "byte_count": 14914,
+      "path": "src/rquant/feature_live_service.py",
+      "sha256": "7de867fbb45200e232c11a2f625e42f4e0d8927c8e9f7aaa67170b1fbb9beb02"
+    },
+    {
+      "byte_count": 38753,
+      "path": "src/rquant/feature_spool.py",
+      "sha256": "0d22b00539531db4ac1c394ff5fcc8edfd2da8bfa9b627d912a04df347f23363"
+    },
+    {
+      "byte_count": 2793,
+      "path": "src/rquant/feature_weight_search.py",
+      "sha256": "c826aeb1cbc5058e3fa0d10a0651b6567d5f14714fbc09639250ba23de05198f"
+    },
+    {
+      "byte_count": 6803,
+      "path": "src/rquant/financial_data_center.py",
+      "sha256": "53f3bd58dfc9621df0fafa657763001e7f7601af6d7698abc6dca92cfac83e4c"
+    },
+    {
+      "byte_count": 8091,
+      "path": "src/rquant/financial_pit.py",
+      "sha256": "8c2c9a4e8324ba5aea93c301921b3bb5364b9d4f6e76bf7b9333b150e6116cf4"
+    },
+    {
+      "byte_count": 52420,
+      "path": "src/rquant/financial_pit_acquisition.py",
+      "sha256": "67b37c82215b4e136fed6780472cd3652d20e93ce66e648bb76afaefb286959e"
+    },
+    {
+      "byte_count": 16505,
+      "path": "src/rquant/financial_pit_facts.py",
+      "sha256": "3acc7ecb7ce02bfd645827269304c7871f5cc724dafe911902d4df889d5379e5"
+    },
+    {
+      "byte_count": 18920,
+      "path": "src/rquant/formal_runtime.py",
+      "sha256": "720e0855bd619b6737e5c4909638b829f9dc8717802cb98f86062b59460fe63d"
+    },
+    {
+      "byte_count": 17904,
+      "path": "src/rquant/formal_runtime_command.py",
+      "sha256": "2643ab6be2d25966e4929cb572c40f51ef4adc97aeb217097a6dccdfa0e9b356"
+    },
+    {
+      "byte_count": 11422,
+      "path": "src/rquant/formal_runtime_composition.py",
+      "sha256": "72bb8d8d8eb60c474b1be76238710a93c15ecdf1ad696b937bb32ecd17903c0f"
+    },
+    {
+      "byte_count": 58314,
+      "path": "src/rquant/formal_smoke_execution.py",
+      "sha256": "f706b8f0d9eaeaaccb247c14b70338efa02c687fad365421ab935e27c0c69420"
+    },
+    {
+      "byte_count": 13406,
+      "path": "src/rquant/formal_smoke_protocol.py",
+      "sha256": "944d248b0c26b30a14b48cba7c7fd14180355feea165050057f6c921d62c3be6"
+    },
+    {
+      "byte_count": 14610,
+      "path": "src/rquant/formal_smoke_replay.py",
+      "sha256": "bce9b0f8db0d0f4d53c765115563208f01564e1daf806646f168a3c7a580214b"
+    },
+    {
+      "byte_count": 10609,
+      "path": "src/rquant/formal_smoke_runtime_entry.py",
+      "sha256": "9ee5d4740b8b642d8c45a91507d9442d3a24a30fa956aedbcf61c32bfe8ca817"
+    },
+    {
+      "byte_count": 28257,
+      "path": "src/rquant/formula_market_job_projection.py",
+      "sha256": "999199ee6e905a8bdde351a2203e07b82a84c9f9d8c19ae16e4e3855fb5d9611"
+    },
+    {
+      "byte_count": 5404,
+      "path": "src/rquant/formula_market_page_backend.py",
+      "sha256": "3be01ff730c51b2ba31e7b1eebb64ac32249c8bdf27b8f658b8deaa4cbd7cb6d"
+    },
+    {
+      "byte_count": 3629,
+      "path": "src/rquant/formula_market_private_config.py",
+      "sha256": "98eb17cae6de6e7a6c7ac1b78a5a6c216509949ee1d2f6bdb8381304a13e512b"
+    },
+    {
+      "byte_count": 2994,
+      "path": "src/rquant/formula_market_worker_entry.py",
+      "sha256": "93dab572e912bbdb0d81bb95f8c00feae0ca87ebb65a39037dabb79183888b21"
+    },
+    {
+      "byte_count": 6722,
+      "path": "src/rquant/formula_pool_auto_cycle.py",
+      "sha256": "9780d75c6daf4bddee28a273750dfe4b25eb65a90cea69f6aa1307583b09fa48"
+    },
+    {
+      "byte_count": 22310,
+      "path": "src/rquant/formula_pool_batch.py",
+      "sha256": "44b9daf5d54ec578455acc2c85a12acaa8ddf0eda2b79daa4bf654050f8da99f"
+    },
+    {
+      "byte_count": 20224,
+      "path": "src/rquant/formula_pool_daily.py",
+      "sha256": "1e6188234c005f753afd0920906f0079c03d1e016053b902c583cf96adf7f61c"
+    },
+    {
+      "byte_count": 13163,
+      "path": "src/rquant/formula_pool_definition.py",
+      "sha256": "2ee73d480b8b3e5a1fb0606ac34ee4be3f6463dd04f7cc6c26e6372ef31fd024"
+    },
+    {
+      "byte_count": 26027,
+      "path": "src/rquant/formula_pool_serving_projection.py",
+      "sha256": "b84d7ab051e2173b72c9ef490ee62612ec60cdf21a7e5f5d60717a60b69d4709"
+    },
+    {
+      "byte_count": 25375,
+      "path": "src/rquant/fundamental_daily.py",
+      "sha256": "ab98f484c7366df6252d92d80d100f00da2701f8cb919508e18fbc803317735b"
+    },
+    {
+      "byte_count": 3799,
+      "path": "src/rquant/fundamental_receipts.py",
+      "sha256": "b150959884cb95adaaf6df6df9f2f761a963ecc7c7d08ad1d6f4e4387f93dd53"
+    },
+    {
+      "byte_count": 50332,
+      "path": "src/rquant/growth_board_surge_strategy.py",
+      "sha256": "e646e96d9619d5b63119e9663c1b92c736bcf3808a06a3470b682b4fe654d792"
+    },
+    {
+      "byte_count": 9834,
+      "path": "src/rquant/growth_eligibility.py",
+      "sha256": "69557121b9c2b67c06636ad30a508a997394ce90c1d0ebdd7776e985e09a2375"
+    },
+    {
+      "byte_count": 18195,
+      "path": "src/rquant/health.py",
+      "sha256": "03f143d5868057da474d7e1efbe66bebddc244a5d926dabee03afdbc81a8ed62"
+    },
+    {
+      "byte_count": 92,
+      "path": "src/rquant/indicator/__init__.py",
+      "sha256": "bf8012c0b523e601c0fc30eacb35180a07165a2513f96c35d24e3e65b18be241"
+    },
+    {
+      "byte_count": 3329,
+      "path": "src/rquant/indicator/technical.py",
+      "sha256": "44aa148e01f535666ab8b3abb604fc41e47f38e5303e9adc2f6de2ea2f7d58e3"
+    },
+    {
+      "byte_count": 20985,
+      "path": "src/rquant/indicator_backfill.py",
+      "sha256": "14516d65efeecd9749d3739b7d2f7037f8eb3726237b6690ac8d0931b9cc89bf"
+    },
+    {
+      "byte_count": 26828,
+      "path": "src/rquant/ingest.py",
+      "sha256": "66444cf0952075940680b57e5f4d032d3fdca507bed5b11e72c396281eea5d49"
+    },
+    {
+      "byte_count": 33179,
+      "path": "src/rquant/intraday_backfill.py",
+      "sha256": "e5f3defedfef04dba2fcbcba439603a1a1b84e0b14213f08b4b12c78a87ad055"
+    },
+    {
+      "byte_count": 26336,
+      "path": "src/rquant/intraday_feature_engine.py",
+      "sha256": "44b9c834b40e77e1ba23c89cf2ffd184144a9479d3d0a04594b12c05378f25cd"
+    },
+    {
+      "byte_count": 35301,
+      "path": "src/rquant/job_center_authority.py",
+      "sha256": "4014ac422dcd50bb950c63741d66d7b5c063bb987d4afc0f4e4e83c2b7d31c03"
+    },
+    {
+      "byte_count": 49175,
+      "path": "src/rquant/lab_artifact_catalog.py",
+      "sha256": "5fc1d7e2ce6154792cf56082588fdc14ca83ff2ce61c1390a1ed34307ef5aca1"
+    },
+    {
+      "byte_count": 27968,
+      "path": "src/rquant/lab_artifact_catalog_readers.py",
+      "sha256": "9576de629a869ad7ca5dd7baf0168eafd51ee4a56a78f5547c143bf791b26e6d"
+    },
+    {
+      "byte_count": 46026,
+      "path": "src/rquant/lab_artifact_catalog_runtime.py",
+      "sha256": "adda326b4b6ca1ab775b2b248c94e5a26e07a0874c978f6095ea12a8d621d32a"
+    },
+    {
+      "byte_count": 17180,
+      "path": "src/rquant/lab_artifact_export.py",
+      "sha256": "62846b045a3ade4d677bbbb9e794d32c0620d0d845d7a254bb315bc213bf156e"
+    },
+    {
+      "byte_count": 25296,
+      "path": "src/rquant/lab_artifact_preview.py",
+      "sha256": "99910dcfcc3ea6a605b9bff6f3d963bb03dd19e54daa7aa8c3b949f607b08148"
+    },
+    {
+      "byte_count": 55152,
+      "path": "src/rquant/lab_artifact_protocol.py",
+      "sha256": "a155e67eefb73c71d86a5b865703989d2025c1675887950a71a7c38b624efac1"
+    },
+    {
+      "byte_count": 379100,
+      "path": "src/rquant/lab_artifacts.py",
+      "sha256": "6bdbdf3ab6a3e7a7e5f8a38d6b253f9749932e9302b105dedce1b69644846131"
+    },
+    {
+      "byte_count": 34874,
+      "path": "src/rquant/lab_claim_finalizer.py",
+      "sha256": "230c328588fc082313ae5d4d6030e4f6ee84cbee797721f31697413b6be42561"
+    },
+    {
+      "byte_count": 18520,
+      "path": "src/rquant/lab_claim_finalizer_composition.py",
+      "sha256": "f3232ff206b74b9d20cddf9ceda25cba784d2fa2cb5d48d3f16f4041b10f2af5"
+    },
+    {
+      "byte_count": 12973,
+      "path": "src/rquant/lab_claim_finalizer_daemon.py",
+      "sha256": "4598622bbab17944605b8cbb3945626b88ea9fb327a9f4cef67d2e33b7850d78"
+    },
+    {
+      "byte_count": 76277,
+      "path": "src/rquant/lab_claim_finalizer_runtime.py",
+      "sha256": "01fe75ab079da6122ae29064df1e655c6c3c2898154f19dfccd6a9f7930f7887"
+    },
+    {
+      "byte_count": 13914,
+      "path": "src/rquant/lab_claim_finalizer_trust.py",
+      "sha256": "bc320420355260a3ee243487bf4bac0662b65c58214211a763d6d33f7d468a30"
+    },
+    {
+      "byte_count": 44456,
+      "path": "src/rquant/lab_claim_publication.py",
+      "sha256": "39695efb6f87fd44f5ca2e711cae3ed5d6805ebf40db982286f5fda1e372fe81"
+    },
+    {
+      "byte_count": 164152,
+      "path": "src/rquant/lab_daemon.py",
+      "sha256": "3997d08600eb599ee8e472a01f660ffe1d7ddb2e39200476f5c08307d7aff811"
+    },
+    {
+      "byte_count": 9901,
+      "path": "src/rquant/lab_eta.py",
+      "sha256": "f79df33a000ded6e570a85807d5483d75dc0e483582fc485b58704d1723683ba"
+    },
+    {
+      "byte_count": 103806,
+      "path": "src/rquant/lab_finalizer.py",
+      "sha256": "209820852e33a9db1cf9f0e8b39311bd6cdf10babd6e0243b5928fa9b8e7582d"
+    },
+    {
+      "byte_count": 13052,
+      "path": "src/rquant/lab_formal_runtime_entry.py",
+      "sha256": "9dd802a3f8e0b4a15670de4b8301902c101a6acec231f00c691a5c419acf99c3"
+    },
+    {
+      "byte_count": 4522,
+      "path": "src/rquant/lab_full_audit.py",
+      "sha256": "bd376079df802fd82f32b66e964ca61c6550c2ad669ffc90a59f0139e3c8858e"
+    },
+    {
+      "byte_count": 50082,
+      "path": "src/rquant/lab_high_water_authority.py",
+      "sha256": "744a8afa924ebf541779a5995e0e994cdf301d39c1de3223ddac01ba9ebe9467"
+    },
+    {
+      "byte_count": 25128,
+      "path": "src/rquant/lab_highwater_authority.py",
+      "sha256": "12e61c6889a573aa83ee349d12858abd9728f4c41fd04a99cbb87176cc27727a"
+    },
+    {
+      "byte_count": 47632,
+      "path": "src/rquant/lab_job_center.py",
+      "sha256": "efcd4a195c44727cb60ed301c89bae9b0c6ad5aaeb5cbd47d5a96011190a632a"
+    },
+    {
+      "byte_count": 113124,
+      "path": "src/rquant/lab_job_protocol.py",
+      "sha256": "32cc78a7b94bfe479457c26d779dc6005f64203608bff1a17c67cc37375dbd8e"
+    },
+    {
+      "byte_count": 725799,
+      "path": "src/rquant/lab_jobs.py",
+      "sha256": "5071b0efe6065bfe4bea60915c4604d860e60665edd7195affad6e385941fb4e"
+    },
+    {
+      "byte_count": 42689,
+      "path": "src/rquant/lab_jobs_serving_authority.py",
+      "sha256": "ab1f69913dadb7422566ee9ff83c2ab62be9be29568d0aceef212f01993a83bf"
+    },
+    {
+      "byte_count": 72818,
+      "path": "src/rquant/lab_launchd_install.py",
+      "sha256": "0fbff4925fcec98eb731cfb59e0368ea319c21efaceecfb8283856646cc1e75f"
+    },
+    {
+      "byte_count": 840,
+      "path": "src/rquant/lab_logging.py",
+      "sha256": "6b0ffb48075acf30dfd2f3c5db0753eb51cdd78a8903d494f0bfcd8129ad10d6"
+    },
+    {
+      "byte_count": 5941,
+      "path": "src/rquant/lab_page_control.py",
+      "sha256": "718e83f241c2d5bc32da5b93c4e6044b66d78f08ecddbb5e1bc6fd865e17fabb"
+    },
+    {
+      "byte_count": 81659,
+      "path": "src/rquant/lab_resource_authority_adapter.py",
+      "sha256": "d9bcdc439e3caa20e0d7e6884d45c9791b8707c179b6a45285a6750949598565"
+    },
+    {
+      "byte_count": 4916,
+      "path": "src/rquant/lab_result_digest.py",
+      "sha256": "3838284932047ef51bd15a2683bd88b7b44de974e9629f83a7963f30d40a588f"
+    },
+    {
+      "byte_count": 100257,
+      "path": "src/rquant/lab_scheduler.py",
+      "sha256": "0fe1f4c8a0b3ff3d1d88634b610d79ea6a124f5cffc778c9e5c674d413a4e948"
+    },
+    {
+      "byte_count": 110078,
+      "path": "src/rquant/lab_shard_protocol.py",
+      "sha256": "b7277cd8fb3a8f832e1f1d58ee72a59c7e31e926dbe9d086e70a8121a40d6799"
+    },
+    {
+      "byte_count": 113947,
+      "path": "src/rquant/lab_source_stage.py",
+      "sha256": "c27d614c760c0a2a70f2ccd3f02283a5ff6f3472ba9de1479f1f039c53fd55db"
+    },
+    {
+      "byte_count": 486184,
+      "path": "src/rquant/lab_worker.py",
+      "sha256": "283f59d7b420e0f759bab9c5c92d72c9fb2ee6eb4007214c560d26482fad6893"
+    },
+    {
+      "byte_count": 4916,
+      "path": "src/rquant/lab_worker_registry.py",
+      "sha256": "707864b6c127af7c3767a74ea87f42f8c9317686428867d5aa5782e548b479d0"
+    },
+    {
+      "byte_count": 158922,
+      "path": "src/rquant/legacy_shadow_export.py",
+      "sha256": "ddfa77810a88ba41eb4c3d28ce265e83e741503960897834d572ffd7c488fd7e"
+    },
+    {
+      "byte_count": 4365,
+      "path": "src/rquant/limit_list_backfill.py",
+      "sha256": "69d064267c7d267733280f02fcf86f95f3eb3965eec4e9bb597231eb882d54ca"
+    },
+    {
+      "byte_count": 17910,
+      "path": "src/rquant/limit_up_pool.py",
+      "sha256": "37a5b73c4964ef9d920b11d8ee27de98c545ccb42d3d03767d805be3880dd987"
+    },
+    {
+      "byte_count": 4710,
+      "path": "src/rquant/live_contracts.py",
+      "sha256": "f80605c314514135b57d87383b3773d70a47fbdb9c37967f02e7f2108ad7c3d9"
+    },
+    {
+      "byte_count": 109794,
+      "path": "src/rquant/live_spool.py",
+      "sha256": "499b4cfce08c1218a29e5baee43999195e8c0bee6456656704b2ff7b8c8ff1c5"
+    },
+    {
+      "byte_count": 956,
+      "path": "src/rquant/llm/__init__.py",
+      "sha256": "c77fa243616603af8c61fd85790a9482880e4e58668fcd3dede534209de24bda"
+    },
+    {
+      "byte_count": 7213,
+      "path": "src/rquant/llm/client.py",
+      "sha256": "e8dba5ee7cc972e3244708820063a882ec8d37d23a221dfc7910773038d84f95"
+    },
+    {
+      "byte_count": 1014,
+      "path": "src/rquant/llm/compile.py",
+      "sha256": "5a0a85272ed8d92744b541e32e9bd26fe31e102de4c97ddb7a25b97b1501ccdb"
+    },
+    {
+      "byte_count": 1927,
+      "path": "src/rquant/llm/dispatch.py",
+      "sha256": "cbd9429445adcb230380ed81ab7b199d557cc6b25e1e2b77441ab56d4771124e"
+    },
+    {
+      "byte_count": 8095,
+      "path": "src/rquant/llm/prompts.py",
+      "sha256": "92bc304d16d26ef15869f006f37c0a0090b944ac102829f6408920e2a5e3259e"
+    },
+    {
+      "byte_count": 13006,
+      "path": "src/rquant/llm/registry.py",
+      "sha256": "78275a153d9c5f90ca89ef712ae0c3b02e90d1735bdae24022d0afcd49a2e6f4"
+    },
+    {
+      "byte_count": 5273,
+      "path": "src/rquant/llm/schema_export.py",
+      "sha256": "227a113dbce2da034d6d4aa11c9a14960129eb663e08de8092506014da961ae6"
+    },
+    {
+      "byte_count": 1625,
+      "path": "src/rquant/llm/schemas.py",
+      "sha256": "49e5369b5bac1ef9558b1fbbfa42e52cb71159a48ad5453edb26184a27a3d39f"
+    },
+    {
+      "byte_count": 2231,
+      "path": "src/rquant/logging.py",
+      "sha256": "65e5a0577f9744bcd6a7e29df9ecc78e456d858a9281852d3e2d07cdacfa1a04"
+    },
+    {
+      "byte_count": 11142,
+      "path": "src/rquant/manual_watchlist.py",
+      "sha256": "08ab5e1a08f683857b2de6df5fd5615703b177fc4a9cb92c78bbffe05bb2d5fd"
+    },
+    {
+      "byte_count": 21358,
+      "path": "src/rquant/market_backfill.py",
+      "sha256": "215604aff0117359b445c412eb1256c4d49a7f15db4c05168aa83df068cef511"
+    },
+    {
+      "byte_count": 14780,
+      "path": "src/rquant/market_context.py",
+      "sha256": "32bf3b5f7e7c16ced94ed2c8e6cad6e6d5dc30139d510d1563a172e96d1b9723"
+    },
+    {
+      "byte_count": 16361,
+      "path": "src/rquant/market_minute_gateway.py",
+      "sha256": "f9b22392aba62fb8f09842cfc3cbdacb900983bb47c7e59fd35ce05ebe273933"
+    },
+    {
+      "byte_count": 1409,
+      "path": "src/rquant/market_minute_source_service.py",
+      "sha256": "9652ca80c0658196550f7a8666f820ba5320912ece288b4526d908a1cbfa48f3"
+    },
+    {
+      "byte_count": 5765,
+      "path": "src/rquant/metadata_catalog.py",
+      "sha256": "211f082e6f84c4d8a16504055285722a4f99c96334082a0ece140866551d563d"
+    },
+    {
+      "byte_count": 59230,
+      "path": "src/rquant/midday_briefing.py",
+      "sha256": "8a5c593b8568440b99f780afaeca09ec96f0f8cecc446bd425379580db5ded57"
+    },
+    {
+      "byte_count": 46993,
+      "path": "src/rquant/minute_replay.py",
+      "sha256": "67bc49a36ebfc3bcdf7dc799060203c8b11014aac5271eda919b0d7d216dc8d4"
+    },
+    {
+      "byte_count": 65,
+      "path": "src/rquant/models/__init__.py",
+      "sha256": "7048ddebd356c27b08c88a43721f2bcd71d4777f3893cbcf13ba492cc6d9c473"
+    },
+    {
+      "byte_count": 714,
+      "path": "src/rquant/models/ohlcv.py",
+      "sha256": "645a2794b9c395be9ad8a7423d73b795462e3e34cc3bf950ace85e3e93955766"
+    },
+    {
+      "byte_count": 38151,
+      "path": "src/rquant/monitor.py",
+      "sha256": "9d418f41d827dcd2e4dc6289c05eace56532ec3517c88d4dc300a514d741a4b0"
+    },
+    {
+      "byte_count": 92348,
+      "path": "src/rquant/notification_state.py",
+      "sha256": "2b91a71986d96a5ed47b40e6fc19f6a6f4e54ee28dcce30f67fadaa10efa41b2"
+    },
+    {
+      "byte_count": 13651,
+      "path": "src/rquant/notification_worker.py",
+      "sha256": "2ea93063a7c58eee439a4291ac0fa6e5948b827fd512cb865b8ae07432355e2f"
+    },
+    {
+      "byte_count": 199,
+      "path": "src/rquant/notify/__init__.py",
+      "sha256": "1f9781183048ce53fb7d3df8aefd2acdf367f8d144118ce023bd981accd62a21"
+    },
+    {
+      "byte_count": 4959,
+      "path": "src/rquant/notify/api.py",
+      "sha256": "20b8f3d40563e8903ee219758c1208dd6fdd012cf57c7ccb164bca52a5ae94b8"
+    },
+    {
+      "byte_count": 2958,
+      "path": "src/rquant/notify/client.py",
+      "sha256": "7b1f2f06feb0490468abd01a8251f1603a280bacc1fc59523cf028519357bb83"
+    },
+    {
+      "byte_count": 16275,
+      "path": "src/rquant/notify/gate.py",
+      "sha256": "2991fb7303946ead4941a8821d429f8908f1bdea06fff88bad6e971d62c55a65"
+    },
+    {
+      "byte_count": 4153,
+      "path": "src/rquant/notify/log.py",
+      "sha256": "472d641ac682f11810ab7741e8afb5936ef4a9d96b4ef053bcc7e294721bd14f"
+    },
+    {
+      "byte_count": 8244,
+      "path": "src/rquant/notify/messages.py",
+      "sha256": "fd7af607e62b707b5a7714cba339b803818cc7a138a1845b734ca5d3d3c133ea"
+    },
+    {
+      "byte_count": 61,
+      "path": "src/rquant/ops/__init__.py",
+      "sha256": "fe7453f490cfa9069780008d7f564b9c8d0824d3fc272e65dfc410ffef367848"
+    },
+    {
+      "byte_count": 80583,
+      "path": "src/rquant/ops/production_deploy.py",
+      "sha256": "bda49c6e47da3faf6d21a36a571c73f3284567aeec7fdd24022022f982d51a7c"
+    },
+    {
+      "byte_count": 42261,
+      "path": "src/rquant/ops/r07_deploy_evidence.py",
+      "sha256": "6840651a50ddd514ae7b53030c3170237a2af8cb3c9d8d4f361825f3949a3ea6"
+    },
+    {
+      "byte_count": 18851,
+      "path": "src/rquant/ops_status.py",
+      "sha256": "cf1293ee7e7b99e1a84475a0390eff19e470db3c0a27fa87f62abf5474a57ac5"
+    },
+    {
+      "byte_count": 3773,
+      "path": "src/rquant/ops_status_serving.py",
+      "sha256": "b6d49f967303a0ab9ed93edc88c14f6f2cfc02f549f1647b190180da7f5ada76"
+    },
+    {
+      "byte_count": 10039,
+      "path": "src/rquant/order_execution_costs.py",
+      "sha256": "1566383e2a19307b5610679c5a5bf0b32bb9ca04b4b5bd0a8c11f7e39859ca4a"
+    },
+    {
+      "byte_count": 8093,
+      "path": "src/rquant/overfit.py",
+      "sha256": "ea7c97d2b4cc2995ddb75b1c98833b31fff28ef810bfeadd353b6b1c0d49d8db"
+    },
+    {
+      "byte_count": 7161,
+      "path": "src/rquant/overfit_pbo.py",
+      "sha256": "49cf4ab4c2d91fb0e07cdfd8b50a5e63264bb3fea88a37c747e40178cb163f8c"
+    },
+    {
+      "byte_count": 238572,
+      "path": "src/rquant/page_control.py",
+      "sha256": "03f3ffb55de69a116cbb5f78a2d1f22132ad11748d5488c5c074bf7fff3f8522"
+    },
+    {
+      "byte_count": 30990,
+      "path": "src/rquant/page_control_service.py",
+      "sha256": "6d6ee5b0bac77dbd83d20c446ef5b74d15a1b19cae017176f905ffdb4731c82e"
+    },
+    {
+      "byte_count": 17444,
+      "path": "src/rquant/panorama_auth.py",
+      "sha256": "1587515b38488c2951e3e1b9c648871956dbf850346be0f6c58bf306360831c6"
+    },
+    {
+      "byte_count": 96205,
+      "path": "src/rquant/panorama_data.py",
+      "sha256": "0ab3ecf4b603c6d7ca30444eba613fd2d2211067fa3d7bbd8dfd6916a148c5e8"
+    },
+    {
+      "byte_count": 23751,
+      "path": "src/rquant/panorama_poller.py",
+      "sha256": "f71bf95e5196eed5cf0e67783ab7f0cddbed64fec885e214175f0c7f3575707c"
+    },
+    {
+      "byte_count": 13240,
+      "path": "src/rquant/paper.py",
+      "sha256": "8473dbd07b544b929d394fc67832d53b18ea5bbedc50a3343c5464ade1b6b7c8"
+    },
+    {
+      "byte_count": 278877,
+      "path": "src/rquant/paper_broker.py",
+      "sha256": "562b0a4eb2210aba2fac6d008adb45521eba6b8f23ba97b87306c7751633f37e"
+    },
+    {
+      "byte_count": 20170,
+      "path": "src/rquant/paper_contracts.py",
+      "sha256": "0b548c487cf156fad3031cccc68e76437649794a85d17b77d70b02848ada2b6a"
+    },
+    {
+      "byte_count": 21058,
+      "path": "src/rquant/paper_execution_constraint_producer.py",
+      "sha256": "f7e673b3fbb02f66be50dfe3e8dab74928f9097f094008b0f6259933002fb6d3"
+    },
+    {
+      "byte_count": 36501,
+      "path": "src/rquant/paper_execution_constraints.py",
+      "sha256": "bbffe263d61d3a155c8865b4d49418a9c3bb289b807b94df6a6184786268e146"
+    },
+    {
+      "byte_count": 1886,
+      "path": "src/rquant/paper_history_serving.py",
+      "sha256": "8bcac933cd733a3370070bfa9d36746df181eb5fa4d35e747048c817f53bf221"
+    },
+    {
+      "byte_count": 5888,
+      "path": "src/rquant/paper_ledger_anchor.py",
+      "sha256": "111c6855142b2d47695b75abd9db7be5989848c3ca745a7495e4ca75f9bb3739"
+    },
+    {
+      "byte_count": 31240,
+      "path": "src/rquant/paper_ledger_migration.py",
+      "sha256": "c50b2e3b2686c1c8cd92da3a00912c9bf01aa8085d75d958f94c327ab4cc0ab6"
+    },
+    {
+      "byte_count": 35023,
+      "path": "src/rquant/paper_ledger_v4.py",
+      "sha256": "9e1380da562e3d8d9ee413dac69af62edfb5bfc232b5d1b742c15cb477752199"
+    },
+    {
+      "byte_count": 74719,
+      "path": "src/rquant/paper_migration_publication.py",
+      "sha256": "2f08ac1bfee3191bc191413e000ee793dd68c9e49b23a52640d0bfcb7836238c"
+    },
+    {
+      "byte_count": 26243,
+      "path": "src/rquant/paper_signal_consumer.py",
+      "sha256": "48cf50c8ec4230c87487d42634a1ada3faccb15ef37759a45ba6ca0a514a1365"
+    },
+    {
+      "byte_count": 52257,
+      "path": "src/rquant/paper_signal_worker.py",
+      "sha256": "33e8ee9e757cc1d9cfb8b6db2a7c1ef89b8681e75c90ad9af65088cb1b6ccfd3"
+    },
+    {
+      "byte_count": 1059,
+      "path": "src/rquant/perf/__init__.py",
+      "sha256": "48d1d110bc94443a85e57fa35a62a9475bb1bb0afdf624377911516375dd8f03"
+    },
+    {
+      "byte_count": 11459,
+      "path": "src/rquant/perf/core.py",
+      "sha256": "4c4c79daffea5b4609f4e9ba075b67ea786b541d6af76d9ffdfb0e5a878c52fa"
+    },
+    {
+      "byte_count": 5825,
+      "path": "src/rquant/perf/trades.py",
+      "sha256": "6e44e073e8c1c07371623ac68842e6676fa4cefe08c6883d5ca0e706d6cf7c07"
+    },
+    {
+      "byte_count": 23260,
+      "path": "src/rquant/pipeline.py",
+      "sha256": "779a686f7899de7230150c7e07f54ef9180eb883c59f0372528ab32f3a42e40d"
+    },
+    {
+      "byte_count": 18537,
+      "path": "src/rquant/pit_visibility.py",
+      "sha256": "8b2d9c393a92ff97d63a16c76da04849371fc537b8be6cf0be35b896a5113a74"
+    },
+    {
+      "byte_count": 11116,
+      "path": "src/rquant/pool_definition_projection.py",
+      "sha256": "c19665e48f8820d3e274565b886f7a57d66d08e95e98e886355e063139e535b8"
+    },
+    {
+      "byte_count": 1632,
+      "path": "src/rquant/pool_member_return.py",
+      "sha256": "0a7a4a295c6917c4f38cccd2f4afcdff8d078e274ed0f1e955a85fd0f31cc86d"
+    },
+    {
+      "byte_count": 10691,
+      "path": "src/rquant/pool_membership.py",
+      "sha256": "0f1991b4a03f6b0868fe550d31d886b46cc00df8e552afbbe6f23a4a73950645"
+    },
+    {
+      "byte_count": 4431,
+      "path": "src/rquant/pool_result_receipt.py",
+      "sha256": "d2025dec1b2b9083a6a05986dffacf27b9e8b24d8a7a9c111eb496bfe969ab4d"
+    },
+    {
+      "byte_count": 1159,
+      "path": "src/rquant/portfolio/__init__.py",
+      "sha256": "498d5377ae81b33aeb6e8326f50827c279049ba44a0ace714f070880dd41e23a"
+    },
+    {
+      "byte_count": 6126,
+      "path": "src/rquant/portfolio/drawdown.py",
+      "sha256": "28f4eb74e7c7df4a28595bb152bc59790709b827de758dfaecfcbb41ceb50fa9"
+    },
+    {
+      "byte_count": 10835,
+      "path": "src/rquant/portfolio/exposure.py",
+      "sha256": "3f8440bff005ff60c171d6eb23580d50103a1682a0ee7ac50b7bdcb9fa77ea3a"
+    },
+    {
+      "byte_count": 12913,
+      "path": "src/rquant/portfolio/weights.py",
+      "sha256": "1716f8a4b565b74817f0b7663688b32138dfe543fb8d71ef67246c3860dc18bf"
+    },
+    {
+      "byte_count": 13137,
+      "path": "src/rquant/pre_market_check.py",
+      "sha256": "71445a8f1d134794d2070953b539b6bfa6a4a358f5e533dd045df1c79898ebcc"
+    },
+    {
+      "byte_count": 64441,
+      "path": "src/rquant/preflight.py",
+      "sha256": "5e97b4b20bd9991e5f72ea36c888c4c8fe9c8c7ba65c91111a4622529b689d8b"
+    },
+    {
+      "byte_count": 5974,
+      "path": "src/rquant/presets.py",
+      "sha256": "499635a4090cefafcd00e55920d797fbd643c6fcaeb9bb673df9e36e635d191b"
+    },
+    {
+      "byte_count": 7246,
+      "path": "src/rquant/price_adjustment.py",
+      "sha256": "211994a62ec1b77bfae61b773c40ea506ca3969e94d047159a2150e0cfcd8187"
+    },
+    {
+      "byte_count": 21791,
+      "path": "src/rquant/price_alert_admission.py",
+      "sha256": "cd72a6fbc2d90528ccf987ac6389d6800495e373e3325283c9f393b88bb3ed25"
+    },
+    {
+      "byte_count": 16640,
+      "path": "src/rquant/price_alert_rule_store.py",
+      "sha256": "ed562820f524262337c2ed1382d076e6aa430b427ee530dff6a93af630382f9a"
+    },
+    {
+      "byte_count": 2548,
+      "path": "src/rquant/private_fs.py",
+      "sha256": "a9ad506922c2dd631513f8413dae7045b8a301d604bebd6d5a4a2d30b34c49a4"
+    },
+    {
+      "byte_count": 12656,
+      "path": "src/rquant/privilege_launcher.py",
+      "sha256": "40753a032407ca12c9e5395556c139ecf37562975dec6e1b6fa9095a994e7091"
+    },
+    {
+      "byte_count": 6665,
+      "path": "src/rquant/promotions_serving_authority.py",
+      "sha256": "7392bacf12523c293b91db752e2c122fa484165ad9ee06f98af2bc2a67d677f3"
+    },
+    {
+      "byte_count": 9863,
+      "path": "src/rquant/pulse_watch.py",
+      "sha256": "66e885ced4ee3d2febbe49b7dc181b193853ac8b07802f0060df8a0a6d8174dc"
+    },
+    {
+      "byte_count": 30228,
+      "path": "src/rquant/readside_replica_gate.py",
+      "sha256": "1a901d93b3d8bb097ecc7b080d42e77dc65185ec86e8a174e339906ef3d6fe04"
+    },
+    {
+      "byte_count": 28344,
+      "path": "src/rquant/recovery_manifest.py",
+      "sha256": "bedbfad4c61eda22e382598418d56ce094593d1b0163d4140dbef7a502ccfd62"
+    },
+    {
+      "byte_count": 132748,
+      "path": "src/rquant/reference_data_registry.py",
+      "sha256": "39318c70903acb9a04000c70841dfa94f07be978635b50d32228aa54cab1f6f8"
+    },
+    {
+      "byte_count": 30740,
+      "path": "src/rquant/reference_slow_publisher.py",
+      "sha256": "13650fb9fc5063172122a93b362944405bfbc2a8ebb8e7b749c9574e3833f165"
+    },
+    {
+      "byte_count": 36873,
+      "path": "src/rquant/reference_slow_runtime.py",
+      "sha256": "35418430db75ac32efa754eb98f8448022e91adb61bcd5f43e65f257f957abfe"
+    },
+    {
+      "byte_count": 68764,
+      "path": "src/rquant/reference_slow_source.py",
+      "sha256": "339c1a0ac68459a3a6e08da022c6ec44f5618e1af66253aa21250119bdcc0d5a"
+    },
+    {
+      "byte_count": 197390,
+      "path": "src/rquant/release_generation.py",
+      "sha256": "c0cbd23385cbef1a43945dd9e05d5c65ac1c0324f0f1f68edbab213176056c16"
+    },
+    {
+      "byte_count": 1476,
+      "path": "src/rquant/replay_cache.py",
+      "sha256": "e62b87e6518381b24be54ec25cfb90ff5d203c06a7db50654a254edb35802bb8"
+    },
+    {
+      "byte_count": 9770,
+      "path": "src/rquant/replay_entry_cache.py",
+      "sha256": "0ea679c66443809caa88edd3c6d9121af00e9b0f0a9e37629e176675a5e874bb"
+    },
+    {
+      "byte_count": 83729,
+      "path": "src/rquant/replay_lineage_authority.py",
+      "sha256": "739d118b84a3082668a9a86cc090291796f42f08677eaa5108a10d7635aa975b"
+    },
+    {
+      "byte_count": 4828,
+      "path": "src/rquant/replica_generation.py",
+      "sha256": "552d73f73481ca1dec3c63a197cc5de0be26ac39153e0ab7ab08147526f0b4f9"
+    },
+    {
+      "byte_count": 15625,
+      "path": "src/rquant/research_catalog.py",
+      "sha256": "cbf07dc75a761b62d052abde3c312dbad45d0cdd0779b9cb113044ccc213c75f"
+    },
+    {
+      "byte_count": 19912,
+      "path": "src/rquant/research_gate.py",
+      "sha256": "c15f0b82157d53b7d6ae30806b70ab27464347258e116c7f4281bae5f7f8a6b6"
+    },
+    {
+      "byte_count": 98700,
+      "path": "src/rquant/research_ingest.py",
+      "sha256": "356b02b96e51c59fc8b628a6f0f21a1ce14843ad12f0d8c1c0c1584d2c9ba707"
+    },
+    {
+      "byte_count": 32190,
+      "path": "src/rquant/research_lake.py",
+      "sha256": "ffbedbd369099e37fc72430ebb491c5039fc168df1bdc1045fbab084381d2009"
+    },
+    {
+      "byte_count": 24018,
+      "path": "src/rquant/research_manifest.py",
+      "sha256": "bf6af2640796d9821ca6034d94d415128a24aca35eea96efa2c71adb866e00c0"
+    },
+    {
+      "byte_count": 14462,
+      "path": "src/rquant/research_metadata_terminal_inbox.py",
+      "sha256": "5d4d545a4786fdfaa953209d0267e80c7c5f12c229b940d8bbaf23ba8bafd198"
+    },
+    {
+      "byte_count": 72518,
+      "path": "src/rquant/research_migration.py",
+      "sha256": "d499e06ab7f67f43a8ee33ab5c0a5d27a4650c9ef148617238e5f0bef2236763"
+    },
+    {
+      "byte_count": 66879,
+      "path": "src/rquant/research_minute_repair.py",
+      "sha256": "d6bd427902a5c042c1e42454d39a677495ea29b7e800b8448088e22c6c3de83f"
+    },
+    {
+      "byte_count": 919,
+      "path": "src/rquant/research_query/__init__.py",
+      "sha256": "5797b5b192a311f92c9a72dd33a3286a735ef930fbbed7fc829442292eeb680f"
+    },
+    {
+      "byte_count": 7709,
+      "path": "src/rquant/research_query/child.py",
+      "sha256": "484d5d019fdfb8b406ec92369562da7cfa109944ffe72ab14b0429fd9696bf1c"
+    },
+    {
+      "byte_count": 4102,
+      "path": "src/rquant/research_query/cli.py",
+      "sha256": "6dc579d905410b3a13f80e17965108e87299867321c7e01d362e6a4228a3edbb"
+    },
+    {
+      "byte_count": 6038,
+      "path": "src/rquant/research_query/contracts.py",
+      "sha256": "8e6ea666d8a7701ef0b25cec6fe3a7a9e8456b6c4776154379ee98eaab726dc8"
+    },
+    {
+      "byte_count": 7354,
+      "path": "src/rquant/research_query/executor.py",
+      "sha256": "39fe1c0840e7be5b201d54d2c4786dab85db38c386751f22e46a0ef7b828cb83"
+    },
+    {
+      "byte_count": 5415,
+      "path": "src/rquant/research_query/saved.py",
+      "sha256": "b1a903e67bdcd3fae2e6535a43911701619a82d3e33149fbb302ba479f2739cb"
+    },
+    {
+      "byte_count": 14208,
+      "path": "src/rquant/research_query/service.py",
+      "sha256": "0082187064b8df2aaad37bad6d8707b09d74cd88e1bdc8d0e7456287c4b755e3"
+    },
+    {
+      "byte_count": 10283,
+      "path": "src/rquant/research_query/snapshot.py",
+      "sha256": "46e57a0331be2df7864880b2431332eeb15c7406f0a34770d15c058cd5913986"
+    },
+    {
+      "byte_count": 57327,
+      "path": "src/rquant/research_repair.py",
+      "sha256": "d67de000d42618198943c82bb4d8177f136dee43a472c790c2ed4b2e6df19c93"
+    },
+    {
+      "byte_count": 40893,
+      "path": "src/rquant/research_run_spec.py",
+      "sha256": "62bdbd984c2e1a07bee588708b5fa6bbf2aff364c7cee0216fd8707b190f018c"
+    },
+    {
+      "byte_count": 2411,
+      "path": "src/rquant/research_sdk.py",
+      "sha256": "122eee66f279232c9c7b0ad566177e6c742fadda90b86733ef481960340f4694"
+    },
+    {
+      "byte_count": 63447,
+      "path": "src/rquant/research_snapshot.py",
+      "sha256": "6e05ecec4fbd4a50fe852e30d9472faa146118694470cd0c59192e27eb0de551"
+    },
+    {
+      "byte_count": 68280,
+      "path": "src/rquant/research_sync.py",
+      "sha256": "ad5b3a7c50664b2b9ce67e85ab70e3c910198d2738e33526c70a5ba7f93193a4"
+    },
+    {
+      "byte_count": 24540,
+      "path": "src/rquant/resource_admission.py",
+      "sha256": "bdfa49f9c88cfb8707e205f8f082ce3403b0250c6898f913bb211c151c5d839a"
+    },
+    {
+      "byte_count": 43561,
+      "path": "src/rquant/resource_authority_service.py",
+      "sha256": "82cc84a505d12ef1103f8ff58d8652c0158ab158daf1bbf241b1894a060cecc6"
+    },
+    {
+      "byte_count": 50297,
+      "path": "src/rquant/resource_journal_high_water.py",
+      "sha256": "0e9a198860160bbae231353fb05424a8b1b5b31f1909223bc400bfd433814d59"
+    },
+    {
+      "byte_count": 444,
+      "path": "src/rquant/risk/__init__.py",
+      "sha256": "78a1b97ec5763e5616331afc73b0bb071488b2f08db61159f93b21ef3b3d0897"
+    },
+    {
+      "byte_count": 12123,
+      "path": "src/rquant/risk/blacklist.py",
+      "sha256": "c3ea8231e295b096d74f7daaacf89327668325ce80ef8aad1a18799b538f1c9a"
+    },
+    {
+      "byte_count": 4283,
+      "path": "src/rquant/risk_search.py",
+      "sha256": "3342b34fef1780a5a6eefdb9178cb6feea9293d8d15a22e5bdeb0e068200d5cf"
+    },
+    {
+      "byte_count": 100153,
+      "path": "src/rquant/runtime_artifact_retention.py",
+      "sha256": "230a5d1d47da3e22fe194eb8299edc42106a4420e0bce6f6b7d510d87d9aa819"
+    },
+    {
+      "byte_count": 11518,
+      "path": "src/rquant/runtime_artifact_terminal_lifecycle.py",
+      "sha256": "b4caa174646d05803fb11358eeb643bc3fe4fe7f1eba99ef30be84f4e2b64a2a"
+    },
+    {
+      "byte_count": 124745,
+      "path": "src/rquant/runtime_authority.py",
+      "sha256": "25b92777957094442497c90524e3d9200eaff369a4e7b37bfa2e3ce4a0a58557"
+    },
+    {
+      "byte_count": 61528,
+      "path": "src/rquant/runtime_authority_publish.py",
+      "sha256": "6cf03a5ac77d0efd0c60ef89d2bb3e5fc45b68cc6f73c9013e980561ffa63546"
+    },
+    {
+      "byte_count": 79092,
+      "path": "src/rquant/runtime_authority_stage.py",
+      "sha256": "e0b459c56b4b16a633f77897ea770e4c4712b34cd6c315d5274b547b5d7c1c1f"
+    },
+    {
+      "byte_count": 8148,
+      "path": "src/rquant/runtime_builder_artifact_catalog.py",
+      "sha256": "fd274b8e3fe1a75e8e63b517099e1854d080487acd25b46e1b9bff7617706d9d"
+    },
+    {
+      "byte_count": 20183,
+      "path": "src/rquant/runtime_builder_authority.py",
+      "sha256": "a84c5886c8b82648476a32a522201242a3d6b7dc9170e7bd6d0bc73c91827abe"
+    },
+    {
+      "byte_count": 39347,
+      "path": "src/rquant/runtime_builder_candidate.py",
+      "sha256": "9c93369115cb62fe5786cb32813eaf43acfa1176c7deb8ed6dee21e8369c188e"
+    },
+    {
+      "byte_count": 15133,
+      "path": "src/rquant/runtime_builder_daily.py",
+      "sha256": "799aacf5b76b844944441614c75936c16b733b67c373591683f24ec2a5e02691"
+    },
+    {
+      "byte_count": 114202,
+      "path": "src/rquant/runtime_builder_daily_orchestrator.py",
+      "sha256": "2c43766492c7e670bbf53060d78afb26dc7045f207959b609f9ea0948636e569"
+    },
+    {
+      "byte_count": 7031,
+      "path": "src/rquant/runtime_builder_feature.py",
+      "sha256": "bedd114aace6fd10fa705d8f5a3adba56cf6ac7c8536eeff9747598a41320a8f"
+    },
+    {
+      "byte_count": 20410,
+      "path": "src/rquant/runtime_builder_paper.py",
+      "sha256": "c7e6d348022bcd99457e06b73b819ac1fce1c333aa50bd4beda0bb4104370519"
+    },
+    {
+      "byte_count": 36317,
+      "path": "src/rquant/runtime_builder_retention.py",
+      "sha256": "aa4d0b167c3a1be95587710913ae4d0d568a59942f33db1573ebc4fad7f665f8"
+    },
+    {
+      "byte_count": 19043,
+      "path": "src/rquant/runtime_builder_serving.py",
+      "sha256": "4b504cfefe6b38977b0b15b99dec02411e86e18b1ab3255be6208bdf866d0a24"
+    },
+    {
+      "byte_count": 20024,
+      "path": "src/rquant/runtime_builder_shadow.py",
+      "sha256": "b9d6f49b819c657c5e4b2ad325a21ac03e9a0a90aee92bc2c7f2a6df9df183c9"
+    },
+    {
+      "byte_count": 63478,
+      "path": "src/rquant/runtime_builder_signal.py",
+      "sha256": "a440b3786a4f102b299bb9193f89d4e7ec59b06b9f02d7cd2c66b262bc87e989"
+    },
+    {
+      "byte_count": 23733,
+      "path": "src/rquant/runtime_builder_strategy.py",
+      "sha256": "d846b142d7e01fa2418770d75bbd7e2bb0793f606a6f710f9dd752041e120c0c"
+    },
+    {
+      "byte_count": 31397,
+      "path": "src/rquant/runtime_candidate_universe.py",
+      "sha256": "79dbcf2325db2c5a42a03e53f8c8a3baa10f52a4df0f064fe89a7d609ee1882b"
+    },
+    {
+      "byte_count": 31188,
+      "path": "src/rquant/runtime_capabilities.py",
+      "sha256": "d8a04e1fdded457b2ac2ff07a148a54c453ec6c5d427f51b4b3c7caa9da7038a"
+    },
+    {
+      "byte_count": 32662,
+      "path": "src/rquant/runtime_code_attestation.py",
+      "sha256": "4c5779e66a33f8c5272231ddf8a1f1cad08d7a72665d29becae7bdc798fb8d81"
+    },
+    {
+      "byte_count": 43076,
+      "path": "src/rquant/runtime_code_generation.py",
+      "sha256": "13da1eadc5afbb5377a5515ad167030da2910ceeb78dd8917ec24f441f19b0ee"
+    },
+    {
+      "byte_count": 48246,
+      "path": "src/rquant/runtime_code_operations.py",
+      "sha256": "98a6d9abe8e80bb4ed679dff5f9460fe54906ba641ca29cdd94869bc1e94faeb"
+    },
+    {
+      "byte_count": 2905,
+      "path": "src/rquant/runtime_contracts.py",
+      "sha256": "27894e1a61142f33f2e7c23bdf500adfd5ed211b1d14622b4204d470f2097455"
+    },
+    {
+      "byte_count": 10020,
+      "path": "src/rquant/runtime_credential_sealer_client.py",
+      "sha256": "084e0d2c436f201a29c4169e7818e0bca2a9b3aad5c1d6e6953bad7706ed9eca"
+    },
+    {
+      "byte_count": 13801,
+      "path": "src/rquant/runtime_definition_bootstrap.py",
+      "sha256": "ab7045959e0d5b7350b410a5c84a1d8765b35288fb3cd9662f9951afcfa2b9cd"
+    },
+    {
+      "byte_count": 171989,
+      "path": "src/rquant/runtime_deployment_bundle.py",
+      "sha256": "df1a5f79009d6254ea54fbd38642f83a7f704cab6a204bc94943c6741dcbd95f"
+    },
+    {
+      "byte_count": 6095,
+      "path": "src/rquant/runtime_deployment_preflight.py",
+      "sha256": "a683dab9c5ecee1f3b2d39ea646c5da62a72dfe0f46712abec60421020ea1bb8"
+    },
+    {
+      "byte_count": 58184,
+      "path": "src/rquant/runtime_deployment_profile.py",
+      "sha256": "f2e4529dadf4e8274d60f504c90aef7a3d95421746131df469276c0ec4d4e282"
+    },
+    {
+      "byte_count": 52757,
+      "path": "src/rquant/runtime_deployment_rollout.py",
+      "sha256": "92a43598b92f2860bfd2034dc953ec2f45578c869ad60b812e4235ceedc158cc"
+    },
+    {
+      "byte_count": 1127,
+      "path": "src/rquant/runtime_exec_wrapper/__init__.py",
+      "sha256": "8f9fb071ace638b92ed48aad32828243a1f60501442ccaa8647f8116cbe52346"
+    },
+    {
+      "byte_count": 2736,
+      "path": "src/rquant/runtime_exec_wrapper/__main__.py",
+      "sha256": "3597c656305d0962eaf65a144bae5400ee4fe6b14fdf774c08d028ea09dba163"
+    },
+    {
+      "byte_count": 43573,
+      "path": "src/rquant/runtime_exec_wrapper/_verify.py",
+      "sha256": "cdd1d7a7dd118016f49296073585f2409ad5ea63437779521354e17c8d96d573"
+    },
+    {
+      "byte_count": 17016,
+      "path": "src/rquant/runtime_generation_lineage.py",
+      "sha256": "202d96724346ecbae1725b65a404cf2b5c92f9b6e6fdc70e1793bcbf439f661d"
+    },
+    {
+      "byte_count": 31098,
+      "path": "src/rquant/runtime_health_authority.py",
+      "sha256": "77d107e302c3e892644a3834588dfe016e3b6d7d926393f145ab745f2606b216"
+    },
+    {
+      "byte_count": 7845,
+      "path": "src/rquant/runtime_legacy_generation_binding.py",
+      "sha256": "2d32f538f94a3fc979e69ad82bf23ee0e1af4d599e1886bbc030f70f35ea8062"
+    },
+    {
+      "byte_count": 10133,
+      "path": "src/rquant/runtime_market_calendar_generation.py",
+      "sha256": "059ba73aa5f40369892d89f4aefec63c2087156df14e62d033380aa1ced70a69"
+    },
+    {
+      "byte_count": 17536,
+      "path": "src/rquant/runtime_market_session.py",
+      "sha256": "1f0d490e66c03d3637dce64e2671c04978a3dc3b8937a46298770ab73be77e60"
+    },
+    {
+      "byte_count": 22484,
+      "path": "src/rquant/runtime_notification_providers.py",
+      "sha256": "37d4df8f2f576fe270a71ab4e4bd4b9ae80236cf012ae3867711846c4b2c021d"
+    },
+    {
+      "byte_count": 26116,
+      "path": "src/rquant/runtime_paper_quote.py",
+      "sha256": "aabc049e61da5009ede61e80df68c3e6deddb561c4d936a6964934e6f336f1d1"
+    },
+    {
+      "byte_count": 8682,
+      "path": "src/rquant/runtime_peer_artifacts.py",
+      "sha256": "6f778ba0597e5520c67fd14248985a612e17369bf21aa8677a015d23d733829d"
+    },
+    {
+      "byte_count": 137790,
+      "path": "src/rquant/runtime_production_profile.py",
+      "sha256": "c27aca96e5c5b8b3bea2687148831166154f3ef4fef9684c8566626908155af5"
+    },
+    {
+      "byte_count": 70034,
+      "path": "src/rquant/runtime_quarantine.py",
+      "sha256": "01bff2303b36f2d61ddca9b33cb403b6a3339de791a46475ce8642fe72c1ad66"
+    },
+    {
+      "byte_count": 19093,
+      "path": "src/rquant/runtime_read_interrupt.py",
+      "sha256": "ed54df54ce3df840b2fb2a2ae1a44bd020673f6a855bd209eac1bd16fa2de0f8"
+    },
+    {
+      "byte_count": 133967,
+      "path": "src/rquant/runtime_recovery_artifacts.py",
+      "sha256": "32f74bfe47ce9b9be71ca187fb7f3a6ffde342358ce7585c27107390b5dcaf70"
+    },
+    {
+      "byte_count": 69663,
+      "path": "src/rquant/runtime_recovery_backup.py",
+      "sha256": "cb585858a98d18661d164473c9d94eb702db89a7276f727ca78dd06669357428"
+    },
+    {
+      "byte_count": 195101,
+      "path": "src/rquant/runtime_recovery_coordinator.py",
+      "sha256": "51f1f81620d338b83aa444fa4e6c8ef69d29bc98e452821caa0be31cc6363895"
+    },
+    {
+      "byte_count": 10866,
+      "path": "src/rquant/runtime_recovery_production.py",
+      "sha256": "e9dc1aaca3a3f2ea45cdb38dcf673bff2f66a01f89d2171ac99cfd8dab119f8b"
+    },
+    {
+      "byte_count": 129795,
+      "path": "src/rquant/runtime_recovery_service.py",
+      "sha256": "fcef618aa4376ae98934b9f4f6ff5d2c1bea804892c7c2debdf3fc3e3d36047e"
+    },
+    {
+      "byte_count": 202995,
+      "path": "src/rquant/runtime_resource_admission.py",
+      "sha256": "c074a5f53939a73b89f61ecb7803f70f996d0340ae6eb59e3eff92323c37851f"
+    },
+    {
+      "byte_count": 11870,
+      "path": "src/rquant/runtime_routing_policy.py",
+      "sha256": "975e0e8772ae45783d6f64ff2f93601e796fa304ad890c137b7a29f207001cd0"
+    },
+    {
+      "byte_count": 51848,
+      "path": "src/rquant/runtime_schema_registry.py",
+      "sha256": "deecf62ab4c6aa3405f8aa0370fa31e512d77ffae6671d95551573e228de537f"
+    },
+    {
+      "byte_count": 75091,
+      "path": "src/rquant/runtime_service_builtin.py",
+      "sha256": "0afdf1a4b636351cfbd22ec6f9e1cb734cf7d7465ffa7e1c7241bb697d1ce8bc"
+    },
+    {
+      "byte_count": 55766,
+      "path": "src/rquant/runtime_service_control.py",
+      "sha256": "fb81f4d3a0f6a0d537c1a7bc88f02cb20af82193e64d52692fc8ae53537c822b"
+    },
+    {
+      "byte_count": 12946,
+      "path": "src/rquant/runtime_service_entrypoint.py",
+      "sha256": "e8e08c1c05545197ecd2bd9da846850749943b99b5fcf3d1da42e1723b1c4b35"
+    },
+    {
+      "byte_count": 38841,
+      "path": "src/rquant/runtime_service_main.py",
+      "sha256": "acc1011d2b81d4c8e6a4fedab002ffcabe3e28d0e8fb24f8ffc1c38620247fc7"
+    },
+    {
+      "byte_count": 64596,
+      "path": "src/rquant/runtime_serving_authority.py",
+      "sha256": "908e6c518713044ba91b80ecd8f2c25287eb3b94cbb6a2deb92f0720cc830dce"
+    },
+    {
+      "byte_count": 37350,
+      "path": "src/rquant/runtime_serving_snapshot.py",
+      "sha256": "70b41c3c2d6510fdaa40b81b00473891805af93660fa24aee30e7205983d6dfc"
+    },
+    {
+      "byte_count": 23037,
+      "path": "src/rquant/runtime_shadow_job.py",
+      "sha256": "ef34b73467ac7c49bc4e8bff2888210140bfe0922ffec3529da143b82a3023a5"
+    },
+    {
+      "byte_count": 11960,
+      "path": "src/rquant/runtime_shadow_service.py",
+      "sha256": "984b33c03e4a196798c163003c3df2bb56c5d0aa5d2504bd3abc03c8f969cf3b"
+    },
+    {
+      "byte_count": 44920,
+      "path": "src/rquant/runtime_shadow_sources.py",
+      "sha256": "f6275265d35be279469846d705d1472a011f09b31b6f1a359cf2d1fef05a6924"
+    },
+    {
+      "byte_count": 108366,
+      "path": "src/rquant/runtime_shadow_validation.py",
+      "sha256": "398714124a754705bc6e7d930d69f17940a13709691a7df792e3b02eb19fd639"
+    },
+    {
+      "byte_count": 2919,
+      "path": "src/rquant/scheduler_intent_authorization.py",
+      "sha256": "99218f1505c0e39aba7dad8ff9df7473564245f237252e7f674bbf3e0ae86c9a"
+    },
+    {
+      "byte_count": 108455,
+      "path": "src/rquant/schema_compatibility.py",
+      "sha256": "e6501a7f3ab514bc30883616a77e33849723bfcc21aca2fd4a61f415c4cf6058"
+    },
+    {
+      "byte_count": 1492,
+      "path": "src/rquant/screen/__init__.py",
+      "sha256": "b736442b34b1e2a768ed8f11857cd961dc5f1e6603625f09ef8b5aed6eb67770"
+    },
+    {
+      "byte_count": 2515,
+      "path": "src/rquant/screen/core.py",
+      "sha256": "12892b6b25235d716c4da506440865dd35cf640cfb85132536ad8aadf89853e7"
+    },
+    {
+      "byte_count": 4375,
+      "path": "src/rquant/screen/dynamic_ma.py",
+      "sha256": "c54b42b7aaf88961be7d91729c76bb4197b6279a12823fca697ae8ec961a9138"
+    },
+    {
+      "byte_count": 22759,
+      "path": "src/rquant/screen/dynamic_rsi.py",
+      "sha256": "0c521818e8936de551f28e633becaa0ffd2a057257bf773668f10ce56c838e0b"
+    },
+    {
+      "byte_count": 6219,
+      "path": "src/rquant/screen/formula_catalog_run.py",
+      "sha256": "11a5131c3104c62fc6d951bdb485e58ce78738cfa0ad0684dbb34af0b7d366be"
+    },
+    {
+      "byte_count": 29430,
+      "path": "src/rquant/screen/formula_history_projection.py",
+      "sha256": "142400b6a595d0483ab776e9845af29b052f7ba8a86bcaacd071d03f1986bce6"
+    },
+    {
+      "byte_count": 33683,
+      "path": "src/rquant/screen/formula_market_jobs.py",
+      "sha256": "f815e00bd836abc9c8e86f6e1dcd84c9a383c1669bcb38a928a072d4964987c6"
+    },
+    {
+      "byte_count": 5732,
+      "path": "src/rquant/screen/formula_market_run.py",
+      "sha256": "9e6fd9c9d4e570ce059a2140ab34bb400a4697034fe4807275b0d2e23625cd0f"
+    },
+    {
+      "byte_count": 28357,
+      "path": "src/rquant/screen/formula_market_universe.py",
+      "sha256": "34317a1c5718046312823c14cb589d17d921080e51ee5d7e3548413435d83427"
+    },
+    {
+      "byte_count": 33531,
+      "path": "src/rquant/screen/loader.py",
+      "sha256": "5613c1e96e4a92d39fca66cf5181bdb43b319ce4e261183678f0b04de6008b0d"
+    },
+    {
+      "byte_count": 1125,
+      "path": "src/rquant/screen/pool_ranking.py",
+      "sha256": "e5cf6886c2897e2c3c35bbb11e47dae34fded075e2829aa573035fd21d0c55e9"
+    },
+    {
+      "byte_count": 7399,
+      "path": "src/rquant/screen/ranking.py",
+      "sha256": "57c494b73e02c670b7ea80559a86dc93e35acc9d8ab5f7084d8daece83f46881"
+    },
+    {
+      "byte_count": 20390,
+      "path": "src/rquant/screen/replica_source.py",
+      "sha256": "be43c23cef4e0ac8eb06515cf895ab3c3b7c87e33bb29389be3cf882ab079a87"
+    },
+    {
+      "byte_count": 12952,
+      "path": "src/rquant/screen/rules.py",
+      "sha256": "8155d0e9eb92531f279038b6fcd4bb9efdd2326f2a0abcb0b6651caa9fb89ed8"
+    },
+    {
+      "byte_count": 140,
+      "path": "src/rquant/screen/tdx/__init__.py",
+      "sha256": "e422a2cf475585ad674e915a87eaa3f3a3d98e4741c0bdc9e013af00d20227b2"
+    },
+    {
+      "byte_count": 2985,
+      "path": "src/rquant/screen/tdx/ast.py",
+      "sha256": "cd6e8255aae65922b5f8708f848b18a80330f268f2a416a98f51f4fc7c1d355c"
+    },
+    {
+      "byte_count": 22209,
+      "path": "src/rquant/screen/tdx/evaluate.py",
+      "sha256": "cdde3a0896207878c4ae544ad4bc2c1179c88eefbbb7d2235fcb60719e3a535b"
+    },
+    {
+      "byte_count": 6345,
+      "path": "src/rquant/screen/tdx/parser.py",
+      "sha256": "add21372e5b9fea0af19c33271eb4074ac013080bb5ae7b791bcaa59410f2141"
+    },
+    {
+      "byte_count": 4503,
+      "path": "src/rquant/screen/tdx/tokens.py",
+      "sha256": "6863107b024ed1a58c2b1e5b6bd76ffae0855eda4d353798d10821235b8c5ed3"
+    },
+    {
+      "byte_count": 12711,
+      "path": "src/rquant/screen/tdx/validate.py",
+      "sha256": "d27f3117ce83e78970fc3bdcf3684ec8114b9bd2a9e701319525cc60f15f4a10"
+    },
+    {
+      "byte_count": 543,
+      "path": "src/rquant/security_codes.py",
+      "sha256": "622a53acb96fc65287cee7b736879955f0923c2807425a2951367b282a1c2fcf"
+    },
+    {
+      "byte_count": 46019,
+      "path": "src/rquant/security_status.py",
+      "sha256": "f6e6233a569e346712fb5dd0798bc021d6916d55f0bd8212a55ac9c14c93bf6f"
+    },
+    {
+      "byte_count": 13924,
+      "path": "src/rquant/serving_alert_projection.py",
+      "sha256": "ba81a8ab3865bfdf709a8d7e5813540011a56f31c7870e3d1fc408d4dc569699"
+    },
+    {
+      "byte_count": 6038,
+      "path": "src/rquant/serving_contracts.py",
+      "sha256": "0387b18c6b2540a71e86bf28cf14a63b6b5cf2a2504095a556916be2c188cd60"
+    },
+    {
+      "byte_count": 8095,
+      "path": "src/rquant/serving_manual_watchlist_projection.py",
+      "sha256": "da7944ef87deed59f2dc7442f89708ea1127a8ad467d190f09cad7d9a030c92d"
+    },
+    {
+      "byte_count": 8332,
+      "path": "src/rquant/serving_manual_watchlist_read.py",
+      "sha256": "63d85df278afe8b805e294988a40142a892b47c8d6a58095a4e034b8269defa3"
+    },
+    {
+      "byte_count": 251883,
+      "path": "src/rquant/serving_page_projection_source.py",
+      "sha256": "d53a3e4a0ebe4cef3202b127376b7db94839eec786b8bc2ad830ad14ddc7b0bb"
+    },
+    {
+      "byte_count": 1656,
+      "path": "src/rquant/serving_paths.py",
+      "sha256": "acf4ba78176c13c78fc11caf735d1f30c2aa82153397daac413d2402e67eaf47"
+    },
+    {
+      "byte_count": 13115,
+      "path": "src/rquant/serving_price_alert_rule_projection.py",
+      "sha256": "6f15584e571fd7b76b84bf76e6983676dbeac305e08ccb176a466b8d3742724c"
+    },
+    {
+      "byte_count": 45199,
+      "path": "src/rquant/serving_publisher.py",
+      "sha256": "c1c1cefe429ee9450e7eb5abb9007d83a68dc31d7d05dc6e932d15d5730aa8a5"
+    },
+    {
+      "byte_count": 105815,
+      "path": "src/rquant/serving_read_models.py",
+      "sha256": "301f0ffeb0aa5f008fe5f9b0ca01b18889ef0ac2fe791ebbb20cd2d4f353f705"
+    },
+    {
+      "byte_count": 9260,
+      "path": "src/rquant/session_candidate_input.py",
+      "sha256": "73ea70100b62888d4962e1f74fb1b47db9f9d8575bcb1b530c96793772289c5e"
+    },
+    {
+      "byte_count": 112554,
+      "path": "src/rquant/signal_bus.py",
+      "sha256": "77d814d208b341fd631fd497c9008c5ccaacc510ea8b745265caa77d252b3cf9"
+    },
+    {
+      "byte_count": 12780,
+      "path": "src/rquant/signal_contracts.py",
+      "sha256": "7345d806de6d0236bb7deef633c1640ff6aefcb63dc2c92fdf29512f7b880508"
+    },
+    {
+      "byte_count": 9653,
+      "path": "src/rquant/signal_family_constants.py",
+      "sha256": "59bab9ac3e94c69d30fa2dc6c0122b3eea00e4075d1b5a19757ba69a02acce80"
+    },
+    {
+      "byte_count": 122777,
+      "path": "src/rquant/signal_family_differential_gate.py",
+      "sha256": "fe25688dbd66dcf6ef6f607d5b085820c83e14e30d275d4f07d901015f050004"
+    },
+    {
+      "byte_count": 114831,
+      "path": "src/rquant/signal_family_root_verifier.py",
+      "sha256": "f9702f2dcf3ad8313d2bc997127e309b4263e1dede70b6f9a2a817a9087176ad"
+    },
+    {
+      "byte_count": 37984,
+      "path": "src/rquant/signal_family_successor_registry.py",
+      "sha256": "6a054f19ffc0671a2a927981f3750da070f5c0e37572840c20706e1177939a47"
+    },
+    {
+      "byte_count": 103773,
+      "path": "src/rquant/signal_family_verification.py",
+      "sha256": "edb858ebdbdc0ebd75f41bebe27bf61c4dd060218a6e0f1fe91250e2a4d3b00e"
+    },
+    {
+      "byte_count": 825,
+      "path": "src/rquant/signal_family_verifier_entry/__init__.py",
+      "sha256": "9daa2c0fbdf545b164ccfe1588c5488ca80a85573be1451afa480851bccb4201"
+    },
+    {
+      "byte_count": 3605,
+      "path": "src/rquant/signal_family_verifier_entry/__main__.py",
+      "sha256": "107d92949fdda60cbfbb5d345451a2be2809cb257b6262eab2bc9a332da3f028"
+    },
+    {
+      "byte_count": 18737,
+      "path": "src/rquant/signal_family_verifier_entry/_artifact.py",
+      "sha256": "c679a3a5a4489e9bc183cc77ced8b04327d3d924448ffebd548bccbdffa6826c"
+    },
+    {
+      "byte_count": 4541,
+      "path": "src/rquant/signal_family_verifier_entry/_cli.py",
+      "sha256": "fc8479409929f5238a2c93ea36058c352e694af07668134dd7bd0b575725b091"
+    },
+    {
+      "byte_count": 1269,
+      "path": "src/rquant/signal_family_verifier_entry/_frozen_manifest.py",
+      "sha256": "c5d51bf02c344ef1e726fd5d90f158c9d032beb04775dda5df3fdccc6fe79cf8"
+    },
+    {
+      "byte_count": 2978,
+      "path": "src/rquant/signal_family_verifier_harness/__init__.py",
+      "sha256": "9bd010d7af6d76a386df1cc27eca1b8f283c19b689d7167bc3ef5179cf65d4a6"
+    },
+    {
+      "byte_count": 3444,
+      "path": "src/rquant/signal_family_verifier_harness/__main__.py",
+      "sha256": "bab52e4ed7df05f29c406265830f2ab78d9a2ee1559ec642dd2d19c3241bf7f1"
+    },
+    {
+      "byte_count": 3027,
+      "path": "src/rquant/signal_family_verifier_harness/_canonical.py",
+      "sha256": "5dba29dd9c8b61bd24a7d00442ccf10317de030889472fada4c02d87962686da"
+    },
+    {
+      "byte_count": 14111,
+      "path": "src/rquant/signal_family_verifier_harness/_request.py",
+      "sha256": "68aa26f2be42b34988b05ad7a05471a2127b69d85792c668bcc80eb5499a278f"
+    },
+    {
+      "byte_count": 4001,
+      "path": "src/rquant/signal_family_verifier_harness/_resolve.py",
+      "sha256": "9dfa3110a653feba6683de26e9c48770b00d263e2428058b35feb121259b3dd8"
+    },
+    {
+      "byte_count": 48073,
+      "path": "src/rquant/signal_family_verifier_harness/_surfaces.py",
+      "sha256": "eedab525d018070921882b1c220903d9d16be845fae089da25ef296298603847"
+    },
+    {
+      "byte_count": 26187,
+      "path": "src/rquant/signal_family_verifier_harness/_workspace.py",
+      "sha256": "b39c1d22c64e9e646d219e7de40e314e885a85c7928e25d31f2dcf8890b7222a"
+    },
+    {
+      "byte_count": 2828,
+      "path": "src/rquant/signal_observed_prefix.py",
+      "sha256": "63f874e6eb4234669a476f67f5176da025b76eb6c728b146d8cbac83e801d0ce"
+    },
+    {
+      "byte_count": 16366,
+      "path": "src/rquant/signal_provenance.py",
+      "sha256": "4ebfc64921111c1ceb81b10319e8528f5715d6d2f268ad9558d35b164f0cc2f5"
+    },
+    {
+      "byte_count": 50417,
+      "path": "src/rquant/signal_route_spool.py",
+      "sha256": "bd68d406f6afd0bb28978b17fd70618ff92ecf21f57cf8cd1597a7ae2136cabd"
+    },
+    {
+      "byte_count": 58688,
+      "path": "src/rquant/signal_router_runtime.py",
+      "sha256": "cc4f91523f062128eba0f3978009acf0e0d85c37706a98bb26b7bc8bbba78322"
+    },
+    {
+      "byte_count": 171527,
+      "path": "src/rquant/source_broker.py",
+      "sha256": "eb829fbe3dcfbf82b9a82b7f17f1ae885f46f389e867cf8d59eb2fc8ea1e868e"
+    },
+    {
+      "byte_count": 6367,
+      "path": "src/rquant/source_broker_client.py",
+      "sha256": "c5e15905fb95b4a737833956e46adac717771ea5d361be8ea708e82c0ab8f8a4"
+    },
+    {
+      "byte_count": 18841,
+      "path": "src/rquant/source_broker_protocol.py",
+      "sha256": "6327cfd515513e7a302c10611a2efdd765d41b2453ecd2c7e4d502a13302d587"
+    },
+    {
+      "byte_count": 12434,
+      "path": "src/rquant/source_broker_service.py",
+      "sha256": "8abc19e3eec62a22355b605c3d79ee1c049ec462d920396fff8def5dce6b1190"
+    },
+    {
+      "byte_count": 3068,
+      "path": "src/rquant/source_broker_transport_adapter.py",
+      "sha256": "8ed3c532b2e3b244b222c5434fc7c067c5149ee22ff6d3d7999b0b73acb9723d"
+    },
+    {
+      "byte_count": 262144,
+      "path": "src/rquant/source_broker_v2.py",
+      "sha256": "51de8a7379745f86392033eec6f95473c31467bb56749bdabe72751bf104d681"
+    },
+    {
+      "byte_count": 51990,
+      "path": "src/rquant/source_broker_v2_authority.py",
+      "sha256": "8b39ac7818fc2a776eacaecc94a68022a05ec34d4fbce6784ffa321c9044a757"
+    },
+    {
+      "byte_count": 51451,
+      "path": "src/rquant/source_broker_v2_authority_service.py",
+      "sha256": "2cdaf9551351928d1f6f5b90c1c220e1705c040c552681b853641ea6863c43c3"
+    },
+    {
+      "byte_count": 26825,
+      "path": "src/rquant/source_broker_v2_heartbeat.py",
+      "sha256": "8e93628c4094359aea362c296170b406121fdea7414404bfdd0e3c79ec0fa019"
+    },
+    {
+      "byte_count": 23943,
+      "path": "src/rquant/source_broker_v2_job_protocol.py",
+      "sha256": "fd896dea778f819122914fd251ea7f95e376e0f1c07f8a892882b6a228531a56"
+    },
+    {
+      "byte_count": 20048,
+      "path": "src/rquant/source_broker_v2_queue.py",
+      "sha256": "73f3612560a07a19c940ed0df6bb4054b2070bbea906376ee0337e3fcf4e001b"
+    },
+    {
+      "byte_count": 154240,
+      "path": "src/rquant/source_broker_v2_runner.py",
+      "sha256": "3b684b420f01a640a3765401c87974fe22e422d5ce80135733dd50b88285f855"
+    },
+    {
+      "byte_count": 58234,
+      "path": "src/rquant/source_broker_v2_runtime.py",
+      "sha256": "b6007620ed0d26ee30e0e91a46ca31f88540d0d0934386b918635213ed32964d"
+    },
+    {
+      "byte_count": 22672,
+      "path": "src/rquant/source_broker_v2_server.py",
+      "sha256": "780c4ed9ec0df7345d13493cf7159b40c234fe446887306726054a645c6b2019"
+    },
+    {
+      "byte_count": 145105,
+      "path": "src/rquant/source_broker_v2_service.py",
+      "sha256": "314addfd57c2a45913c547ef3ad6670dd5196a49cffe58f53bd9a4ff86c058ba"
+    },
+    {
+      "byte_count": 49718,
+      "path": "src/rquant/source_operation_contracts.py",
+      "sha256": "e995038de72e2d7255f959c204b3766d8c05e7d8121167ccf795af2a1c402b43"
+    },
+    {
+      "byte_count": 170887,
+      "path": "src/rquant/source_quota_authority.py",
+      "sha256": "60c70061ad9ab022c9f6733de494e89b104d35c3ef4d37061cd370d64ebe8625"
+    },
+    {
+      "byte_count": 28753,
+      "path": "src/rquant/source_quota_broker_adapter.py",
+      "sha256": "4e5bc2dea43743de23f212d57b18055582863ae7ff85c7533d85836ee2353662"
+    },
+    {
+      "byte_count": 17279,
+      "path": "src/rquant/source_quota_external_root_adapter.py",
+      "sha256": "ab44097cdcaf0d6e5d35c36a839550c7d7135a6f72af70071089545cac4d52c2"
+    },
+    {
+      "byte_count": 56296,
+      "path": "src/rquant/source_quota_store.py",
+      "sha256": "156bf4d65e437a1a93790a41158be3cdfd9879407fbfdedd03c6f00298be68f7"
+    },
+    {
+      "byte_count": 10146,
+      "path": "src/rquant/source_quota_transport.py",
+      "sha256": "b2d1a220a075baaeda8c0006fcb094f506ad176082072a6b6d360d1b9460bfb3"
+    },
+    {
+      "byte_count": 6361,
+      "path": "src/rquant/stage1_acceptance.py",
+      "sha256": "aa949f01b59894cfc38671fff8c748142cb3970e2ebc4aa4286f9145af3f6e2f"
+    },
+    {
+      "byte_count": 164,
+      "path": "src/rquant/state/__init__.py",
+      "sha256": "b286bfa873385a7defb8e2616c3ab0e028c8a72120740fbaaebbbe889604d13c"
+    },
+    {
+      "byte_count": 14957,
+      "path": "src/rquant/state/derive.py",
+      "sha256": "39b616601e6d5cb3c8d122dc90f08935e52bce88371407b78795a30a8b0340d3"
+    },
+    {
+      "byte_count": 24780,
+      "path": "src/rquant/stock_features.py",
+      "sha256": "6534551e041eacd851277567b6788788fa0482895359b94d8246b77c91b2a58d"
+    },
+    {
+      "byte_count": 73,
+      "path": "src/rquant/storage/__init__.py",
+      "sha256": "00f28d12c94ba118074527e6c03995338153c592e5109146da8e9c544b6e78e8"
+    },
+    {
+      "byte_count": 139834,
+      "path": "src/rquant/storage/duckdb.py",
+      "sha256": "b8c280df628716127a39fc15b7dfdc3426d8866c103aef195e15db61d7e5f129"
+    },
+    {
+      "byte_count": 8894,
+      "path": "src/rquant/storage/migrations.py",
+      "sha256": "29857aeb2797e53f62e6f696c85a3f107ec10619e75523f4b40de96ab047b17b"
+    },
+    {
+      "byte_count": 44848,
+      "path": "src/rquant/storage/schema.py",
+      "sha256": "d7d2c7ace12ed5cc34410c3b5d425d9b718c15bf00b72bebe296124c4d079e5f"
+    },
+    {
+      "byte_count": 25432,
+      "path": "src/rquant/strategy_candidate_feature_join.py",
+      "sha256": "ecdd2fc661d5aa244dd2606c7d002073383c788cf2e6ad036ac0af11abb49d5e"
+    },
+    {
+      "byte_count": 27264,
+      "path": "src/rquant/strategy_candidate_producers.py",
+      "sha256": "cbdaa7b05df2d71b19cf17f32ef9441cb947529dbd5eef9dca4cb321045f2765"
+    },
+    {
+      "byte_count": 5553,
+      "path": "src/rquant/strategy_candidate_publish_service.py",
+      "sha256": "5f766091d4e2428daa82e486a230ee5b2e036ce973328f4e8a82c350393abf3d"
+    },
+    {
+      "byte_count": 101820,
+      "path": "src/rquant/strategy_candidate_snapshot.py",
+      "sha256": "8a732d4fd3c75124d5777cb255bc70b154fa2154786e82fa28fe05b5621515c1"
+    },
+    {
+      "byte_count": 13998,
+      "path": "src/rquant/strategy_catalog_source.py",
+      "sha256": "1fa164f81b26e024396a86212e9149fe10f1d37f306501742caae36ba4deba36"
+    },
+    {
+      "byte_count": 6778,
+      "path": "src/rquant/strategy_compare.py",
+      "sha256": "629a0353f55fdd6632bc7a17ef75e5e1c4726f28e0a73e4afd6fb64d2b908844"
+    },
+    {
+      "byte_count": 7518,
+      "path": "src/rquant/strategy_dependencies.py",
+      "sha256": "ab10c48e073e6642efc7adf97c6e971f5ced9fe17335cdf74e78f9b5a8442130"
+    },
+    {
+      "byte_count": 55278,
+      "path": "src/rquant/strategy_evaluators.py",
+      "sha256": "bb2fe11c59ab82eeacd5c040f8c3310387c1a7f312a5483b48e1a4726b9a3fa6"
+    },
+    {
+      "byte_count": 19494,
+      "path": "src/rquant/strategy_execution_costs.py",
+      "sha256": "d396fba659d7636f2636cfb30f920604aa51d934bbeb2e0b670185ff071f9d5e"
+    },
+    {
+      "byte_count": 55195,
+      "path": "src/rquant/strategy_job_adapters.py",
+      "sha256": "de97264cc202e1aca13bf8f9c4411d34ab5e53f098fd4674f298bda99745a855"
+    },
+    {
+      "byte_count": 13888,
+      "path": "src/rquant/strategy_live_service.py",
+      "sha256": "e46def0817555f096630613df13ff18d99251df55570c872f5533d0644c72d3e"
+    },
+    {
+      "byte_count": 16320,
+      "path": "src/rquant/strategy_optimizer.py",
+      "sha256": "d15bd495ef9059f80d17e8195459da304287b7c16d971f223153fa69976b01a0"
+    },
+    {
+      "byte_count": 53229,
+      "path": "src/rquant/strategy_paper_lifecycle.py",
+      "sha256": "fd8d7ae5c1afe7cc38f10437a793b4f4c2070636e26c19307030c40c0dd6bda1"
+    },
+    {
+      "byte_count": 1278,
+      "path": "src/rquant/strategy_ranking.py",
+      "sha256": "e4ea4d348dbf175f3716733b70c179a1b5ed7ba8f3ba999c4f9c3aab0fdf8b21"
+    },
+    {
+      "byte_count": 4494,
+      "path": "src/rquant/strategy_replay_metrics.py",
+      "sha256": "afe09f91e20c2658338a063911841730a873501934cdb719c1425e1af1281382"
+    },
+    {
+      "byte_count": 146069,
+      "path": "src/rquant/strategy_runner.py",
+      "sha256": "2ba8642a5d3fc5688e6247ab48822b752f313fc3a3beaebba93c4f0199d8d490"
+    },
+    {
+      "byte_count": 8326,
+      "path": "src/rquant/strategy_spec.py",
+      "sha256": "951907204b81849ac3a42c3029a7507a4c693b32d4bf7d5b8117564e1477acfb"
+    },
+    {
+      "byte_count": 5049,
+      "path": "src/rquant/strict_json.py",
+      "sha256": "4605e1bc163396a8a24575b519f236cbe4957fa32d3fd8affc3ba71a0fa0b06d"
+    },
+    {
+      "byte_count": 87042,
+      "path": "src/rquant/surge_watch.py",
+      "sha256": "bb7fc4b99a5632ebbb12772b8f0007601666e53bacc88a226cbfaa2fcecbfc22"
+    },
+    {
+      "byte_count": 13573,
+      "path": "src/rquant/suspension.py",
+      "sha256": "d9b55e558442ddf4589671e8289f7d0ab751a3cab0bbfe43a911cfbab9f82a45"
+    },
+    {
+      "byte_count": 2474,
+      "path": "src/rquant/suspension_evidence.py",
+      "sha256": "fe2cdd7d2cbc11f6b3f7f018006bfb10e7811313a377f1862bfa8c817ebd4966"
+    },
+    {
+      "byte_count": 18408,
+      "path": "src/rquant/topn_selection.py",
+      "sha256": "37a3db03079bd51212c37c30b82e0d5d923ee78838bc1bcaaf173f86e2347d8b"
+    },
+    {
+      "byte_count": 8033,
+      "path": "src/rquant/topn_walk_forward.py",
+      "sha256": "2101bcb76d54bf627e88344a561e26da2ef5162f2650f97ff192c4d737153ee3"
+    },
+    {
+      "byte_count": 16181,
+      "path": "src/rquant/trade_calendar.py",
+      "sha256": "7444c91dde1cf5bd110c963d6e8db62093b6f236c0c1324f47dbe1594569b830"
+    },
+    {
+      "byte_count": 45752,
+      "path": "src/rquant/tushare_docs.py",
+      "sha256": "6aa745f86b8386eda52264423e751e186b4d9089d40d94cdcd5f5e6fc361aa83"
+    },
+    {
+      "byte_count": 12639,
+      "path": "src/rquant/unit_log_daemon.py",
+      "sha256": "bcb64b6edf1dc9e439b772b4529086bcb4d977e78e13dd538a6f7403d6d5214a"
+    },
+    {
+      "byte_count": 3957,
+      "path": "src/rquant/unit_log_emitter.py",
+      "sha256": "31f166b6335c13d5486f954a8603c06e8843f103ca4ca8cbd9b744c2653a6f76"
+    },
+    {
+      "byte_count": 15560,
+      "path": "src/rquant/unit_log_reader.py",
+      "sha256": "a7ca6972bafb8b523a5a3a0abf0fa3a5ce23e1245b21867cec7cbc8946035fd1"
+    },
+    {
+      "byte_count": 16671,
+      "path": "src/rquant/unit_log_service.py",
+      "sha256": "c08e6ee3fa3a2e8a97efbb96a7dd64e663c7aa4695d4cc6528ae7f0ca7cdebc7"
+    },
+    {
+      "byte_count": 21222,
+      "path": "src/rquant/volume_profile.py",
+      "sha256": "994fb55698f2c7b5837c526d28444c3c7867cd1d372af666eb77dd3f0faa3592"
+    },
+    {
+      "byte_count": 394,
+      "path": "src/rquant/vp/__init__.py",
+      "sha256": "e0e8fa78cb2606e5c6a39b72c09aece24a0cf302ee6c78e96b4990fac48311ed"
+    },
+    {
+      "byte_count": 2512,
+      "path": "src/rquant/vp/engine/__init__.py",
+      "sha256": "f97a07d6f9124ada41206f70e9225b3978e66663cf9fc57dc4f6b4b4b2b83321"
+    },
+    {
+      "byte_count": 5664,
+      "path": "src/rquant/vp/engine/anchored.py",
+      "sha256": "c546e81ade781d1d87d86e653a46e11418ed3a8c7bbf8dc2ed2a857052d6ceaf"
+    },
+    {
+      "byte_count": 21498,
+      "path": "src/rquant/vp/engine/composite.py",
+      "sha256": "fe43ddaf81971e80132200f5f74883e7079680707156fe41a8c668dc51f00f8a"
+    },
+    {
+      "byte_count": 3124,
+      "path": "src/rquant/vp/engine/config.py",
+      "sha256": "4e490a4617057fa8e611006c63c1340d7240daa5b2f9f234bac7792d4e724f4d"
+    },
+    {
+      "byte_count": 6064,
+      "path": "src/rquant/vp/engine/lvn.py",
+      "sha256": "f3665c3f8fc06c8e926b9cc790f3d6520a8511e38b0da282203b1222a821606e"
+    },
+    {
+      "byte_count": 11675,
+      "path": "src/rquant/vp/engine/profile.py",
+      "sha256": "b1e1fb668c3b955b1eb4e81a8db5f4e7cea28260daeb9764ba6c8ec9ccd35702"
+    },
+    {
+      "byte_count": 4633,
+      "path": "src/rquant/vp/engine/session.py",
+      "sha256": "328b7609050ca7725130436728a9cd61c1aaed94088ece4cb0a46e2f02b56075"
+    },
+    {
+      "byte_count": 412,
+      "path": "src/rquant/vp/sandbox/__init__.py",
+      "sha256": "8828859684722ea37ba44029ea01bd7b54a267516c33089470c20ac7dfa85f9a"
+    },
+    {
+      "byte_count": 1074,
+      "path": "src/rquant/vp/sandbox/factor.py",
+      "sha256": "907ec78f2ca97371a6ec82e8a671961abc9e23f935accf10a82966e589ca96b8"
+    },
+    {
+      "byte_count": 528,
+      "path": "src/rquant/vp/sandbox/test_factor.py",
+      "sha256": "e3e3c48a27bc4f3c19e2a52e976b11e4baf63f4fd610cdac2f2ae86af0a7c170"
+    },
+    {
+      "byte_count": 20653,
+      "path": "src/rquant/watchlist_admission.py",
+      "sha256": "94700a0835f11415ac838346deba9d04d276fce13ff5860b2b02150bf86507c7"
+    },
+    {
+      "byte_count": 34718,
+      "path": "src/rquant/watchlist_quote_gateway.py",
+      "sha256": "de1489b4615ea7fc9a9991fef0cf5d3c084564d8fce70e6112f2545eead32568"
+    },
+    {
+      "byte_count": 11995,
+      "path": "src/rquant/watchlist_quote_provider.py",
+      "sha256": "9887c87c25392da73ebf9495d5315b3da9492582cd4f74e6bc84f7d9b35e8923"
+    },
+    {
+      "byte_count": 1627,
+      "path": "src/rquant/watchlist_quote_source_service.py",
+      "sha256": "55ab72239293312a3411dc34fe7c550b28596013eb9066344c3640da61c6a50f"
+    },
+    {
+      "byte_count": 333,
+      "path": "src/rquant/web/__init__.py",
+      "sha256": "4d9dc91901a9f99c4620b7fae7169bf93ac7e190dc02b25ccab9045d5a16853d"
+    },
+    {
+      "byte_count": 4027,
+      "path": "src/rquant/web/alert_ack_gateway.py",
+      "sha256": "2cfbbec6cee8c944d55d070c2f71f780cc032fb2a99c841a30f16523f2aaafc5"
+    },
+    {
+      "byte_count": 775,
+      "path": "src/rquant/web/alert_ack_read.py",
+      "sha256": "afe149e8d02706b2e814890715f6205fb7d0ea5f2fa893c50ce41b94224c8507"
+    },
+    {
+      "byte_count": 24649,
+      "path": "src/rquant/web/app.py",
+      "sha256": "58ad44de4a8a2db40c3310856a46075efbb55d23771769b2ebe2f3f2504d8f69"
+    },
+    {
+      "byte_count": 4364,
+      "path": "src/rquant/web/backfill_plan_command_gateway.py",
+      "sha256": "ddf3635891b64db381c2eedbbacf7f51ab6795c9ef7ff73dba94dea52e0f5cca"
+    },
+    {
+      "byte_count": 4459,
+      "path": "src/rquant/web/calendar.py",
+      "sha256": "fdff4b5f03eee36bfb94338412d2f02ae68cf0caf416f9ca064c7c7cbd38adb3"
+    },
+    {
+      "byte_count": 3402,
+      "path": "src/rquant/web/cli.py",
+      "sha256": "fae5fd633b353c136866087d070208254dfa4852f6e24a276b909045ff916f98"
+    },
+    {
+      "byte_count": 4147,
+      "path": "src/rquant/web/data_audit_report_command_gateway.py",
+      "sha256": "b16e3a587ce4c874682b836677307d5b2338940208919fa1dfc1484a66a49af8"
+    },
+    {
+      "byte_count": 1296,
+      "path": "src/rquant/web/envelope.py",
+      "sha256": "ca8d5829574c2269b85c20b162f05ea4609d35fbaa08023bf842002ea9ff23de"
+    },
+    {
+      "byte_count": 4238,
+      "path": "src/rquant/web/formula_market_command_gateway.py",
+      "sha256": "cc2fdfc2a8b248d3cdef8bc9dd616acec96f7db92590c908fde5ee380922e281"
+    },
+    {
+      "byte_count": 4616,
+      "path": "src/rquant/web/formula_market_read.py",
+      "sha256": "94fdc33389a331316930850235fecbe32a4a60409623dd331e36215c8f9e44ed"
+    },
+    {
+      "byte_count": 9085,
+      "path": "src/rquant/web/formula_pool_read.py",
+      "sha256": "542254e0873731f3086370717f072071f817942228e02f169609a9891af672d4"
+    },
+    {
+      "byte_count": 2469,
+      "path": "src/rquant/web/ingress.py",
+      "sha256": "689d688674e7f731c591ef5f2b1078e0ef8c6040eae5d15166f4e8c0e5b9cbe7"
+    },
+    {
+      "byte_count": 3886,
+      "path": "src/rquant/web/lab_control_gateway.py",
+      "sha256": "511d0f48d38f53703e3e2b2870bf4d46141d22247675858ca4237999a1c12a8a"
+    },
+    {
+      "byte_count": 6553,
+      "path": "src/rquant/web/labels.py",
+      "sha256": "87c4f6a5110d6c09d9e7baf5e1c5777600582f189ac2ecc1017f34bac8dafe66"
+    },
+    {
+      "byte_count": 2752,
+      "path": "src/rquant/web/manual_watchlist_read.py",
+      "sha256": "6d862996023e9bea71e6b781b8fd7d97217c0e46ede71d80fcad47c7534ce0ac"
+    },
+    {
+      "byte_count": 2045,
+      "path": "src/rquant/web/market.py",
+      "sha256": "31648099645d55d1145f2217335696d65d2e0ca8953a7e11afa02c890ed70698"
+    },
+    {
+      "byte_count": 85,
+      "path": "src/rquant/web/models/__init__.py",
+      "sha256": "813a0f337bf4655cade9ec81dcf1d9382deff99e783f68816bce55d5201cdd85"
+    },
+    {
+      "byte_count": 1141,
+      "path": "src/rquant/web/models/alert_ack.py",
+      "sha256": "152d26405f375b743fbee61f39e59f596a2a422c5f25d812e18412d7214c343c"
+    },
+    {
+      "byte_count": 1227,
+      "path": "src/rquant/web/models/backfill_plan_commands.py",
+      "sha256": "3625e548b9e7cce578dfcbcbf78012bbe8721a97aea975953d6f6d7ab4a1fef3"
+    },
+    {
+      "byte_count": 5333,
+      "path": "src/rquant/web/models/backfill_plans.py",
+      "sha256": "288f876eb7e0ab4977c4b1f2a023cba6f886e3e102b48af1cfcda9b85fd89814"
+    },
+    {
+      "byte_count": 1800,
+      "path": "src/rquant/web/models/backtests.py",
+      "sha256": "66ec8e428686bfd5409996d3ae5dd39da5552e32c3959a609cf31c28eb293813"
+    },
+    {
+      "byte_count": 705,
+      "path": "src/rquant/web/models/common.py",
+      "sha256": "88844610a125180c06dd37947134043e19cd4257d113147878e468ccad4ec4da"
+    },
+    {
+      "byte_count": 1231,
+      "path": "src/rquant/web/models/data_audit.py",
+      "sha256": "a3966275ffaadc7a699a7bdcc23f75beb186122496d00afd2c88407e727e8345"
+    },
+    {
+      "byte_count": 8802,
+      "path": "src/rquant/web/models/data_audit_report.py",
+      "sha256": "b8a675dba2931de41f14bd17de2d5cb944bfacdb5d4a67eac52e4a6ebf58b42a"
+    },
+    {
+      "byte_count": 1233,
+      "path": "src/rquant/web/models/data_audit_report_commands.py",
+      "sha256": "755ca5a6dc86da8485a6d3e575fa206edfffda646a45f020b06e2bd5c98f4f0c"
+    },
+    {
+      "byte_count": 1681,
+      "path": "src/rquant/web/models/experiments.py",
+      "sha256": "f940d64a419e94a2561c0490d11bd991fcaafe413570184a0478e7baed3acf41"
+    },
+    {
+      "byte_count": 4142,
+      "path": "src/rquant/web/models/factor_results.py",
+      "sha256": "536cc3cafd4092a9e753628d48a72b3586db3b631fd7d2e6768da527794589b4"
+    },
+    {
+      "byte_count": 2455,
+      "path": "src/rquant/web/models/factors.py",
+      "sha256": "ea08735fb3d61c2dba0a48aaafce2a1210369956f989325551f0c0e7c02f1c8e"
+    },
+    {
+      "byte_count": 1124,
+      "path": "src/rquant/web/models/formula_market_commands.py",
+      "sha256": "f01ba10f38a0b144407884a792db764a77939762401afa97c36337505770cf60"
+    },
+    {
+      "byte_count": 1729,
+      "path": "src/rquant/web/models/formula_market_read.py",
+      "sha256": "e52eaa939c500e917ac915737d3363d610ac777bb7cb1b5e4b06a85045b3374f"
+    },
+    {
+      "byte_count": 1402,
+      "path": "src/rquant/web/models/formula_pool_read.py",
+      "sha256": "3d14a0aae3711b00989d10bb5506777b61126113ce536e4d93fe35a274fb6785"
+    },
+    {
+      "byte_count": 1432,
+      "path": "src/rquant/web/models/formula_pool_save_commands.py",
+      "sha256": "1fbbd18fac0d756517818e42c923f51fdda0864a323a21a158d07143fe3a242a"
+    },
+    {
+      "byte_count": 3475,
+      "path": "src/rquant/web/models/fundamentals.py",
+      "sha256": "be89aa90a35891d4601b91b78ea9a3ff9f1f3b068e0d4cf7b19a6f51e6678960"
+    },
+    {
+      "byte_count": 2087,
+      "path": "src/rquant/web/models/health.py",
+      "sha256": "3027b2912c38e14339b2647c787667e6b2fd27696007c3d7a0b1feb65cf8e5ce"
+    },
+    {
+      "byte_count": 1425,
+      "path": "src/rquant/web/models/lab_controls.py",
+      "sha256": "fa04fbbb4bf6dd444191cb67e57641e23caa627aa9930c9a8f792fb935850224"
+    },
+    {
+      "byte_count": 2984,
+      "path": "src/rquant/web/models/manual_watchlist.py",
+      "sha256": "6c6f7f81d164531b7719c01cd4358741eb0af0850ef0c2586d0ab431eee85c76"
+    },
+    {
+      "byte_count": 3980,
+      "path": "src/rquant/web/models/monitor.py",
+      "sha256": "d74755260825814df8a798805dfabb76439610b36f6096e84df22777ad760514"
+    },
+    {
+      "byte_count": 4415,
+      "path": "src/rquant/web/models/overview.py",
+      "sha256": "5fe3462f02e91d9ea548ae073652847306fe606562c50d2ce61e9acb39b73bfc"
+    },
+    {
+      "byte_count": 5183,
+      "path": "src/rquant/web/models/panorama.py",
+      "sha256": "08e09fb2a1121412e6fc627379dea809637d5e38984919a2aa152a2dffbb4fef"
+    },
+    {
+      "byte_count": 3174,
+      "path": "src/rquant/web/models/paper.py",
+      "sha256": "7b0bd3fda457381f94590bb6e41896a019b105f8581329a427a75dba7cd36db8"
+    },
+    {
+      "byte_count": 6168,
+      "path": "src/rquant/web/models/pool_editor.py",
+      "sha256": "ca19ac097ba07010d23277e57867c0ee7dff89afab4e3c0f52ecccf3764bbc49"
+    },
+    {
+      "byte_count": 2919,
+      "path": "src/rquant/web/models/pools.py",
+      "sha256": "e5ce2198a54a4e3efd22320d0bc1caf14a228aa95add6e7a93881617f63ba413"
+    },
+    {
+      "byte_count": 5338,
+      "path": "src/rquant/web/models/screen.py",
+      "sha256": "a19492c8951a9b1bd29f6ef77e2bcf0d015ef1bb96dfdfb1d6df64678f5a98c2"
+    },
+    {
+      "byte_count": 649,
+      "path": "src/rquant/web/models/stocks.py",
+      "sha256": "4bc78d129d393c1af828cf85045412f0e47915ef4f908517fd6604e2c371fb89"
+    },
+    {
+      "byte_count": 676,
+      "path": "src/rquant/web/models/strategies.py",
+      "sha256": "2a2c11a89a8fc0792687a27cb0117c4e5c78c6ab144d514f579a59f9ac11113c"
+    },
+    {
+      "byte_count": 5721,
+      "path": "src/rquant/web/models/tasks.py",
+      "sha256": "5936bcdd7e817c14923dc6b55106e347714ccfa2b7d9aeaba0d4b8b90f23e1fd"
+    },
+    {
+      "byte_count": 3773,
+      "path": "src/rquant/web/nl_parser.py",
+      "sha256": "e1499d6262ca5a980fc16a57412768a6c8611f85ed0324ede665b11a547eafe5"
+    },
+    {
+      "byte_count": 25962,
+      "path": "src/rquant/web/panorama.py",
+      "sha256": "fb4f25c726e737b531f4d6d7b82649438183b5e1f4c2c5a4da9225efbc34e682"
+    },
+    {
+      "byte_count": 11534,
+      "path": "src/rquant/web/paper_history.py",
+      "sha256": "abdeb6e857df763592f89ed32b9b19bcd28973e4838c4e90d16b4f49251065a7"
+    },
+    {
+      "byte_count": 4097,
+      "path": "src/rquant/web/pool_editor_gateway.py",
+      "sha256": "87f8730b8d51b069db27246ef781f35f4b8777a1468c0f8bd89135275a1a6724"
+    },
+    {
+      "byte_count": 10125,
+      "path": "src/rquant/web/pool_editor_read.py",
+      "sha256": "1df25b394c45b35bb88b910cdbf43794df0fdf6ba9dae47db9470461d2c1265a"
+    },
+    {
+      "byte_count": 7717,
+      "path": "src/rquant/web/pool_nl_preview.py",
+      "sha256": "0494559304f0300fdad4236ce1e5f0cdc29c1497498b07f4c9174ffd06cf21b6"
+    },
+    {
+      "byte_count": 10604,
+      "path": "src/rquant/web/pool_rule_view.py",
+      "sha256": "425cc1d842d98c6dcb1cf95b5de347d7869848c1704c1610b3cdf9c41fdcec1b"
+    },
+    {
+      "byte_count": 3298,
+      "path": "src/rquant/web/proxy_identity.py",
+      "sha256": "bb9ba719f5aea4866f4d7bf40df107acd8b4dd1ebcbdbc305d7bb8f1fff0bba3"
+    },
+    {
+      "byte_count": 6711,
+      "path": "src/rquant/web/readers.py",
+      "sha256": "3a94c249bdb0b8261f9b7bf6abd34c833bccff09ebcc7376b438de44273511e1"
+    },
+    {
+      "byte_count": 80,
+      "path": "src/rquant/web/routes/__init__.py",
+      "sha256": "d46e7100dfc9fa8c500b249dda68467e4a93fb8d5e4b43706d882cbcceb224b7"
+    },
+    {
+      "byte_count": 3415,
+      "path": "src/rquant/web/routes/backfill_plan_commands.py",
+      "sha256": "c70f8f48fc4b9078890ce57c43fade845241645b45ce7ebd96ddea80304f0912"
+    },
+    {
+      "byte_count": 18147,
+      "path": "src/rquant/web/routes/backfill_plans.py",
+      "sha256": "c3d9a0c08c9a12536599de29d31bd4b0af88045f6d7c20b71d5a7b58178e660c"
+    },
+    {
+      "byte_count": 9661,
+      "path": "src/rquant/web/routes/backtests.py",
+      "sha256": "90292bb31d6ad28fb26ab3c536696d6c87297bba1f96bce12a9f3f53a8add335"
+    },
+    {
+      "byte_count": 4992,
+      "path": "src/rquant/web/routes/catalog.py",
+      "sha256": "2431bb85a0ea70cb03f5aff021b5bf2dafb4612bb3fbc981db0b72589c2c8632"
+    },
+    {
+      "byte_count": 8964,
+      "path": "src/rquant/web/routes/data_audit.py",
+      "sha256": "af01a80b220fd8455c30eaad33b1372586526094db247b9bdcc39077fe6069c9"
+    },
+    {
+      "byte_count": 19366,
+      "path": "src/rquant/web/routes/data_audit_report.py",
+      "sha256": "0c6f2e97d010f9e34d946ba1967abcaf3e6cdcb259f37462431ecd280ad68dfa"
+    },
+    {
+      "byte_count": 5432,
+      "path": "src/rquant/web/routes/data_audit_report_calendar.py",
+      "sha256": "f1eb479e9085dee0e70534be4a1072b83f475f3940ad2d87525dc23018fa7854"
+    },
+    {
+      "byte_count": 3509,
+      "path": "src/rquant/web/routes/data_audit_report_commands.py",
+      "sha256": "c86b2e0cdb2d55619a6ca76a290716fdeaa89722db2b8dd49fa2123011bc33f8"
+    },
+    {
+      "byte_count": 9770,
+      "path": "src/rquant/web/routes/experiments.py",
+      "sha256": "5b51bf8369d643c0dfe9e0147d2ff6dc57523fae1932e85a3eb099d6ebb9164c"
+    },
+    {
+      "byte_count": 12720,
+      "path": "src/rquant/web/routes/factor_results.py",
+      "sha256": "6115f75cbf241acc818b3ab3a08d1d242a3bf15eb3923b81ecce30be2695d744"
+    },
+    {
+      "byte_count": 6058,
+      "path": "src/rquant/web/routes/factor_runs.py",
+      "sha256": "167ea5d38d4df01be7c7e60cdcadcbb652e54ad01be2d31a882799c87bf50de5"
+    },
+    {
+      "byte_count": 15090,
+      "path": "src/rquant/web/routes/factor_saves.py",
+      "sha256": "125cfce05e64279d9d9d4c744020a49063f9314a6f81451d13ed5b9dd2b3d5fa"
+    },
+    {
+      "byte_count": 12733,
+      "path": "src/rquant/web/routes/factor_tracking.py",
+      "sha256": "3d423967c985d500d1664a944b7066984e3c155cccc50fa7df851a5f0f674b39"
+    },
+    {
+      "byte_count": 18498,
+      "path": "src/rquant/web/routes/factors.py",
+      "sha256": "98492f32dd1b71a6f43e0509c203f391199f07e0cebbe0722cd65d4410352e4f"
+    },
+    {
+      "byte_count": 4816,
+      "path": "src/rquant/web/routes/formula_market_commands.py",
+      "sha256": "8ae21e00e1ad6261dd390ee0d9ba0d3e7a170d820a92a364fe737083ee9e0d42"
+    },
+    {
+      "byte_count": 14251,
+      "path": "src/rquant/web/routes/formula_market_read.py",
+      "sha256": "b9b16bde4dd1f9efa5f85d228c84192deff546c6eb04cede5066f3cc14a3fea7"
+    },
+    {
+      "byte_count": 11136,
+      "path": "src/rquant/web/routes/formula_pool_read.py",
+      "sha256": "7b6237160e0afeaf6920d93440b11de38edc64f5ca0e4188f07110c6a0b88133"
+    },
+    {
+      "byte_count": 3969,
+      "path": "src/rquant/web/routes/formula_pool_save_commands.py",
+      "sha256": "fe585fadd66c720cee6a807a7c8c7cb4b72a6099f548e280f5efe77d79a36152"
+    },
+    {
+      "byte_count": 3668,
+      "path": "src/rquant/web/routes/fundamentals.py",
+      "sha256": "a974aa75cdfe3b21a4f15f3dc8eef52c91baeac4a34988b3ea6f152b37a0c323"
+    },
+    {
+      "byte_count": 13251,
+      "path": "src/rquant/web/routes/health.py",
+      "sha256": "c4d47a3812da2322ba7e6722a329467bb96381411094a7f1adfc4eeac3b1643e"
+    },
+    {
+      "byte_count": 19358,
+      "path": "src/rquant/web/routes/manual_watchlist.py",
+      "sha256": "1d2507a1ab0d1fac8aa54eab34e6b3b4ec5dde62a8ad7d097f52300f1032c21d"
+    },
+    {
+      "byte_count": 6407,
+      "path": "src/rquant/web/routes/meta.py",
+      "sha256": "5495f835b04993589af4b8e74062fe0d9fbaf20fa3978f814ad097e3cfbd8a65"
+    },
+    {
+      "byte_count": 36104,
+      "path": "src/rquant/web/routes/monitor.py",
+      "sha256": "1e44644ea7b9249ac0a5efbb78011d6cbbe9098556d033f149f68bec1588c918"
+    },
+    {
+      "byte_count": 22030,
+      "path": "src/rquant/web/routes/overview.py",
+      "sha256": "334665eb0d7b1c436cb831f2d924c051f02de25ced24f7c7f2543baadf1b82fa"
+    },
+    {
+      "byte_count": 12167,
+      "path": "src/rquant/web/routes/panorama.py",
+      "sha256": "4984cebaa58e0b83e73baef14042c2583283a3b07d3b35513c4ca53e8288f5b9"
+    },
+    {
+      "byte_count": 8410,
+      "path": "src/rquant/web/routes/paper.py",
+      "sha256": "883a69b39a77596b332985fd7c0b53a80e14d481e793142b9f46348295a36c4f"
+    },
+    {
+      "byte_count": 15532,
+      "path": "src/rquant/web/routes/pool_editor.py",
+      "sha256": "447d05c3a1ec974c925d68fe51353e514d1fad2f2d44de5feab6173a06f78c61"
+    },
+    {
+      "byte_count": 26234,
+      "path": "src/rquant/web/routes/pools.py",
+      "sha256": "6a7d47a9f6fd9165df95283e82c3306c7d4070fec34db880ef80623bfff16a26"
+    },
+    {
+      "byte_count": 6846,
+      "path": "src/rquant/web/routes/research_query.py",
+      "sha256": "d7dba6f899a46bd57fae602924adf50c7339c1b0f0643612595332914ba24d4d"
+    },
+    {
+      "byte_count": 10079,
+      "path": "src/rquant/web/routes/screen.py",
+      "sha256": "e79fc38130074a8e3f42dd7ed313c4d231340e962d433716048a706d62612c49"
+    },
+    {
+      "byte_count": 10269,
+      "path": "src/rquant/web/routes/service_logs.py",
+      "sha256": "d48e974eea85456991a73f3a358d48007834cf716aa0b49cdd9978c498f13045"
+    },
+    {
+      "byte_count": 5677,
+      "path": "src/rquant/web/routes/stocks.py",
+      "sha256": "2e5cff70172fa657578c7f1885a7a24792bebdcd96fa85fe57615196095d57c6"
+    },
+    {
+      "byte_count": 4377,
+      "path": "src/rquant/web/routes/strategies.py",
+      "sha256": "cf736b789c04a2dab138299a4229227614539d059a03f6c550849bf8c3d85c48"
+    },
+    {
+      "byte_count": 25423,
+      "path": "src/rquant/web/routes/tasks.py",
+      "sha256": "73a488bc598f40b18ff358c3dfa41ce4dc101ec39b1ae8d4a9412847a7db5604"
+    },
+    {
+      "byte_count": 7739,
+      "path": "src/rquant/web/routes/tasks_controls.py",
+      "sha256": "00ff1d1270a6677d2492f7005789adcf5353adacdfa63a5894a6a9dde1f44b1d"
+    },
+    {
+      "byte_count": 15837,
+      "path": "src/rquant/web/screen_catalog.py",
+      "sha256": "07d385ff51889afb0da15aa8d119d1d6f4d1c0f678c94138f1e2d33cfa58a929"
+    },
+    {
+      "byte_count": 6175,
+      "path": "src/rquant/web/screen_nl_preview.py",
+      "sha256": "0ff89c3359ea864f5319bdbc6e6db04afb8cad22c99262e89778da050cf001a6"
+    },
+    {
+      "byte_count": 25391,
+      "path": "src/rquant/web/screen_service.py",
+      "sha256": "45d104d7605096fa3f32d58270cffc0596722ad68764c355b4726e1664c03c3e"
+    },
+    {
+      "byte_count": 4324,
+      "path": "src/rquant/web/security.py",
+      "sha256": "cbcecff16d03d5a4d5fe8f6deb0bb94b7afded0edc3be1e3a19a1ddf977913cc"
+    },
+    {
+      "byte_count": 6234,
+      "path": "src/rquant/web/service_log_access_audit.py",
+      "sha256": "979e96d6b8e3606f9a1cb196e4527f7d9b4c53e16c90cfa44838ea454d0cfdae"
+    },
+    {
+      "byte_count": 10845,
+      "path": "src/rquant/web/serving.py",
+      "sha256": "b64c560dc9664e4b2aa1360258c258f2bd89c2442f7aea21b6c5d0bab934d677"
+    },
+    {
+      "byte_count": 33913,
+      "path": "src/rquant/web/settings.py",
+      "sha256": "92ea5214fb29f07985c859f87bd020a1d7278249bd27edb22d3da7aa69e3d7d1"
+    },
+    {
+      "byte_count": 1635,
+      "path": "src/rquant/web/signal_display.py",
+      "sha256": "f254f3cb71909defaeb0179f6732bed5a6bbfa8d0f7d1bf9844ca4a69b087a41"
+    },
+    {
+      "byte_count": 11482,
+      "path": "src/rquant/web/status.py",
+      "sha256": "1ded0e85df832c75848e5fe038eae3ed0b0ab0561aee0418bf6d513b2e504ec1"
+    },
+    {
+      "byte_count": 15440,
+      "path": "src/rquant/web/task_overview.py",
+      "sha256": "69a30b4d0355abb3101f203c7b438da428da8b09c01d7cd7bc7850957109fe3d"
+    },
+    {
+      "byte_count": 21473,
+      "path": "src/rquant/workload_evidence.py",
+      "sha256": "27ce8e8e4d693968f91f2dcac8061bda2d66797ad83e9695d5cd0675cee563b8"
+    },
+    {
+      "byte_count": 55213,
+      "path": "src/rquant/workload_isolation.py",
+      "sha256": "f19c73b450b34591ad2f3b685bf4966743cb2f374e23838e228dcf9dc469d62b"
+    }
+  ]
+}

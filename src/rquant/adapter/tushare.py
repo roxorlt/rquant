@@ -5,10 +5,12 @@
 
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Callable
 from datetime import date, datetime
-from typing import Any, TypeVar
+from decimal import Decimal
+from typing import Any, Literal, TypeVar, cast
 
 import pandas as pd
 import tushare as ts
@@ -24,6 +26,43 @@ from rquant.trade_calendar import normalize_trade_calendar
 # 分页取数 / 多指数循环时相邻请求间隔（对齐 dataset_backfill._API_SLEEP）
 _PAGE_SLEEP = 0.35
 _T = TypeVar("_T")
+
+SDK_NULL_NORMALIZATION_VERSION = 'tushare-nullable-v1'
+_SDK_NULLABLE_FIELDS: dict[str,frozenset[str]] = {
+    'daily':frozenset(), 'adj_factor':frozenset(), 'stock_st':frozenset(),
+    'daily_basic':frozenset({'turnover_rate','volume_ratio','total_mv','circ_mv','pe_ttm','pb','dv_ttm'}),
+    'namechange':frozenset({'end_date','ann_date','change_reason'}),
+    'fina_indicator':frozenset({'ann_date','roe','or_yoy','netprofit_yoy'}),
+    'income':frozenset({'ann_date','f_ann_date','report_type'}),
+    'balancesheet':frozenset({'ann_date','f_ann_date','report_type'}),
+    'cashflow':frozenset({'ann_date','f_ann_date','report_type'}),
+    'forecast':frozenset({'ann_date','type'}), 'express':frozenset({'ann_date'}),
+    'dividend':frozenset({'div_proc'}),
+}
+
+
+def normalize_sdk_nullable_response(api_name: str,response: pd.DataFrame) -> pd.DataFrame:
+    """Keep SDK JSON null semantics in the frozen nullable-field whitelist."""
+    nullable=_SDK_NULLABLE_FIELDS.get(api_name,frozenset())
+    result=response.copy()
+    for column in result.columns:
+        values=[]
+        for value in result[column]:
+            is_nan=isinstance(value,float) and math.isnan(value)
+            if value is pd.NA or is_nan:
+                if column not in nullable:
+                    raise ValueError(
+                        'nonfinite or pandas missing value is outside nullable source fields'
+                    )
+                value=None
+            elif isinstance(value,float) and not math.isfinite(value):
+                raise ValueError('supplier infinity cannot become a missing value')
+            elif isinstance(value,Decimal) and not value.is_finite():
+                raise ValueError('supplier Decimal nonfinite value cannot become missing')
+            values.append(value)
+        if column in nullable:
+            result[column]=pd.Series(values,index=result.index,dtype=object)
+    return result
 
 #: `stk_auction` 向 Tushare 要、并且向下游保证一定出现的列，顺序与列集都与
 #: `rquant.auction_match_gateway.AUCTION_MATCH_COLUMNS` 逐字相同。这里不 import 那个模块
@@ -114,6 +153,7 @@ class TushareAdapter:
         token: str | None = None,
         backup_token: str | None = None,
         transport_observer: SourceTransportObserver | None = None,
+        *,sdk_null_normalization: Literal['tushare-nullable-v1'] | None = None,
     ) -> None:
         self._primary_token = token or _settings().tushare_token_main
         self._backup_token = (
@@ -122,6 +162,12 @@ class TushareAdapter:
         self._pro = ts.pro_api(self._primary_token)
         self._using_backup = False
         self._transport_observer = transport_observer
+        self._sdk_null_normalization = sdk_null_normalization
+
+    def bind_sdk_null_normalization(self,version: Literal['tushare-nullable-v1'] | None) -> None:
+        if version not in {None,SDK_NULL_NORMALIZATION_VERSION}:
+            raise ValueError('unknown source null normalization version')
+        self._sdk_null_normalization=version
 
     def bind_transport_observer(
         self,
@@ -131,6 +177,18 @@ class TushareAdapter:
 
     def _transport_call(self, api_name: str, call: Callable[[], _T]) -> _T:
         observer = getattr(self, "_transport_observer", None)
+        if getattr(self,'_sdk_null_normalization',None) is not None:
+            if observer is None:
+                raise SourceQuotaConflictError(
+                    'source null normalization requires a bound original observer'
+                )
+            original=call
+            def normalized() -> _T:
+                result=original()
+                if not isinstance(result,pd.DataFrame):
+                    raise ValueError('normalized supplier response must be a table')
+                return cast(_T,normalize_sdk_nullable_response(api_name,result))
+            call=normalized
         if observer is None:
             return call()
         return observer.observe(api_name, call)
@@ -255,6 +313,67 @@ class TushareAdapter:
                 time.sleep(wait)
         return None
 
+    def _financial_raw(self,api_name: str,parameters: dict[str,str]) -> pd.DataFrame:
+        required=(
+            {'ts_code','period'} if api_name=='fina_indicator'
+            else {'ts_code','ann_date'} if api_name=='dividend'
+            else {'ts_code','start_date','end_date'}
+        )
+        if (
+            api_name not in {
+                'fina_indicator','income','balancesheet','cashflow','forecast','express','dividend'
+            }
+            or set(parameters)!=required
+        ):
+            raise ValueError('financial SDK request is outside the original whitelist')
+        for name,value in parameters.items():
+            if name=='ts_code':
+                if (
+                    len(value)!=9 or value[:6].isdigit() is False
+                    or value[6:] not in {'.SH','.SZ','.BJ'}
+                ):
+                    raise ValueError('financial SDK security is invalid')
+            elif (
+                len(value)!=8 or not value.isascii() or not value.isdigit()
+                or datetime.strptime(value,'%Y%m%d').strftime('%Y%m%d')!=value
+            ):
+                raise ValueError('financial SDK date is invalid')
+        if parameters.get('start_date','')>parameters.get('end_date','99999999'):
+            raise ValueError('financial SDK date window is reversed')
+        result=self._call_with_backoff(api_name,lambda:getattr(self._pro,api_name)(**parameters))
+        return pd.DataFrame() if result is None else result
+
+    def fina_indicator(self,*,ts_code: str,period: str) -> pd.DataFrame:
+        return self._financial_raw('fina_indicator',{'ts_code':ts_code,'period':period})
+
+    def income(self,*,ts_code: str,start_date: str,end_date: str) -> pd.DataFrame:
+        return self._financial_raw(
+            'income',{'ts_code':ts_code,'start_date':start_date,'end_date':end_date}
+        )
+
+    def balancesheet(self,*,ts_code: str,start_date: str,end_date: str) -> pd.DataFrame:
+        return self._financial_raw(
+            'balancesheet',{'ts_code':ts_code,'start_date':start_date,'end_date':end_date}
+        )
+
+    def cashflow(self,*,ts_code: str,start_date: str,end_date: str) -> pd.DataFrame:
+        return self._financial_raw(
+            'cashflow',{'ts_code':ts_code,'start_date':start_date,'end_date':end_date}
+        )
+
+    def forecast(self,*,ts_code: str,start_date: str,end_date: str) -> pd.DataFrame:
+        return self._financial_raw(
+            'forecast',{'ts_code':ts_code,'start_date':start_date,'end_date':end_date}
+        )
+
+    def express(self,*,ts_code: str,start_date: str,end_date: str) -> pd.DataFrame:
+        return self._financial_raw(
+            'express',{'ts_code':ts_code,'start_date':start_date,'end_date':end_date}
+        )
+
+    def dividend(self,*,ts_code: str,ann_date: str) -> pd.DataFrame:
+        return self._financial_raw('dividend',{'ts_code':ts_code,'ann_date':ann_date})
+
     def trade_cal_raw(self, start: date, end: date, exchange: str = "SSE") -> pd.DataFrame:
         """Return all known civil dates, including weekends and exchange holidays."""
         columns = ["exchange", "cal_date", "is_open", "pretrade_date"]
@@ -265,7 +384,11 @@ class TushareAdapter:
         logger.info(f"Tushare trade_cal 请求：exchange={exchange} start={start_str} end={end_str}")
 
         try:
-            df = self._pro.trade_cal(exchange=exchange, start_date=start_str, end_date=end_str)
+            df = self._transport_call('trade_cal',lambda: self._pro.trade_cal(
+                exchange=exchange,start_date=start_str,end_date=end_str,
+            ))
+        except (SourceQuotaConflictError,SourceQuotaExhaustedError):
+            raise
         except Exception as e:
             if self._switch_to_backup():
                 df = self._pro.trade_cal(exchange=exchange, start_date=start_str, end_date=end_str)
@@ -348,6 +471,19 @@ class TushareAdapter:
         logger.info(f"Tushare namechange 返回 {len(normalized)} 行")
         return normalized
 
+    def namechange_history_raw(self, *, ts_code: str) -> pd.DataFrame:
+        """Preserve one code's history; start/end would filter announcement dates."""
+        frame = self._call_with_backoff(
+            "namechange",
+            lambda: self._pro.namechange(
+                ts_code=ts_code,
+                fields="ts_code,name,start_date,end_date,ann_date,change_reason",
+            ),
+        )
+        if not isinstance(frame, pd.DataFrame):
+            raise ValueError("namechange response is not a table")
+        return frame
+
     def suspend_d_raw(self, trade_date: date) -> pd.DataFrame:
         """Fetch the full-market suspend/resume event snapshot for one date."""
         columns = ["ts_code", "trade_date", "suspend_timing", "suspend_type"]
@@ -405,9 +541,9 @@ class TushareAdapter:
         return df
 
     def daily_basic_by_date(self, trade_date: date) -> pd.DataFrame:
-        """按交易日拉全市场每日基本面指标（历史回补用，字段对齐 daily_basic 表）。"""
+        """按交易日拉全市场每日指标，含旧表字段和 PIT 估值观察字段。"""
         ds = trade_date.strftime("%Y%m%d")
-        fields = "ts_code,trade_date,turnover_rate,volume_ratio,total_mv,circ_mv"
+        fields = "ts_code,trade_date,turnover_rate,volume_ratio,total_mv,circ_mv,pe_ttm,pb,dv_ttm"
         logger.info(f"Tushare daily_basic(by_date) 请求：trade_date={ds}")
 
         df = self._call_with_backoff(
@@ -850,7 +986,7 @@ class TushareAdapter:
         logger.info(f"Tushare daily_basic 返回 {len(df)} 行")
         return df
 
-    def stock_basic(self, list_status: str = "L") -> pd.DataFrame:
+    def stock_basic(self, list_status: str = "L", exchange: str = "") -> pd.DataFrame:
         """股票基础信息（代码 / 名称 / 行业 / 上市日期 / 退市日期等）。
 
         list_status: L=上市, D=退市, P=暂停上市
@@ -861,15 +997,8 @@ class TushareAdapter:
         `stock_basic source is missing columns: delist_date` 失败、一次都没发布过。
         空结果也保持列齐全（#277 同一类）：零行但没有列的表会被校验当成「缺列」整批拒。
         """
-        logger.info(f"Tushare stock_basic 请求：list_status={list_status}")
-        df = self._call_with_backoff(
-            "stock_basic",
-            lambda: self._pro.stock_basic(
-                exchange="",
-                list_status=list_status,
-                fields=",".join(STOCK_BASIC_COLUMNS),
-            ),
-        )
+        logger.info(f"Tushare stock_basic 请求：exchange={exchange} list_status={list_status}")
+        df = self._stock_basic_raw(list_status=list_status, exchange=exchange)
         if df is None or df.empty:
             logger.info(f"Tushare stock_basic 成功返回空：list_status={list_status}")
             return pd.DataFrame(
@@ -877,6 +1006,59 @@ class TushareAdapter:
             )
         logger.info(f"Tushare stock_basic 返回 {len(df)} 行")
         return df
+
+    def stock_basic_partition(self, *, list_status: str, exchange: str) -> pd.DataFrame:
+        """Return one raw source partition, refusing ambiguous empty responses."""
+        df = self._stock_basic_raw(list_status=list_status, exchange=exchange)
+        if not isinstance(df, pd.DataFrame):
+            raise RuntimeError("Tushare stock_basic partition did not return a table")
+        missing = set(STOCK_BASIC_COLUMNS) - set(df.columns)
+        if missing:
+            raise RuntimeError(
+                "Tushare stock_basic partition missing columns: " + ", ".join(sorted(missing))
+            )
+        return df
+
+    def _stock_basic_raw(self, *, list_status: str, exchange: str) -> pd.DataFrame | None:
+        return self._call_with_backoff(
+            "stock_basic",
+            lambda: self._pro.stock_basic(
+                exchange=exchange,
+                list_status=list_status,
+                fields=",".join(STOCK_BASIC_COLUMNS),
+            ),
+        )
+
+    def stock_basic_history_raw(self, *, list_status: str, exchange: str) -> pd.DataFrame:
+        """Preserve one explicit listing partition, including malformed response columns."""
+        if list_status not in {"L", "D", "P", "G", "UN"}:
+            raise ValueError("unsupported historical stock_basic list_status")
+        if exchange not in {"", "SSE", "SZSE", "BSE"}:
+            raise ValueError("unsupported historical stock_basic exchange")
+        frame = self._call_with_backoff(
+            "stock_basic",
+            lambda: self._pro.stock_basic(
+                exchange=exchange,
+                list_status=list_status,
+                fields="ts_code,name,exchange,curr_type,market,list_status,list_date,delist_date",
+            ),
+        )
+        if not isinstance(frame, pd.DataFrame):
+            raise RuntimeError("Tushare stock_basic history did not return a table")
+        return frame
+
+    def bak_basic_raw(self, trade_date: date) -> pd.DataFrame:
+        """Preserve the provider's daily names and listing dates without filling gaps."""
+        frame = self._call_with_backoff(
+            "bak_basic",
+            lambda: self._pro.bak_basic(
+                trade_date=trade_date.strftime("%Y%m%d"),
+                fields="trade_date,ts_code,name,list_date",
+            ),
+        )
+        if not isinstance(frame, pd.DataFrame):
+            raise RuntimeError("Tushare bak_basic did not return a table")
+        return frame
 
     # ══ 统一数据集回补层薄方法（dataset_backfill 注册表用） ══════════════════
     # 各方法 docstring 里的字段清单为 2026-07-01 trade_date=20260701 实测返回。

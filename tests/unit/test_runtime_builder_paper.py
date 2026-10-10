@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Callable
+from contextlib import closing
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -32,6 +34,7 @@ from rquant.signal_router_runtime import (
 )
 from rquant.strategy_runner import RunnerSignalRecord
 from tests.paper_cost_fixtures import paper_execution_cost_spec, paper_instrument_context
+from tests.unit.test_paper_broker import _intent, _quote
 
 NOW = datetime(2026, 7, 31, 1, 30, tzinfo=UTC)
 COMMIT = "a" * 40
@@ -173,6 +176,63 @@ def test_paper_consumer_delegates_signal_with_durable_cursor(tmp_path: Path) -> 
     assert replay.output_sequence == 1
 
 
+def test_v1_paper_broker_rejects_real_mixed_spool_without_advancing(tmp_path: Path) -> None:
+    from rquant.paper_signal_consumer import PaperSignalConsumerStateStore
+    from rquant.signal_route_spool import publish_mixed_notification_bus_prefix
+    from tests.unit.test_price_alert_event_contracts import AT
+    from tests.unit.test_price_alert_route_spool import mixed_fixture
+
+    producer, bus, _activation, _one, _price, _three = mixed_fixture(tmp_path)
+    try:
+        publish_mixed_notification_bus_prefix(
+            bus=bus,
+            spool=SignalRouteSpool(tmp_path / "signal-spool"),
+            limit=100,
+            observed_at=AT,
+        )
+        state = PaperSignalConsumerStateStore(tmp_path / "consumer.sqlite3")
+        before = state.cursor()
+        step = paper_broker_builder(
+            clock=lambda: AT,
+            quote_resolver=lambda *args: pytest.fail("rejected source must not execute"),
+            trade_date_resolver=lambda now: now.date(),
+        )(_manifest(tmp_path, RuntimeServiceKind.PAPER_BROKER))
+        with pytest.raises((TypeError, ValueError, RuntimeError)):
+            step()
+        assert state.cursor() == before
+        with closing(sqlite3.connect(tmp_path / "queue.sqlite3")) as connection:
+            assert connection.execute("SELECT COUNT(*) FROM paper_signal_queue").fetchone()[0] == 0
+        with closing(sqlite3.connect(tmp_path / "broker.sqlite3")) as connection:
+            assert connection.execute("SELECT COUNT(*) FROM paper_order").fetchone()[0] == 0
+    finally:
+        producer.close()
+
+
+@pytest.mark.parametrize("fault", ["partial", "protocol", "owner"])
+def test_paper_broker_rejects_invalid_owner_history_at_build(tmp_path: Path, fault: str) -> None:
+    from rquant.paper_signal_consumer import PaperSignalConsumerStateStore
+
+    state = PaperSignalConsumerStateStore(tmp_path / "consumer.sqlite3")
+    state.install_mixed_notification_history()
+    with closing(sqlite3.connect(state.path)) as connection, connection:
+        if fault == "partial":
+            connection.execute("DROP TABLE paper_price_non_trading_receipt")
+        elif fault == "protocol":
+            connection.execute("UPDATE paper_notification_history SET protocol='invalid'")
+        else:
+            connection.execute(
+                "UPDATE paper_notification_history SET consumer_fingerprint=?", ("f" * 64,)
+            )
+    before = state.cursor()
+    with pytest.raises(ValueError, match="paper mixed history"):
+        paper_broker_builder(
+            clock=lambda: NOW,
+            quote_resolver=lambda *args: pytest.fail("invalid owner must not execute"),
+            trade_date_resolver=lambda now: now.date(),
+        )(_manifest(tmp_path, RuntimeServiceKind.PAPER_BROKER))
+    assert state.cursor() == before
+
+
 def test_retired_paper_consumer_pause_never_advances_its_cursor(tmp_path: Path) -> None:
     bus = SignalBusStore(tmp_path / "bus.sqlite3")
     bus.ingest(_signal(), received_at=NOW)
@@ -278,7 +338,13 @@ def test_paper_broker_publishes_account_authority_with_explicit_stale_marks(
     assert isinstance(authority.payload, PaperAccountsPayload)
     account = authority.payload.paper_accounts[0]
     assert account.holdings[0].market_price == Decimal("10.00")
-    assert authority.sequence == 1
+    projections = {item.table_name: item for item in authority.payload.projections}
+    assert set(projections) == {"paper_order_window", "paper_order_history", "paper_fill_history"}
+    assert projections["paper_order_window"].rows[0]["total_orders"] == 1
+    assert projections["paper_order_window"].rows[0]["retained_fills"] == 1
+    assert len(projections["paper_order_history"].rows) == 1
+    assert len(projections["paper_fill_history"].rows) == 1
+    assert authority.sequence >= 1
     assert first.source_generations[PAPER_ACCOUNTS_DATASET_ID] == authority.generation_id
     assert replay.source_generations[PAPER_ACCOUNTS_DATASET_ID] == authority.generation_id
 
@@ -318,6 +384,213 @@ def test_paused_paper_broker_publishes_empty_fresh_account_without_advancing(
     assert authority.status is FreshnessStatus.FRESH
     assert isinstance(authority.payload, PaperAccountsPayload)
     assert authority.payload.paper_accounts[0].holdings == ()
+    assert authority.payload.projections[0].table_name == "paper_order_window"
+    assert authority.payload.projections[0].rows[0]["total_orders"] == 0
+
+
+def test_rejected_order_advances_history_without_changing_account_balance(
+    tmp_path: Path,
+) -> None:
+    _publish_signal(tmp_path)
+    authority_root = tmp_path / "paper-authority"
+    settings = {
+        **_broker_settings(tmp_path),
+        "paused": True,
+        "serving_authority_root": str(authority_root),
+    }
+    manifest = RuntimeServiceManifest(
+        **{
+            **_manifest(tmp_path, RuntimeServiceKind.PAPER_BROKER).model_dump(mode="json"),
+            "settings": settings,
+        }
+    )
+    times = iter((NOW, NOW, NOW + timedelta(minutes=2), NOW + timedelta(minutes=2)))
+    step = paper_broker_builder(
+        clock=lambda: next(times),
+        quote_resolver=lambda *_args: object(),  # type: ignore[arg-type]
+        trade_date_resolver=lambda _now: date(2026, 7, 31),
+    )(manifest)
+    first = step()
+    reader = ServingSourceAuthorityReader(
+        root=authority_root,
+        expected_producer_commit=COMMIT,
+        expected_dataset_id=PAPER_ACCOUNTS_DATASET_ID,
+        expected_payload_kind="paper_accounts",
+    )
+    before = reader(NOW)
+    from rquant.paper_broker import BrokerCostPolicy, PaperBrokerStore
+
+    store = PaperBrokerStore(
+        Path(settings["broker_path"]),
+        account_id="paper-main",
+        initial_cash=Decimal("100000"),
+        cost_policy=BrokerCostPolicy.from_execution_cost_spec(paper_execution_cost_spec()),
+    )
+    store.submit_intent(
+        _intent(account_id="paper-main", event_time=NOW + timedelta(minutes=1)),
+        decision_time=NOW + timedelta(minutes=1, seconds=2),
+        trade_date=date(2026, 7, 31),
+        quote=_quote("10.00", suspended=True),
+    )
+    second = step()
+    after = reader(NOW + timedelta(minutes=2))
+
+    assert (
+        first.source_generations[PAPER_ACCOUNTS_DATASET_ID]
+        != second.source_generations[PAPER_ACCOUNTS_DATASET_ID]
+    )
+    assert isinstance(before.payload, PaperAccountsPayload)
+    assert isinstance(after.payload, PaperAccountsPayload)
+    assert before.payload.paper_accounts == after.payload.paper_accounts
+    assert after.sequence > before.sequence
+    window = next(
+        item for item in after.payload.projections if item.table_name == "paper_order_window"
+    )
+    assert window.rows[0]["total_orders"] == 1
+
+
+def test_new_close_evidence_advances_source_once_and_survives_replay(tmp_path: Path) -> None:
+    _publish_signal(tmp_path)
+    from rquant.paper_broker import BrokerCostPolicy, PaperBrokerStore
+    from rquant.paper_contracts import PaperOrderStatus, PaperOrderType
+
+    authority_root = tmp_path / "paper-authority"
+    settings = {
+        **_broker_settings(tmp_path),
+        "paused": True,
+        "serving_authority_root": str(authority_root),
+    }
+    manifest = RuntimeServiceManifest(
+        **{
+            **_manifest(tmp_path, RuntimeServiceKind.PAPER_BROKER).model_dump(mode="json"),
+            "settings": settings,
+        }
+    )
+    observed_at = datetime.now(UTC) + timedelta(minutes=1)
+    times = iter(
+        (
+            observed_at,
+            observed_at,
+            observed_at + timedelta(minutes=1),
+            observed_at + timedelta(minutes=1),
+            observed_at + timedelta(minutes=2),
+            observed_at + timedelta(minutes=2),
+        )
+    )
+    step = paper_broker_builder(
+        clock=lambda: next(times),
+        quote_resolver=lambda *_args: object(),  # type: ignore[arg-type]
+        trade_date_resolver=lambda _now: date(2026, 7, 31),
+    )(manifest)
+    store = PaperBrokerStore(
+        Path(settings["broker_path"]),
+        account_id="paper-main",
+        initial_cash=Decimal("100000"),
+        cost_policy=BrokerCostPolicy.from_execution_cost_spec(paper_execution_cost_spec()),
+    )
+    accepted = store.submit_intent(
+        _intent(
+            account_id="paper-main",
+            order_type=PaperOrderType.LIMIT,
+            limit_price=Decimal("9.90"),
+            event_time=NOW - timedelta(seconds=2),
+        ),
+        decision_time=NOW,
+        trade_date=date(2026, 7, 31),
+        quote=_quote("10.00"),
+    )
+    first = step()
+    store.close_open_order(
+        accepted.order_id,
+        status=PaperOrderStatus.CANCELLED,
+        decided_at=NOW + timedelta(minutes=1),
+    )
+    second = step()
+    replay = step()
+
+    assert (
+        first.source_generations[PAPER_ACCOUNTS_DATASET_ID]
+        != second.source_generations[PAPER_ACCOUNTS_DATASET_ID]
+    )
+    assert (
+        replay.source_generations[PAPER_ACCOUNTS_DATASET_ID]
+        == second.source_generations[PAPER_ACCOUNTS_DATASET_ID]
+    )
+    authority = ServingSourceAuthorityReader(
+        root=authority_root,
+        expected_producer_commit=COMMIT,
+        expected_dataset_id=PAPER_ACCOUNTS_DATASET_ID,
+        expected_payload_kind="paper_accounts",
+    )(observed_at + timedelta(minutes=2))
+    assert isinstance(authority.payload, PaperAccountsPayload)
+    order_rows = next(
+        item.rows
+        for item in authority.payload.projections
+        if item.table_name == "paper_order_history"
+    )
+    assert order_rows[0]["status"] == PaperOrderStatus.CANCELLED.value
+
+
+def test_existing_account_only_authority_upgrades_to_history_source(tmp_path: Path) -> None:
+    _publish_signal(tmp_path)
+    from rquant.paper_broker import BrokerCostPolicy, PaperBrokerStore
+    from rquant.runtime_contracts import canonical_sha256
+    from rquant.runtime_serving_authority import ServingSourceAuthorityPublisher
+    from rquant.runtime_serving_snapshot import SourceReadResult
+    from rquant.serving_contracts import FreshnessStatus
+
+    settings = {
+        **_broker_settings(tmp_path),
+        "paused": True,
+        "serving_authority_root": str(tmp_path / "paper-authority"),
+    }
+    store = PaperBrokerStore(
+        Path(settings["broker_path"]),
+        account_id="paper-main",
+        initial_cash=Decimal("100000"),
+        cost_policy=BrokerCostPolicy.from_execution_cost_spec(paper_execution_cost_spec()),
+    )
+    account = store.account_authority_snapshot(as_of=NOW, market_prices={}, producer_commit=COMMIT)
+    legacy: dict[str, object] = {
+        "dataset_id": "paper_accounts",
+        "sequence": account.revision,
+        "event_time": NOW,
+        "published_at": NOW,
+        "status": FreshnessStatus.FRESH,
+        "reason": None,
+        "payload": PaperAccountsPayload(paper_accounts=(account.snapshot,)),
+    }
+    legacy["generation_id"] = canonical_sha256(legacy)
+    ServingSourceAuthorityPublisher(
+        root=Path(settings["serving_authority_root"]),
+        producer_commit=COMMIT,
+        dataset_id="paper_accounts",
+        payload_kind="paper_accounts",
+        clock=lambda: NOW,
+    ).publish(SourceReadResult.model_validate(legacy))
+    manifest = RuntimeServiceManifest(
+        **{
+            **_manifest(tmp_path, RuntimeServiceKind.PAPER_BROKER).model_dump(mode="json"),
+            "settings": settings,
+        }
+    )
+    step = paper_broker_builder(
+        clock=lambda: NOW + timedelta(minutes=1),
+        quote_resolver=lambda *_args: object(),  # type: ignore[arg-type]
+        trade_date_resolver=lambda _now: date(2026, 7, 31),
+    )(manifest)
+
+    result = step()
+    current = ServingSourceAuthorityReader(
+        root=Path(settings["serving_authority_root"]),
+        expected_producer_commit=COMMIT,
+        expected_dataset_id=PAPER_ACCOUNTS_DATASET_ID,
+        expected_payload_kind="paper_accounts",
+    )(NOW + timedelta(minutes=1))
+
+    assert isinstance(current.payload, PaperAccountsPayload)
+    assert len(current.payload.projections) == 3
+    assert result.source_generations[PAPER_ACCOUNTS_DATASET_ID] == current.generation_id
 
 
 def test_paper_broker_default_loader_binds_manifest_pit_authorities(

@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+from rquant.paper_research import PaperResearchAdapterCatalog
+
 import re
 import stat
 from collections.abc import Callable
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Annotated, Literal, TypeAlias
+from typing import TYPE_CHECKING, Annotated, Literal, TypeAlias
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
@@ -17,6 +19,7 @@ from rquant.definition_registry import ImmutableDefinitionRegistry, StrategySpec
 from rquant.experiment_registry import (
     ExperimentAttempt,
     ExperimentRegistry,
+    ExperimentRegistryReadonlyReader,
     ExperimentSubmissionIntent,
     FormalExperimentPlan,
     IncompleteHypothesisFamilyError,
@@ -40,6 +43,8 @@ from rquant.lab_jobs import (
     JobStatus,
     LabJobReader,
 )
+from rquant.lab_scheduling_control import LabSchedulingCommandEnvelope, LabSchedulingCommandReceipt, LabSchedulingSubmission
+from rquant.portfolio_backtest_adapter import PortfolioBacktestRunInput
 from rquant.research_gate import ResearchGateDecision
 from rquant.research_run_spec import (
     DatasetSnapshotIdentity,
@@ -54,7 +59,7 @@ from rquant.research_run_spec import (
     ResourceClass,
     StrategyExecutionIdentity,
 )
-from rquant.runtime_contracts import canonical_sha256
+from rquant.runtime_contracts import canonical_sha256, normalize_aware_utc
 from rquant.strategy_job_adapters import (
     AuctionGapParameters,
     GrowthBoardSurgeParameters,
@@ -63,11 +68,26 @@ from rquant.strategy_job_adapters import (
     build_adapter_execution_contract,
     default_strategy_job_adapter_registry,
 )
-from rquant.strict_json import canonical_json_bytes
+from rquant.strategy_template_adapter import (
+    StrategyTemplateAdapterCatalog,
+    StrategyTemplateRunInput,
+    strategy_template_adapter_registry,
+    template_adapter_id,
+)
+from rquant.strict_json import canonical_json_bytes, strict_model_validate_json
+from rquant.minute_backtest_formal_adapter import MinuteFormalRunInput, minute_formal_adapter_registry
+from rquant.minute_backtest_producer import MinuteReplayCatalog
+from rquant.minute_backtest_parameter_adapter import MinuteParameterFormalReplayAdapter, MinuteParameterFormalRunInput
+from rquant.minute_backtest_parameter_producer import MinuteParameterReplayCatalog, MinuteParameterResolvedReadUnit
+from rquant.strategy_job_adapters import StrategyJobAdapterRegistry
 
 _CLEAN_CODE_SHA = re.compile(r"^[0-9a-f]{40}$")
 _MAX_RESEARCH_DATE_SPAN_DAYS = 5 * 366
 _MAX_WALK_FORWARD_FOLDS = 64
+_MAX_PRIVATE_PUBLICATION_BYTES = 1024 * 1024
+
+if TYPE_CHECKING:
+    from rquant.experiment_platform import ExperimentChildAdmission, ExperimentPlatformStore
 
 ResearchJobSubmissionErrorCode: TypeAlias = Literal[
     "input_bounds",
@@ -130,7 +150,11 @@ ResearchRunInput: TypeAlias = Annotated[
     NShapeComparisonRunInput
     | NShapeOptimizationRunInput
     | AuctionGapRunInput
-    | GrowthBoardSurgeRunInput,
+    | GrowthBoardSurgeRunInput
+    | StrategyTemplateRunInput
+    | PortfolioBacktestRunInput
+    | MinuteFormalRunInput
+    | MinuteParameterFormalRunInput,
     Field(discriminator="kind"),
 ]
 
@@ -220,6 +244,24 @@ def _run_identity(
             "growth-board-surge",
             run_input.parameters,
         )
+    if isinstance(run_input, StrategyTemplateRunInput):
+        return (
+            run_input.parameters.strategy_id,
+            ResearchJobType.STRATEGY_REPLAY,
+            template_adapter_id(run_input.parameters.strategy_id),
+            run_input.parameters,
+        )
+    if isinstance(run_input, PortfolioBacktestRunInput):
+        return (
+            "portfolio_backtest",
+            ResearchJobType.STRATEGY_REPLAY,
+            "portfolio-backtest",
+            run_input.parameters,
+        )
+    if isinstance(run_input, MinuteParameterFormalRunInput):
+        return ("minute_parameter_replay", ResearchJobType.STRATEGY_REPLAY, "minute-parameter-replay", run_input.parameters)
+    if isinstance(run_input, MinuteFormalRunInput):
+        return ("minute_runtime_replay", ResearchJobType.STRATEGY_REPLAY, "minute-runtime-replay", run_input.parameters)
     raise TypeError(f"unsupported research run input: {type(run_input).__name__}")
 
 
@@ -285,9 +327,28 @@ def _validate_run_input_bounds(run_input: ResearchRunInput) -> None:
             )
 
 
-def _preflight_research_plan(spec: ResearchRunSpec) -> None:
+def _preflight_research_plan(
+    spec: ResearchRunSpec,
+    *,
+    template_catalog: StrategyTemplateAdapterCatalog | None = None,
+    paper_catalog: PaperResearchAdapterCatalog | None = None,
+    minute_catalog: MinuteReplayCatalog | None = None,
+    parameter_catalog: MinuteParameterReplayCatalog | None = None,
+) -> None:
     try:
-        definitions = default_strategy_job_adapter_registry().plan(spec)
+        from rquant.paper_research_adapter import paper_research_adapter_registry
+        if sum(x is not None for x in (template_catalog, paper_catalog, minute_catalog, parameter_catalog)) > 1:
+            raise ValueError("one original plan requires one exact owned catalog")
+        registry = (
+            (default_strategy_job_adapter_registry() if paper_catalog is None else paper_research_adapter_registry(paper_catalog))
+            if template_catalog is None
+            else strategy_template_adapter_registry(template_catalog)
+        )
+        if minute_catalog is not None:
+            registry = minute_formal_adapter_registry(minute_catalog)
+        if parameter_catalog is not None:
+            registry = StrategyJobAdapterRegistry((MinuteParameterFormalReplayAdapter(parameter_catalog),))
+        definitions = registry.plan(spec)
     except (OverflowError, TypeError, ValueError, ValidationError) as exc:
         raise ResearchJobSubmissionError("adapter_plan", str(exc)) from exc
     if len(definitions) > MAX_JOB_SHARDS:
@@ -334,6 +395,9 @@ def build_research_job_submission(
     max_attempts: int = 1,
     trusted_strategy_registration: StrategySpecRegistration | None = None,
     formal_experiment_plan: FormalExperimentPlan | None = None,
+    template_catalog: StrategyTemplateAdapterCatalog | None = None,
+    minute_catalog: MinuteReplayCatalog | None = None,
+    parameter_catalog: MinuteParameterReplayCatalog | None = None,
 ) -> ResearchJobSubmission:
     decision = ResearchGateDecision.model_validate(gate_decision)
     if not decision.allowed:
@@ -344,13 +408,25 @@ def build_research_job_submission(
     _validate_gate_snapshot(decision, dataset_snapshot)
     strategy_name, job_type, adapter_id, typed_parameters = _run_identity(run_input)
     _validate_run_input_bounds(run_input)
-    expected_contract = build_adapter_execution_contract(adapter_id, "1", code_sha)
+    parameter_run = isinstance(run_input, MinuteParameterFormalRunInput)
+    native_minute_run = isinstance(run_input, MinuteFormalRunInput) and not parameter_run
+    adapter_version = "2" if native_minute_run else "1"
+    if native_minute_run and minute_catalog is None:
+        raise PermissionError("minute formal submission requires an installed independent catalog")
+    if minute_catalog is not None and not native_minute_run:
+        raise PermissionError("minute catalog cannot grant authority to another research input")
+    if parameter_run and parameter_catalog is None:
+        raise PermissionError("parameter formal submission requires its complete installed fact catalog")
+    if parameter_catalog is not None and not parameter_run:
+        raise PermissionError("parameter catalog cannot grant authority to another research input")
+    expected_contract = build_adapter_execution_contract(adapter_id, adapter_version, code_sha)
     if feature_contract != expected_contract:
         raise ValueError("feature contract does not match the typed adapter and code SHA")
     try:
         arguments = tuple(
             _research_parameter(name, getattr(typed_parameters, name))
             for name in type(typed_parameters).model_fields
+            if not (parameter_run and name == "prepared_publication_json" and getattr(typed_parameters, name) is None)
         )
         parameters = ResearchRunParameters(
             strategy_name=strategy_name,
@@ -362,7 +438,7 @@ def build_research_job_submission(
             decision=decision,
             strategy_name=strategy_name,
             adapter_id=adapter_id,
-            adapter_version="1",
+            adapter_version=adapter_version,
             code_sha=code_sha,
             deadline=deadline,
             dataset_snapshot=dataset_snapshot,
@@ -390,7 +466,8 @@ def build_research_job_submission(
         )
     except (TypeError, ValueError, ValidationError) as exc:
         raise ResearchJobSubmissionError("input_bounds", str(exc)) from exc
-    _preflight_research_plan(spec)
+    _preflight_research_plan(spec, template_catalog=template_catalog, minute_catalog=minute_catalog,
+        parameter_catalog=parameter_catalog)
     command = SubmitJobCommand(
         job_id=job_id,
         spec=spec,
@@ -577,6 +654,11 @@ CommandSubmissionResult: TypeAlias = Annotated[
 ]
 
 
+if TYPE_CHECKING:
+    from rquant.strategy_template_runtime import StrategyTemplateRuntimeDirectory
+    from rquant.experiment_platform_templates import ExperimentTemplateRuntimeBinding
+
+
 class LabCommandSubmissionFacade:
     """Read scheduler state and publish commands without opening a writable ledger."""
 
@@ -588,12 +670,84 @@ class LabCommandSubmissionFacade:
         experiment_registry: ExperimentRegistry | None = None,
         definition_registry: ImmutableDefinitionRegistry | None = None,
         clock: Callable[[], datetime] | None = None,
+        template_directory: StrategyTemplateRuntimeDirectory | None = None,
+        experiment_template_binding: ExperimentTemplateRuntimeBinding | None = None,
+        minute_parameter_catalog: MinuteParameterReplayCatalog | None = None,
+        resolved_read_unit: MinuteParameterResolvedReadUnit | None = None,
+        _minute_input_read: object | None = None,
     ) -> None:
         self.reader = reader
         self.spool = spool
         self.experiment_registry = experiment_registry
         self.definition_registry = definition_registry
+        self.minute_parameter_catalog = (None if minute_parameter_catalog is None else
+            MinuteParameterReplayCatalog.model_validate(minute_parameter_catalog.model_dump(mode="python")))
+        if resolved_read_unit is not None and type(resolved_read_unit) is not MinuteParameterResolvedReadUnit:
+            raise TypeError("parameter facade requires its exact lexical source unit")
+        self.resolved_read_unit = resolved_read_unit
+        if _minute_input_read is not None:
+            from rquant.minute_backtest_parameter_study_projection import _MinuteStudyVerifiedInputRead
+
+            if type(_minute_input_read) is not _MinuteStudyVerifiedInputRead:
+                raise TypeError("minute facade needs its actual authenticated lexical input read")
+            _minute_input_read._assert_active(reader=reader, catalog=self.minute_parameter_catalog)
+        self._minute_input_read = _minute_input_read
         self.clock = clock or (lambda: datetime.now(UTC))
+        from rquant.strategy_template_runtime import require_template_runtime_directory
+
+        self.template_directory = require_template_runtime_directory(template_directory)
+        from rquant.experiment_platform_templates import require_experiment_template_runtime_binding
+        self.experiment_template_binding = require_experiment_template_runtime_binding(experiment_template_binding)
+        if self.experiment_template_binding is not None and self.experiment_template_binding.store.registry is not experiment_registry:
+            raise ValueError("private template directory needs the same original experiment registry")
+
+    def parameter_definitions_for_spec(self, spec: ResearchRunSpec, *,
+        resolved_read_unit: MinuteParameterResolvedReadUnit | None = None,
+        _minute_input_read: object | None = None) -> ImmutableDefinitionRegistry:
+        if spec.parameters.strategy_name != "minute_parameter_replay" or self.minute_parameter_catalog is None or self.definition_registry is None:
+            raise PermissionError("parameter definition view requires the complete installed catalog and original registry")
+        input_read = self._minute_input_read if _minute_input_read is None else _minute_input_read
+        if input_read is not None:
+            from rquant.minute_backtest_parameter_study_projection import _MinuteStudyVerifiedInputRead
+
+            if type(input_read) is not _MinuteStudyVerifiedInputRead:
+                raise TypeError("minute definition view needs its exact authenticated lexical input read")
+            input_read._assert_active(reader=self.reader, catalog=self.minute_parameter_catalog, spec=spec)
+            return input_read._definition_registry()
+        unit = self.resolved_read_unit if resolved_read_unit is None else resolved_read_unit
+        adapter = (MinuteParameterFormalReplayAdapter(self.minute_parameter_catalog) if unit is None
+            else MinuteParameterFormalReplayAdapter(self.minute_parameter_catalog, resolved_read_unit=unit))
+        expected = adapter.expected(adapter.parameters(spec))
+        from rquant.minute_backtest_parameter_definition import minute_parameter_research_registry
+
+        return ImmutableDefinitionRegistry(self.definition_registry.root,
+            execution_registry=minute_parameter_research_registry(expected.frozen.runtime.parameters,
+                producer_commit=spec.code_sha))
+
+    def submit_scheduling_control(self, envelope: LabSchedulingCommandEnvelope) -> LabSchedulingSubmission:
+        envelope = LabSchedulingCommandEnvelope.model_validate(envelope)
+        existing = self.spool.find(envelope.request_id)
+        if existing is not None:
+            saved = existing.envelope if isinstance(existing, LabSpoolEntry) else existing.receipt
+            if type(saved) not in (LabSchedulingCommandEnvelope, LabSchedulingCommandReceipt) or saved.content_hash != envelope.content_hash:
+                raise RequestContentConflictError("scheduler original UUID has different content or scope")
+        else:
+            current = self.reader.scheduling_state()
+            if current is None or current.queue_identity != envelope.command.queue_identity:
+                raise ValueError("global scheduling is unavailable for the original queue")
+            existing = self.spool.publish(envelope)
+        if isinstance(existing, LabSpoolEntry):
+            if existing.envelope != envelope:
+                raise RequestContentConflictError("scheduler original request differs")
+            receipt = None
+            status = "pending"
+            generation = (existing.device, existing.inode)
+        else:
+            receipt = LabSchedulingCommandReceipt.model_validate(existing.receipt)
+            status = receipt.status
+            observed = existing.path.lstat()
+            generation = (observed.st_dev, observed.st_ino)
+        return LabSchedulingSubmission(request_id=envelope.request_id, content_hash=envelope.content_hash, queue_identity=envelope.command.queue_identity, expected_version=envelope.command.expected_version, status=status, spool_path=existing.path, spool_generation=generation, receipt=receipt)
 
     @staticmethod
     def _experiment_submission_intent(
@@ -665,11 +819,20 @@ class LabCommandSubmissionFacade:
             raise FormalSubmissionAuthorityError(
                 "formal plan receipts do not exactly match the research job"
             )
-        if self.definition_registry is None:
+        directory = self.template_directory
+        if self.experiment_template_binding is not None:
+            directory = self.experiment_template_binding.directory_for_job(command.job_id, command.spec) or directory
+        template_catalog = None if directory is None else directory.catalog_for_spec(command.spec)
+        definitions = self.definition_registry
+        if template_catalog is not None:
+            definitions = directory.store.definition_registry(execution.strategy_id)
+        if command.spec.parameters.strategy_name == "minute_parameter_replay":
+            definitions = self.parameter_definitions_for_spec(command.spec)
+        if definitions is None:
             raise FormalSubmissionAuthorityError(
                 "v3 research submission requires an authoritative Definition Registry"
             )
-        registration = self.definition_registry.read_strategy_spec(
+        registration = definitions.read_strategy_spec(
             execution.strategy_definition_fingerprint,
             as_of=observed_at,
         )
@@ -714,11 +877,85 @@ class LabCommandSubmissionFacade:
             observed_at=observed_at,
         )
         assert self.experiment_registry is not None
+        platform = self._private_experiment_platform(envelope)
+        if platform is not None:
+            stored = self.experiment_registry.get_submission_intent_for_job(intent.job_id)
+            if stored != intent or platform.child(intent.job_id) is None:
+                raise FormalSubmissionAuthorityError("private formal family is not fully ready")
+            return
         self.experiment_registry.register_attempt(
             experiment.spec,
             registered_at=observed_at,
             submission=intent,
         )
+
+    def _private_experiment_platform(
+        self, envelope: LabCommandEnvelope
+    ) -> ExperimentPlatformStore | None:
+        command = envelope.command
+        if not isinstance(command, SubmitJobCommand) or command.spec.experiment is None:
+            return None
+        from rquant.experiment_platform import ExperimentPlatformStore, PRIVATE_FAMILY_PREFIXES
+
+        if not command.spec.experiment.hypothesis_family.startswith(PRIVATE_FAMILY_PREFIXES):
+            return None
+        if self.experiment_registry is None:
+            raise FormalSubmissionAuthorityError("private experiment registry is unavailable")
+        return ExperimentPlatformStore(self.experiment_registry)
+
+    def _admit_private_publication(self, envelope: LabCommandEnvelope) -> None:
+        platform = self._private_experiment_platform(envelope)
+        if platform is not None:
+            intent = self._experiment_submission_intent(envelope)
+            assert intent is not None
+            platform.admit_publication(intent, now=self.clock())
+
+    def _validate_private_publication(self, envelope: LabCommandEnvelope) -> None:
+        command = envelope.command
+        if not isinstance(command, SubmitJobCommand) or command.spec.experiment is None:
+            return
+        from rquant.experiment_platform import (
+            ExperimentChildAdmission,
+            ExperimentPlatformStore,
+            PRIVATE_FAMILY_PREFIXES,
+            validate_experiment_publication_grant,
+        )
+
+        if not command.spec.experiment.hypothesis_family.startswith(PRIVATE_FAMILY_PREFIXES):
+            return
+        intent = self._experiment_submission_intent(envelope)
+        assert intent is not None
+        if type(self.experiment_registry) is not ExperimentRegistryReadonlyReader:
+            platform = self._private_experiment_platform(envelope)
+            assert platform is not None
+            platform.validate_publication(intent)
+            return
+        with self.experiment_registry._read_snapshot() as connection:
+            ExperimentPlatformStore._require_schema(connection)
+            rows = connection.execute(
+                "SELECT job_id,experiment_id,hypothesis_family,owner,"
+                "typeof(payload_json),length(CAST(payload_json AS BLOB)),"
+                "CASE WHEN typeof(payload_json)='text' AND "
+                "length(CAST(payload_json AS BLOB)) BETWEEN 2 AND ? "
+                "THEN payload_json END FROM experiment_child_admission "
+                "WHERE job_id=? LIMIT 2",
+                (_MAX_PRIVATE_PUBLICATION_BYTES, str(intent.job_id)),
+            ).fetchall()
+            if not rows:
+                validate_experiment_publication_grant(None, intent)
+                return
+            if len(rows) != 1 or rows[0][4] != "text" or rows[0][6] is None:
+                raise PermissionError("private publication child exceeds its complete byte budget")
+            row = rows[0]
+            child = strict_model_validate_json(ExperimentChildAdmission, row[6])
+            if (
+                (str(child.job_id), child.experiment_id, child.family_id, child.owner)
+                != tuple(row[:4])
+                or child.job_id != intent.job_id
+                or child.family_id != command.spec.experiment.hypothesis_family
+            ):
+                raise PermissionError("private publication scalar and complete child identities conflict")
+            validate_experiment_publication_grant(child, intent)
 
     def validate_prepared_experiment_submission(
         self,
@@ -750,6 +987,7 @@ class LabCommandSubmissionFacade:
             raise FormalSubmissionAuthorityError(
                 "formal submission Experiment attempt identity conflicts with its plan"
             )
+        self._validate_private_publication(envelope)
 
     def _mark_experiment_submission_published(self, envelope: LabCommandEnvelope) -> None:
         intent = self._experiment_submission_intent(envelope)
@@ -779,12 +1017,151 @@ class LabCommandSubmissionFacade:
                 or envelope.content_hash != intent.command_content_hash
             ):
                 raise RuntimeError("experiment submission outbox conflicts with command envelope")
+            self._admit_private_publication(envelope)
             published = self._publish(envelope)
             if isinstance(published, CommandSubmissionConflict):
                 raise RuntimeError("experiment submission recovery hit a command conflict")
             self._mark_experiment_submission_published(envelope)
             recovered.append(published)
         return tuple(recovered)
+
+    def recover_private_experiment_cancellations(
+        self,
+        *,
+        observed_at: datetime,
+    ) -> tuple[ExperimentChildAdmission, ...]:
+        """Resume original cancel requests; a transport receipt is not cancellation."""
+        if self.experiment_registry is None:
+            return ()
+        from rquant.experiment_platform import ExperimentPlatformStore
+        from rquant.experiment_registry import _private_platform_schema
+
+        with self.experiment_registry._connect() as connection:
+            if not _private_platform_schema(connection):
+                return ()
+        platform = ExperimentPlatformStore(self.experiment_registry)
+        observed = normalize_aware_utc(observed_at)
+        progress = []
+        for child in platform.pending_cancellations():
+            job = self.reader.get_job(child.job_id)
+            if job is None:
+                progress.append(child)
+                continue
+            if job.updated_at > observed:
+                raise ValueError("cancellation job fact is from the future")
+            self._validate_private_cancel_binding(child, observed_at=observed)
+            terminal = {
+                JobStatus.SUCCEEDED: "already_completed",
+                JobStatus.CANCELLED: "confirmed",
+            }.get(job.status)
+            if job.status is JobStatus.FAILED and not job.recoverable:
+                terminal = "failed"
+            if terminal is not None:
+                self.synchronize_experiment_lifecycle(child.job_id, observed_at=observed)
+                child = child.model_copy(update={"cancel_state": terminal})
+                platform.record_cancel_progress(child)
+                progress.append(child)
+                continue
+            if not child.cancel_request_chain:
+                key = f"experiment.cancel:{child.job_id}:{job.version}:0"
+                child = child.model_copy(
+                    update={
+                        "cancel_job_version": job.version,
+                        "cancel_request_chain": (self._request_id(key),),
+                    }
+                )
+                platform.record_cancel_progress(child)
+            index = len(child.cancel_request_chain) - 1
+            key = f"experiment.cancel:{child.job_id}:{child.cancel_job_version}:{index}"
+            if self._request_id(key) != child.cancel_request_chain[-1]:
+                raise ValueError("original cancel request binding changed")
+            result = self._submit_control(
+                CancelJobCommand(
+                    job_id=child.job_id,
+                    expected_version=child.cancel_job_version,
+                    reason="experiment family cancellation",
+                ),
+                interaction_key=key,
+                private_cancellation=child,
+            )
+            stale = isinstance(result, CommandSubmissionStale) or (
+                isinstance(result, CommandSubmissionConflict)
+                and result.reason == "scheduler_rejected"
+                and (result.scheduler_reason or "").startswith("stale_version:")
+            )
+            if stale:
+                # Both branches prove the old request did not apply. Re-read the
+                # actual version and persist its successor before any transport.
+                context = self.reader.get_command_context(child.job_id)
+                if context is not None and context.job.version != child.cancel_job_version:
+                    version = context.job.version
+                    key = f"experiment.cancel:{child.job_id}:{version}:{index + 1}"
+                    child = child.model_copy(
+                        update={
+                            "cancel_job_version": version,
+                            "cancel_request_chain": (
+                                *child.cancel_request_chain,
+                                self._request_id(key),
+                            ),
+                        }
+                    )
+                    platform.record_cancel_progress(child)
+            progress.append(child)
+        return tuple(progress)
+
+    def _validate_private_cancel_binding(
+        self, child: ExperimentChildAdmission, *, observed_at: datetime
+    ) -> None:
+        from rquant.experiment_platform import ExperimentPlatformStore
+
+        if self.experiment_registry is None:
+            raise FormalSubmissionAuthorityError("private cancellation registry is unavailable")
+        platform = ExperimentPlatformStore(self.experiment_registry)
+        persisted = platform.child(child.job_id)
+        if (
+            persisted != child
+            or child.cancel_state != "pending"
+            or child.publish_grant_seq is None
+            or child.cancel_seq is None
+            or child.cancel_seq <= child.publish_grant_seq
+        ):
+            raise FormalSubmissionAuthorityError("private cancellation has no persisted admission")
+        family = platform.get_family(child.owner, child.family_id)
+        intent = self.experiment_registry.get_submission_intent_for_job(child.job_id)
+        if (
+            family.state != "ready"
+            or intent is None
+            or (
+                intent.job_id,
+                intent.request_id,
+                intent.experiment_id,
+                intent.command_content_hash,
+            )
+            != (child.job_id, child.request_id, child.experiment_id, child.command_content_hash)
+        ):
+            raise FormalSubmissionAuthorityError("private cancellation ownership changed")
+        original = LabCommandEnvelope.model_validate_json(intent.envelope_json)
+        self.validate_prepared_experiment_submission(original, observed_at=observed_at)
+        job = self.reader.get_job(child.job_id)
+        if (
+            not isinstance(original.command, SubmitJobCommand)
+            or job is None
+            or job.spec != original.command.spec
+            or job.spec.experiment is None
+            or job.spec.experiment.hypothesis_family != child.family_id
+            or job.spec.experiment.experiment_id != child.experiment_id
+        ):
+            raise FormalSubmissionAuthorityError(
+                "private cancellation job or immutable spec changed"
+            )
+
+    @staticmethod
+    def _private_control_spec(spec: ResearchRunSpec) -> bool:
+        from rquant.experiment_platform import PRIVATE_FAMILY_PREFIXES
+
+        return spec.experiment is not None and spec.experiment.hypothesis_family.startswith(
+            PRIVATE_FAMILY_PREFIXES
+        )
 
     def synchronize_experiment_lifecycle(
         self,
@@ -868,6 +1245,13 @@ class LabCommandSubmissionFacade:
             )
         if existing is None:
             return None
+        saved = existing.envelope if isinstance(existing, LabSpoolEntry) else existing.receipt
+        if isinstance(saved, (LabSchedulingCommandEnvelope, LabSchedulingCommandReceipt)):
+            return CommandSubmissionConflict(
+                request_id=envelope.request_id,
+                job_id=envelope.command.job_id,
+                reason="interaction_content_conflict",
+            )
         content_hash = (
             existing.envelope.content_hash
             if isinstance(existing, LabSpoolEntry)
@@ -974,7 +1358,13 @@ class LabCommandSubmissionFacade:
         existing = self._existing(envelope)
         if existing is not None:
             if isinstance(existing, CommandSubmissionReceipt):
-                self._prepare_experiment_submission(envelope)
+                platform = self._private_experiment_platform(envelope)
+                if platform is None:
+                    self._prepare_experiment_submission(envelope)
+                else:
+                    intent = self._experiment_submission_intent(envelope)
+                    assert intent is not None
+                    platform.validate_publication(intent)
                 self._mark_experiment_submission_published(envelope)
             return existing
         if self.reader.get_job(validated.job_id) is not None:
@@ -984,6 +1374,7 @@ class LabCommandSubmissionFacade:
                 reason="job_id_exists",
             )
         self._prepare_experiment_submission(envelope)
+        self._admit_private_publication(envelope)
         published = self._publish(envelope)
         if isinstance(published, CommandSubmissionReceipt):
             self._mark_experiment_submission_published(envelope)
@@ -998,7 +1389,7 @@ class LabCommandSubmissionFacade:
         interaction_key: str | None = None,
     ) -> CommandSubmissionResult:
         source = self.reader.get_job(source_job_id)
-        if source is None:
+        if source is None or self._private_control_spec(source.spec):
             return CommandSubmissionConflict(
                 request_id=self._request_id(interaction_key),
                 job_id=new_job_id,
@@ -1018,6 +1409,7 @@ class LabCommandSubmissionFacade:
         command: LabCommand,
         *,
         interaction_key: str | None,
+        private_cancellation: ExperimentChildAdmission | None = None,
     ) -> CommandSubmissionResult:
         if isinstance(command, SubmitJobCommand):
             raise TypeError("control submission cannot contain a create command")
@@ -1026,6 +1418,26 @@ class LabCommandSubmissionFacade:
             command=command,
         )
         existing = self._existing(envelope)
+        job = self.reader.get_job(command.job_id)
+        if job is not None and self._private_control_spec(job.spec):
+            if private_cancellation is None:
+                return CommandSubmissionConflict(
+                    request_id=envelope.request_id,
+                    job_id=command.job_id,
+                    reason="job_not_found",
+                )
+            self._validate_private_cancel_binding(private_cancellation, observed_at=self.clock())
+            if (
+                not isinstance(command, CancelJobCommand)
+                or command.job_id != private_cancellation.job_id
+                or command.expected_version != private_cancellation.cancel_job_version
+                or not private_cancellation.cancel_request_chain
+                or envelope.request_id != private_cancellation.cancel_request_chain[-1]
+                or command.reason != "experiment family cancellation"
+            ):
+                raise FormalSubmissionAuthorityError("original private cancel request changed")
+        elif private_cancellation is not None:
+            raise FormalSubmissionAuthorityError("private cancellation has no matching private job")
         if existing is not None:
             return existing
         context = self.reader.get_command_context(command.job_id)
@@ -1178,11 +1590,17 @@ class ExperimentLifecycleCoordinator:
 
     _MAX_RECOVERY_JOBS = 999
 
-    def __init__(self, facade: LabCommandSubmissionFacade) -> None:
+    def __init__(
+        self,
+        facade: LabCommandSubmissionFacade,
+        *,
+        evidence_sink: Callable[[datetime], object] | None = None,
+    ) -> None:
         if facade.experiment_registry is None:
             raise RuntimeError("experiment lifecycle coordinator requires ExperimentRegistry")
         self.facade = facade
         self.registry = facade.experiment_registry
+        self.evidence_sink = evidence_sink
 
     def validate_submission(
         self,
@@ -1250,6 +1668,9 @@ class ExperimentLifecycleCoordinator:
                 continue
             self.synchronize(intent.job_id, observed_at=observed_at)
             synchronized.append(intent.job_id)
+        self.facade.recover_private_experiment_cancellations(observed_at=observed_at)
+        if self.evidence_sink is not None:
+            self.evidence_sink(observed_at)
         return ExperimentLifecycleRecoveryResult(
             recovered_submission_count=len(recovered),
             synchronized_job_ids=tuple(synchronized),

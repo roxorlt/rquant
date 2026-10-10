@@ -4,15 +4,25 @@ from __future__ import annotations
 
 import json
 import os
+import unicodedata
 from collections.abc import Callable, Iterator, Mapping
 from datetime import datetime
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Protocol, Self
 from urllib.parse import urlsplit
+from weakref import WeakKeyDictionary
 from zoneinfo import ZoneInfo
 
-from rquant.delivery_contracts import DeliveryChannel
+from rquant.condition_alert_route import ConditionAlertBusEventRecord
+from rquant.condition_alert_runtime_contracts import (
+    ConditionAlertEventEnvelope,
+    parse_condition_alert_event,
+)
+from rquant.delivery_contracts import (
+    DeliveryChannel, OutboxRecord, NotificationMergeGroup,
+    PhysicalPostBinding, PhysicalPostObservation,
+)
 from rquant.notification_worker import (
     ConfirmedDeliveryFailureError,
     NotificationDelivery,
@@ -20,6 +30,8 @@ from rquant.notification_worker import (
     UnknownDeliveryOutcomeError,
 )
 from rquant.notify.client import PushDeerClient, PushPlusClient
+from rquant.price_alert_route import PriceAlertBusEventRecord
+from rquant.price_alert_runtime_contracts import PriceAlertEventEnvelope, parse_price_alert_event
 from rquant.runtime_contracts import RuntimeContractModel, canonical_sha256
 from rquant.signal_contracts import SignalAction, SignalEnvelopeFamily
 
@@ -279,6 +291,19 @@ class ExistingClientNotificationTransport:
             return NotificationTransportResult.accepted()
         return NotificationTransportResult.unknown()
 
+    def send_observed(
+        self, *, binding: PhysicalPostBinding, endpoint: str, credential: str,
+        title: str, body: str, sink: Callable[[PhysicalPostObservation], None],
+        clock: Callable[[], datetime],
+    ) -> None:
+        endpoint = _require_https_endpoint(endpoint)
+        factory = self._factories[binding.target.channel]
+        client = factory([credential], endpoint)
+        if type(client) not in {PushDeerClient, PushPlusClient}:
+            raise TypeError("physical statistics require the original observed POST client")
+        client.push(title, body, observation_binding=binding,
+                    observation_sink=sink, observation_clock=clock)
+
 
 def _format_shanghai(value: datetime) -> str:
     localized = value.astimezone(_SHANGHAI)
@@ -323,6 +348,188 @@ def format_signal_notification(signal: SignalEnvelopeFamily) -> tuple[str, str]:
         )
     )
     return title, body
+
+
+def format_price_alert_notification(event: PriceAlertEventEnvelope) -> tuple[str, str]:
+    value = parse_price_alert_event(event)
+    name = "".join(
+        " " if unicodedata.category(char).startswith("C") else char
+        for char in value.rule_name
+        if char not in "[]()*_~<>`!\\"
+    ).strip()
+    name = " ".join(name.split())[:80] or "到价提醒"
+    direction = "达到" if value.comparison == "gte" else "低于或等于"
+    body = (
+        f"{name} · {value.ts_code} · 价格 {value.price} {direction} {value.threshold} · "
+        f"{value.quote_observed_at.astimezone(_SHANGHAI):%H:%M:%S}"
+    )
+    title = "rQuant 到价提醒"
+    if len((title + body).encode("utf-8")) > 1024:
+        raise ValueError("price notification exceeds 1 KiB")
+    return title, body
+
+
+def format_condition_alert_notification(event: ConditionAlertEventEnvelope) -> tuple[str, str]:
+    value = parse_condition_alert_event(event)
+
+    def clean(value: str) -> str:
+        return " ".join(
+            "".join(
+                " " if unicodedata.category(c).startswith("C") else c
+                for c in value
+                if c not in "[]()*_~<>`!\\"
+            ).split()
+        )[:80]
+
+    name = clean(value.rule_name) or "条件提醒"
+    stock = clean(value.stock_name or "")
+    action = "满足条件" if value.trigger_kind == "matched" else "已恢复"
+    from rquant.monitor_builtin_contracts import BuiltinConditionAlertEventEnvelope, BuiltinMarketDetection
+
+    if type(value) is BuiltinConditionAlertEventEnvelope:
+        detection = value.detection
+        facts = (f"市场 · {detection.window_minutes}分钟 · {detection.before} → {detection.after}"
+            if type(detection) is BuiltinMarketDetection else
+            f"{value.ts_code} {stock} · 价格 {detection.trigger_price}" +
+            ("" if detection.threshold is None else f" · 阈值 {detection.threshold}"))
+        title = f"rQuant {name}"
+        body = f"{facts} · {value.event_time.astimezone(_SHANGHAI):%H:%M:%S}"
+        if len((title + body).encode()) > 1024:
+            raise ValueError("builtin notification exceeds 1 KiB")
+        return title, body
+    title = f"rQuant 条件提醒 · {value.priority}"
+    body = (
+        f"{name} · {value.ts_code} {stock} · {action} · "
+        f"{value.event_time.astimezone(_SHANGHAI):%H:%M:%S}"
+    )
+    if len((title + body).encode()) > 1024:
+        raise ValueError("condition notification exceeds 1 KiB")
+    return title, body
+
+
+class PriceAlertPreparedNotification:
+    __slots__ = ("__weakref__",)
+
+    def __init__(self) -> None:
+        raise TypeError("price notification preparation belongs to its actual provider")
+
+
+_PRICE_PREPARED: WeakKeyDictionary[
+    PriceAlertPreparedNotification,
+    tuple[object, PriceAlertBusEventRecord, OutboxRecord, str, str, str | None],
+] = WeakKeyDictionary()
+
+
+def _prepare_price(
+    provider: object,
+    event: PriceAlertBusEventRecord,
+    record: OutboxRecord,
+    *,
+    credential: str | None,
+) -> PriceAlertPreparedNotification:
+    if (
+        type(event) is not PriceAlertBusEventRecord
+        or type(record) is not OutboxRecord
+        or event.event_id != record.signal_id
+    ):
+        raise TypeError("price preparation requires the exact sealed event and original leased row")
+    title, body = format_price_alert_notification(event.event)
+    value = object.__new__(PriceAlertPreparedNotification)
+    _PRICE_PREPARED[value] = provider, event, record, title, body, credential
+    return value
+
+
+def _consume_prepared_price(
+    provider: object,
+    prepared: object,
+    admitted: object,
+    *,
+    store: object,
+    record: OutboxRecord,
+    now: datetime,
+) -> tuple[str, str, str | None]:
+    from rquant.price_alert_runtime_projection import consume_price_alert_admitted_delivery
+
+    if type(prepared) is not PriceAlertPreparedNotification or prepared not in _PRICE_PREPARED:
+        raise TypeError("price provider requires its own unconsumed preparation")
+    issuer, event, original, title, body, credential = _PRICE_PREPARED[prepared]
+    if issuer is not provider or original != record:
+        raise TypeError("price preparation belongs to a different provider or original lease")
+    receipt = consume_price_alert_admitted_delivery(admitted, store=store, record=record, now=now)
+    if (receipt.event_id, receipt.payload_sha256, receipt.target) != (
+        event.event_id,
+        event.payload_hash,
+        record.target,
+    ):
+        raise ValueError("price admission differs from the prepared event and target")
+    del _PRICE_PREPARED[prepared]
+    return title, body, credential
+
+
+class ConditionAlertPreparedNotification:
+    __slots__ = ("__weakref__",)
+
+    def __init__(self) -> None:
+        raise TypeError("condition notification preparation belongs to its actual provider")
+
+
+_CONDITION_PREPARED: WeakKeyDictionary[
+    ConditionAlertPreparedNotification,
+    tuple[object, ConditionAlertBusEventRecord, OutboxRecord, str, str, str | None],
+] = WeakKeyDictionary()
+
+
+def _prepare_condition(
+    provider: object,
+    event: ConditionAlertBusEventRecord,
+    record: OutboxRecord,
+    *,
+    credential: str | None,
+) -> ConditionAlertPreparedNotification:
+    if (
+        type(event) is not ConditionAlertBusEventRecord
+        or type(record) is not OutboxRecord
+        or event.event_id != record.signal_id
+    ):
+        raise TypeError(
+            "condition preparation requires the exact sealed event and original leased row"
+        )
+    title, body = format_condition_alert_notification(event.event)
+    value = object.__new__(ConditionAlertPreparedNotification)
+    _CONDITION_PREPARED[value] = provider, event, record, title, body, credential
+    return value
+
+
+def _consume_prepared_condition(
+    provider: object,
+    prepared: object,
+    admitted: object,
+    *,
+    store: object,
+    record: OutboxRecord,
+    now: datetime,
+) -> tuple[str, str, str | None]:
+    from rquant.condition_alert_runtime_projection import consume_condition_alert_admitted_delivery
+
+    if (
+        type(prepared) is not ConditionAlertPreparedNotification
+        or prepared not in _CONDITION_PREPARED
+    ):
+        raise TypeError("condition provider requires its own unconsumed preparation")
+    issuer, event, original, title, body, credential = _CONDITION_PREPARED[prepared]
+    if issuer is not provider or original != record:
+        raise TypeError("condition preparation belongs to a different provider or original lease")
+    receipt = consume_condition_alert_admitted_delivery(
+        admitted, store=store, record=record, now=now
+    )
+    if (receipt.event_id, receipt.payload_sha256, receipt.target) != (
+        event.event_id,
+        event.payload_hash,
+        record.target,
+    ):
+        raise ValueError("condition admission differs from the prepared event and target")
+    del _CONDITION_PREPARED[prepared]
+    return title, body, credential
 
 
 class RecipientScopedNotificationProvider(NotificationProvider):
@@ -386,6 +593,116 @@ class RecipientScopedNotificationProvider(NotificationProvider):
         )
         return f"{self._channel.value}:{receipt}"
 
+    def prepare_price(
+        self, event: PriceAlertBusEventRecord, record: OutboxRecord
+    ) -> PriceAlertPreparedNotification:
+        target = record.target
+        if target.channel is not self._channel:
+            raise ConfirmedDeliveryFailureError("price channel mismatch")
+        credential = self._capabilities.credential_for(self._channel, target.recipient_id)
+        if credential is None:
+            raise ConfirmedDeliveryFailureError("price recipient capability is unavailable")
+        return _prepare_price(self, event, record, credential=credential)
+
+    def deliver_price(
+        self,
+        prepared: PriceAlertPreparedNotification,
+        admitted: object,
+        *,
+        store: object,
+        record: OutboxRecord,
+        now: datetime,
+    ) -> str:
+        title, body, credential = _consume_prepared_price(
+            self, prepared, admitted, store=store, record=record, now=now
+        )
+        if credential is None or record.target.channel is not self._channel:
+            raise ConfirmedDeliveryFailureError("price recipient preparation is invalid")
+        try:
+            result = self._transport.send(
+                channel=self._channel,
+                endpoint=self._endpoint,
+                credential=credential,
+                title=title,
+                body=body,
+            )
+        except Exception:
+            raise UnknownDeliveryOutcomeError("notification delivery outcome is unknown") from None
+        if (
+            type(result) is not NotificationTransportResult
+            or result.disposition is NotificationTransportDisposition.UNKNOWN
+        ):
+            raise UnknownDeliveryOutcomeError("notification delivery outcome is unknown")
+        if result.disposition is NotificationTransportDisposition.REJECTED:
+            raise ConfirmedDeliveryFailureError("provider rejected delivery")
+        receipt = canonical_sha256(
+            {
+                "contract": "runtime-price-notification-receipt/v1",
+                "channel": self._channel,
+                "recipient_id": record.target.recipient_id,
+                "outbox_id": record.outbox_id,
+                "event_id": record.signal_id,
+                "title": title,
+                "body": body,
+            }
+        )
+        return f"{self._channel.value}:{receipt}"
+
+    def prepare_condition(
+        self, event: ConditionAlertBusEventRecord, record: OutboxRecord
+    ) -> ConditionAlertPreparedNotification:
+        target = record.target
+        if target.channel is not self._channel:
+            raise ConfirmedDeliveryFailureError("condition channel mismatch")
+        credential = self._capabilities.credential_for(self._channel, target.recipient_id)
+        if credential is None:
+            raise ConfirmedDeliveryFailureError("condition recipient capability is unavailable")
+        return _prepare_condition(self, event, record, credential=credential)
+
+    def deliver_condition(
+        self,
+        prepared: ConditionAlertPreparedNotification,
+        admitted: object,
+        *,
+        store: object,
+        record: OutboxRecord,
+        now: datetime,
+    ) -> str:
+        title, body, credential = _consume_prepared_condition(
+            self, prepared, admitted, store=store, record=record, now=now
+        )
+        if credential is None or record.target.channel is not self._channel:
+            raise ConfirmedDeliveryFailureError("condition recipient preparation is invalid")
+        try:
+            result = self._transport.send(
+                channel=self._channel,
+                endpoint=self._endpoint,
+                credential=credential,
+                title=title,
+                body=body,
+            )
+        except Exception:
+            raise UnknownDeliveryOutcomeError("notification delivery outcome is unknown") from None
+        if (
+            type(result) is not NotificationTransportResult
+            or result.disposition is NotificationTransportDisposition.UNKNOWN
+        ):
+            raise UnknownDeliveryOutcomeError("notification delivery outcome is unknown")
+        if result.disposition is NotificationTransportDisposition.REJECTED:
+            raise ConfirmedDeliveryFailureError("provider rejected delivery")
+        receipt = canonical_sha256(
+            {
+                "contract": "runtime-condition-notification-receipt/v1",
+                "channel": self._channel,
+                "recipient_id": record.target.recipient_id,
+                "outbox_id": record.outbox_id,
+                "event_id": record.signal_id,
+                "title": title,
+                "body": body,
+            }
+        )
+        return f"{self._channel.value}:{receipt}"
+
 
 class SuppressedNotificationProvider(NotificationProvider):
     """The shadow transport: the batch runs in full and no byte leaves the host.
@@ -410,6 +727,199 @@ class SuppressedNotificationProvider(NotificationProvider):
 
     def deliver(self, delivery: NotificationDelivery) -> str:
         return f"shadow:{delivery.record.outbox_id}"
+
+    def prepare_price(
+        self, event: PriceAlertBusEventRecord, record: OutboxRecord
+    ) -> PriceAlertPreparedNotification:
+        return _prepare_price(self, event, record, credential=None)
+
+    def deliver_price(
+        self,
+        prepared: PriceAlertPreparedNotification,
+        admitted: object,
+        *,
+        store: object,
+        record: OutboxRecord,
+        now: datetime,
+    ) -> str:
+        _consume_prepared_price(self, prepared, admitted, store=store, record=record, now=now)
+        return f"shadow:{record.outbox_id}"
+
+    def prepare_condition(
+        self, event: ConditionAlertBusEventRecord, record: OutboxRecord
+    ) -> ConditionAlertPreparedNotification:
+        return _prepare_condition(self, event, record, credential=None)
+
+    def deliver_condition(
+        self,
+        prepared: ConditionAlertPreparedNotification,
+        admitted: object,
+        *,
+        store: object,
+        record: OutboxRecord,
+        now: datetime,
+    ) -> str:
+        _consume_prepared_condition(self, prepared, admitted, store=store, record=record, now=now)
+        return f"shadow:{record.outbox_id}"
+
+
+class MergePreparedNotification:
+    __slots__ = ("__weakref__",)
+
+    def __init__(self) -> None:
+        raise TypeError("merge transport requires the original committed preparation")
+
+
+_MERGE_PREPARED: WeakKeyDictionary[
+    MergePreparedNotification,
+    tuple[object, object, PhysicalPostBinding, tuple[OutboxRecord, ...], str, str, str | None],
+] = WeakKeyDictionary()
+
+
+def format_merged_member_payload(payload_json: str) -> str:
+    from rquant.signal_contracts import parse_signal_envelope
+    from rquant.strict_json import strict_json_loads
+
+    payload = strict_json_loads(payload_json.encode())
+    tag = payload.get("envelope_schema")
+    if tag == "rquant.price-alert-event/v1":
+        title, body = format_price_alert_notification(parse_price_alert_event(payload_json))
+    elif tag in {"rquant.condition-alert-event/v1", "rquant.builtin-condition-alert-event/v1"}:
+        title, body = format_condition_alert_notification(parse_condition_alert_event(payload_json))
+    else:
+        title, body = format_signal_notification(parse_signal_envelope(payload_json))
+    return title + "\n\n" + body
+
+
+def prepare_merged_notification(
+    provider: object, *, store: object, group: NotificationMergeGroup,
+    records: tuple[OutboxRecord, ...], worker_id: str, now: datetime,
+    price_activation: object | None, condition_activation: object | None,
+) -> tuple[MergePreparedNotification, PhysicalPostBinding]:
+    from rquant.notification_state import NotificationStateStore
+
+    if type(store) is not NotificationStateStore or type(group) is not NotificationMergeGroup:
+        raise TypeError("merge preparation requires the original typed notifier store")
+    if type(provider) not in {RecipientScopedNotificationProvider, SuppressedNotificationProvider}:
+        raise TypeError("merge cannot fall back to a generic notification provider")
+    shadow = type(provider) is SuppressedNotificationProvider
+    if shadow != (group.binding.mode == "shadow") or not records or len(records) > 100:
+        raise ValueError("merge provider differs from its current mode or bounded members")
+    credential: str | None = None
+    if not shadow:
+        if (provider._channel != group.target.channel
+                or type(provider._transport) is not ExistingClientNotificationTransport):
+            raise ValueError("merge requires the original receiver-scoped observed transport")
+        credential = provider._capabilities.credential_for(group.target.channel, group.target.recipient_id)
+        if credential is None:
+            raise ConfirmedDeliveryFailureError("merge receiver is no longer authorized")
+        _require_https_endpoint(provider._endpoint)
+    prepared_members: list[tuple[str, object, OutboxRecord]] = []
+    parts: list[str] = []
+    for record in records:
+        if record.target != group.target or record.outbox_id not in group.members:
+            raise ValueError("merge member receiver or original group differs")
+        if group.family == "price":
+            event = store.notification_event(record.signal_id)
+            if type(event) is not PriceAlertBusEventRecord or price_activation is None:
+                raise TypeError("price merge requires its original price event and activation")
+            prepared = provider.prepare_price(event, record)
+            title, body = format_price_alert_notification(event.event)
+        elif group.family in {"condition", "builtin"}:
+            event = store.notification_event(record.signal_id)
+            if type(event) is not ConditionAlertBusEventRecord or condition_activation is None:
+                raise TypeError("condition merge requires its original condition event and activation")
+            prepared = provider.prepare_condition(event, record)
+            title, body = format_condition_alert_notification(event.event)
+        elif group.family == "signal":
+            signal = store.signal(record.signal_id)
+            if signal is None:
+                raise ValueError("merge original signal is unavailable")
+            prepared = NotificationDelivery(signal=signal, record=record, deadline=record.lease_until)
+            title, body = format_signal_notification(signal)
+        else:
+            raise TypeError("builtin merge requires its committed builtin admission")
+        parts.append(title + "\n\n" + body)
+        prepared_members.append((group.family, prepared, record))
+    title = f"{len(records)}条提醒"
+    body = "\n\n---\n\n".join(parts)
+    if len((title + body).encode()) > 64 * 1024:
+        raise ValueError("complete merged notification exceeds sixty-four KiB")
+    rights: list[tuple[str, object, object, OutboxRecord]] = []
+    for family, prepared, record in prepared_members:
+        if family == "price":
+            authority = store.price_alert_delivery_authority()
+            if authority is None:
+                raise ValueError("price authority is unavailable")
+            admitted = store.admit_price_alert_delivery(
+                record, activation=price_activation, worker_id=worker_id,
+                expected_revision=authority.authority_revision, admitted_at=now,
+            )
+        elif family in {"condition", "builtin"}:
+            authority = store.condition_alert_delivery_authority()
+            if authority is None:
+                raise ValueError("condition authority is unavailable")
+            admitted = store.admit_condition_alert_delivery(
+                record, activation=condition_activation, worker_id=worker_id,
+                expected_revision=authority.authority_revision, admitted_at=now,
+            )
+        else:
+            admitted = None
+        if family != "signal" and admitted is None:
+            raise ValueError("merge admission has already committed; no automatic resend")
+        rights.append((family, prepared, admitted, record))
+
+    def consume() -> None:
+        for family, prepared, admitted, record in rights:
+            if family == "price":
+                _, _, actual = _consume_prepared_price(provider, prepared, admitted, store=store, record=record, now=now)
+            elif family in {"condition", "builtin"}:
+                _, _, actual = _consume_prepared_condition(provider, prepared, admitted, store=store, record=record, now=now)
+            else:
+                actual = credential
+            if actual != credential:
+                raise ValueError("merge member credential differs from its current receiver")
+
+    binding = store.commit_merge_intent(
+        group, records, worker_id=worker_id, now=now,
+        request_sha256=canonical_sha256({"title": title, "body": body}), consume=consume,
+        request_utf8_bytes=len((title + body).encode()),
+    )
+    token = object.__new__(MergePreparedNotification)
+    _MERGE_PREPARED[token] = provider, store, binding, records, title, body, credential
+    return token, binding
+
+
+def deliver_merged_notification(
+    provider: object, prepared: MergePreparedNotification, *, store: object,
+    now: datetime, clock: Callable[[], datetime],
+) -> PhysicalPostBinding:
+    if type(prepared) is not MergePreparedNotification or prepared not in _MERGE_PREPARED:
+        raise TypeError("merge provider requires a fresh single-use committed send right")
+    issuer, original, binding, records, title, body, credential = _MERGE_PREPARED.pop(prepared)
+    if issuer is not provider or original is not store or now < binding.issued_at:
+        raise TypeError("merge send right belongs to another original issuer or clock")
+    with store._read_snapshot() as connection:
+        group = next(g for g in store._merge_groups(connection) if g.group_id == binding.group_id)
+        if group.status != "intent" or not store.merge_binding_matches(group.binding):
+            raise ValueError("merge original intent or installed mode changed")
+        for record in records:
+            row = connection.execute("SELECT * FROM delivery_outbox WHERE outbox_id=?", (record.outbox_id,)).fetchone()
+            if row is None or store._outbox_from_row(row) != record:
+                raise ValueError("merge original lease changed before POST")
+            store._verify_lease(row, worker_id=record.lease_owner, attempt_no=record.attempt_count, completed_at=now)
+            store.validate_merge_cohort(connection, group, record)
+            store._validate_merge_member_authority(connection, group.family, record, now)
+    if type(provider) is SuppressedNotificationProvider:
+        return binding
+    if type(provider) is not RecipientScopedNotificationProvider or (
+        credential is None or provider._capabilities.credential_for(binding.target.channel, binding.target.recipient_id) != credential
+    ):
+        raise ValueError("merge current recipient capability changed before POST")
+    provider._transport.send_observed(binding=binding, endpoint=provider._endpoint,
+                                     credential=credential, title=title, body=body,
+                                     sink=store.record_physical_post, clock=clock)
+    return binding
 
 
 CapabilityInput = RecipientNotificationCapabilities | Mapping[DeliveryChannel, Mapping[str, str]]

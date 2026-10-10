@@ -1,0 +1,4 @@
+
+> rquant-web@0.0.0 typecheck /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/web
+> tsc -p tsconfig.app.json --noEmit && tsc -p tsconfig.node.json --noEmit
+

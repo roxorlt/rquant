@@ -1,0 +1,9 @@
+# Install as /etc/sudoers.d/rquant-web with mode 0440, owner root:root.
+# Validate before install: visudo -cf deploy/sudoers/rquant-web
+#
+# The one privilege scripts/web-release.sh needs: restart the read-only web API after it
+# switches /home/lighthouse/rquant-web/current. A separate drop-in rather than a line in
+# rquant-production-deploy, so it installs and rolls back (rm) on its own without
+# rewriting the production deployer's sudoers file.
+
+lighthouse ALL=(root) NOPASSWD: /usr/bin/systemctl restart rquant-web.service

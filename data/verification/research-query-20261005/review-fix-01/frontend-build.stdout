@@ -1,0 +1,76 @@
+
+> rquant-web@0.0.0 build /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/web
+> tsc -p tsconfig.app.json --noEmit && vite build
+
+vite v8.3.1 building client environment for production...
+transforming...
+✓ 2397 modules transformed.
+rendering chunks...
+dist/index.html                                                        1.69 kB
+dist/assets/OFL-BhJ6fBOA.txt                                           6.54 kB
+dist/assets/ibm-plex-mono-latin-400-normal-DMJ8VG8y.woff2             14.70 kB
+dist/assets/ibm-plex-mono-latin-500-normal-DSY6xOcd.woff2             14.88 kB
+dist/assets/ibm-plex-sans-condensed-latin-600-normal-CRd5VyFf.woff2   19.81 kB
+dist/assets/ibm-plex-sans-condensed-latin-500-normal-BqaLkUoX.woff2   19.95 kB
+dist/assets/overview-_vEy8A42.css                                      0.09 kB
+dist/assets/strategies-B5T3PUXU.css                                    0.36 kB
+dist/assets/experiments-CLhbOD7L.css                                   1.69 kB
+dist/assets/backtest-BcSFKe0i.css                                      1.88 kB
+dist/assets/query-4b52v_nq.css                                         2.30 kB
+dist/assets/monitor-D7VKe316.css                                       3.74 kB
+dist/assets/paper-BZYKA4Aq.css                                         3.87 kB
+dist/assets/tasks-DWplMdYn.css                                         4.53 kB
+dist/assets/factors-B8dCLPPB.css                                       7.92 kB
+dist/assets/pools-faqgAOgx.css                                        13.16 kB
+dist/assets/screener-WVMsXFOZ.css                                     15.18 kB
+dist/assets/datacenter-2vkktn5o.css                                   15.34 kB
+dist/assets/index-DeuUOAxc.css                                        29.27 kB
+dist/assets/omit-CM_Et8lu.js                                           0.11 kB
+dist/assets/color-Cv3IYI4H.js                                          0.13 kB
+dist/assets/Pill-D0gvSNJd.js                                           0.24 kB
+dist/assets/Segmented-oknVAguZ.js                                      0.31 kB
+dist/assets/ChangeText-CKSnlzOs.js                                     0.31 kB
+dist/assets/Panel-C_4XV7BQ.js                                          0.48 kB
+dist/assets/SearchInput-0Ar7VSnA.js                                    0.52 kB
+dist/assets/StockCell-BEQq07Cp.js                                      0.53 kB
+dist/assets/KpiStrip-C9iONzHz.js                                       0.64 kB
+dist/assets/ReportsPage-D_JvNkea.js                                    0.85 kB
+dist/assets/useMeta-KqkeJbaz.js                                        0.95 kB
+dist/assets/classPrivateFieldSet2-Ca_2-qVK.js                          1.11 kB
+dist/assets/AlertAcknowledgment--RhM6ed3.js                            1.28 kB
+dist/assets/StatusBadge-BuR5b81b.js                                    1.81 kB
+dist/assets/tokens-aBUwXuPA.js                                         2.05 kB
+dist/assets/ConfirmDialog-l3BKQSbA.js                                  2.71 kB
+dist/assets/strategies-ejlsACKI.js                                     3.43 kB
+dist/assets/ReportPage-tkIOTo3u.js                                     3.45 kB
+dist/assets/LicensesPage-J0M1AjDF.js                                   3.49 kB
+dist/assets/react-dom-DFcZGaq7.js                                      3.86 kB
+dist/assets/CloseOutlined-BkwEDDMF.js                                  6.05 kB
+dist/assets/screen-D-0iD-8o.js                                         6.54 kB
+dist/assets/experiments-BNYhcQF7.js                                    7.25 kB
+dist/assets/health-Dpvnnb1L.js                                         7.27 kB
+dist/assets/endpoints-Dpq8Z5I-.js                                      7.29 kB
+dist/assets/reports-Cmm0wuUy.js                                        8.52 kB
+dist/assets/PageHeader-CPbVu2Uo.js                                     9.26 kB
+dist/assets/overview-zUgHKelP.js                                       9.46 kB
+dist/assets/backtest-94ygIslg.js                                      11.21 kB
+dist/assets/paper-BUYbliSx.js                                         11.88 kB
+dist/assets/query-C5lC4kt2.js                                         12.27 kB
+dist/assets/Drawer-CjqJHb_f.js                                        15.06 kB
+dist/assets/context-DfGxclov.js                                       15.69 kB
+dist/assets/monitor-CibIsINH.js                                       23.13 kB
+dist/assets/tasks-Dvkgzr_I.js                                         29.25 kB
+dist/assets/Tabs-B1TrLEUl.js                                          35.61 kB
+dist/assets/datacenter-BmRA8qxi.js                                    56.44 kB
+dist/assets/PurePanel-s7P1e6Nk.js                                     63.26 kB
+dist/assets/screener-CQ2QCPS_.js                                      73.84 kB
+dist/assets/DataTable-B1cAE10v.js                                     75.37 kB
+dist/assets/lib-CXHRsyda.js                                           97.16 kB
+dist/assets/factors-Dlqq3YsB.js                                      104.52 kB
+dist/assets/pools-r5NMV2Sp.js                                        120.11 kB
+dist/assets/panorama-DcXHGnjp.js                                     144.56 kB
+dist/assets/index-B_Lnw_Ry.js                                        359.07 kB
+dist/assets/useServingQuery-DrHFRKye.js                              416.49 kB
+dist/assets/options-Brs-0tOy.js                                      642.68 kB
+
+✓ built in 276ms

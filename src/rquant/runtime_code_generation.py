@@ -20,6 +20,7 @@ from rquant.adapter_manifest import VerifyOnlyEd25519Keyring
 from rquant.authority_path_security import (
     AuthorityPathSecurityError,
     SecureRegularFileLease,
+    _SharedSecureFileLeaseAncestors,
     open_secure_regular_file_lease,
 )
 from rquant.runtime_code_attestation import (
@@ -156,6 +157,7 @@ class RuntimeCodeGenerationCapability:
         loaded: LoadedRuntimeCodeGeneration,
         pointer_lease: SecureRegularFileLease,
         artifact_leases: tuple[SecureRegularFileLease, ...],
+        ancestor_owner: _SharedSecureFileLeaseAncestors,
         require_authority_paths: Callable[[], None],
         require_exact_tree: Callable[[], None],
         require_current_promotion: Callable[[], None],
@@ -164,6 +166,7 @@ class RuntimeCodeGenerationCapability:
         self.loaded = loaded
         self._pointer_lease = pointer_lease
         self._artifact_leases = artifact_leases
+        self._ancestor_owner = ancestor_owner
         self._require_authority_paths = require_authority_paths
         self._require_exact_tree = require_exact_tree
         self._require_current_promotion = require_current_promotion
@@ -225,6 +228,7 @@ class RuntimeCodeGenerationCapability:
         for lease in reversed(self._artifact_leases):
             lease.close()
         self._pointer_lease.close()
+        self._ancestor_owner.close()
 
     def __enter__(self) -> RuntimeCodeGenerationCapability:
         self.require_live()
@@ -1017,6 +1021,7 @@ def open_attested_runtime_generation(
 
     pointer_lease: SecureRegularFileLease | None = None
     artifact_leases: list[SecureRegularFileLease] = []
+    ancestor_owner = _SharedSecureFileLeaseAncestors()
     try:
         pointer_lease = open_secure_regular_file_lease(
             runtime_root / "current",
@@ -1026,6 +1031,7 @@ def open_attested_runtime_generation(
             allowed_modes=frozenset({0o400, 0o440, 0o444}),
             max_bytes=_POINTER_BYTES,
         )
+        ancestor_owner.adopt(pointer_lease)
         expected_pointer = f"{loaded.evidence.generation_id}\n".encode("ascii")
         if pointer_lease.read_all(max_bytes=_POINTER_BYTES) != expected_pointer:
             raise RuntimeCodeGenerationError("runtime generation changed while opening")
@@ -1058,6 +1064,7 @@ def open_attested_runtime_generation(
                 min_bytes=0,
             )
             artifact_leases.append(lease)
+            ancestor_owner.adopt(lease)
             if lease.read_all(max_bytes=max(1, len(expected_payload) + 1)) != expected_payload:
                 raise RuntimeCodeGenerationError("runtime generation changed while leasing")
         if fault_hook is not None:
@@ -1066,6 +1073,7 @@ def open_attested_runtime_generation(
             loaded=loaded,
             pointer_lease=pointer_lease,
             artifact_leases=tuple(artifact_leases),
+            ancestor_owner=ancestor_owner,
             require_authority_paths=require_authority_paths,
             require_exact_tree=require_exact_tree,
             require_current_promotion=require_current_promotion,
@@ -1084,6 +1092,7 @@ def open_attested_runtime_generation(
             lease.close()
         if pointer_lease is not None:
             pointer_lease.close()
+        ancestor_owner.close()
         raise
 
 

@@ -15,8 +15,10 @@ from rquant.dashboard.runtime_console_data import (
     ConsoleFreshness,
     ConsoleLimits,
     ConsoleLoadState,
+    LabJobRow,
     load_runtime_console,
     query_acquired_serving_frame,
+    read_runtime_console_sections,
 )
 from rquant.serving_contracts import FreshnessStatus, ServingDatasetWatermark
 from rquant.serving_publisher import (
@@ -195,6 +197,50 @@ def test_loads_a_verified_generation_into_typed_console_sections(
     assert snapshot.paper_holdings[0].unrealized_pnl == 50
     assert snapshot.lab_jobs[0].eta_finish_center == _NOW + timedelta(minutes=12)
     assert snapshot.promotions[0].approved is True
+
+
+@pytest.mark.parametrize("phase", [None, "replay"])
+def test_console_query_preserves_the_original_nullable_lab_phase(
+    phase: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    row = list(_FakeReader.connection.rows["lab_jobs"][0])
+    row[6] = phase
+    _FakeReader.connection.rows["lab_jobs"][0] = tuple(row)
+    monkeypatch.setattr("rquant.dashboard.runtime_console_data.ServingReader", _FakeReader)
+
+    snapshot = load_runtime_console("/serving", now=_NOW, limits=ConsoleLimits(lab_jobs=7))
+
+    assert snapshot.state is ConsoleLoadState.READY
+    assert snapshot.lab_jobs[0].phase == phase
+    assert snapshot.lab_jobs[0].progress_fraction == 0.5
+    assert snapshot.lab_jobs[0].status == "running"
+    assert len(_FakeReader.connection.queries) == 7
+    lab_query, parameters = next(
+        (sql, parameters)
+        for sql, parameters in _FakeReader.connection.queries
+        if 'FROM "lab_jobs"' in sql
+    )
+    assert '"phase"' in lab_query and "SELECT *" not in lab_query.upper()
+    assert " LIMIT ?" in lab_query and parameters == (7,)
+
+
+@pytest.mark.parametrize("phase", [42, [], {}])
+def test_console_query_still_rejects_non_string_lab_phase(phase: object) -> None:
+    row = list(_FakeReader.connection.rows["lab_jobs"][0])
+    row[6] = phase
+    _FakeReader.connection.rows["lab_jobs"][0] = tuple(row)
+
+    with pytest.raises(ValidationError):
+        read_runtime_console_sections(_FakeReader.connection)
+
+
+def test_nullable_lab_phase_is_still_required() -> None:
+    original = read_runtime_console_sections(_FakeReader.connection).lab_jobs[0]
+    missing_phase = original.model_dump(mode="python")
+    del missing_phase["phase"]
+
+    with pytest.raises(ValidationError):
+        LabJobRow.model_validate(missing_phase)
 
 
 def test_queries_are_fixed_column_whitelists_with_bounded_limits(

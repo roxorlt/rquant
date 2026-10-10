@@ -40,6 +40,19 @@ def _snapshot() -> pd.DataFrame:
     )
 
 
+def test_select_preserves_only_observed_optional_fields_and_vendor_clock_text() -> None:
+    from rquant.watchlist_quote_provider import _select_watchlist_rows
+    snapshot=_snapshot()
+    snapshot["昨收"]=10.0
+    snapshot["涨跌幅"]=1.0
+    snapshot["时间戳"]="09:26:04"
+    rows=_select_watchlist_rows(snapshot,("600000.SH",))
+    assert rows[0]["pre_close"]==10.0 and rows[0]["pct_chg"]==1.0
+    assert rows[0]["vendor_time_text"]=="09:26:04"
+    assert "source_observed_at" not in rows[0]
+    assert "float_shares" not in rows[0] and "up_limit" not in rows[0]
+
+
 def _record_pid() -> None:
     path = Path(os.environ["RQUANT_WATCHLIST_QUOTE_TEST_PID_PATH"])
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)

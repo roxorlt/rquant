@@ -1,0 +1,1 @@
+import{On as e}from"./useMeta-BItLf5LJ.js";function t(t,n,r={}){let i=e({queryKey:t,queryFn:n,enabled:r.enabled??!0,staleTime:r.staleTime,refetchInterval:r.refetchInterval});return{data:i.data?.data,serving:i.data?.serving,isLoading:i.isLoading,isFetching:i.isFetching,error:i.error,refetch:()=>{i.refetch()}}}export{t};

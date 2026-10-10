@@ -1,0 +1,17 @@
+[
+  {
+    "id": "gap-status",
+    "kind": "gap-status",
+    "title": "差距总览",
+    "date": "2026-09-25",
+    "summary": "16 个模块的现状、已有能力、还缺什么，以及对应的能力编号和工作流；随每个发布列车更新。"
+  },
+  {
+    "id": "2026-09-24-quant-platform-research",
+    "kind": "html",
+    "title": "量化投研平台调研，以及 rQuant 还差什么",
+    "date": "2026-09-24",
+    "file": "reports/2026-09-24-quant-platform-research.html",
+    "summary": "19 家国内外量化平台和开源工具的功能调研，归为 16 个模块逐一对照 rQuant（固定快照）。"
+  }
+]

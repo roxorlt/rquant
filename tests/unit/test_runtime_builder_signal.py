@@ -5,6 +5,7 @@ import json
 import os
 import sqlite3
 from collections.abc import Callable
+from contextlib import closing
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -42,7 +43,11 @@ from rquant.runtime_shadow_validation import ShadowStrategyBinding
 from rquant.serving_page_projection_source import DuckDBSignalPageProjectionSource
 from rquant.signal_bus import SignalBusStore
 from rquant.signal_contracts import SignalAction, SignalEnvelope
-from rquant.signal_route_spool import SignalRouteSpool, publish_signal_bus_prefix
+from rquant.signal_route_spool import (
+    ReadonlySignalRouteSpool,
+    SignalRouteSpool,
+    publish_signal_bus_prefix,
+)
 from rquant.signal_router_runtime import (
     ReadonlySignalRouteAuthority,
     RouteSourceDescriptor,
@@ -432,6 +437,272 @@ def test_signal_router_maps_committed_cursor_and_remaining_backlog(tmp_path: Pat
     assert result.degraded_reasons == ()
 
 
+def test_router_publishes_verified_bus_prefix_after_catching_up(tmp_path: Path) -> None:
+    observed = datetime.now(UTC) + timedelta(seconds=10)
+    source = _Source((RunnerSignalRecord(sequence=1, signal=_signal("2")),))
+    step = signal_router_builder(
+        source_loader=lambda _source_id: source,
+        target_resolver=_route_target,
+        clock=lambda: observed,
+    )(_router_manifest(tmp_path))
+
+    result = step()
+    linked = ReadonlySignalRouteSpool(tmp_path / "signal-spool").bus_prefix_link()
+
+    assert result.output_sequence == 1
+    assert linked is not None
+    assert linked.bus_prefix.source_high_watermark == 1
+    assert linked.bus_prefix.source_inspected_at == observed
+    assert linked.bus_prefix.upstream_complete is False
+
+
+def test_router_limits_idle_prefix_checks_to_one_per_minute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    observed = datetime.now(UTC) + timedelta(seconds=10)
+    tick = 100.0
+    attempts: list[datetime] = []
+    original = SignalRouteSpool.publish_bus_prefix_link
+
+    def record_attempt(
+        spool: SignalRouteSpool, *, bus: SignalBusStore, observed_at: datetime
+    ) -> object:
+        attempts.append(observed_at)
+        return original(spool, bus=bus, observed_at=observed_at)
+
+    monkeypatch.setattr(SignalRouteSpool, "publish_bus_prefix_link", record_attempt)
+    step = signal_router_builder(
+        source_loader=lambda _source_id: _Source(()),
+        target_resolver=_route_target,
+        clock=lambda: observed,
+        monotonic_clock=lambda: tick,
+    )(_router_manifest(tmp_path))
+    step()
+    link_path = tmp_path / "signal-spool" / "bus-prefix-link.json"
+    first_link = link_path.read_bytes()
+    first_observed = observed
+
+    for next_tick in (102.0, 159.0):
+        tick = next_tick
+        observed += timedelta(seconds=2)
+        step()
+
+    assert len(attempts) == 1
+    assert link_path.read_bytes() == first_link
+    tick = 160.0
+    observed += timedelta(seconds=56)
+    step()
+
+    assert attempts == [first_observed, observed]
+    assert link_path.read_bytes() != first_link
+    linked = ReadonlySignalRouteSpool(tmp_path / "signal-spool").bus_prefix_link()
+    assert linked is not None
+    assert linked.bus_prefix.source_inspected_at == observed
+
+
+@pytest.mark.parametrize("outcome", ("none", "error"))
+def test_router_throttles_failed_prefix_attempts_without_interrupting_routes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    observed = datetime.now(UTC) + timedelta(seconds=10)
+    tick = 100.0
+    attempts: list[float] = []
+
+    def unavailable(
+        _spool: SignalRouteSpool, *, bus: SignalBusStore, observed_at: datetime
+    ) -> None:
+        del bus, observed_at
+        attempts.append(tick)
+        if outcome == "error":
+            raise OSError("optional prefix write unavailable")
+
+    monkeypatch.setattr(SignalRouteSpool, "publish_bus_prefix_link", unavailable)
+    signal = SignalEnvelope.model_validate(
+        {
+            **_signal("3").model_dump(mode="python", exclude={"signal_id"}),
+            "event_time": observed - timedelta(seconds=2),
+            "available_at": observed - timedelta(seconds=1),
+            "expires_at": observed + timedelta(minutes=5),
+        }
+    )
+    source = _Source((RunnerSignalRecord(sequence=1, signal=signal),))
+    step = signal_router_builder(
+        source_loader=lambda _source_id: source,
+        target_resolver=_route_target,
+        clock=lambda: observed,
+        monotonic_clock=lambda: tick,
+    )(_router_manifest(tmp_path))
+
+    results = []
+    committed_outbox = None
+    for next_tick in (100.0, 102.0, 159.0, 160.0, 162.0, 220.0):
+        tick = next_tick
+        results.append(step())
+        if tick == 100.0:
+            committed_outbox = SignalBusStore(tmp_path / "signal-bus.sqlite3").outbox_records()
+
+    bus = SignalBusStore(tmp_path / "signal-bus.sqlite3")
+    assert attempts == [100.0, 160.0, 220.0]
+    assert [result.output_sequence for result in results] == [1] * 6
+    assert bus.route_cursor("n-shape-v1").last_sequence == 1
+    assert len(bus.route_receipts("n-shape-v1")) == 1
+    assert committed_outbox is not None and len(committed_outbox) == 1
+    assert bus.outbox_records() == committed_outbox
+    assert ReadonlySignalRouteSpool(tmp_path / "signal-spool").bus_prefix_link() is None
+
+
+def test_auxiliary_prefix_clock_failure_does_not_interrupt_committed_routes(
+    tmp_path: Path,
+) -> None:
+    observed = datetime.now(UTC) + timedelta(seconds=10)
+    signal = SignalEnvelope.model_validate(
+        {
+            **_signal("7").model_dump(mode="python", exclude={"signal_id"}),
+            "event_time": observed - timedelta(seconds=2),
+            "available_at": observed - timedelta(seconds=1),
+            "expires_at": observed + timedelta(minutes=5),
+        }
+    )
+
+    def broken_monotonic_clock() -> float:
+        raise RuntimeError("auxiliary monotonic clock unavailable")
+
+    step = signal_router_builder(
+        source_loader=lambda _source_id: _Source((RunnerSignalRecord(sequence=1, signal=signal),)),
+        target_resolver=_route_target,
+        clock=lambda: observed,
+        monotonic_clock=broken_monotonic_clock,
+    )(_router_manifest(tmp_path))
+
+    result = step()
+    bus = SignalBusStore(tmp_path / "signal-bus.sqlite3")
+    assert result.output_sequence == 1
+    assert bus.route_cursor("n-shape-v1").last_sequence == 1
+    assert len(bus.outbox_records()) == 1
+    assert ReadonlySignalRouteSpool(tmp_path / "signal-spool").bus_prefix_link() is None
+
+
+def test_router_prefix_cadence_recovers_from_clock_rollback_and_cold_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    observed = datetime.now(UTC) + timedelta(seconds=10)
+    tick = 100.0
+    attempts: list[datetime] = []
+    original = SignalRouteSpool.publish_bus_prefix_link
+
+    def record_attempt(
+        spool: SignalRouteSpool, *, bus: SignalBusStore, observed_at: datetime
+    ) -> object:
+        attempts.append(observed_at)
+        return original(spool, bus=bus, observed_at=observed_at)
+
+    monkeypatch.setattr(SignalRouteSpool, "publish_bus_prefix_link", record_attempt)
+    source = _Source((RunnerSignalRecord(sequence=1, signal=_signal("4")),))
+
+    def build_step() -> Callable[[], object]:
+        return signal_router_builder(
+            source_loader=lambda _source_id: source,
+            target_resolver=_route_target,
+            clock=lambda: observed,
+            monotonic_clock=lambda: tick,
+        )(_router_manifest(tmp_path))
+
+    step = build_step()
+    step()
+    first = ReadonlySignalRouteSpool(tmp_path / "signal-spool").bus_prefix_link()
+    assert first is not None
+
+    observed -= timedelta(days=1)
+    tick = 160.0
+    step()
+    assert attempts == [first.bus_prefix.source_inspected_at, observed]
+    assert ReadonlySignalRouteSpool(tmp_path / "signal-spool").bus_prefix_link() == first
+
+    observed = first.bus_prefix.source_inspected_at + timedelta(minutes=2)
+    tick = 10.0
+    step()
+    rolled = ReadonlySignalRouteSpool(tmp_path / "signal-spool").bus_prefix_link()
+    assert rolled is not None
+    assert rolled.bus_prefix.source_inspected_at == observed
+    assert len(attempts) == 3
+
+    observed += timedelta(seconds=2)
+    tick = 12.0
+    step()
+    assert len(attempts) == 3
+
+    restarted = build_step()
+    restarted()
+    assert len(attempts) == 4
+    fresh = ReadonlySignalRouteSpool(tmp_path / "signal-spool").bus_prefix_link()
+    assert fresh is not None
+    assert fresh.bus_prefix.source_inspected_at == observed
+
+
+def test_paused_or_spool_backlogged_router_does_not_attempt_prefix_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempts: list[datetime] = []
+    original = SignalRouteSpool.publish_bus_prefix_link
+
+    def record_attempt(
+        spool: SignalRouteSpool, *, bus: SignalBusStore, observed_at: datetime
+    ) -> object:
+        attempts.append(observed_at)
+        return original(spool, bus=bus, observed_at=observed_at)
+
+    monkeypatch.setattr(SignalRouteSpool, "publish_bus_prefix_link", record_attempt)
+    observed = datetime.now(UTC) + timedelta(seconds=10)
+    paused_root = tmp_path / "paused"
+    paused_root.mkdir()
+    paused = signal_router_builder(
+        source_loader=lambda _source_id: _Source(()),
+        target_resolver=_route_target,
+        clock=lambda: observed,
+        monotonic_clock=lambda: 100.0,
+    )(_router_manifest(paused_root, paused=True))
+    paused()
+    assert attempts == []
+
+    routed_root = tmp_path / "backlog"
+    routed_root.mkdir()
+    bus = SignalBusStore(routed_root / "signal-bus.sqlite3")
+    source = _Source(
+        (
+            RunnerSignalRecord(sequence=1, signal=_signal("5")),
+            RunnerSignalRecord(sequence=2, signal=_signal("6")),
+        )
+    )
+    route_runner_signals(
+        source_id="n-shape-v1",
+        source=source,
+        bus=bus,
+        cursors=SignalRouteCursorStore(
+            routed_root / "route-cursor.sqlite3",
+            routing_policy_fingerprint=POLICY,
+        ),
+        routed_at=observed,
+        target_resolver=_route_target,
+        limit=10,
+    )
+    step = signal_router_builder(
+        source_loader=lambda _source_id: source,
+        target_resolver=_route_target,
+        clock=lambda: observed,
+        monotonic_clock=lambda: 100.0,
+    )(_router_manifest(routed_root, batch_limit=1))
+
+    first = step()
+    assert first.degraded_reasons == ("signal_router:spool_catchup",)
+    assert attempts == []
+    assert ReadonlySignalRouteSpool(routed_root / "signal-spool").bus_prefix_link() is None
+
+    second = step()
+    assert second.degraded_reasons == ()
+    assert attempts == [observed]
+    assert ReadonlySignalRouteSpool(routed_root / "signal-spool").bus_prefix_link() is not None
+
+
 def test_single_signal_router_routes_multiple_strategy_sources_with_one_bus_writer(
     tmp_path: Path,
 ) -> None:
@@ -735,6 +1006,71 @@ def test_notifier_loads_providers_outside_manifest_and_maps_backlog(tmp_path: Pa
     assert len(result.source_generations["signal_route_spool"]) == 64
     assert result.degraded_reasons == ()
     assert state.outbox_records()[0].status is OutboxStatus.SUCCEEDED
+
+
+@pytest.mark.parametrize("mixed_installed", [False, True], ids=["v1", "mixed"])
+def test_notifier_owner_history_controls_real_mixed_input(
+    tmp_path: Path, mixed_installed: bool
+) -> None:
+    from rquant.price_alert_route import install_price_alert_history
+    from rquant.signal_route_spool import publish_mixed_notification_bus_prefix
+    from tests.unit.test_price_alert_event_contracts import AT
+    from tests.unit.test_price_alert_route_spool import mixed_fixture
+
+    producer, bus, _activation, one, price, three = mixed_fixture(tmp_path)
+    try:
+        publish_mixed_notification_bus_prefix(
+            bus=bus,
+            spool=SignalRouteSpool(tmp_path / "signal-spool"),
+            limit=100,
+            observed_at=AT,
+        )
+        state = NotificationStateStore(tmp_path / "notification-state.sqlite3")
+        if mixed_installed:
+            install_price_alert_history(state)
+        before = state.replication_cursor()
+        step = notifier_builder(provider_loader=lambda: {}, clock=lambda: AT)(
+            _notifier_manifest(tmp_path)
+        )
+        if mixed_installed:
+            assert step().output_sequence == 3
+            assert state.notification_event(price.event.event_id).event == price.event
+            assert state.signal(one.signal_id) == one
+            assert state.signal(three.signal_id) == three
+            assert step().output_sequence == 3
+            assert len(state.outbox_records()) == 3
+        else:
+            with pytest.raises((TypeError, ValueError, RuntimeError)):
+                step()
+            assert state.replication_cursor() == before
+            assert state.outbox_records() == ()
+            with state._read_snapshot() as connection:
+                assert connection.execute("SELECT COUNT(*) FROM signal_envelope").fetchone()[0] == 0
+    finally:
+        producer.close()
+
+
+@pytest.mark.parametrize("fault", ["partial", "protocol"])
+def test_notifier_rejects_invalid_owner_history_at_build(tmp_path: Path, fault: str) -> None:
+    from rquant.price_alert_route import install_price_alert_history
+
+    state = NotificationStateStore(tmp_path / "notification-state.sqlite3")
+    install_price_alert_history(state)
+    with closing(sqlite3.connect(state.path)) as connection, connection:
+        if fault == "partial":
+            connection.execute("DROP TABLE price_alert_route_receipt")
+        else:
+            connection.execute(
+                "UPDATE signal_bus_metadata SET metadata_value='invalid' "
+                "WHERE metadata_key='mixed_notification_history'"
+            )
+    before = state.replication_cursor()
+    with pytest.raises(ValueError, match="mixed notification history"):
+        notifier_builder(provider_loader=lambda: {}, clock=lambda: NOW)(
+            _notifier_manifest(tmp_path)
+        )
+    assert state.replication_cursor() == before
+    assert state.outbox_records() == ()
 
 
 def test_notifier_default_loader_uses_scoped_environment_before_claim(
@@ -1111,6 +1447,10 @@ def test_notifier_builtin_refreshes_signal_page_projections_from_replica(
             INSERT INTO minute_bar VALUES
               ('600000.SH', '2026-07-31 09:30:00', '1min', 10, 10, 10, 10,
                100, 1000, 'tushare', '2026-07-31 09:31:00');
+            CREATE TABLE monitor_event (
+                trade_date DATE, trigger_time TIMESTAMP, ts_code VARCHAR, level VARCHAR,
+                trigger_price DOUBLE, level_price DOUBLE, trigger_type VARCHAR, pool VARCHAR
+            );
             """
         )
     finally:
@@ -1188,6 +1528,10 @@ def _page_projection_replica(tmp_path: Path, *, synced_at: datetime) -> Path:
             INSERT INTO minute_bar VALUES
               ('600000.SH', '2026-07-31 09:30:00', '1min', 10, 10, 10, 10,
                100, 1000, 'tushare', '2026-07-31 09:31:00');
+            CREATE TABLE monitor_event (
+                trade_date DATE, trigger_time TIMESTAMP, ts_code VARCHAR, level VARCHAR,
+                trigger_price DOUBLE, level_price DOUBLE, trigger_type VARCHAR, pool VARCHAR
+            );
             """
         )
         connection.execute("CHECKPOINT")
@@ -1250,9 +1594,7 @@ def test_the_notifier_begins_each_iteration_s_replica_accounting(
         begun.append(1)
         original(self)
 
-    monkeypatch.setattr(
-        DuckDBSignalPageProjectionSource, "begin_replica_iteration", counted
-    )
+    monkeypatch.setattr(DuckDBSignalPageProjectionSource, "begin_replica_iteration", counted)
     step = notifier_builder(
         provider_loader=lambda: {DeliveryChannel.PUSHDEER: _Provider()},
         clock=lambda: NOW,
@@ -1415,8 +1757,7 @@ def two_notifier_generations(tmp_path: Path, sealed_bundle_installs: None) -> Pa
             root,
             producer_commit=commit,
             manifests=tuple(
-                manifest.model_copy(update={"producer_commit": commit})
-                for manifest in manifests
+                manifest.model_copy(update={"producer_commit": commit}) for manifest in manifests
             ),
             capability_env=capabilities,
         )
@@ -2202,9 +2543,7 @@ def test_the_notifier_never_writes_into_the_page_control_root(tmp_path: Path) ->
             serving_authority_root=str(notifications / "serving-authority"),
             page_projection_database_path=str(replica),
             page_projection_canvas_catalog_root=str(catalog),
-            page_projection_canvas_receipt_root=str(
-                catalog.parent / "canvas-publication-receipts"
-            ),
+            page_projection_canvas_receipt_root=str(catalog.parent / "canvas-publication-receipts"),
             page_projection_page_control_outbox_path=str(outbox.path),
             page_projection_canvas_active_key_id=authority.keyring.active_key_id,
             page_projection_canvas_active_public_key_pem=public_key,
@@ -2245,9 +2584,9 @@ class _GrowingSource:
             ),
             after_sequence=after_sequence,
             limit=limit,
-            records=tuple(
-                record for record in self.records if record.sequence > after_sequence
-            )[:limit],
+            records=tuple(record for record in self.records if record.sequence > after_sequence)[
+                :limit
+            ],
         )
 
 
@@ -2382,9 +2721,9 @@ class _RacingSource:
             ),
             after_sequence=after_sequence,
             limit=limit,
-            records=tuple(
-                record for record in self.records if record.sequence > after_sequence
-            )[:limit],
+            records=tuple(record for record in self.records if record.sequence > after_sequence)[
+                :limit
+            ],
         )
 
 
@@ -2417,9 +2756,12 @@ def test_a_source_that_grows_while_being_routed_still_reports_the_move(
     assert first.watermark_advanced is True
     assert raced.watermark_advanced is True
     assert raced.processed_count == 1
-    assert SignalBusStore(
-        tmp_path / "signal-bus.sqlite3"
-    ).route_cursor("n-shape-v1").observed_high_watermark == 3
+    assert (
+        SignalBusStore(tmp_path / "signal-bus.sqlite3")
+        .route_cursor("n-shape-v1")
+        .observed_high_watermark
+        == 3
+    )
 
 
 def test_a_second_source_that_grows_alone_still_reports_the_move(tmp_path: Path) -> None:

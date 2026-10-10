@@ -1,0 +1,781 @@
+{
+  "kind": "research_query_five_review_fixes_verification",
+  "runtime": {
+    "product": "Codex native subagent",
+    "task": "/root/research_query_impl",
+    "role": "original implementer",
+    "parent": "/root",
+    "initial_tracked_state": "clean at delegated start; all new modifications by implementer"
+  },
+  "worktree": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk",
+  "branch": "cdx/20261005-research-query",
+  "base_commit": "380e20919a7b85237b63743669d3c801995d1092",
+  "review_start_commit": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb",
+  "frozen_product_commit": "025ef8ae5a7d21f3d5a4f2dd9563ce2e400cf30d",
+  "finding_status": {
+    "RQ-R01": "implemented and directly verified; pending original independent reviewer recheck",
+    "RQ-R02": "implemented and directly verified; pending original independent reviewer recheck",
+    "RQ-R03": "implemented and directly verified; pending original independent reviewer recheck",
+    "RQ-R04": "implemented and directly verified; pending original independent reviewer recheck",
+    "RQ-R05": "implemented and directly verified; pending original independent reviewer recheck"
+  },
+  "results": {
+    "backend_concentrated_red": {
+      "failed": 17,
+      "passed": 8
+    },
+    "frontend_concentrated_red": {
+      "failed": 2,
+      "deselected": 8
+    },
+    "five_backend_green": {
+      "passed": 25
+    },
+    "direct_query_regression": {
+      "passed": 67,
+      "skipped": 2,
+      "skip_reason": "macOS cannot enforce Linux hard resource contract"
+    },
+    "final_query_ui_csv": {
+      "passed": 12
+    },
+    "save_as_direct_red": {
+      "failed": 1,
+      "deselected": 10
+    },
+    "root_linux_r07": {
+      "status": "passed",
+      "child_reaped": 11,
+      "spill_samples": 3970,
+      "spill_logical_bytes": 0,
+      "spill_allocated_bytes": 0
+    },
+    "post_commit_dist": {
+      "status": "passed",
+      "command_seconds": 0.94073875000322,
+      "first_screen_gzip_kib": 325.0,
+      "limit_kib": 550.0
+    }
+  },
+  "latest_required_green_commands": [
+    "backend-five-green-02",
+    "query-direct-green",
+    "r01-final",
+    "frontend-query-green-02",
+    "frontend-typecheck-green-02",
+    "frontend-build-final",
+    "frontend-lint-final-02",
+    "python-code-lint-final",
+    "dist-verify",
+    "openapi-generate",
+    "ts-generate"
+  ],
+  "commands": [
+    {
+      "label": "backend-five-green-02",
+      "command_sha256": "01b3dfd45eaa086dcdaac23a488b301dcb7d5fe2d3593082b58296a22b5fe380",
+      "argv": [
+        "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/.venv/bin/python",
+        "-I",
+        "-B",
+        "-c",
+        "import sys,pytest;sys.path.insert(0,\"/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/src\");raise SystemExit(pytest.main([\"tests/unit/test_research_query_review.py\",\"tests/unit/test_web_research_query.py\",\"-k\",\"rq_r or complete_http\",\"-q\"]))"
+      ],
+      "cwd": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk",
+      "started_utc": "2026-10-04T22:11:47.350240+00:00",
+      "elapsed_seconds": 2.7693331250011397,
+      "exit_code": 0,
+      "stdout_sha256": "fe7eb4ad47639e92c8757978f586fa9f3a1a238e5596434abfa538559dfd6f4c",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "starting_candidate": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb"
+    },
+    {
+      "label": "backend-five-green",
+      "command_sha256": "d3997f6b1d354fb57db01fbbc17e1e5ff855c8e18f72e95e44176f7d7636b762",
+      "argv": [
+        "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/.venv/bin/python",
+        "-I",
+        "-B",
+        "-c",
+        "import sys,pytest;sys.path.insert(0,\"/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/src\");raise SystemExit(pytest.main([\"tests/unit/test_research_query_review.py\",\"tests/unit/test_web_research_query.py\",\"-k\",\"rq_r or complete_http\",\"-q\"]))"
+      ],
+      "cwd": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk",
+      "started_utc": "2026-10-04T22:10:48.568636+00:00",
+      "elapsed_seconds": 2.3851009579993843,
+      "exit_code": 1,
+      "stdout_sha256": "d6382a9e911f6ba7600d471ea6b9e78a3aa89d0c20ea8fdd0ce3f467e7612d41",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "starting_candidate": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb"
+    },
+    {
+      "label": "backend-freeze",
+      "command_sha256": "fbef68267b94395d07d16a7f488ec8009d8a229d8fbc5fdb9623c89e1b39afcd",
+      "argv": [
+        "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/.venv/bin/python",
+        "-I",
+        "-B",
+        "data/verification/research-query-20261005/review-fix-01/freeze_backend.py"
+      ],
+      "cwd": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk",
+      "started_utc": "2026-10-04T22:18:36.883974+00:00",
+      "elapsed_seconds": 0.11155970800245996,
+      "exit_code": 0,
+      "stdout_sha256": "b8144d9472f3fbf1fe8c7056c1d09149862d55306469bd161c50046318e1ca31",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "starting_candidate": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb"
+    },
+    {
+      "label": "backend-red",
+      "command_sha256": "2aa042aaccc16b81998aa353f13112f7adb52b187cb0dcc7a7887e0b33a54d72",
+      "argv": [
+        "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/.venv/bin/python",
+        "-I",
+        "-B",
+        "-c",
+        "import sys,pytest; sys.path.insert(0,\"/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/src\"); raise SystemExit(pytest.main([\"tests/unit/test_research_query_review.py\",\"tests/unit/test_web_research_query.py::test_complete_http_envelope_keeps_bounded_partial_prefix\",\"-q\"]))"
+      ],
+      "started_utc": "2026-10-04T22:02:58.114196+00:00",
+      "elapsed_seconds": 3.0501617090012587,
+      "exit_code": 1,
+      "starting_candidate": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb",
+      "phase": "red_before_corresponding_product_fixes",
+      "stdout_sha256": "6062406fb14a1e6241e1c21988a78d3ff1528beab24af28c632a85a9a9eab602",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "dist-verify",
+      "command_sha256": "301ac879f8855dce089cb55027f6dfc52be8a81b63a974ddadd546c32b13ca66",
+      "argv": [
+        "/opt/homebrew/bin/pnpm",
+        "verify:dist"
+      ],
+      "cwd": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/web",
+      "started_utc": "2026-10-04T22:32:51.643092+00:00",
+      "elapsed_seconds": 0.94073875000322,
+      "exit_code": 0,
+      "stdout_sha256": "55c708f1bb73073ad52055534f0e44aa619bddee19e3e0afedd9d73505dea90f",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "starting_candidate": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb"
+    },
+    {
+      "label": "freeze-script-format",
+      "command_sha256": "12081135d72712a3c79f2524712b42ffa58317879580ccc959a3f3f7d9eadfbf",
+      "argv": [
+        "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/.venv/bin/ruff",
+        "format",
+        "data/verification/research-query-20261005/review-fix-01/freeze_backend.py"
+      ],
+      "cwd": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk",
+      "started_utc": "2026-10-04T22:18:36.764439+00:00",
+      "elapsed_seconds": 0.009681332998297876,
+      "exit_code": 0,
+      "stdout_sha256": "413a709001976657cb743636fd34e48fc41d8d302d665460d3f874b3313da127",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "starting_candidate": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb"
+    },
+    {
+      "label": "frontend-build-final",
+      "command_sha256": "945779c9fb275ae904129d6ddb8ae264e9936e6b60eadfe7df13e5daee57d657",
+      "argv": [
+        "/opt/homebrew/bin/pnpm",
+        "build"
+      ],
+      "cwd": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/web",
+      "started_utc": "2026-10-04T22:29:32.041069+00:00",
+      "elapsed_seconds": 4.391404624999268,
+      "exit_code": 0,
+      "stdout_sha256": "0f5afa55a215c10abcb6c309898bceb2cbc28e43be3dfeb48be48c241a6d0e8d",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "starting_candidate": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb"
+    },
+    {
+      "label": "frontend-build",
+      "command_sha256": "79121fc9a0fde5d83c1ce26dd42d1bde67001f9af38edeb68b77fc0608405299",
+      "argv": [
+        "/opt/homebrew/bin/pnpm",
+        "build"
+      ],
+      "cwd": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/web",
+      "started_utc": "2026-10-04T22:19:43.188042+00:00",
+      "elapsed_seconds": 4.278211500000907,
+      "exit_code": 0,
+      "stdout_sha256": "dc8da016a147dd62ea56458cc044e2535e10eb71bae4ed9cbb45d97c5c2cb89c",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "starting_candidate": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb"
+    },
+    {
+      "label": "frontend-format",
+      "command_sha256": "c5027fd301fef37f47bc3b09602c4d371cc2d89e6a54a1bd9043484a814bd73e",
+      "argv": [
+        "/opt/homebrew/bin/pnpm",
+        "exec",
+        "biome",
+        "check",
+        "--write",
+        "src/pages/query/index.tsx",
+        "src/pages/query/query.test.tsx",
+        "src/pages/query/bigint-wire.fixture.json"
+      ],
+      "cwd": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/web",
+      "started_utc": "2026-10-04T22:14:32.367137+00:00",
+      "elapsed_seconds": 0.37531591700098943,
+      "exit_code": 0,
+      "stdout_sha256": "1e7674ec34efaf7c95e6436d2a62df64968df4a57568128a5b97e53c8af847ff",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "starting_candidate": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb"
+    },
+    {
+      "label": "frontend-lint-final-02",
+      "command_sha256": "b0fc00d104bd23eacebe7db29ad1d643c467e67e122e50277d7720d279de5e8e",
+      "argv": [
+        "/opt/homebrew/bin/pnpm",
+        "exec",
+        "biome",
+        "ci",
+        "src/pages/query/index.tsx",
+        "src/pages/query/query.test.tsx",
+        "src/pages/query/bigint-wire.fixture.json"
+      ],
+      "cwd": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/web",
+      "started_utc": "2026-10-04T22:29:32.041067+00:00",
+      "elapsed_seconds": 0.2917348749979283,
+      "exit_code": 0,
+      "stdout_sha256": "536162d60ed44d5ec5e78a6fb2012ca18a62f1c9280d96c2e0532028bb18cd4c",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "starting_candidate": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb"
+    },
+    {
+      "label": "frontend-lint-final",
+      "command_sha256": "de979bb77633370d25e292e1500ddb167ac7a19cac960547745a860fb1fab0d0",
+      "argv": [
+        "/opt/homebrew/bin/pnpm",
+        "exec",
+        "biome",
+        "ci",
+        "src/pages/query/index.tsx",
+        "src/pages/query/query.test.tsx",
+        "src/pages/query/bigint-wire.fixture.json"
+      ],
+      "cwd": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/web",
+      "started_utc": "2026-10-04T22:22:07.419861+00:00",
+      "elapsed_seconds": 0.3509149579986115,
+      "exit_code": 1,
+      "stdout_sha256": "00bc39064903ddebd3ccc1d308b53d6ec62718d1d4279329c142612c85c3f8ff",
+      "stderr_sha256": "61b9ae0c2284ab57bebc1b80897c792d68c3214e11fd17664a3f445237741f1b",
+      "starting_candidate": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb"
+    },
+    {
+      "label": "frontend-lint-green",
+      "command_sha256": "c6f63f67da5fa2a32123872e62efb56b674e55c8da2ce21c634e2c16b8f14a15",
+      "argv": [
+        "/opt/homebrew/bin/pnpm",
+        "exec",
+        "biome",
+        "ci",
+        "src/pages/query/index.tsx",
+        "src/pages/query/query.test.tsx",
+        "src/pages/query/bigint-wire.fixture.json"
+      ],
+      "cwd": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/web",
+      "started_utc": "2026-10-04T22:23:06.761657+00:00",
+      "elapsed_seconds": 0.26661095800227486,
+      "exit_code": 0,
+      "stdout_sha256": "536162d60ed44d5ec5e78a6fb2012ca18a62f1c9280d96c2e0532028bb18cd4c",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "starting_candidate": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb"
+    },
+    {
+      "label": "frontend-query-final",
+      "command_sha256": "4d415a7535e0f614558e87835cebe8217dbad6dba519a23e81f0691e1724477b",
+      "argv": [
+        "/opt/homebrew/bin/pnpm",
+        "exec",
+        "vitest",
+        "run",
+        "src/api/researchQuery.test.ts",
+        "src/pages/query/query.test.tsx"
+      ],
+      "cwd": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/web",
+      "started_utc": "2026-10-04T22:18:36.884082+00:00",
+      "elapsed_seconds": 4.093370792001224,
+      "exit_code": 0,
+      "stdout_sha256": "1c73aec0a564b735abe331bbaa0e67cee37994d11620c53982b25530a3b4b400",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "starting_candidate": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb"
+    },
+    {
+      "label": "frontend-query-format-02",
+      "command_sha256": "e530f138f819ccef4d4f145850e44e5cc9868a1dd70954e7c9192370aadf2239",
+      "argv": [
+        "/opt/homebrew/bin/pnpm",
+        "exec",
+        "biome",
+        "check",
+        "--write",
+        "src/pages/query/index.tsx",
+        "src/pages/query/query.test.tsx",
+        "src/pages/query/bigint-wire.fixture.json"
+      ],
+      "cwd": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/web",
+      "started_utc": "2026-10-04T22:25:56.754450+00:00",
+      "elapsed_seconds": 0.270469791998039,
+      "exit_code": 0,
+      "stdout_sha256": "af9d21698a0e1f35784ad410bb60e538e03f26a3ab99a2b49a0789fb2e004975",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "starting_candidate": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb"
+    },
+    {
+      "label": "frontend-query-green-02",
+      "command_sha256": "69f7a658996e6beb41e2ae0eb84104922659accc92c47459b30a4c91e7f9bc79",
+      "argv": [
+        "/opt/homebrew/bin/pnpm",
+        "exec",
+        "vitest",
+        "run",
+        "src/api/researchQuery.test.ts",
+        "src/pages/query/query.test.tsx"
+      ],
+      "cwd": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/web",
+      "started_utc": "2026-10-04T22:25:57.104552+00:00",
+      "elapsed_seconds": 3.6184722920006607,
+      "exit_code": 0,
+      "stdout_sha256": "c3dbddbdc3b5ea5fa2f5a43d767ec2f245207378b503f2412eca182dedb90135",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "starting_candidate": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb"
+    },
+    {
+      "label": "frontend-query-green",
+      "command_sha256": "9f51c41a55e54cf9e85a542bddf4e9c5456e1eb88092f0f7cf1e54a15bf21a4e",
+      "argv": [
+        "/opt/homebrew/bin/pnpm",
+        "exec",
+        "vitest",
+        "run",
+        "src/api/researchQuery.test.ts",
+        "src/pages/query/query.test.tsx"
+      ],
+      "cwd": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/web",
+      "started_utc": "2026-10-04T22:13:37.743452+00:00",
+      "elapsed_seconds": 3.7848796250000305,
+      "exit_code": 0,
+      "stdout_sha256": "21940a6671391ad34b15b2df62100d1dad70fe4dfe8d8289bccced5fb3541f7c",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "starting_candidate": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb"
+    },
+    {
+      "label": "frontend-red",
+      "command_sha256": "f3b4fa6a7b6a22db152a34fcb50393c55b67333c1bf75fee2cb1db168d7d7410",
+      "argv": [
+        "/opt/homebrew/bin/pnpm",
+        "exec",
+        "vitest",
+        "run",
+        "src/pages/query/query.test.tsx",
+        "-t",
+        "RQ-R"
+      ],
+      "started_utc": "2026-10-04T22:02:58.114161+00:00",
+      "elapsed_seconds": 3.211051416998089,
+      "exit_code": 1,
+      "starting_candidate": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb",
+      "phase": "red_before_corresponding_product_fixes",
+      "stdout_sha256": "5eaa74e1ecc510a45fd89467ee54459539013929921682b5af77a7d9f430a90c",
+      "stderr_sha256": "32e2fe2c2fb3401f2cec1f536b37500f193ac7f7fd751df2296b60f7eda69be8"
+    },
+    {
+      "label": "frontend-size",
+      "command_sha256": "554d5f8fcff828bd39d2c65b833e4e8791e6ce4dc289a4b1fa0e757ec3d58770",
+      "argv": [
+        "/opt/homebrew/bin/pnpm",
+        "size"
+      ],
+      "cwd": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/web",
+      "started_utc": "2026-10-04T22:22:07.419853+00:00",
+      "elapsed_seconds": 0.32932658399658976,
+      "exit_code": 0,
+      "stdout_sha256": "650db535e4ee87d854926b282ab2d39bcac59b74d0621515f24b14bafbb9a394",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "starting_candidate": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb"
+    },
+    {
+      "label": "frontend-test-format",
+      "command_sha256": "a0cd1acba83aedac1fd1ccff52ae4dfed99c46efe9692b9c2af518d17b660c6e",
+      "argv": [
+        "/opt/homebrew/bin/pnpm",
+        "exec",
+        "biome",
+        "check",
+        "--write",
+        "src/pages/query/query.test.tsx"
+      ],
+      "cwd": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/web",
+      "started_utc": "2026-10-04T22:23:06.411782+00:00",
+      "elapsed_seconds": 0.2743088749994058,
+      "exit_code": 0,
+      "stdout_sha256": "ccfebc79f7598bc69ce8a65c6d04b7de141f387ff15133e465919e3a807d10a4",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "starting_candidate": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb"
+    },
+    {
+      "label": "frontend-typecheck-green-02",
+      "command_sha256": "ea0bc1959d4f21a111a03f2c7a2318b3344bbe1443648eb51457f8a525c73f86",
+      "argv": [
+        "/opt/homebrew/bin/pnpm",
+        "typecheck"
+      ],
+      "cwd": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/web",
+      "started_utc": "2026-10-04T22:25:57.104552+00:00",
+      "elapsed_seconds": 5.172829333001573,
+      "exit_code": 0,
+      "stdout_sha256": "6432b078b2254d18a8a5f985441e86d0a5f2d9e1691095a74cd4205bc6f7aedb",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "starting_candidate": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb"
+    },
+    {
+      "label": "frontend-typecheck-green",
+      "command_sha256": "d0ba525e48c57cf5e69e5a88bce2f07af9b8d048e99c260e8f480114685739b6",
+      "argv": [
+        "/opt/homebrew/bin/pnpm",
+        "typecheck"
+      ],
+      "cwd": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/web",
+      "started_utc": "2026-10-04T22:18:36.884102+00:00",
+      "elapsed_seconds": 5.346413125000254,
+      "exit_code": 0,
+      "stdout_sha256": "6432b078b2254d18a8a5f985441e86d0a5f2d9e1691095a74cd4205bc6f7aedb",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "starting_candidate": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb"
+    },
+    {
+      "label": "frontend-typecheck",
+      "command_sha256": "7ed05a1c5d9b10bc9760859e30c6cc6994734ffed5c39325dd66792b325d84a8",
+      "argv": [
+        "/opt/homebrew/bin/pnpm",
+        "typecheck"
+      ],
+      "cwd": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/web",
+      "started_utc": "2026-10-04T22:14:46.362635+00:00",
+      "elapsed_seconds": 4.22132537500147,
+      "exit_code": 2,
+      "stdout_sha256": "3784884e7965c3cb8ae98e65a3bdc8c7d943dd7df5481f9451bf8d761057c45e",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "starting_candidate": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb"
+    },
+    {
+      "label": "integer-fixture-green",
+      "command_sha256": "455fea5ee6937b3694f54269f00acdf63811bed607c9cb8264c18f3fe310fa31",
+      "argv": [
+        "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/.venv/bin/python",
+        "-I",
+        "-B",
+        "data/verification/research-query-20261005/review-fix-01/generate_integer_fixture.py"
+      ],
+      "cwd": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk",
+      "started_utc": "2026-10-04T22:11:47.350837+00:00",
+      "elapsed_seconds": 0.304669291999744,
+      "exit_code": 0,
+      "stdout_sha256": "c9893685fbe053bdf97f83859829aeb00d7b5d4fd2ec5c46614c41daec0483d5",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "starting_candidate": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb"
+    },
+    {
+      "label": "openapi-generate",
+      "command_sha256": "ecfc687eeebf27664c4dda9bd0de69290f69b3b4cb375e4845e5a4a10b0f3bd3",
+      "argv": [
+        "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/.venv/bin/python",
+        "-I",
+        "-B",
+        "-c",
+        "import sys;sys.path.insert(0,\"/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/src\");from rquant.web.cli import main;raise SystemExit(main([\"web-openapi\"]))"
+      ],
+      "cwd": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk",
+      "started_utc": "2026-10-04T22:11:47.350319+00:00",
+      "elapsed_seconds": 1.7685952920001,
+      "exit_code": 0,
+      "stdout_sha256": "9a0b7f3478c1e029dbbe9bbb0b39603356db33eaee44073a34ab4487d0be661c",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "starting_candidate": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb"
+    },
+    {
+      "label": "proof-format",
+      "command_sha256": "9ff49d117ea4152851cf25277a471bef8ba9405d0ad7cfd8b67ee1f5f0a0bf1e",
+      "argv": [
+        "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/.venv/bin/ruff",
+        "format",
+        "data/verification/research-query-20261005/linux-review-boundaries-r07.py"
+      ],
+      "cwd": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk",
+      "started_utc": "2026-10-04T22:16:38.202450+00:00",
+      "elapsed_seconds": 0.04073433300072793,
+      "exit_code": 0,
+      "stdout_sha256": "413a709001976657cb743636fd34e48fc41d8d302d665460d3f874b3313da127",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "starting_candidate": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb"
+    },
+    {
+      "label": "proof-syntax",
+      "command_sha256": "3e4c761327c8f16022054444750748aa4ea34e3d2fb4b0be1c119808f446631e",
+      "argv": [
+        "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/.venv/bin/python",
+        "-I",
+        "-B",
+        "-c",
+        "import ast,hashlib,json;from pathlib import Path;p=Path(\"data/verification/research-query-20261005/linux-review-boundaries-r07.py\");ast.parse(p.read_text());d=json.loads(Path(\"data/verification/research-query-20261005/linux-backend-freeze-r06.json\").read_text());print(json.dumps({\"proof_parsed\":True,\"old_expected\":d[\"bundle_binding_sha256\"],\"canonical_entries\":hashlib.sha256(json.dumps(d[\"src_files\"],sort_keys=True,separators=(\",\",\":\")).encode()).hexdigest()}))"
+      ],
+      "cwd": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk",
+      "started_utc": "2026-10-04T22:16:38.348010+00:00",
+      "elapsed_seconds": 0.022782666001148755,
+      "exit_code": 0,
+      "stdout_sha256": "e73c39c20b4b7705501a1a0579aa81dfc4c0d83e956cdb1e1176ef88fa0d7814",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "starting_candidate": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb"
+    },
+    {
+      "label": "python-code-lint-final",
+      "command_sha256": "93ffbd9a7132aec1e0207859134dff85a93309f895fd7575bb16b14d7eed516d",
+      "argv": [
+        "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/.venv/bin/ruff",
+        "check",
+        "src/rquant/research_query/contracts.py",
+        "src/rquant/research_query/child.py",
+        "src/rquant/research_query/snapshot.py",
+        "src/rquant/web/routes/research_query.py",
+        "tests/unit/test_research_query_review.py",
+        "tests/unit/test_web_research_query.py"
+      ],
+      "cwd": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk",
+      "started_utc": "2026-10-04T22:30:59.755787+00:00",
+      "elapsed_seconds": 0.04711525000311667,
+      "exit_code": 0,
+      "stdout_sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "starting_candidate": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb"
+    },
+    {
+      "label": "python-format",
+      "command_sha256": "de267034e95d04a903e679075087890f1584df0008433017311b600b1008967d",
+      "argv": [
+        "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/.venv/bin/ruff",
+        "format",
+        "src/rquant/research_query/contracts.py",
+        "src/rquant/research_query/child.py",
+        "src/rquant/research_query/snapshot.py",
+        "src/rquant/web/routes/research_query.py",
+        "tests/unit/test_research_query_review.py",
+        "tests/unit/test_web_research_query.py",
+        "data/verification/research-query-20261005/review-fix-01/run_command.py",
+        "data/verification/research-query-20261005/review-fix-01/generate_integer_fixture.py"
+      ],
+      "cwd": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk",
+      "started_utc": "2026-10-04T22:13:20.464968+00:00",
+      "elapsed_seconds": 0.04188933400291717,
+      "exit_code": 0,
+      "stdout_sha256": "e72039fb8aa1a8be013da856bbb0be1530bed9b4d355245853c765b8826ebe4b",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "starting_candidate": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb"
+    },
+    {
+      "label": "python-lint-final",
+      "command_sha256": "c26f1b19cf847b65b92e10f21f372a1c9de598200e828c88fb01c7f020419d58",
+      "argv": [
+        "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/.venv/bin/ruff",
+        "check",
+        "src/rquant/research_query/contracts.py",
+        "src/rquant/research_query/child.py",
+        "src/rquant/research_query/snapshot.py",
+        "src/rquant/web/routes/research_query.py",
+        "tests/unit/test_research_query_review.py",
+        "tests/unit/test_web_research_query.py",
+        "data/verification/research-query-20261005/review-fix-01/run_command.py",
+        "data/verification/research-query-20261005/review-fix-01/generate_integer_fixture.py",
+        "data/verification/research-query-20261005/review-fix-01/freeze_backend.py"
+      ],
+      "cwd": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk",
+      "started_utc": "2026-10-04T22:20:32.655097+00:00",
+      "elapsed_seconds": 0.009749874996487051,
+      "exit_code": 0,
+      "stdout_sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "starting_candidate": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb"
+    },
+    {
+      "label": "python-lint-green",
+      "command_sha256": "4a2e5bff88afc15cdd7fd157f9f0f5b6bff7ca371569fbdc993209a187584b3c",
+      "argv": [
+        "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/.venv/bin/ruff",
+        "check",
+        "src/rquant/research_query/contracts.py",
+        "src/rquant/research_query/child.py",
+        "src/rquant/research_query/snapshot.py",
+        "src/rquant/web/routes/research_query.py",
+        "tests/unit/test_research_query_review.py",
+        "tests/unit/test_web_research_query.py",
+        "data/verification/research-query-20261005/review-fix-01/run_command.py",
+        "data/verification/research-query-20261005/review-fix-01/generate_integer_fixture.py",
+        "data/verification/research-query-20261005/review-fix-01/freeze_backend.py",
+        "data/verification/research-query-20261005/linux-review-boundaries-r07.py"
+      ],
+      "cwd": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk",
+      "started_utc": "2026-10-04T22:19:43.188040+00:00",
+      "elapsed_seconds": 0.024698707995412406,
+      "exit_code": 1,
+      "stdout_sha256": "f51b8bbdcc3d83e28befdaecb9cff3a40411f6822b76ba0e3cb017fb58b57934",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "starting_candidate": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb"
+    },
+    {
+      "label": "python-lint",
+      "command_sha256": "616b67982158753bb1f0d20162fdf2c126f82c4bd31f72a0507dcf6110126303",
+      "argv": [
+        "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/.venv/bin/ruff",
+        "check",
+        "src/rquant/research_query/contracts.py",
+        "src/rquant/research_query/child.py",
+        "src/rquant/research_query/snapshot.py",
+        "src/rquant/web/routes/research_query.py",
+        "tests/unit/test_research_query_review.py",
+        "tests/unit/test_web_research_query.py",
+        "data/verification/research-query-20261005/review-fix-01/run_command.py",
+        "data/verification/research-query-20261005/review-fix-01/generate_integer_fixture.py"
+      ],
+      "cwd": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk",
+      "started_utc": "2026-10-04T22:14:32.354886+00:00",
+      "elapsed_seconds": 0.04683849999855738,
+      "exit_code": 1,
+      "stdout_sha256": "b059edbb13cd3b2c6c9d4688c17f36f013bc7d4e101413cc5a986ac96681e8cf",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "starting_candidate": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb"
+    },
+    {
+      "label": "query-direct-green",
+      "command_sha256": "08ca78c27cd0bfacc29b7438129e783f12a0d3e80ab1eb8f9f8700ce196771ec",
+      "argv": [
+        "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/.venv/bin/python",
+        "-I",
+        "-B",
+        "-c",
+        "import sys,pytest;sys.path.insert(0,\"/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/src\");raise SystemExit(pytest.main([\"tests/unit/test_research_query.py\",\"tests/unit/test_research_query_review.py\",\"tests/unit/test_research_query_executor.py\",\"tests/unit/test_research_query_service.py\",\"tests/unit/test_research_query_saved.py\",\"tests/unit/test_research_query_cli.py\",\"tests/unit/test_web_research_query.py\",\"tests/unit/test_web_openapi_snapshot.py\",\"tests/unit/test_web_proxy_identity.py::test_current_user_route_inventory_matches_documented_categories\",\"-q\"]))"
+      ],
+      "cwd": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk",
+      "started_utc": "2026-10-04T22:13:57.606387+00:00",
+      "elapsed_seconds": 7.300132042000769,
+      "exit_code": 0,
+      "stdout_sha256": "eb4601a4a1f171521eccd6ec0829e5453a12080aeab660916490f87e0ed8cb76",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "starting_candidate": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb"
+    },
+    {
+      "label": "r01-final",
+      "command_sha256": "b069bd46e8ac8e5ffcfaec06c7d9753ecb9a4e4d13d4984ca44d1ec2d5817957",
+      "argv": [
+        "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/.venv/bin/python",
+        "-I",
+        "-B",
+        "-c",
+        "import sys,pytest;sys.path.insert(0,\"/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/src\");raise SystemExit(pytest.main([\"tests/unit/test_web_research_query.py\",\"-k\",\"complete_http\",\"-q\"]))"
+      ],
+      "cwd": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk",
+      "started_utc": "2026-10-04T22:23:55.950548+00:00",
+      "elapsed_seconds": 2.6029976250065374,
+      "exit_code": 0,
+      "stdout_sha256": "a66fc2f14c436162b27d0d7e64b0223697c54b2a11ca035569521bc5fc9a82f8",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "starting_candidate": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb"
+    },
+    {
+      "label": "r03-save-as-red",
+      "command_sha256": "bd134cda7dbb577c971eeeff030cc2d43cff9e7028844a4d2e7bf7ac79354962",
+      "argv": [
+        "/opt/homebrew/bin/pnpm",
+        "exec",
+        "vitest",
+        "run",
+        "src/pages/query/query.test.tsx",
+        "-t",
+        "另存为"
+      ],
+      "cwd": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/web",
+      "started_utc": "2026-10-04T22:25:16.558171+00:00",
+      "elapsed_seconds": 2.1880083329961053,
+      "exit_code": 1,
+      "stdout_sha256": "d975625326fced891555c169d1ca79d3ef6dd4fde43229682f774449070030e2",
+      "stderr_sha256": "6a5918766fec6431091505fbe9a3f4d2668c578d16360edf0ddf76b699780a4f",
+      "starting_candidate": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb"
+    },
+    {
+      "label": "r04-green",
+      "command_sha256": "92ecbc21a700575f8ee39e68d7e6dfd5bc0065eb6581d1c08502f27bd7659c5a",
+      "argv": [
+        "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/.venv/bin/python",
+        "-I",
+        "-B",
+        "-c",
+        "import sys,pytest; sys.path.insert(0,\"/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/src\"); raise SystemExit(pytest.main([\"tests/unit/test_research_query_review.py\",\"tests/unit/test_research_query.py\",\"-k\",\"rq_r04 or forbidden_sql or legal_sql\",\"-q\"]))"
+      ],
+      "cwd": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk",
+      "started_utc": "2026-10-04T22:05:50.323763+00:00",
+      "elapsed_seconds": 0.5104789170000004,
+      "exit_code": 0,
+      "stdout_sha256": "6c74efd16a82b9020328af4bc08d255011d853272365cf4f96102bd29b009f0d",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "starting_candidate": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb"
+    },
+    {
+      "label": "ts-generate",
+      "command_sha256": "22fde766cc0d07795ae03352254bb798a20fb89b71a1e0928879fd03db4b7356",
+      "argv": [
+        "/opt/homebrew/bin/pnpm",
+        "gen:api"
+      ],
+      "cwd": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/web",
+      "started_utc": "2026-10-04T22:13:20.602784+00:00",
+      "elapsed_seconds": 0.7126460839972424,
+      "exit_code": 0,
+      "stdout_sha256": "125a09b43b9536789a128aecd4d19a04d5faee414550ed5aa309d11882892e0d",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "starting_candidate": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb"
+    }
+  ],
+  "root_linux_receipt": {
+    "path": "review-fix-01/linux-r07-receipt.json",
+    "sha256": "41a9fbb037a654072a669edac1c86986807b61395b5ef86f42fe7a3503678bce",
+    "stdout_sha256": "6f4767bd862491cf1fa488d5b2ad7ac413f161494ce5ca5d430b4549191ffe10"
+  },
+  "source_binding_sha256": "974ce9b49c3b20353e1b1aca3c822f71bcaf7732f5babc99c568cd2722d69e3a",
+  "source_files_match_after_product_commit": true,
+  "reuse": {
+    "shared_backend_passed": 1102,
+    "frontend_passed": 705,
+    "browser_cases": 3,
+    "full_suite_rerun": false,
+    "default_e2e_run": false,
+    "original_sdk_result_reused": true
+  },
+  "limits": {
+    "address_bytes": 2147483648,
+    "file_bytes": 536870912,
+    "memory_bytes": 536870912,
+    "spill_bytes": 0,
+    "seconds": 30,
+    "rows": 10000,
+    "complete_result_or_http_bytes": 16777216,
+    "running": 2,
+    "waiting": 8
+  },
+  "excluded_work": [
+    "production install/deploy",
+    "cross-UID real installation",
+    "Notebook setup",
+    "auction/factor changes",
+    "Streamlit investments"
+  ],
+  "cleanup": {
+    "local_verification_commands_exited": true,
+    "root_linux_children_reaped": true,
+    "root_linux_private_directory_removed": true,
+    "source_and_snapshot_unchanged": true,
+    "worktree_retained_for_review_and_integration": true
+  },
+  "stop": "Product source frozen; evidence commit only. Original reviewer rechecks five stable IDs. No further diagnosis or full rerun.",
+  "metadata_note": "Original two red command records had no hashes; their actual stdout/stderr hashes are recorded here without modifying the original files."
+}

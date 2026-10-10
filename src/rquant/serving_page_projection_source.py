@@ -3,22 +3,35 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import json
+import math
 import os
+import re
 import sqlite3
 import stat
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from tempfile import mkdtemp
 from types import MappingProxyType
-from typing import Annotated, Self
+from typing import TYPE_CHECKING, Annotated, Self
+
+if TYPE_CHECKING:
+    from rquant.factor.job_ledger import FactorLedgerIdentity
+    from rquant.collaboration_commands import PageControlRoleAuthority
+    from rquant.web.models.collaboration import ResultOwnerProof
+    from rquant.condition_alert_runtime_projection import ConditionRuleAuthoritySnapshot
+    from rquant.factor.tracking import FactorTrackingIdentity
+    from rquant.screen.intraday_source import IntradayScreenProjectionSource
+    from rquant.strategy_authoring_projection import StrategyAuthoringProjectionSource
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 import duckdb
+from loguru import logger
 from pydantic import (
     ConfigDict,
     Field,
@@ -28,6 +41,25 @@ from pydantic import (
     model_validator,
 )
 
+from rquant.backfill_plan_artifact import (
+    MAX_BACKFILL_PLAN_BYTES,
+    parse_daily_bar_backfill_plan_bytes,
+)
+from rquant.backfill_plan_core import DailyBarBackfillPlan
+from rquant.backfill_plan_job_projection import (
+    BackfillPlanProgressEvent,
+    BackfillPlanProgressState,
+    read_backfill_plan_job_snapshot,
+    validate_backfill_plan_progress,
+)
+from rquant.backfill_plan_projection import (
+    BACKFILL_PLAN_PROJECTION_TABLES,
+    MAX_DISCOVERABLE_BACKFILL_PLANS,
+    MAX_PREVIEW_BACKFILL_PLANS,
+    decode_backfill_plan_archive_row,
+    project_backfill_plans,
+)
+from rquant.builtin_presets import BUILTIN_PRESET_SCREENS
 from rquant.canvas_publication_receipt import (
     CanvasPublicationCatalogRecord,
     CanvasPublicationKeyring,
@@ -40,6 +72,54 @@ from rquant.canvas_publication_receipt import (
     canvas_publication_receipt_id,
     canvas_source_identity_hash,
 )
+from rquant.data_audit_contracts import REPORT_JOB_PROJECTION_TABLES, REPORT_PROJECTION_TABLES
+from rquant.data_audit_projection import (
+    MAX_AUDIT_ISSUES as _MAX_AUDIT_ISSUES,
+)
+from rquant.data_audit_projection import (
+    DataAuditIssueProjectionRow,
+    DataAuditStatusProjectionRow,
+)
+from rquant.data_audit_report import (
+    MAX_REPORT_BYTES,
+    data_audit_report_path,
+    parse_data_audit_report_bytes,
+)
+from rquant.data_audit_report_job_projection import (
+    DataAuditReportJobProgress,
+    DataAuditReportSuccessfulTask,
+    project_data_audit_report_job,
+    read_data_audit_report_job_snapshot,
+    validate_data_audit_report_job_progress,
+)
+from rquant.data_audit_report_jobs import DataAuditReportJobEvent
+from rquant.data_audit_report_projection import (
+    project_data_audit_report,
+    read_catalog_audit_projection_rows,
+)
+from rquant.factor.definition_serving import project_factor_definition_serving_snapshot
+from rquant.factor.registry import (
+    FactorDefinitionRegistry,
+    FactorRegistryError,
+    FactorRegistryIdentity,
+)
+from rquant.factor.serving_projection import (
+    FACTOR_DEFINITION_PROJECTION_TABLES,
+    project_factor_definition_projections,
+    validate_factor_definition_projections,
+)
+from rquant.formula_market_job_projection import (
+    FORMULA_MARKET_PROJECTION_TABLES,
+    project_formula_market_job,
+    read_formula_market_job_snapshot,
+    validate_formula_market_projections,
+)
+from rquant.formula_pool_serving_projection import (
+    FormulaPoolServingConfig,
+    FormulaPoolSourceWatch,
+    read_formula_pool_projections,
+    validate_formula_pool_projections,
+)
 from rquant.notification_state import (
     NotificationProjectionAuthoritySnapshot,
     NotificationProjectionPublication,
@@ -47,11 +127,25 @@ from rquant.notification_state import (
     NotificationStateStore,
 )
 from rquant.page_control import (
+    AlertAcknowledgment,
     CanvasCurrentHead,
     PageControlOutbox,
     PageControlStatus,
+    parse_page_control_command,
     read_canvas_current_head,
 )
+from rquant.pool_definition_projection import PoolMutation, build_pool_definition_rows
+from rquant.pool_member_return import calculate_adjusted_pool_return
+from rquant.pool_membership import PoolDayEvidence, PoolMemberClose, compute_pool_membership
+from rquant.pool_result_receipt import (
+    DailyScreenAuthority,
+    ScreenRunEvidence,
+    ScreenRunReceipt,
+    member_price_digest,
+    member_set_digest,
+    persisted_result_digests,
+)
+from rquant.price_alert_rule_store import _SCHEMA_COLUMNS, PriceAlertRuleRepository
 from rquant.readside_replica_gate import (
     UNLIMITED_READ_PROFILE,
     ReplicaRead,
@@ -71,8 +165,38 @@ from rquant.runtime_contracts import (
     normalize_aware_utc,
 )
 from rquant.runtime_read_interrupt import READ_INTERRUPTS, interruptible_read
-from rquant.serving_read_models import ServingProjectionPayload
+from rquant.serving_alert_projection import (
+    AlertAckAuthoritySnapshot,
+    build_ack_source_projections,
+)
+from rquant.serving_manual_watchlist_projection import (
+    MAX_MANUAL_WATCHLIST_ROWS as _MAX_MANUAL_WATCHLIST_ROWS,
+)
+from rquant.serving_manual_watchlist_projection import (
+    ManualWatchlistAuthoritySnapshot,
+    ManualWatchlistProjectionRow,
+    build_manual_watchlist_projections,
+    validate_manual_watchlist_projections,
+)
+from rquant.serving_price_alert_rule_projection import (
+    MAX_PRICE_ALERT_RULE_ROWS as _MAX_PRICE_ALERT_RULE_ROWS,
+)
+from rquant.serving_price_alert_rule_projection import (
+    PriceAlertRuleAuthoritySnapshot,
+    PriceAlertRuleProjectionRow,
+    build_price_alert_rule_projections,
+    validate_price_alert_rule_projections,
+)
+from rquant.serving_read_models import (
+    ProjectionScalar,
+    ServingOwnerProjectionCapacityError,
+    ServingProjectionInput,
+    ServingProjectionPayload,
+    require_projection_owner_budget,
+)
 from rquant.storage.duckdb import DuckDBStore
+from rquant.strategy_authoring_projection_contract import STRATEGY_TEMPLATE_PROJECTION_TABLES
+from rquant.strict_json import StrictJsonError, strict_json_loads
 
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 CommitSha = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{40}$")]
@@ -83,11 +207,61 @@ _MAX_CANVAS_HITS = 20_000
 _MAX_CANVAS_DEFINITIONS = 512
 _MAX_CANVAS_DEFINITION_BYTES = 64 * 1024
 _MAX_CANVAS_CATALOG_BYTES = 2 * 1024 * 1024
+_MAX_POOL_DEFINITIONS = 512
+_MAX_POOL_DEFINITION_BYTES = 64 * 1024
+_MAX_POOL_CATALOG_BYTES = 2 * 1024 * 1024
+_MAX_POOL_MUTATIONS = 8_192
+_MAX_POOL_AUDIT_BYTES = 8 * 1024 * 1024
+_MAX_POOL_AUDIT_CELL_CHARS = 128 * 1024
+_MAX_RUN_RECEIPTS = 512
+_MAX_RUN_RECEIPT_SOURCE_ROWS = 16_384
+_MAX_RUN_LINEAGE_NODES = 512
+_MAX_RUN_MEMBERS_PER_POOL = 20_000
+_MAX_RUN_TOTAL_MEMBERS = 100_000
+_RUN_RECEIPT_LOOKBACK_DAYS = 30
+_MAX_POOL_MEMBERSHIP_SOURCE_RECEIPTS = 128
+_MAX_POOL_MEMBERSHIP_SOURCE_MEMBERS = 4_096
+_MAX_EXACT_PARENT_CALENDAR_SPAN_DAYS = 730
+_RUN_RECEIPT_COLUMNS = (
+    "trade_date",
+    "preset_name",
+    "definition_version",
+    "parent_trade_date",
+    "parent_result_version",
+    "hit_count",
+    "member_digest",
+    "lineage_complete",
+    "completed_at",
+    "result_version",
+)
+_RUN_PRICE_RECEIPT_COLUMNS = ("contract", "price_digest")
 _MAX_RESEARCH_GATES = 512
+_MAX_AUDIT_FINDING_LIST_BYTES = 32 * 1024
 _MAX_PULSE_ROWS = 512
 _MAX_PULSE_FILE_BYTES = 256 * 1024
 _MAX_ALERT_FILE_BYTES = 512 * 1024
 _MAX_RUNTIME_CONFIG_BYTES = 16 * 1024
+_MAX_EVENT_ROWS = 10_000
+_MAX_ALERT_ACK_ROWS = 10_000
+_MAX_SURGE_EVENT_BYTES = 8 * 1024 * 1024
+_MAX_LEGACY_NOTIFICATION_BYTES = 8 * 1024 * 1024
+_EVENT_WINDOW_DAYS = 30
+_SURGE_EVENT_TIME = re.compile(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]")
+_STOCK_CODE = re.compile(r"[0-9]{6}\.(?:SH|SZ|BJ)")
+_LEGACY_SCENE_LABELS = MappingProxyType(
+    {
+        "price_level": "价位提醒",
+        "pool2_exit": "二池退出",
+        "daily_summary": "每日汇总",
+        "error": "运行异常",
+        "heartbeat": "运行心跳",
+        "morning_pulse": "早盘脉搏",
+        "midday_report": "午间报告",
+        "surge_watch": "爆量提醒",
+        "pulse_alert": "脉搏异动",
+    }
+)
+_LEGACY_CHANNEL_LABELS = MappingProxyType({"pushdeer": "PushDeer", "pushplus": "PushPlus"})
 _CANVAS_CATALOG_SCHEMA_VERSION = 1
 _PAGE_CONTROL_PROTOCOL_MARKER = "safe-effect-journal-v2"
 _PAGE_CONTROL_PROTOCOL_VERSION = 2
@@ -107,6 +281,10 @@ _EMPTY_PROJECTION_AVAILABLE_AT = datetime(1970, 1, 1, tzinfo=UTC)
 
 class PageProjectionSourceIntegrityError(RuntimeError):
     """A mutable or malformed operational snapshot cannot become Serving evidence."""
+
+
+class _PageControlAuditSnapshotUnavailableError(PageProjectionSourceIntegrityError):
+    """The shared audit transaction itself could not enter or finish safely."""
 
 
 @dataclass(frozen=True)
@@ -213,17 +391,16 @@ def _read_bound_optional_file(
     name: str,
     *,
     max_bytes: int,
+    label: str = "surge live source",
 ) -> tuple[bytes, os.stat_result] | None:
     try:
         item = os.stat(name, dir_fd=binding.descriptor, follow_symlinks=False)
     except FileNotFoundError:
         return None
     if stat.S_ISLNK(item.st_mode) or not stat.S_ISREG(item.st_mode):
-        raise PageProjectionSourceIntegrityError(
-            f"surge live source {name} must be a regular non-symlink file"
-        )
+        raise PageProjectionSourceIntegrityError(f"{label} must be a regular non-symlink file")
     if item.st_size > max_bytes:
-        raise PageProjectionSourceIntegrityError(f"surge live source {name} exceeds size bound")
+        raise PageProjectionSourceIntegrityError(f"{label} exceeds size bound")
     descriptor = os.open(
         name,
         os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
@@ -231,19 +408,169 @@ def _read_bound_optional_file(
     )
     try:
         opened = os.fstat(descriptor)
-        if _file_identity(opened) != _file_identity(item):
-            raise PageProjectionSourceIntegrityError(f"surge live source {name} rotated while open")
+        if _copy_identity(opened) != _copy_identity(item):
+            raise PageProjectionSourceIntegrityError(f"{label} rotated while read")
         with os.fdopen(descriptor, "rb", closefd=False) as handle:
             raw = handle.read(max_bytes + 1)
         after = os.fstat(descriptor)
-        if _file_identity(after) != _file_identity(opened):
-            raise PageProjectionSourceIntegrityError(f"surge live source {name} changed while read")
+        if _copy_identity(after) != _copy_identity(opened):
+            raise PageProjectionSourceIntegrityError(f"{label} changed while read")
+        try:
+            named = os.stat(name, dir_fd=binding.descriptor, follow_symlinks=False)
+        except FileNotFoundError as error:
+            raise PageProjectionSourceIntegrityError(f"{label} rotated while read") from error
+        if _copy_identity(named) != _copy_identity(opened):
+            raise PageProjectionSourceIntegrityError(f"{label} rotated while read")
     finally:
         os.close(descriptor)
     if len(raw) > max_bytes:
-        raise PageProjectionSourceIntegrityError(f"surge live source {name} exceeds size bound")
+        raise PageProjectionSourceIntegrityError(f"{label} exceeds size bound")
     binding.verify()
     return raw, opened
+
+
+_BACKFILL_PLAN_NAME = re.compile(r"daily-bar-backfill-plan-v1-([0-9a-f]{64})\.json\Z")
+_BACKFILL_TEMP_NAME = re.compile(r"\.backfill-plan-[0-9a-f]{32}\Z")
+MAX_BACKFILL_CATALOG_READ_BYTES = 64 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class _BackfillPlanDirectoryEntry:
+    name: str
+    identity: tuple[int, int, int, int, int]
+    published_ns: int
+
+    @property
+    def plan_hash(self) -> str:
+        match = _BACKFILL_PLAN_NAME.fullmatch(self.name)
+        if match is None:
+            raise PageProjectionSourceIntegrityError("backfill plan filename is invalid")
+        return match.group(1)
+
+
+def _list_bound_backfill_plan_entries(
+    binding: _BoundReadonlyDirectory,
+) -> tuple[_BackfillPlanDirectoryEntry, ...]:
+    """List a bounded immutable catalogue without reading large old plans."""
+    names = []
+    for name in os.listdir(binding.descriptor):
+        if _BACKFILL_TEMP_NAME.fullmatch(name):
+            continue
+        if _BACKFILL_PLAN_NAME.fullmatch(name) is None:
+            raise PageProjectionSourceIntegrityError("backfill plan filename is unexpected")
+        names.append(name)
+    if len(names) > MAX_DISCOVERABLE_BACKFILL_PLANS:
+        raise PageProjectionSourceIntegrityError("backfill plan directory exceeds its bound")
+    entries = []
+    for name in names:
+        if _BACKFILL_PLAN_NAME.fullmatch(name) is None:
+            raise PageProjectionSourceIntegrityError("backfill plan filename is invalid")
+        observed = os.stat(name, dir_fd=binding.descriptor, follow_symlinks=False)
+        if not stat.S_ISREG(observed.st_mode) or not (
+            0 < observed.st_size <= MAX_BACKFILL_PLAN_BYTES
+        ):
+            raise PageProjectionSourceIntegrityError("backfill plan must be a bounded regular file")
+        if os.name != "posix" or any(
+            value <= 0 for value in (observed.st_mtime_ns, observed.st_ctime_ns)
+        ):
+            raise PageProjectionSourceIntegrityError(
+                "backfill plan publication time is unavailable"
+            )
+        entries.append(
+            _BackfillPlanDirectoryEntry(
+                name=name,
+                identity=_copy_identity(observed),
+                published_ns=max(observed.st_mtime_ns, observed.st_ctime_ns),
+            )
+        )
+    binding.verify()
+    return tuple(sorted(entries, key=lambda item: (-item.published_ns, item.plan_hash)))
+
+
+def _read_bound_backfill_plan(
+    binding: _BoundReadonlyDirectory, entry: _BackfillPlanDirectoryEntry
+) -> DailyBarBackfillPlan:
+    found = _read_bound_optional_file(
+        binding,
+        entry.name,
+        max_bytes=MAX_BACKFILL_PLAN_BYTES,
+        label="backfill plan",
+    )
+    if found is None or _copy_identity(found[1]) != entry.identity:
+        raise PageProjectionSourceIntegrityError("backfill plan rotated while read")
+    return parse_daily_bar_backfill_plan_bytes(found[0], filename=entry.name)
+
+
+def _verify_bound_backfill_catalogue(
+    binding: _BoundReadonlyDirectory,
+    entries: tuple[_BackfillPlanDirectoryEntry, ...],
+) -> None:
+    binding.verify()
+    if _list_bound_backfill_plan_entries(binding) != entries:
+        raise PageProjectionSourceIntegrityError("backfill plan directory changed while read")
+
+
+def _pool_definition_projection(
+    root: Path,
+    audit: _ReadonlyPageControlAuditReader,
+) -> ServingProjectionPayload:
+    """Read every managed pool through pinned paths in one PageControl audit snapshot."""
+    root = Path(os.path.abspath(root))
+    mutations = audit.pool_mutations()
+    files: dict[str, Mapping[str, object] | None] = {}
+    try:
+        binding = _bind_readonly_directory(root, label="user pool catalog")
+    except FileNotFoundError:
+        binding = None
+    if binding is not None:
+        try:
+            names = sorted(os.listdir(binding.descriptor))
+            definition_names = [name for name in names if name.endswith(".json")]
+            if len(definition_names) + len(BUILTIN_PRESET_SCREENS) > _MAX_POOL_DEFINITIONS:
+                raise PageProjectionSourceIntegrityError("user pools exceed row bound")
+            total_bytes = 0
+            identities: dict[str, os.stat_result] = {}
+            for name in definition_names:
+                base_name = name.removesuffix(".json")
+                if not re.fullmatch(r"[\w\u4e00-\u9fff-]+", base_name):
+                    raise PageProjectionSourceIntegrityError("user pool filename is invalid")
+                found = _read_bound_optional_file(
+                    binding,
+                    name,
+                    max_bytes=_MAX_POOL_DEFINITION_BYTES,
+                    label="user pool definition",
+                )
+                if found is None:
+                    raise PageProjectionSourceIntegrityError("user pool rotated while read")
+                raw_bytes, identity = found
+                identities[name] = identity
+                total_bytes += len(raw_bytes)
+                if total_bytes > _MAX_POOL_CATALOG_BYTES:
+                    raise PageProjectionSourceIntegrityError("user pool catalog exceeds byte bound")
+                try:
+                    value = strict_json_loads(raw_bytes)
+                except (UnicodeDecodeError, StrictJsonError, ValueError):
+                    value = None
+                files[base_name] = value if isinstance(value, dict) else None
+            if sorted(os.listdir(binding.descriptor)) != names:
+                raise PageProjectionSourceIntegrityError("user pool catalog rotated while read")
+            for name, before in identities.items():
+                after = os.stat(name, dir_fd=binding.descriptor, follow_symlinks=False)
+                if _copy_identity(after) != _copy_identity(before):
+                    raise PageProjectionSourceIntegrityError(
+                        "user pool definition changed while read"
+                    )
+            binding.verify()
+        finally:
+            binding.close()
+    rows = build_pool_definition_rows(files, mutations, root_path=str(root))
+    # A client request time is not a server publication time. Verified command and
+    # file versions live in the rows, whose content hash changes only with facts.
+    return ServingProjectionPayload(
+        table_name="pool_definition",
+        available_at=_EMPTY_PROJECTION_AVAILABLE_AT,
+        rows=rows,
+    )
 
 
 def _local_naive(value: datetime) -> datetime:
@@ -646,11 +973,31 @@ class _ReadonlyPageControlAuditReader:
     #: silent mix of two generations -- and the revalidation below reports the rotation
     #: from the identity comparison rather than from that open, so the wording names the
     #: generation that moved. (DuckDB re-opens the inode, so its reader does pin.)
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, reject_sidecars: bool = False) -> None:
         self.path = Path(os.path.abspath(path))
         self._snapshot_connection: sqlite3.Connection | None = None
+        self._reject_sidecars = reject_sidecars
+        self._price_rule_read = False
+        self._require_no_sidecars()
         validated = self._validate_schema()
+        self._require_no_sidecars()
         self._validated_node_identity = (validated.st_dev, validated.st_ino)
+
+    def _require_no_sidecars(self) -> None:
+        if not (self._reject_sidecars or self._price_rule_read):
+            return
+        for suffix in ("-wal", "-shm"):
+            try:
+                os.lstat(Path(f"{self.path}{suffix}"))
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise PageProjectionSourceIntegrityError(
+                    "PageControl audit sidecar cannot be checked"
+                ) from exc
+            raise PageProjectionSourceIntegrityError(
+                "PageControl audit sidecar is not allowed for verified projections"
+            )
 
     def _connect(self, path: Path | str | None = None) -> sqlite3.Connection:
         database_path = self.path if path is None else Path(path)
@@ -676,10 +1023,103 @@ class _ReadonlyPageControlAuditReader:
         with self._connect() as connection, interruptible_read(connection):
             yield connection
 
+    def collaboration_projections(
+        self, collaboration: PageControlRoleAuthority, *, observed_at: datetime,
+    ) -> tuple[ServingProjectionPayload, ...]:
+        from rquant.collaboration_commands import PageControlRoleAuthority
+        from rquant.command_audit_projection import read_command_audit_source
+
+        if type(collaboration) is not PageControlRoleAuthority:
+            raise PermissionError("original role authority is required")
+        identity = collaboration.require_outbox_path(self.path)
+        observed = normalize_aware_utc(observed_at)
+        state = collaboration.read_state()
+        if self._snapshot_connection is None:
+            with self.snapshot():
+                return self.collaboration_projections(collaboration, observed_at=observed)
+        connection = self._snapshot_connection
+
+        def actual_actor(command_id: str, command_hash: str) -> str | None:
+            row = PageControlOutbox._bounded_command_row(connection, command_id)
+            if row is None or row["command_hash"] != command_hash:
+                raise PermissionError("original audit command binding differs")
+            proof = PageControlOutbox._journal_authorization(row, collaboration)
+            return None if proof is None else proof.actor_id
+
+        window = read_command_audit_source(connection, actor_resolver=actual_actor)
+        generation = canonical_sha256({"journal_identity": identity,
+            "role_state_sha256": state.content_sha256, "window": window})
+        projections = (
+            ServingProjectionPayload(table_name="collaboration_role", available_at=observed,
+                rows=tuple({**entry.model_dump(mode="json"), "ordinal": ordinal, "revision": state.revision,
+                    "state_sha256": state.content_sha256} for ordinal, entry in enumerate(state.users))),
+            ServingProjectionPayload(table_name="command_audit_window", available_at=observed,
+                rows=({"window_key": "current", "source_generation": generation,
+                    "journal_identity": identity,
+                    "role_revision": state.revision, "role_state_sha256": state.content_sha256,
+                    "row_count": len(window.items), "has_more": window.has_more},)),
+            ServingProjectionPayload(table_name="command_audit", available_at=observed,
+                rows=tuple(item.model_dump(mode="json", exclude={"schema_version"}) for item in window.items)),
+        )
+        if collaboration.read_state() != state or collaboration.require_outbox_path(self.path) != identity:
+            raise PermissionError("original role or journal generation changed during projection")
+        return projections
+
+    def result_submission_bindings(
+        self, collaboration: PageControlRoleAuthority, *, domain: str,
+        factor_ledger_identity: FactorLedgerIdentity | None = None,
+    ) -> tuple[ResultOwnerProof, ...]:
+        """Read actual accepted command/effect pairs from this bound original journal."""
+        from rquant.collaboration_commands import PageControlRoleAuthority
+
+        kinds = {"factor": "submit_factor_run", "portfolio": "submit_portfolio_backtest",
+            "strategy": "run_strategy_template"}
+        if type(collaboration) is not PageControlRoleAuthority or domain not in kinds:
+            raise PermissionError("exact bound original ownership source required")
+        if domain == "factor":
+            from rquant.factor.job_ledger import FactorLedgerIdentity
+            if type(factor_ledger_identity) is not FactorLedgerIdentity:
+                raise PermissionError("original factor ledger instance is required")
+        elif factor_ledger_identity is not None:
+            raise PermissionError("factor ledger cannot authorize another result domain")
+        identity = collaboration.require_outbox_path(self.path)
+        state = collaboration.read_state()
+        if self._snapshot_connection is None:
+            with self.snapshot():
+                return self.result_submission_bindings(collaboration, domain=domain,
+                    factor_ledger_identity=factor_ledger_identity)
+        connection = self._snapshot_connection
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(page_control_command)")}
+        if "authorization_json" not in columns:
+            return ()
+        found = {}
+        for row in PageControlOutbox._result_submission_rows(connection, kinds[domain]):
+            if row["authorization_json"] is None:
+                continue
+            if domain == "factor":
+                from rquant.page_control import _COMMAND_ADAPTER, _OwnedSubmitFactorRun
+                command = _COMMAND_ADAPTER.validate_json(row["payload_json"])
+                if type(command) is not _OwnedSubmitFactorRun:
+                    raise PermissionError("original private factor submission is required")
+                if factor_ledger_identity is None or command.ledger_identity != factor_ledger_identity:
+                    continue
+            proof = PageControlOutbox._result_submission_binding(row, collaboration)
+            if proof is None or proof.owner_id not in {entry.username for entry in state.users}:
+                continue
+            key = proof.job_id, proof.spec_hash
+            previous = found.get(key)
+            if previous is not None and previous != proof:
+                raise PermissionError("result has ambiguous original submission provenance")
+            found[key] = proof
+        if collaboration.read_state() != state or collaboration.require_outbox_path(self.path) != identity:
+            raise PermissionError("original result role or journal generation changed")
+        return tuple(found[key] for key in sorted(found))
+
     @contextmanager
     def snapshot(self) -> Iterator[None]:
         if self._snapshot_connection is not None:
             raise RuntimeError("PageControl audit snapshot is already active")
+        self._require_no_sidecars()
         before = os.lstat(self.path)
         if (
             stat.S_ISLNK(before.st_mode)
@@ -714,6 +1154,7 @@ class _ReadonlyPageControlAuditReader:
                 raise PageProjectionSourceIntegrityError(
                     "PageControl audit rotated while binding its exact generation"
                 )
+            self._require_no_sidecars()
             connection = self._connect(bound_path)
             self._validate_schema_connection(connection)
             connection.execute("BEGIN")
@@ -722,6 +1163,7 @@ class _ReadonlyPageControlAuditReader:
             self._snapshot_connection = connection
             self.assert_quiescent()
             yield
+            self._require_no_sidecars()
             after_data_version = int(connection.execute("PRAGMA data_version").fetchone()[0])
         except BaseException:
             self._snapshot_connection = None
@@ -737,6 +1179,7 @@ class _ReadonlyPageControlAuditReader:
             connection.close()
         integrity_error: PageProjectionSourceIntegrityError | None = None
         try:
+            self._require_no_sidecars()
             after = os.lstat(self.path)
             bound_after = os.fstat(descriptor)
             if _file_identity(after) != _file_identity(before):
@@ -766,6 +1209,7 @@ class _ReadonlyPageControlAuditReader:
                 integrity_error = PageProjectionSourceIntegrityError(
                     "PageControl audit generation changed or entered in-flight state"
                 )
+            self._require_no_sidecars()
         except PageProjectionSourceIntegrityError as exc:
             integrity_error = exc
         except (OSError, sqlite3.Error) as exc:
@@ -803,6 +1247,10 @@ class _ReadonlyPageControlAuditReader:
         return after
 
     def _validate_schema_connection(self, connection: sqlite3.Connection) -> None:
+        additive_columns = {
+            "page_control_command": {"authorization_json": ("TEXT", 0, None, 0)},
+            "page_control_effect": {"original_admission_json": ("TEXT", 0, None, 0)},
+        }
         for table_name, expected in self._REQUIRED_TABLES.items():
             rows = connection.execute(f"PRAGMA table_info({table_name})").fetchall()
             observed = {
@@ -814,7 +1262,8 @@ class _ReadonlyPageControlAuditReader:
                 )
                 for row in rows
             }
-            if observed != expected:
+            extended = {**expected, **additive_columns.get(table_name, {})}
+            if observed != expected and observed != extended:
                 raise PageProjectionSourceIntegrityError(
                     "PageControl audit schema is invalid or incomplete"
                 )
@@ -855,6 +1304,302 @@ class _ReadonlyPageControlAuditReader:
                 "PageControl audit contains an in-flight mutating command"
             )
 
+    def alert_ack_snapshot(self) -> AlertAckAuthoritySnapshot | None:
+        """Read activation and every acknowledgment in the pinned SQLite transaction."""
+        if self._snapshot_connection is None:
+            raise RuntimeError("PageControl alert read requires an active audit snapshot")
+        try:
+            return self._read_alert_ack_snapshot()
+        except sqlite3.Error as exc:
+            raise PageProjectionSourceIntegrityError(
+                "PageControl alert authority cannot be read"
+            ) from exc
+
+    def _read_alert_ack_snapshot(self) -> AlertAckAuthoritySnapshot | None:
+        with self._read_connection() as connection:
+            present = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' "
+                    "AND name IN ('page_control_alert_activation', 'page_control_alert_ack')"
+                ).fetchall()
+            }
+            if not present:
+                return None
+            if present != {"page_control_alert_activation", "page_control_alert_ack"}:
+                raise PageProjectionSourceIntegrityError(
+                    "PageControl alert authority tables are incomplete"
+                )
+            expected = {
+                "page_control_alert_activation": {
+                    "marker_name": ("TEXT", 0, None, 1),
+                    "activated_at": ("TEXT", 1, None, 0),
+                },
+                "page_control_alert_ack": {
+                    "alert_id": ("TEXT", 0, None, 1),
+                    "confirmation_id": ("TEXT", 1, None, 0),
+                    "actor_id": ("TEXT", 1, None, 0),
+                    "confirmed_at": ("TEXT", 1, None, 0),
+                    "generation_id": ("TEXT", 1, None, 0),
+                },
+            }
+            for table_name, columns in expected.items():
+                observed = {
+                    str(row[1]): (
+                        str(row[2]).upper(),
+                        int(row[3]),
+                        None if row[4] is None else str(row[4]),
+                        int(row[5]),
+                    )
+                    for row in connection.execute(f"PRAGMA table_info({table_name})")
+                }
+                if observed != columns:
+                    raise PageProjectionSourceIntegrityError(
+                        "PageControl alert authority schema is invalid"
+                    )
+            unique_confirmation = False
+            for index in connection.execute("PRAGMA index_list(page_control_alert_ack)"):
+                if int(index[2]) != 1:
+                    continue
+                index_name = str(index[1]).replace('"', '""')
+                index_columns = tuple(
+                    str(column[2])
+                    for column in connection.execute(f'PRAGMA index_info("{index_name}")')
+                )
+                if index_columns == ("confirmation_id",):
+                    unique_confirmation = True
+                    break
+            if not unique_confirmation:
+                raise PageProjectionSourceIntegrityError(
+                    "PageControl alert confirmation uniqueness is missing"
+                )
+            activation_rows = connection.execute(
+                "SELECT marker_name, activated_at FROM page_control_alert_activation LIMIT 2"
+            ).fetchall()
+            rows = connection.execute(
+                "SELECT alert_id, confirmation_id, actor_id, confirmed_at, generation_id "
+                "FROM page_control_alert_ack ORDER BY alert_id LIMIT ?",
+                (_MAX_ALERT_ACK_ROWS + 1,),
+            ).fetchall()
+        if len(activation_rows) > 1 or len(rows) > _MAX_ALERT_ACK_ROWS:
+            raise PageProjectionSourceIntegrityError(
+                "PageControl alert authority exceeds its bounded snapshot"
+            )
+        if not activation_rows:
+            if rows:
+                raise PageProjectionSourceIntegrityError(
+                    "PageControl alert rows exist without activation"
+                )
+            return None
+        if activation_rows[0]["marker_name"] != "alert_ack":
+            raise PageProjectionSourceIntegrityError(
+                "PageControl alert activation marker is invalid"
+            )
+        try:
+            acknowledgments = tuple(AlertAcknowledgment.model_validate(dict(row)) for row in rows)
+            return AlertAckAuthoritySnapshot.create(
+                activated_at=datetime.fromisoformat(activation_rows[0]["activated_at"]),
+                rows=acknowledgments,
+            )
+        except (TypeError, ValueError) as exc:
+            raise PageProjectionSourceIntegrityError(
+                "PageControl alert authority snapshot is invalid"
+            ) from exc
+
+    def ai_assistance_projections(self, observed_at: datetime) -> tuple[ServingProjectionPayload, ...]:
+        from rquant.ai_assistance import build_ai_page_projections
+        with self._read_connection() as connection:
+            return build_ai_page_projections(connection, observed_at)
+
+    def manual_watchlist_snapshot(self) -> ManualWatchlistAuthoritySnapshot | None:
+        """Read activation and the full bounded row set in the pinned audit transaction."""
+        if self._snapshot_connection is None:
+            raise RuntimeError("PageControl watchlist read requires an active audit snapshot")
+        try:
+            return self._read_manual_watchlist_snapshot()
+        except sqlite3.Error as exc:
+            raise PageProjectionSourceIntegrityError(
+                "PageControl manual watchlist authority cannot be read"
+            ) from exc
+
+    def _read_manual_watchlist_snapshot(self) -> ManualWatchlistAuthoritySnapshot | None:
+        with self._read_connection() as connection:
+            marker = connection.execute(
+                "SELECT protocol_version, activated_at FROM page_control_protocol_activation "
+                "WHERE marker_name = ?",
+                ("manual-watchlist/v1",),
+            ).fetchone()
+            table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'manual_watchlist'"
+            ).fetchone()
+            if marker is None and table is None:
+                return None
+            if marker is None or table is None or marker["protocol_version"] != 1:
+                raise PageProjectionSourceIntegrityError(
+                    "PageControl manual watchlist activation and table are inconsistent"
+                )
+            expected = {
+                "owner_id": ("TEXT", 1, None, 1),
+                "ts_code": ("TEXT", 1, None, 2),
+                "version": ("INTEGER", 1, None, 0),
+                "deleted": ("INTEGER", 1, None, 0),
+                "source": ("TEXT", 0, None, 0),
+                "price_levels_json": ("TEXT", 1, None, 0),
+                "expires_at_utc": ("TEXT", 0, None, 0),
+                "updated_at_utc": ("TEXT", 0, None, 0),
+            }
+            observed = {
+                str(row[1]): (
+                    str(row[2]).upper(),
+                    int(row[3]),
+                    None if row[4] is None else str(row[4]),
+                    int(row[5]),
+                )
+                for row in connection.execute("PRAGMA table_info(manual_watchlist)")
+            }
+            if observed != expected:
+                raise PageProjectionSourceIntegrityError(
+                    "PageControl manual watchlist schema is invalid"
+                )
+            rows = connection.execute(
+                "SELECT owner_id, ts_code, version, deleted, source, price_levels_json, "
+                "expires_at_utc, updated_at_utc FROM manual_watchlist "
+                "ORDER BY owner_id, ts_code LIMIT ?",
+                (_MAX_MANUAL_WATCHLIST_ROWS + 1,),
+            ).fetchall()
+        if len(rows) > _MAX_MANUAL_WATCHLIST_ROWS:
+            raise PageProjectionSourceIntegrityError(
+                "PageControl manual watchlist exceeds its bounded snapshot"
+            )
+        try:
+            entries = []
+            for row in rows:
+                if type(row["deleted"]) is not int or row["deleted"] not in (0, 1):
+                    raise ValueError("manual watchlist deletion marker is invalid")
+                entries.append(
+                    ManualWatchlistProjectionRow(
+                        owner_id=row["owner_id"],
+                        ts_code=row["ts_code"],
+                        version=row["version"],
+                        deleted=bool(row["deleted"]),
+                        source=row["source"],
+                        price_levels_json=row["price_levels_json"],
+                        expires_at=row["expires_at_utc"],
+                        updated_at=row["updated_at_utc"],
+                    )
+                )
+            return ManualWatchlistAuthoritySnapshot.create(
+                activated_at=datetime.fromisoformat(marker["activated_at"]),
+                rows=entries,
+            )
+        except (TypeError, ValueError) as exc:
+            raise PageProjectionSourceIntegrityError(
+                "PageControl manual watchlist snapshot is invalid"
+            ) from exc
+
+    def price_alert_rule_snapshot(self) -> PriceAlertRuleAuthoritySnapshot | None:
+        """Read all current heads in the same pinned transaction as the watchlist."""
+        if self._snapshot_connection is None:
+            raise RuntimeError("PageControl price rules require an active audit snapshot")
+        self._price_rule_read = True
+        self._require_no_sidecars()
+        try:
+            with self._read_connection() as connection:
+                marker = connection.execute(
+                    "SELECT protocol_version, activated_at FROM page_control_protocol_activation "
+                    "WHERE marker_name = ?",
+                    ("price-alert-rule/v1",),
+                ).fetchone()
+                table = connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'price_alert_rule'"
+                ).fetchone()
+                if marker is None and table is None:
+                    return None
+                if marker is None or table is None or marker["protocol_version"] != 1:
+                    raise PageProjectionSourceIntegrityError(
+                        "PageControl price rule activation and table are inconsistent"
+                    )
+                actual = tuple(
+                    (row[1], row[2], row[3], row[5])
+                    for row in connection.execute("PRAGMA table_info(price_alert_rule)")
+                )
+                if actual != _SCHEMA_COLUMNS:
+                    raise PageProjectionSourceIntegrityError(
+                        "PageControl price rule schema is invalid"
+                    )
+                rows = connection.execute(
+                    "SELECT owner_id, rule_id, version, deleted, ts_code, "
+                    "membership_version, rule_json, updated_at_utc FROM price_alert_rule "
+                    "ORDER BY owner_id, rule_id LIMIT ?",
+                    (_MAX_PRICE_ALERT_RULE_ROWS + 1,),
+                ).fetchall()
+            self._require_no_sidecars()
+            if len(rows) > _MAX_PRICE_ALERT_RULE_ROWS:
+                raise PageProjectionSourceIntegrityError(
+                    "PageControl price rules exceed their bounded snapshot"
+                )
+            activated = marker["activated_at"]
+            if not isinstance(activated, str):
+                raise ValueError("price rule activation time is invalid")
+            activated_at = normalize_aware_utc(datetime.fromisoformat(activated))
+            if activated_at.isoformat(timespec="microseconds") != activated:
+                raise ValueError("price rule activation time is not canonical")
+            return PriceAlertRuleAuthoritySnapshot.create(
+                activated_at=activated_at,
+                rows=(
+                    PriceAlertRuleProjectionRow.from_entry(PriceAlertRuleRepository._entry(row))
+                    for row in rows
+                ),
+            )
+        except sqlite3.Error as exc:
+            raise PageProjectionSourceIntegrityError(
+                "PageControl price rule authority cannot be read"
+            ) from exc
+        except (TypeError, ValueError) as exc:
+            raise PageProjectionSourceIntegrityError(
+                "PageControl price rule snapshot is invalid"
+            ) from exc
+
+    def condition_alert_rule_snapshot(self) -> ConditionRuleAuthoritySnapshot | None:
+        from rquant.condition_alert_rule_store import ConditionAlertRuleRepository
+        from rquant.condition_alert_runtime_projection import ConditionRuleAuthoritySnapshot
+
+        if self._snapshot_connection is None:
+            raise RuntimeError("condition authority requires the original audit snapshot")
+        self._price_rule_read = True
+        self._require_no_sidecars()
+        with self._read_connection() as connection:
+            marker = connection.execute(
+                "SELECT protocol_version,activated_at FROM page_control_protocol_activation "
+                "WHERE marker_name='condition-alert-rule/v1'"
+            ).fetchone()
+            present = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='condition_alert_rule'"
+            ).fetchone()
+            if marker is None and present is None:
+                return None
+            if marker is None or present is None or marker[0] != 1:
+                raise PageProjectionSourceIntegrityError(
+                    "condition authority schema and activation differ"
+                )
+            repo = ConditionAlertRuleRepository(connection)
+            repo._require_schema()
+            rows = connection.execute(
+                "SELECT owner_id,rule_id,version,deleted,rule_json,updated_at_utc "
+                "FROM condition_alert_rule ORDER BY owner_id,rule_id LIMIT 10001"
+            ).fetchall()
+        if len(rows) > 10000:
+            raise PageProjectionSourceIntegrityError(
+                "condition authority full heads exceed capacity"
+            )
+        activated = normalize_aware_utc(datetime.fromisoformat(marker[1]))
+        if activated.isoformat(timespec="microseconds") != marker[1]:
+            raise ValueError("condition activation time is not canonical")
+        self._require_no_sidecars()
+        return ConditionRuleAuthoritySnapshot.create(
+            activated_at=activated, rows=tuple(repo._entry(row) for row in rows)
+        )
+
     def audit(self, command_id: str) -> _ReadonlyPageControlAudit | None:
         with self._read_connection() as connection:
             row = connection.execute(
@@ -886,14 +1631,16 @@ class _ReadonlyPageControlAuditReader:
                 FROM page_control_command AS c
                 LEFT JOIN page_control_effect AS e USING (command_id)
                 WHERE c.status = ?
-                  AND c.command_kind IN (?, ?, ?, ?, ?)
+                  AND c.command_kind IN (?, ?, ?, ?, ?, ?, ?)
                 ORDER BY c.rowid
                 """,
                 (
                     PageControlStatus.SUCCEEDED.value,
                     "save_canvas",
+                    "create_canvas",
                     "delete_canvas",
                     "set_canvas_pool_refs",
+                    "add_pool_to_canvas",
                     "save_user_pool",
                     "fork_builtin_pool",
                 ),
@@ -906,11 +1653,154 @@ class _ReadonlyPageControlAuditReader:
                 latest[canvas_name] = audit
         return MappingProxyType(latest)
 
+    def pool_mutations(self) -> Mapping[str, PoolMutation]:
+        """Newest successful mutation per pool, from this pinned audit generation."""
+        with self._read_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT c.command_id, c.command_kind, c.command_hash,
+                       CASE WHEN length(c.payload_json) <= ?
+                            THEN c.payload_json ELSE NULL END AS payload_json,
+                       c.status,
+                       CASE WHEN length(c.result_json) <= ?
+                            THEN c.result_json ELSE NULL END AS result_json,
+                       e.command_id AS effect_command_id,
+                       e.command_hash AS effect_command_hash,
+                       e.effect_kind, e.status AS effect_status,
+                       CASE WHEN length(e.result_json) <= ?
+                            THEN e.result_json ELSE NULL END AS effect_result_json
+                FROM page_control_command AS c
+                LEFT JOIN page_control_effect AS e USING (command_id)
+                WHERE c.status = ?
+                  AND c.command_kind IN (?, ?, ?, ?, ?, ?)
+                ORDER BY c.rowid DESC
+                LIMIT ?
+                """,
+                (
+                    _MAX_POOL_AUDIT_CELL_CHARS,
+                    _MAX_POOL_AUDIT_CELL_CHARS,
+                    _MAX_POOL_AUDIT_CELL_CHARS,
+                    PageControlStatus.SUCCEEDED.value,
+                    "save_user_pool",
+                    "save_user_pool_v2",
+                    "save_user_pool_v3",
+                    "save_nl_preset",
+                    "fork_builtin_pool",
+                    "delete_user_pool",
+                    _MAX_POOL_MUTATIONS + 1,
+                ),
+            )
+            return self._pool_mutations_from_rows(rows)
+
+    def formula_pool_saves(self) -> Mapping[str, PoolMutation]:
+        """Successful formula saves from the same pinned, read-only audit generation."""
+        if self._snapshot_connection is None:
+            raise RuntimeError("formula pool audit requires an active snapshot")
+        with self._read_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT c.command_id, c.command_kind, c.command_hash,
+                       CASE WHEN length(c.payload_json) <= ?
+                            THEN c.payload_json ELSE NULL END AS payload_json,
+                       c.status,
+                       CASE WHEN length(c.result_json) <= ?
+                            THEN c.result_json ELSE NULL END AS result_json,
+                       e.command_id AS effect_command_id,
+                       e.command_hash AS effect_command_hash,
+                       e.effect_kind, e.status AS effect_status,
+                       CASE WHEN length(e.result_json) <= ?
+                            THEN e.result_json ELSE NULL END AS effect_result_json
+                FROM page_control_command AS c
+                LEFT JOIN page_control_effect AS e USING (command_id)
+                WHERE c.status = ? AND c.command_kind = ?
+                ORDER BY c.rowid DESC LIMIT ?
+                """,
+                (
+                    _MAX_POOL_AUDIT_CELL_CHARS,
+                    _MAX_POOL_AUDIT_CELL_CHARS,
+                    _MAX_POOL_AUDIT_CELL_CHARS,
+                    PageControlStatus.SUCCEEDED.value,
+                    "save_formula_pool_v1",
+                    _MAX_POOL_MUTATIONS + 1,
+                ),
+            ).fetchall()
+        saves = self._pool_mutations_from_rows(rows)
+        if len(saves) != len(rows):
+            raise PageProjectionSourceIntegrityError("formula pool has repeated save authority")
+        return saves
+
+    @classmethod
+    def _pool_mutations_from_rows(cls, rows: Iterable[sqlite3.Row]) -> Mapping[str, PoolMutation]:
+        latest: dict[str, PoolMutation] = {}
+        audit_bytes = 0
+        for position, row in enumerate(rows):
+            if position >= _MAX_POOL_MUTATIONS:
+                raise PageProjectionSourceIntegrityError(
+                    "PageControl pool audit exceeds event bound"
+                )
+            if any(
+                row[field] is None
+                for field in ("payload_json", "result_json", "effect_result_json")
+            ):
+                raise PageProjectionSourceIntegrityError(
+                    "PageControl pool audit exceeds cell bound or lacks result"
+                )
+            audit_bytes += sum(
+                len(value.encode("utf-8"))
+                for value in (
+                    row["payload_json"],
+                    row["result_json"],
+                    row["effect_result_json"],
+                )
+                if isinstance(value, str)
+            )
+            if audit_bytes > _MAX_POOL_AUDIT_BYTES:
+                raise PageProjectionSourceIntegrityError(
+                    "PageControl pool audit exceeds byte bound"
+                )
+            audit = cls._audit_row(row)
+            try:
+                command = parse_page_control_command(dict(audit.payload))
+                receipt = strict_json_loads(row["result_json"])
+                effect = strict_json_loads(row["effect_result_json"])
+            except (TypeError, ValueError, StrictJsonError) as exc:
+                raise PageProjectionSourceIntegrityError(
+                    "PageControl pool audit is malformed"
+                ) from exc
+            if (
+                command.kind != audit.command_kind
+                or canonical_sha256(command.model_dump(mode="json")) != audit.command_hash
+                or not isinstance(receipt, dict)
+                or receipt != effect
+            ):
+                raise PageProjectionSourceIntegrityError(
+                    "PageControl pool effect result mismatches command"
+                )
+            base_name = (
+                command.target_base_name
+                if command.kind == "fork_builtin_pool"
+                else command.name
+                if command.kind == "save_nl_preset"
+                else command.base_name
+            )
+            if base_name not in latest:
+                latest[base_name] = PoolMutation(
+                    command_id=audit.command_id,
+                    command_kind=audit.command_kind,
+                    command_hash=audit.command_hash,
+                    payload=audit.payload,
+                    result=receipt,
+                )
+            if len(latest) > _MAX_POOL_DEFINITIONS:
+                raise PageProjectionSourceIntegrityError("PageControl pools exceed row bound")
+        return MappingProxyType(latest)
+
     @staticmethod
     def _canvas_name_for_audit(audit: _ReadonlyPageControlAudit) -> str | None:
         field_name = (
             "name"
-            if audit.command_kind in {"save_canvas", "delete_canvas", "set_canvas_pool_refs"}
+            if audit.command_kind
+            in {"save_canvas", "create_canvas", "delete_canvas", "set_canvas_pool_refs"}
             else "canvas_name"
         )
         value = audit.payload.get(field_name)
@@ -925,7 +1815,7 @@ class _ReadonlyPageControlAuditReader:
     @staticmethod
     def _audit_row(row: sqlite3.Row) -> _ReadonlyPageControlAudit:
         try:
-            payload = json.loads(row["payload_json"])
+            payload = strict_json_loads(row["payload_json"])
             status = PageControlStatus(row["status"])
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             raise PageProjectionSourceIntegrityError("PageControl audit row is malformed") from exc
@@ -960,6 +1850,890 @@ class _ReadonlyPageControlAuditReader:
 
 
 @dataclass(frozen=True, slots=True)
+class _VerifiedRunReceipts:
+    latest: tuple[ScreenRunReceipt, ...]
+    lineage: tuple[ScreenRunReceipt, ...]
+    price_digest_verified: frozenset[str]
+    newest_candidate_day: date | None
+    newest_candidate_at: datetime | None
+    exact_parent_steps: tuple[tuple[str, int], ...]
+    membership_daily: tuple[ScreenRunReceipt, ...] | None
+    membership_candidate_keys: frozenset[tuple[date, str]]
+
+
+def _exact_parent_steps(
+    connection: duckdb.DuckDBPyConnection,
+    *,
+    receipt: ScreenRunReceipt,
+    observed: datetime,
+) -> int | None:
+    parent_day = receipt.parent_trade_date
+    if parent_day is None:
+        return None
+    span = (receipt.trade_date - parent_day).days
+    if span <= 0 or span > _MAX_EXACT_PARENT_CALENDAR_SPAN_DAYS:
+        return None
+    calendar = connection.execute(
+        """
+        SELECT COUNT(*), COUNT(DISTINCT cal_date),
+               COUNT(*) FILTER (WHERE cal_date IN (?, ?) AND is_open),
+               COUNT(*) FILTER (WHERE cal_date > ? AND is_open),
+               COUNT(*) FILTER (WHERE updated_at <= ?)
+        FROM trade_calendar
+        WHERE exchange = 'SSE' AND cal_date BETWEEN ? AND ?
+        """,
+        (parent_day, receipt.trade_date, parent_day, observed, parent_day, receipt.trade_date),
+    ).fetchone()
+    assert calendar is not None
+    expected_rows = span + 1
+    if (
+        calendar[0] != expected_rows
+        or calendar[1] != expected_rows
+        or calendar[2] != 2
+        or calendar[4] != expected_rows
+    ):
+        return None
+    target_bar = connection.execute(
+        "SELECT 1 FROM daily_bar WHERE trade_date = ? LIMIT 1", (parent_day,)
+    ).fetchone()
+    return int(calendar[3]) if target_bar is not None else None
+
+
+def _read_verified_run_receipts(
+    connection: duckdb.DuckDBPyConnection,
+    *,
+    cutoff: datetime,
+    observed: datetime,
+    generation_sealed_before_cutoff: bool,
+) -> _VerifiedRunReceipts | None:
+    present = connection.execute(
+        "SELECT 1 FROM information_schema.tables "
+        "WHERE table_schema = 'main' AND table_name = 'screen_run_receipt'"
+    ).fetchone()
+    if present is None:
+        return None
+    columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info('screen_run_receipt')").fetchall()
+    }
+    if not set(_RUN_RECEIPT_COLUMNS).issubset(columns):
+        raise PageProjectionSourceIntegrityError("screen run receipt table is incomplete")
+    price_columns = set(_RUN_PRICE_RECEIPT_COLUMNS)
+    if columns & price_columns and not price_columns <= columns:
+        raise PageProjectionSourceIntegrityError("screen run price receipt columns are incomplete")
+    receipt_columns = (
+        _RUN_RECEIPT_COLUMNS + _RUN_PRICE_RECEIPT_COLUMNS
+        if price_columns <= columns
+        else _RUN_RECEIPT_COLUMNS
+    )
+    receipt_select = ", ".join(receipt_columns)
+    candidate_rows = connection.execute(
+        f"""
+        SELECT {receipt_select}
+        FROM screen_run_receipt
+        WHERE trade_date BETWEEN ? AND ? AND completed_at <= ?
+        ORDER BY trade_date DESC, preset_name
+        LIMIT ?
+        """,
+        (
+            cutoff.date() - timedelta(days=_RUN_RECEIPT_LOOKBACK_DAYS),
+            cutoff.date(),
+            observed,
+            _MAX_RUN_RECEIPT_SOURCE_ROWS + 1,
+        ),
+    ).fetchall()
+    if len(candidate_rows) > _MAX_RUN_RECEIPT_SOURCE_ROWS:
+        raise PageProjectionSourceIntegrityError("screen run receipt source exceeds bound")
+    latest_by_pool: dict[str, tuple[object, ...]] = {}
+    for raw in candidate_rows:
+        latest_by_pool.setdefault(str(raw[1]), raw)
+    if len(latest_by_pool) > _MAX_RUN_RECEIPTS:
+        raise PageProjectionSourceIntegrityError("screen run receipt exceeds row bound")
+
+    candidates = tuple(latest_by_pool[name] for name in sorted(latest_by_pool))
+    newest = max((row[0] for row in candidates), default=None)
+    newest_at = max((_database_timestamp(row[8]) for row in candidate_rows), default=None)
+    verified: dict[tuple[date, str], ScreenRunReceipt | None] = {}
+    price_digest_verified: set[str] = set()
+    member_total = 0
+
+    def verify(raw: tuple[object, ...]) -> ScreenRunReceipt | None:
+        nonlocal member_total
+        key = (raw[0], raw[1])
+        if key in verified:
+            return verified[key]
+        if len(verified) >= _MAX_RUN_LINEAGE_NODES:
+            raise PageProjectionSourceIntegrityError("screen run receipt lineage exceeds bound")
+        verified[key] = None
+        try:
+            receipt = ScreenRunReceipt.model_validate(dict(zip(receipt_columns, raw, strict=True)))
+        except ValueError:
+            return None
+        if receipt.trade_date > cutoff.date() or receipt.completed_at > observed:
+            return None
+        member_rows = connection.execute(
+            """
+            SELECT ts_code, close FROM screen_result
+            WHERE trade_date = ? AND preset_name = ? AND created_at <= ?
+            ORDER BY ts_code LIMIT ?
+            """,
+            (receipt.trade_date, receipt.preset_name, cutoff, _MAX_RUN_MEMBERS_PER_POOL + 1),
+        ).fetchall()
+        member_total += len(member_rows)
+        if len(member_rows) > _MAX_RUN_MEMBERS_PER_POOL or member_total > _MAX_RUN_TOTAL_MEMBERS:
+            raise PageProjectionSourceIntegrityError("screen run receipt members exceed bound")
+        codes = [str(row[0]) for row in member_rows]
+        try:
+            matches = (
+                len(codes) == receipt.hit_count
+                and member_set_digest(codes) == receipt.member_digest
+            )
+        except ValueError:
+            return None
+        if not matches:
+            return None
+        if receipt.parent_trade_date is not None:
+            if receipt.parent_trade_date >= receipt.trade_date:
+                return None
+            parent_rows = connection.execute(
+                f"""
+                SELECT {receipt_select}
+                FROM screen_run_receipt
+                WHERE trade_date = ? AND result_version = ? AND completed_at <= ?
+                LIMIT 2
+                """,
+                (receipt.parent_trade_date, receipt.parent_result_version, observed),
+            ).fetchall()
+            if len(parent_rows) != 1:
+                return None
+            parent = verify(parent_rows[0])
+            if (
+                parent is None
+                or parent.completed_at > receipt.completed_at
+                or parent.lineage_complete != receipt.lineage_complete
+            ):
+                return None
+        if (
+            receipt.contract == "screen-run-receipt/v2"
+            and receipt.price_digest
+            == member_price_digest([(str(code), close) for code, close in member_rows])
+        ):
+            assert receipt.result_version is not None
+            price_digest_verified.add(receipt.result_version)
+        verified[key] = receipt
+        return receipt
+
+    latest = tuple(item for raw in candidates if (item := verify(raw)) is not None)
+    membership_candidate_keys = frozenset((raw[0], str(raw[1])) for raw in candidate_rows)
+    membership_daily: tuple[ScreenRunReceipt, ...] | None = None
+    try:
+        source_members = sum(int(raw[5]) for raw in candidate_rows)
+    except (TypeError, ValueError):
+        source_members = _MAX_POOL_MEMBERSHIP_SOURCE_MEMBERS + 1
+    if (
+        len(candidate_rows) <= _MAX_POOL_MEMBERSHIP_SOURCE_RECEIPTS
+        and 0 <= source_members <= _MAX_POOL_MEMBERSHIP_SOURCE_MEMBERS
+    ):
+        try:
+            membership_daily = tuple(
+                item for raw in candidate_rows if (item := verify(raw)) is not None
+            )
+        except PageProjectionSourceIntegrityError:
+            membership_daily = None
+    lineage = tuple(item for item in verified.values() if item is not None)
+    tables = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = 'main' AND table_name IN ('trade_calendar', 'daily_bar')"
+        ).fetchall()
+    }
+    exact_parent_steps: list[tuple[str, int]] = []
+    # daily_bar has no row timestamp, so its target-day presence proves a PIT fact
+    # only after the immutable replica generation was already sealed.
+    if generation_sealed_before_cutoff and tables == {"trade_calendar", "daily_bar"}:
+        step_cache: dict[tuple[date, date], int | None] = {}
+        for item in lineage:
+            if item.parent_trade_date is None:
+                continue
+            key = (item.parent_trade_date, item.trade_date)
+            if key not in step_cache:
+                step_cache[key] = _exact_parent_steps(connection, receipt=item, observed=observed)
+            steps = step_cache[key]
+            if steps is not None and item.result_version is not None:
+                exact_parent_steps.append((item.result_version, steps))
+    return _VerifiedRunReceipts(
+        latest=latest,
+        lineage=lineage,
+        price_digest_verified=frozenset(price_digest_verified),
+        newest_candidate_day=newest,
+        newest_candidate_at=newest_at,
+        exact_parent_steps=tuple(exact_parent_steps),
+        membership_daily=membership_daily,
+        membership_candidate_keys=membership_candidate_keys,
+    )
+
+
+def _current_receipt_versions(
+    receipts: _VerifiedRunReceipts,
+    definitions: ServingProjectionPayload,
+) -> frozenset[str]:
+    by_name = {str(row["pool_name"]): row for row in definitions.rows}
+    by_version = {item.result_version: item for item in receipts.lineage}
+    exact_parent_steps = dict(receipts.exact_parent_steps)
+    current_cache: dict[str, bool] = {}
+
+    def current(receipt: ScreenRunReceipt) -> bool:
+        assert receipt.result_version is not None
+        if receipt.result_version in current_cache:
+            return current_cache[receipt.result_version]
+        row = by_name.get(receipt.preset_name)
+        matches = bool(
+            row is not None
+            and row["state"] == "available"
+            and row["version"] == receipt.definition_version
+            and receipt.lineage_complete
+        )
+        if matches and row is not None:
+            parent_name = row["depends_on"]
+            if parent_name is None:
+                matches = receipt.parent_result_version is None
+            else:
+                parent = by_version.get(receipt.parent_result_version)
+                matches = bool(
+                    row["delay_mode"] == "exact"
+                    and parent is not None
+                    and parent.preset_name == parent_name
+                    and parent.trade_date == receipt.parent_trade_date
+                    and exact_parent_steps.get(receipt.result_version) == row["delay_days"]
+                    and current(parent)
+                )
+        current_cache[receipt.result_version] = matches
+        return matches
+
+    return frozenset(
+        item.result_version
+        for item in receipts.lineage
+        if item.result_version is not None and current(item)
+    )
+
+
+def _receipt_projection(
+    receipts: _VerifiedRunReceipts,
+    definitions: ServingProjectionPayload,
+) -> ServingProjectionPayload:
+    current_versions = _current_receipt_versions(receipts, definitions)
+    rows = tuple(
+        {
+            "trade_date": item.trade_date.isoformat(),
+            "preset_name": item.preset_name,
+            "definition_version": item.definition_version,
+            "result_version": item.result_version,
+            "parent_trade_date": (
+                None if item.parent_trade_date is None else item.parent_trade_date.isoformat()
+            ),
+            "parent_result_version": item.parent_result_version,
+            "hit_count": item.hit_count,
+            "member_digest": item.member_digest,
+            "lineage_complete": item.lineage_complete,
+            "current_definition": item.result_version in current_versions,
+            "completed_at": item.completed_at.isoformat(),
+        }
+        for item in receipts.latest
+    )
+    available = max(
+        (item.completed_at for item in receipts.latest), default=_EMPTY_PROJECTION_AVAILABLE_AT
+    )
+    return ServingProjectionPayload(
+        table_name="screen_run_receipt", available_at=available, rows=rows
+    )
+
+
+def _verified_daily_screen_authority(
+    connection: duckdb.DuckDBPyConnection,
+    authority: DailyScreenAuthority,
+    *,
+    observed: datetime,
+) -> DailyScreenAuthority | None:
+    from rquant.daily_canonical_publisher import DailyCanonicalPublishReceipt
+
+    tables = connection.execute(
+        "SELECT table_name FROM information_schema.tables WHERE table_schema='main' "
+        "AND table_name IN ('daily_canonical_publication','daily_canonical_publish_receipt')"
+    ).fetchall()
+    if len(tables) != 2:
+        return None
+    raw = connection.execute(
+        "SELECT generation_id,payload_sha256,payload_json "
+        "FROM daily_canonical_publish_receipt WHERE receipt_id=?",
+        [authority.canonical_receipt_id],
+    ).fetchone()
+    if raw is None or not isinstance(raw[2], str) or len(raw[2].encode()) > 2 * 1024 * 1024:
+        return None
+    try:
+        receipt = DailyCanonicalPublishReceipt.model_validate_json(raw[2])
+    except ValueError:
+        return None
+    publication = connection.execute(
+        "SELECT trade_date,source_generation_id,db_content_sha256,canonical_receipt_id,is_current "
+        "FROM daily_canonical_publication WHERE generation_id=?",
+        [authority.canonical_generation_id],
+    ).fetchone()
+    publication_id = (
+        receipt.receipt_id
+        if receipt.publication_mode == "committed"
+        else receipt.recovery_of_receipt_id
+    )
+    if not (
+        raw[0] == receipt.generation_id == authority.canonical_generation_id
+        and raw[1] == hashlib.sha256(raw[2].encode()).hexdigest()
+        and receipt.receipt_id == authority.canonical_receipt_id
+        and receipt.source_generation_id == authority.source_generation_id
+        and receipt.trade_date == authority.trade_date
+        and receipt.available_at == authority.available_at <= observed
+        and receipt.committed_at <= observed
+        and publication
+        == (
+            receipt.trade_date,
+            receipt.source_generation_id,
+            receipt.db_content_sha256,
+            publication_id,
+            True,
+        )
+    ):
+        return None
+    return authority
+
+
+def _screen_evidence_projection(
+    connection: duckdb.DuckDBPyConnection,
+    receipts: _VerifiedRunReceipts | None,
+    *,
+    cutoff: datetime,
+    observed: datetime,
+) -> ServingProjectionPayload | None:
+    if (
+        receipts is None
+        or not connection.execute(
+            "SELECT COUNT(*) FROM information_schema.tables "
+            "WHERE table_schema='main' AND table_name='screen_run_evidence'"
+        ).fetchone()[0]
+    ):
+        return None
+    rows: list[dict[str, object]] = []
+    available = _EMPTY_PROJECTION_AVAILABLE_AT
+    for receipt in receipts.latest:
+        raw = connection.execute(
+            "SELECT result_version,evidence_version,payload_json "
+            "FROM screen_run_evidence WHERE trade_date=? AND preset_name=?",
+            [receipt.trade_date, receipt.preset_name],
+        ).fetchone()
+        if raw is None:
+            continue
+        if not isinstance(raw[2], str) or len(raw[2].encode()) > 2 * 1024 * 1024:
+            raise PageProjectionSourceIntegrityError("screen input evidence exceeds bound")
+        try:
+            proof = ScreenRunEvidence.model_validate_json(raw[2])
+            actual = connection.execute(
+                "SELECT ts_code,extra FROM screen_result WHERE trade_date=? "
+                "AND preset_name=? AND created_at<=? ORDER BY ts_code LIMIT ?",
+                [receipt.trade_date, receipt.preset_name, cutoff, _MAX_RUN_MEMBERS_PER_POOL + 1],
+            ).fetchall()
+            digests = persisted_result_digests(actual, ranked=proof.ranking_plan_digest is not None)
+            if (
+                raw[:2] != (proof.result_version, proof.evidence_version)
+                or proof.result_version not in receipts.price_digest_verified
+                or proof.result_version != receipt.result_version
+                or proof.definition_version != receipt.definition_version
+                or proof.preset_name != receipt.preset_name
+                or proof.input.trade_date != receipt.trade_date
+                or proof.completed_at != receipt.completed_at
+                or proof.completed_at > observed
+                or proof.input.decision_at > proof.completed_at
+                or proof.input.decision_at > observed
+                or len(actual) != proof.hit_count
+                or proof.hit_count != receipt.hit_count
+                or (proof.input.unknown_count and receipt.lineage_complete)
+                or digests != (proof.persisted_extra_digest, proof.member_rank_digest)
+            ):
+                continue
+        except (ValueError, TypeError):
+            continue
+        authority = proof.input.canonical_authority
+        if (
+            authority is not None
+            and _verified_daily_screen_authority(connection, authority, observed=observed) is None
+        ):
+            continue
+        rows.append(
+            {
+                "trade_date": proof.input.trade_date.isoformat(),
+                "preset_name": proof.preset_name,
+                "definition_version": proof.definition_version,
+                "result_version": proof.result_version,
+                "source_kind": proof.input.source_kind,
+                "source_identity": proof.input.source_identity,
+                "content_digest": proof.input.content_digest,
+                "decision_at": proof.input.decision_at.isoformat(),
+                "universe_count": proof.input.universe_count,
+                "unknown_count": proof.input.unknown_count,
+                "hit_count": proof.hit_count,
+                "ranking_plan_digest": proof.ranking_plan_digest,
+                "member_rank_digest": proof.member_rank_digest,
+                "persisted_extra_digest": proof.persisted_extra_digest,
+                "writer_contract_fingerprint": proof.input.writer_contract_fingerprint,
+                "evidence_version": proof.evidence_version,
+                "completed_at": proof.completed_at.isoformat(),
+                "canonical_receipt_id": authority.canonical_receipt_id if authority else None,
+                "canonical_generation_id": authority.canonical_generation_id if authority else None,
+                "source_generation_id": authority.source_generation_id if authority else None,
+            }
+        )
+        available = max(available, proof.completed_at)
+    return ServingProjectionPayload(
+        table_name="screen_run_evidence", available_at=available, rows=tuple(rows)
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _MembershipSource:
+    target_date: date | None
+    trading_days: tuple[date, ...]
+    calendar_complete: bool
+    receipt_table_present: bool
+    source_limited: bool
+    days: tuple[PoolDayEvidence, ...]
+    candidate_keys: frozenset[tuple[date, str]]
+    return_facts: tuple[_MemberReturnFact, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _MemberReturnFact:
+    pool_name: str
+    trade_date: date
+    ts_code: str
+    close: float | None
+    volume: float | None
+    factor: float | None
+
+
+def _membership_calendar(
+    connection: duckdb.DuckDBPyConnection,
+    *,
+    start: date,
+    end: date,
+    observed: datetime,
+) -> tuple[tuple[date, ...], bool]:
+    columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info('trade_calendar')").fetchall()
+    }
+    if not {"exchange", "cal_date", "is_open", "updated_at"}.issubset(columns):
+        return (), False
+    expected = (end - start).days + 1
+    if expected < 1 or expected > _RUN_RECEIPT_LOOKBACK_DAYS + 1:
+        return (), False
+    rows = connection.execute(
+        """
+        SELECT cal_date, is_open, updated_at FROM trade_calendar
+        WHERE exchange = 'SSE' AND cal_date BETWEEN ? AND ?
+        ORDER BY cal_date LIMIT ?
+        """,
+        (start, end, expected + 1),
+    ).fetchall()
+    if len(rows) != expected:
+        return (), False
+    if any(
+        day != start + timedelta(days=index) or _database_timestamp(updated_at) > observed
+        for index, (day, _is_open, updated_at) in enumerate(rows)
+    ):
+        return (), False
+    trading_days = tuple(day for day, is_open, _updated_at in rows if is_open)
+    return trading_days, bool(trading_days and trading_days[-1] == end)
+
+
+def _read_membership_source(
+    connection: duckdb.DuckDBPyConnection,
+    *,
+    receipts: _VerifiedRunReceipts | None,
+    target_date: date | None,
+    cutoff: datetime,
+    observed: datetime,
+) -> _MembershipSource:
+    if receipts is None or target_date is None:
+        return _MembershipSource(
+            target_date=target_date,
+            trading_days=(),
+            calendar_complete=False,
+            receipt_table_present=receipts is not None,
+            source_limited=False,
+            days=(),
+            candidate_keys=frozenset(),
+            return_facts=(),
+        )
+    if receipts.membership_daily is None:
+        return _MembershipSource(
+            target_date=target_date,
+            trading_days=(),
+            calendar_complete=False,
+            receipt_table_present=True,
+            source_limited=True,
+            days=(),
+            candidate_keys=receipts.membership_candidate_keys,
+            return_facts=(),
+        )
+    tables = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main' "
+            "AND table_name IN ('trade_calendar', 'daily_bar', 'adj_factor')"
+        ).fetchall()
+    }
+    daily_columns = (
+        {str(row[1]) for row in connection.execute("PRAGMA table_info('daily_bar')").fetchall()}
+        if "daily_bar" in tables
+        else set()
+    )
+    daily_has_close = {"trade_date", "ts_code", "close"} <= daily_columns
+    factor_columns = (
+        {str(row[1]) for row in connection.execute("PRAGMA table_info('adj_factor')").fetchall()}
+        if "adj_factor" in tables
+        else set()
+    )
+    has_factor = {"trade_date", "ts_code", "adj_factor"} <= factor_columns
+    start = min(
+        (day for day, _pool in receipts.membership_candidate_keys if day <= target_date),
+        default=target_date,
+    )
+    calendar, complete = (
+        _membership_calendar(connection, start=start, end=target_date, observed=observed)
+        if "trade_calendar" in tables
+        else ((), False)
+    )
+    days: list[PoolDayEvidence] = []
+    return_facts: list[_MemberReturnFact] = []
+    member_total = 0
+    for receipt in receipts.membership_daily:
+        daily_values = (
+            "db.close AS daily_close, "
+            + ("db.vol" if "vol" in daily_columns else "NULL::DOUBLE")
+            + " AS daily_volume"
+            if daily_has_close
+            else "NULL::DOUBLE AS daily_close, NULL::DOUBLE AS daily_volume"
+        )
+        daily_join = (
+            "LEFT JOIN daily_bar AS db ON db.trade_date = sr.trade_date "
+            "AND db.ts_code = sr.ts_code "
+            if daily_has_close
+            else ""
+        )
+        member_rows = connection.execute(
+            "SELECT sr.ts_code, sr.close, "
+            + daily_values
+            + " FROM screen_result AS sr "
+            + daily_join
+            + "WHERE sr.trade_date = ? AND sr.preset_name = ? AND sr.created_at <= ? "
+            + "ORDER BY sr.ts_code LIMIT ?",
+            (
+                receipt.trade_date,
+                receipt.preset_name,
+                cutoff,
+                _MAX_POOL_MEMBERSHIP_SOURCE_MEMBERS + 1,
+            ),
+        ).fetchall()
+        member_total += len(member_rows)
+        if member_total > _MAX_POOL_MEMBERSHIP_SOURCE_MEMBERS:
+            return _MembershipSource(
+                target_date=target_date,
+                trading_days=(),
+                calendar_complete=False,
+                receipt_table_present=True,
+                source_limited=True,
+                days=(),
+                candidate_keys=receipts.membership_candidate_keys,
+                return_facts=(),
+            )
+        prices_match_receipt = receipt.result_version in receipts.price_digest_verified
+        factors: dict[str, float] = {}
+        if has_factor and prices_match_receipt and member_rows:
+            try:
+                factor_rows = connection.execute(
+                    "SELECT af.ts_code, af.adj_factor FROM adj_factor AS af "
+                    "JOIN screen_result AS sr ON sr.trade_date = af.trade_date "
+                    "AND sr.ts_code = af.ts_code "
+                    "WHERE sr.trade_date = ? AND sr.preset_name = ? "
+                    "AND sr.created_at <= ? ORDER BY af.ts_code LIMIT ?",
+                    (
+                        receipt.trade_date,
+                        receipt.preset_name,
+                        cutoff,
+                        len(member_rows) + 1,
+                    ),
+                ).fetchall()
+            except duckdb.Error:
+                factor_rows = []
+            factor_codes = [str(code) for code, _factor in factor_rows]
+            if len(factor_rows) <= len(member_rows) and len(set(factor_codes)) == len(factor_rows):
+                factors = {str(code): factor for code, factor in factor_rows}
+        members: list[PoolMemberClose] = []
+        for code, close, daily_close, daily_volume in member_rows:
+            trusted_close = (
+                close
+                if prices_match_receipt
+                and close is not None
+                and daily_close is not None
+                and math.isfinite(close)
+                and close > 0
+                and close == daily_close
+                else None
+            )
+            members.append(PoolMemberClose(ts_code=str(code), close=trusted_close))
+            return_facts.append(
+                _MemberReturnFact(
+                    pool_name=receipt.preset_name,
+                    trade_date=receipt.trade_date,
+                    ts_code=str(code),
+                    close=trusted_close,
+                    volume=daily_volume,
+                    factor=factors.get(str(code)),
+                )
+            )
+        days.append(
+            PoolDayEvidence(trade_date=receipt.trade_date, receipt=receipt, members=tuple(members))
+        )
+    return _MembershipSource(
+        target_date=target_date,
+        trading_days=calendar,
+        calendar_complete=complete,
+        receipt_table_present=True,
+        source_limited=False,
+        days=tuple(days),
+        candidate_keys=receipts.membership_candidate_keys,
+        return_facts=tuple(return_facts),
+    )
+
+
+def _membership_projection(
+    source: _MembershipSource,
+    *,
+    screen_bounds: tuple[ScreenBoundsProjectionRow, ...],
+    definitions: ServingProjectionPayload,
+    receipts: _VerifiedRunReceipts | None,
+    available_at: datetime,
+) -> ServingProjectionPayload:
+    definition_rows = tuple(
+        row
+        for row in definitions.rows
+        if row["state"] == "available" and isinstance(row["version"], str)
+    )
+    target = source.target_date
+    published_trade_date = (
+        target.isoformat()
+        if target is not None and target <= available_at.astimezone(_SHANGHAI).date()
+        else None
+    )
+    raw_pool_dates = {row.preset_name: row.max_date for row in screen_bounds}
+    current_versions = (
+        _current_receipt_versions(receipts, definitions) if receipts is not None else frozenset()
+    )
+    days_by_pool: dict[str, list[PoolDayEvidence]] = {}
+    for day in source.days:
+        assert day.receipt is not None
+        days_by_pool.setdefault(day.receipt.preset_name, []).append(day)
+    rows: list[dict[str, object]] = []
+    for definition in definition_rows:
+        pool_name = str(definition["pool_name"])
+        pool_days = days_by_pool.get(pool_name, [])
+        current = next((day for day in pool_days if day.trade_date == target), None)
+        result_version = current.receipt.result_version if current and current.receipt else None
+        member_rows: tuple[dict[str, object], ...] = ()
+        if source.source_limited:
+            status = "source_limited"
+        elif not source.receipt_table_present:
+            status = "legacy_unproven" if raw_pool_dates.get(pool_name) == target else "not_run"
+        elif target is None:
+            status = "not_run"
+        elif published_trade_date is None or (
+            (target, pool_name) in source.candidate_keys and current is None
+        ):
+            status = "unverified"
+        elif current is None:
+            status = "legacy_unproven" if raw_pool_dates.get(pool_name) == target else "not_run"
+        elif not source.calendar_complete:
+            status = "calendar_incomplete"
+        elif result_version not in current_versions:
+            status = "definition_mismatch"
+        else:
+            trusted_days = [
+                day
+                for day in pool_days
+                if day.receipt is not None and day.receipt.result_version in current_versions
+            ]
+            trusted_keys = {(day.trade_date, pool_name) for day in trusted_days}
+            trusted_days.extend(
+                PoolDayEvidence(
+                    trade_date=trade_date,
+                    receipt=None,
+                    missing_receipt_reason="legacy_unproven",
+                )
+                for trade_date, name in source.candidate_keys
+                if name == pool_name and (trade_date, name) not in trusted_keys
+            )
+            result = compute_pool_membership(
+                pool_name=pool_name,
+                published_definition_version=str(definition["version"]),
+                trading_days=source.trading_days,
+                days=trusted_days,
+                calendar_complete=True,
+            )
+            status = result.status
+            member_rows = tuple(
+                {
+                    "pool_name": pool_name,
+                    "trade_date": published_trade_date,
+                    "result_version": result.result_version,
+                    "row_kind": "member",
+                    "ts_code": member.ts_code,
+                    "status": status,
+                    "entry_trade_date": (
+                        member.entry_trade_date.isoformat()
+                        if member.entry_trade_date is not None
+                        else None
+                    ),
+                    "entry_close": member.entry_close,
+                    "entry_result_version": member.entry_result_version,
+                    "unknown_reason": member.unknown_reason,
+                }
+                for member in result.members
+            )
+        rows.append(
+            {
+                "pool_name": pool_name,
+                "trade_date": published_trade_date,
+                "result_version": result_version,
+                "row_kind": "status",
+                "ts_code": "",
+                "status": status,
+                "entry_trade_date": None,
+                "entry_close": None,
+                "entry_result_version": None,
+                "unknown_reason": None,
+            }
+        )
+        rows.extend(member_rows)
+    try:
+        return ServingProjectionPayload(
+            table_name="pool_membership", available_at=available_at, rows=tuple(rows)
+        )
+    except ValueError as error:
+        if "byte budget" not in str(error) and "row budget" not in str(error):
+            raise
+        limited = tuple(
+            {**row, "status": "source_limited"} for row in rows if row["row_kind"] == "status"
+        )
+        return ServingProjectionPayload(
+            table_name="pool_membership", available_at=available_at, rows=limited
+        )
+
+
+def _return_projection(
+    source: _MembershipSource,
+    *,
+    membership: ServingProjectionPayload,
+    receipts: _VerifiedRunReceipts | None,
+    observed: datetime,
+) -> ServingProjectionPayload | None:
+    if receipts is None:
+        return None
+    facts = {(fact.pool_name, fact.trade_date, fact.ts_code): fact for fact in source.return_facts}
+    if len(facts) != len(source.return_facts):
+        facts = {}
+    current_receipts = {receipt.preset_name: receipt for receipt in receipts.latest}
+    history_receipts = {
+        (receipt.preset_name, receipt.trade_date): receipt
+        for receipt in receipts.membership_daily or ()
+    }
+    current_status = {
+        str(row["pool_name"]): row
+        for row in membership.rows
+        if row["row_kind"] == "status" and row["status"] == "verified"
+    }
+    rows: list[dict[str, object]] = []
+    for member in membership.rows:
+        if member["row_kind"] != "member" or member["status"] != "verified":
+            continue
+        pool_name = str(member["pool_name"])
+        status = current_status.get(pool_name)
+        current = current_receipts.get(pool_name)
+        entry_day_raw = member["entry_trade_date"]
+        entry_version = member["entry_result_version"]
+        entry_close = member["entry_close"]
+        if (
+            status is None
+            or current is None
+            or entry_day_raw is None
+            or entry_version is None
+            or entry_close is None
+            or status["trade_date"] != current.trade_date.isoformat()
+            or status["result_version"] != current.result_version
+            or member["trade_date"] != status["trade_date"]
+            or member["result_version"] != current.result_version
+            or current.contract != "screen-run-receipt/v2"
+            or current.result_version not in receipts.price_digest_verified
+        ):
+            continue
+        market_close = datetime.combine(current.trade_date, time(15), tzinfo=_SHANGHAI).astimezone(
+            UTC
+        )
+        if observed < market_close or current.completed_at < market_close:
+            continue
+        entry_day = date.fromisoformat(str(entry_day_raw))
+        entry = history_receipts.get((pool_name, entry_day))
+        if (
+            entry is None
+            or entry.result_version != entry_version
+            or entry.contract != "screen-run-receipt/v2"
+            or entry.result_version not in receipts.price_digest_verified
+        ):
+            continue
+        code = str(member["ts_code"])
+        entry_fact = facts.get((pool_name, entry_day, code))
+        current_fact = facts.get((pool_name, current.trade_date, code))
+        if entry_fact is None or current_fact is None or entry_fact.close != entry_close:
+            continue
+        adjusted = calculate_adjusted_pool_return(
+            entry_close=entry_close,
+            current_close=current_fact.close,
+            entry_factor=entry_fact.factor,
+            current_factor=current_fact.factor,
+            current_volume=current_fact.volume,
+        )
+        if adjusted is None:
+            continue
+        rows.append(
+            {
+                "pool_name": pool_name,
+                "trade_date": current.trade_date.isoformat(),
+                "result_version": current.result_version,
+                "ts_code": code,
+                "entry_trade_date": entry_day.isoformat(),
+                "entry_result_version": entry.result_version,
+                "gain_pct": adjusted.gain_pct,
+                "entry_line_price": adjusted.entry_line_price,
+            }
+        )
+    try:
+        return ServingProjectionPayload(
+            table_name="pool_member_return", available_at=membership.available_at, rows=tuple(rows)
+        )
+    except ValueError as error:
+        if "byte budget" not in str(error) and "row budget" not in str(error):
+            raise
+        return ServingProjectionPayload(
+            table_name="pool_member_return", available_at=membership.available_at, rows=()
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class _DatabaseProjection:
     """Everything one page projection takes out of the replica, in one open (#256)."""
 
@@ -968,6 +2742,10 @@ class _DatabaseProjection:
     latest_trade_date: date | None
     canvas_diagnostics: tuple[CanvasDiagnosticProjectionRow, ...]
     canvas_hits: tuple[CanvasHitProjectionRow, ...]
+    run_receipts: _VerifiedRunReceipts | None
+    screen_run_evidence: ServingProjectionPayload | None
+    membership: _MembershipSource
+    monitor_event: ServingProjectionPayload
     available_at: datetime
 
 
@@ -982,7 +2760,10 @@ class DuckDBSignalPageProjectionSource:
         canvas_receipt_root: Path | None = None,
         canvas_publication_keyring: CanvasPublicationKeyring | None = None,
         page_control_outbox: PageControlOutbox | Path | None = None,
+        formula_pool_config: FormulaPoolServingConfig | None = None,
+        user_presets_root: Path | None = None,
         surge_live_root: Path | None = None,
+        notification_log_path: Path | None = None,
         control_root: Path | None = None,
         atomically_published: bool = False,
         read_profile: ReplicaReadProfile = UNLIMITED_READ_PROFILE,
@@ -1002,8 +2783,19 @@ class DuckDBSignalPageProjectionSource:
             None if canvas_receipt_root is None else Path(os.path.abspath(canvas_receipt_root))
         )
         self.canvas_publication_keyring = canvas_publication_keyring
+        self.user_presets_root = (
+            None if user_presets_root is None else Path(os.path.abspath(user_presets_root))
+        )
         self.surge_live_root = (
             None if surge_live_root is None else Path(os.path.abspath(surge_live_root))
+        )
+        self.notification_log_path = (
+            None if notification_log_path is None else Path(os.path.abspath(notification_log_path))
+        )
+        self.formula_pool_config = (
+            None
+            if formula_pool_config is None
+            else FormulaPoolServingConfig.model_validate(formula_pool_config)
         )
         if page_control_outbox is None:
             self.page_control_outbox = None
@@ -1013,12 +2805,25 @@ class DuckDBSignalPageProjectionSource:
                 if isinstance(page_control_outbox, PageControlOutbox)
                 else Path(page_control_outbox)
             )
-            self.page_control_outbox = _ReadonlyPageControlAuditReader(audit_path)
+            self.page_control_outbox = _ReadonlyPageControlAuditReader(
+                audit_path, reject_sidecars=self.formula_pool_config is not None
+            )
 
         if self.canvas_catalog_root is not None and self.page_control_outbox is None:
             raise PageProjectionSourceIntegrityError(
                 "configured canvas catalog requires readonly PageControl audit authority"
             )
+        if self.user_presets_root is not None and self.page_control_outbox is None:
+            raise PageProjectionSourceIntegrityError(
+                "configured user pools require readonly PageControl audit authority"
+            )
+        if self.formula_pool_config is not None and self.page_control_outbox is None:
+            raise PageProjectionSourceIntegrityError(
+                "configured formula pools require readonly PageControl audit authority"
+            )
+        self._formula_pool_watch: FormulaPoolSourceWatch | None = None
+        self._formula_pool_identity: tuple[tuple[int, ...] | None, ...] | None = None
+        self._cached_formula_pool_projections: tuple[ServingProjectionPayload, ...] | None = None
         if self.canvas_catalog_root is not None and (
             self.canvas_receipt_root is None or self.canvas_publication_keyring is None
         ):
@@ -1062,8 +2867,66 @@ class DuckDBSignalPageProjectionSource:
     def __call__(self, observed_at: datetime, /) -> SignalPageProjectionSnapshot:
         if self.page_control_outbox is None:
             return self._build_snapshot(observed_at)
-        with self.page_control_outbox.snapshot():
-            return self._build_snapshot(observed_at)
+        entered = False
+        built = False
+        try:
+            with self.page_control_outbox.snapshot():
+                entered = True
+                result = self._build_snapshot(observed_at)
+                built = True
+            return result
+        except (PageProjectionSourceIntegrityError, OSError, sqlite3.Error, ValueError) as exc:
+            if not entered or built:
+                raise _PageControlAuditSnapshotUnavailableError(
+                    f"PageControl shared audit snapshot is unavailable: {exc}"
+                ) from exc
+            raise
+
+    def _read_formula_pool_projections(
+        self, observed: datetime
+    ) -> tuple[ServingProjectionPayload, ...]:
+        config = self.formula_pool_config
+        if config is None:
+            return ()
+        assert self.page_control_outbox is not None
+        watch = self._formula_pool_watch
+        cached = self._cached_formula_pool_projections
+        if watch is not None and cached is not None:
+            current = watch.identity()
+            if current == self._formula_pool_identity:
+                if watch.identity() != current:
+                    raise PageProjectionSourceIntegrityError(
+                        "formula pool authority changed while reusing verified projection"
+                    )
+                if cached[0].available_at > observed:
+                    raise PageProjectionSourceIntegrityError(
+                        "formula pool authority is newer than observation"
+                    )
+                return cached
+        catalog_before = FormulaPoolSourceWatch.catalog_identity(
+            config, self.page_control_outbox.path
+        )
+        projections = read_formula_pool_projections(
+            config,
+            self.page_control_outbox.formula_pool_saves(),
+            observed_at=observed,
+        )
+        watch = FormulaPoolSourceWatch.from_projections(
+            config, self.page_control_outbox.path, projections
+        )
+        identity = watch.identity()
+        if (
+            FormulaPoolSourceWatch.catalog_identity(config, self.page_control_outbox.path)
+            != catalog_before
+            or watch.identity() != identity
+        ):
+            raise PageProjectionSourceIntegrityError(
+                "formula pool authority changed while binding verified projection"
+            )
+        self._formula_pool_watch = watch
+        self._formula_pool_identity = identity
+        self._cached_formula_pool_projections = projections
+        return projections
 
     def _build_snapshot(self, observed_at: datetime) -> SignalPageProjectionSnapshot:
         observed = normalize_aware_utc(observed_at)
@@ -1098,15 +2961,129 @@ class DuckDBSignalPageProjectionSource:
         hits = database.canvas_hits
         available = database.available_at
         canvas_definitions = self._canvas_definitions(observed=observed)
+        pool_definition = (
+            _pool_definition_projection(
+                self.user_presets_root,
+                self.page_control_outbox,
+            )
+            if self.user_presets_root is not None
+            else (
+                ServingProjectionPayload(
+                    table_name="pool_definition",
+                    available_at=_EMPTY_PROJECTION_AVAILABLE_AT,
+                    rows=build_pool_definition_rows({}, {}, root_path=""),
+                )
+                if database.run_receipts is not None
+                else None
+            )
+        )
+        run_receipt_projection = (
+            _receipt_projection(database.run_receipts, pool_definition)
+            if database.run_receipts is not None and pool_definition is not None
+            else None
+        )
+        membership_definitions = pool_definition or ServingProjectionPayload(
+            table_name="pool_definition",
+            available_at=_EMPTY_PROJECTION_AVAILABLE_AT,
+            rows=build_pool_definition_rows({}, {}, root_path=""),
+        )
+        pool_membership = _membership_projection(
+            database.membership,
+            screen_bounds=screen_bounds,
+            definitions=membership_definitions,
+            receipts=database.run_receipts,
+            available_at=max(
+                available,
+                run_receipt_projection.available_at
+                if run_receipt_projection is not None
+                else _EMPTY_PROJECTION_AVAILABLE_AT,
+                database.run_receipts.newest_candidate_at
+                if database.run_receipts is not None
+                and database.run_receipts.newest_candidate_at is not None
+                else _EMPTY_PROJECTION_AVAILABLE_AT,
+            ),
+        )
+        pool_member_return = _return_projection(
+            database.membership,
+            membership=pool_membership,
+            receipts=database.run_receipts,
+            observed=observed,
+        )
         pulse_history, pulse_alerts, runtime_config = _read_surge_live_projection_sources(
             self.surge_live_root,
             observed=observed,
         )
+        try:
+            surge_event = _read_surge_event_projection(self.surge_live_root, observed=observed)
+        except (OSError, PageProjectionSourceIntegrityError, ValueError) as error:
+            logger.warning("爆量事件来源暂不可用：{}", error)
+            surge_event = None
+        legacy_notification, legacy_notification_status = self.legacy_notification_projections(
+            observed
+        )
+        alert_ack_projections = build_ack_source_projections(
+            None
+            if self.page_control_outbox is None
+            else self.page_control_outbox.alert_ack_snapshot(),
+            observed_at=observed,
+        )
+        try:
+            manual_watchlist_projections = build_manual_watchlist_projections(
+                None
+                if self.page_control_outbox is None
+                else self.page_control_outbox.manual_watchlist_snapshot(),
+                observed_at=observed,
+            )
+        except (OSError, sqlite3.Error, PageProjectionSourceIntegrityError, ValueError) as exc:
+            logger.warning("手动盯盘名单来源暂不可用：{}", exc)
+            manual_watchlist_projections = build_manual_watchlist_projections(
+                None, observed_at=observed
+            )
+        try:
+            price_alert_rule_projections = build_price_alert_rule_projections(
+                None
+                if self.page_control_outbox is None
+                else self.page_control_outbox.price_alert_rule_snapshot(),
+                observed_at=observed,
+                unavailable=self.page_control_outbox is None,
+            )
+        except (OSError, sqlite3.Error, PageProjectionSourceIntegrityError, ValueError) as exc:
+            logger.warning("价格提醒规则来源暂不可用：{}", exc)
+            price_alert_rule_projections = build_price_alert_rule_projections(
+                None, observed_at=observed, unavailable=True
+            )
+        from rquant.condition_alert_runtime_projection import condition_rule_projections
+
+        try:
+            condition_rules = condition_rule_projections(
+                None
+                if self.page_control_outbox is None
+                else self.page_control_outbox.condition_alert_rule_snapshot(),
+                observed_at=observed,
+                unavailable=self.page_control_outbox is None,
+            )
+        except (OSError, sqlite3.Error, ValueError, PageProjectionSourceIntegrityError):
+            condition_rules = condition_rule_projections(
+                None, observed_at=observed, unavailable=True
+            )
+        formula_pool_projections: tuple[ServingProjectionPayload, ...] = ()
+        if self.formula_pool_config is not None:
+            try:
+                formula_pool_projections = self._read_formula_pool_projections(observed)
+            except (OSError, sqlite3.Error, KeyError, ValueError) as exc:
+                raise PageProjectionSourceIntegrityError(
+                    "configured formula pool authority is invalid"
+                ) from exc
         if canvas_definitions:
             available = max(
                 available,
                 max(item.updated_at for item in canvas_definitions),
             )
+        try:
+            ai_projections=() if self.page_control_outbox is None else self.page_control_outbox.ai_assistance_projections(observed)
+        except (OSError,sqlite3.Error,ValueError) as error:
+            logger.warning("助手页面来源暂不可用：{}",error)
+            ai_projections=()
         return SignalPageProjectionSnapshot.create(
             available_at=available,
             screen_bounds=screen_bounds,
@@ -1119,10 +3096,57 @@ class DuckDBSignalPageProjectionSource:
             ),
             canvas_hits=hits,
             canvas_definitions=canvas_definitions,
+            pool_definition=pool_definition,
+            formula_pool_state=(formula_pool_projections[0] if formula_pool_projections else None),
+            formula_pool_definition=(
+                formula_pool_projections[1] if formula_pool_projections else None
+            ),
+            formula_pool_latest_result=(
+                formula_pool_projections[2] if formula_pool_projections else None
+            ),
+            screen_run_receipt=run_receipt_projection,
+            screen_run_evidence=database.screen_run_evidence,
+            pool_membership=pool_membership,
+            pool_member_return=pool_member_return,
             pulse_history=pulse_history,
             pulse_alerts=pulse_alerts,
             surge_runtime_config=runtime_config,
+            monitor_event=database.monitor_event,
+            surge_event=surge_event,
+            legacy_notification=legacy_notification,
+            legacy_notification_status=legacy_notification_status,
+            alert_ack_state=alert_ack_projections[0],
+            alert_ack=(alert_ack_projections[1] if len(alert_ack_projections) > 1 else None),
+            manual_watchlist_state=manual_watchlist_projections[0],
+            manual_watchlist=(
+                manual_watchlist_projections[1] if len(manual_watchlist_projections) > 1 else None
+            ),
+            price_alert_rule_state=price_alert_rule_projections[0],
+            price_alert_rule=(
+                price_alert_rule_projections[1] if len(price_alert_rule_projections) > 1 else None
+            ),
+            condition_alert_rule_state=condition_rules[0],
+            condition_alert_rule=condition_rules[1],
+            ai_projections=ai_projections,
         )
+
+    def legacy_notification_projections(
+        self, observed: datetime
+    ) -> tuple[ServingProjectionPayload | None, ServingProjectionPayload | None]:
+        if self.notification_log_path is None:
+            return None, None
+        try:
+            result = _read_legacy_notification_projections(
+                self.notification_log_path, observed=observed
+            )
+        except (OSError, PageProjectionSourceIntegrityError, ValueError):
+            logger.warning("旧通知记录来源暂不可用")
+            result = None
+        if result is None:
+            return None, _legacy_notification_status(
+                state="unavailable", skipped=0, available_at=_EMPTY_PROJECTION_AVAILABLE_AT
+            )
+        return result
 
     def _read_database_projection(
         self,
@@ -1194,6 +3218,44 @@ class DuckDBSignalPageProjectionSource:
                 (cutoff.date(), cutoff),
             ).fetchone()
             latest_date = None if latest_row is None else latest_row[0]
+            membership_target_date = latest_date
+            run_receipts = _read_verified_run_receipts(
+                connection,
+                cutoff=cutoff,
+                observed=observed or cutoff.replace(tzinfo=_SHANGHAI).astimezone(UTC),
+                generation_sealed_before_cutoff=sealed_before_cutoff,
+            )
+            screen_evidence = _screen_evidence_projection(
+                connection,
+                run_receipts,
+                cutoff=cutoff,
+                observed=observed or cutoff.replace(tzinfo=_SHANGHAI).astimezone(UTC),
+            )
+            if run_receipts is not None:
+                if run_receipts.newest_candidate_day is not None:
+                    membership_target_date = (
+                        max(
+                            membership_target_date,
+                            run_receipts.newest_candidate_day,
+                        )
+                        if membership_target_date is not None
+                        else run_receipts.newest_candidate_day
+                    )
+                trusted_date = max((item.trade_date for item in run_receipts.latest), default=None)
+                if trusted_date is not None:
+                    latest_date = max(latest_date, trusted_date) if latest_date else trusted_date
+                if run_receipts.newest_candidate_day is not None and (
+                    latest_date is None or run_receipts.newest_candidate_day > latest_date
+                ):
+                    # A newer, invalid run cannot make yesterday's members look current.
+                    latest_date = None
+            membership_source = _read_membership_source(
+                connection,
+                receipts=run_receipts,
+                target_date=membership_target_date,
+                cutoff=cutoff,
+                observed=observed or cutoff.replace(tzinfo=_SHANGHAI).astimezone(UTC),
+            )
             diagnostics: tuple[CanvasDiagnosticProjectionRow, ...] = ()
             hits: tuple[CanvasHitProjectionRow, ...] = ()
             if latest_date is not None:
@@ -1267,15 +3329,97 @@ class DuckDBSignalPageProjectionSource:
                 """,
                 (cutoff.date(), cutoff, cutoff, cutoff),
             ).fetchone()
-        if available_row is None or available_row[0] is None:
+            window_start = cutoff.date() - timedelta(days=_EVENT_WINDOW_DAYS - 1)
+            monitor_rows = connection.execute(
+                """
+                SELECT trade_date, trigger_time, ts_code, level, trigger_price,
+                       level_price, trigger_type, pool
+                FROM monitor_event
+                WHERE trade_date BETWEEN ? AND ?
+                  AND trigger_time >= ? AND trigger_time <= ?
+                ORDER BY trade_date DESC, trigger_time DESC, ts_code, level
+                LIMIT ?
+                """,
+                (
+                    window_start,
+                    cutoff.date(),
+                    datetime.combine(window_start, time.min),
+                    cutoff,
+                    _MAX_EVENT_ROWS + 1,
+                ),
+            ).fetchall()
+        receipt_available = (
+            max(
+                (item.completed_at for item in run_receipts.latest),
+                default=None,
+            )
+            if run_receipts is not None
+            else None
+        )
+        if (available_row is None or available_row[0] is None) and receipt_available is None:
             raise PageProjectionSourceIntegrityError("projection database has no PIT evidence")
+        database_available = max(
+            (
+                _database_timestamp(available_row[0])
+                if available_row is not None and available_row[0] is not None
+                else _EMPTY_PROJECTION_AVAILABLE_AT
+            ),
+            receipt_available or _EMPTY_PROJECTION_AVAILABLE_AT,
+        )
+        if len(monitor_rows) > _MAX_EVENT_ROWS:
+            raise PageProjectionSourceIntegrityError("monitor events exceed the row bound")
+        published_monitor: list[dict[str, object]] = []
+        monitor_available = database_available
+        for (
+            trade_day,
+            trigger_at,
+            code,
+            level,
+            price,
+            level_price,
+            trigger_type,
+            pool,
+        ) in monitor_rows:
+            if not isinstance(trigger_at, datetime) or trigger_at.tzinfo is not None:
+                raise PageProjectionSourceIntegrityError(
+                    "monitor event time must be local naive time"
+                )
+            if trade_day != trigger_at.date():
+                raise PageProjectionSourceIntegrityError(
+                    "monitor event trade date differs from time"
+                )
+            at = _database_timestamp(trigger_at)
+            if at > observed:
+                raise PageProjectionSourceIntegrityError("monitor events contain future evidence")
+            monitor_available = max(monitor_available, at)
+            published_monitor.append(
+                {
+                    "trade_date": trade_day.isoformat(),
+                    "trigger_time": at.isoformat(),
+                    "ts_code": str(code),
+                    "level": str(level),
+                    "trigger_price": price,
+                    "level_price": level_price,
+                    "trigger_type": trigger_type,
+                    "pool": pool,
+                }
+            )
+        monitor_projection = ServingProjectionPayload(
+            table_name="monitor_event",
+            available_at=monitor_available,
+            rows=tuple(published_monitor),
+        )
         return _DatabaseProjection(
             screen_bounds=screen_bounds,
             minute_coverage=minute_coverage,
             latest_trade_date=latest_date,
             canvas_diagnostics=diagnostics,
             canvas_hits=hits,
-            available_at=_database_timestamp(available_row[0]),
+            run_receipts=run_receipts,
+            screen_run_evidence=screen_evidence,
+            membership=membership_source,
+            monitor_event=monitor_projection,
+            available_at=database_available,
         )
 
     def _canvas_definitions(
@@ -1669,12 +3813,13 @@ class DuckDBSignalPageProjectionSource:
         rows = connection.execute(
             """
             SELECT table_name FROM information_schema.tables
-            WHERE table_schema = 'main' AND table_name IN ('screen_result', 'minute_bar')
+            WHERE table_schema = 'main'
+              AND table_name IN ('screen_result', 'minute_bar', 'monitor_event')
             """
         ).fetchall()
-        if {str(row[0]) for row in rows} != {"screen_result", "minute_bar"}:
+        if {str(row[0]) for row in rows} != {"screen_result", "minute_bar", "monitor_event"}:
             raise PageProjectionSourceIntegrityError(
-                "projection database is missing screen_result or minute_bar"
+                "projection database is missing screen_result, minute_bar or monitor_event"
             )
 
     @staticmethod
@@ -1790,16 +3935,329 @@ class DuckDBSignalPageProjectionSource:
 class DuckDBLabPageProjectionSource:
     """Project formal research gate metadata from one stable research replica."""
 
-    def __init__(self, database_path: Path, *, control_root: Path | None = None) -> None:
+    def __init__(
+        self,
+        database_path: Path,
+        *,
+        control_root: Path | None = None,
+        audit_report_path: Path | None = None,
+        audit_report_job_state_path: Path | None = None,
+        audit_report_job_directory: Path | None = None,
+        formula_market_job_state_path: Path | None = None,
+        formula_market_job_directory: Path | None = None,
+        backfill_plan_directory: Path | None = None,
+        backfill_plan_job_state_path: Path | None = None,
+        data_center_state_path: Path | None = None,
+        data_center_policy_path: Path | None = None,
+        factor_registry: FactorDefinitionRegistry | None = None,
+        factor_registry_identity: FactorRegistryIdentity | None = None,
+        factor_tracking_identity: FactorTrackingIdentity | None = None,
+        strategy_authoring_source: StrategyAuthoringProjectionSource | None = None,
+    ) -> None:
         self.database_path = Path(os.path.abspath(database_path))
+        if (data_center_state_path is None)!=(data_center_policy_path is None):
+            raise ValueError('data center state and policy paths require paired settings')
+        self.data_center_state_path=data_center_state_path
+        self.data_center_policy_path=data_center_policy_path
         #: this role's own state directory; see `_StableReadonlyDuckDB` (#255)
         self.control_root = None if control_root is None else Path(os.path.abspath(control_root))
+        if audit_report_path is not None and not audit_report_path.is_absolute():
+            raise ValueError("audit report path must be absolute")
+        if (audit_report_job_state_path is None) != (audit_report_job_directory is None):
+            raise ValueError("audit report job state and directory require paired paths")
+        if audit_report_path is not None and audit_report_job_state_path is not None:
+            raise ValueError(
+                "audit report job and explicit file modes are exclusive, not ambiguous"
+            )
+        if audit_report_job_state_path is not None and (
+            not audit_report_job_state_path.is_absolute()
+            or not audit_report_job_directory.is_absolute()
+        ):
+            raise ValueError("audit report job paths must be absolute")
+        self.audit_report_path = audit_report_path
+        self.audit_report_job_state_path = audit_report_job_state_path
+        self.audit_report_job_directory = audit_report_job_directory
+        if (formula_market_job_state_path is None) != (formula_market_job_directory is None):
+            raise ValueError("formula market job state and result directory require paired paths")
+        if formula_market_job_state_path is not None and (
+            not formula_market_job_state_path.is_absolute()
+            or not formula_market_job_directory.is_absolute()
+        ):
+            raise ValueError("formula market job paths must be absolute")
+        self.formula_market_job_state_path = formula_market_job_state_path
+        self.formula_market_job_directory = formula_market_job_directory
+        if backfill_plan_directory is not None and not backfill_plan_directory.is_absolute():
+            raise ValueError("backfill plan directory must be absolute")
+        self.backfill_plan_directory = backfill_plan_directory
+        if backfill_plan_job_state_path is not None:
+            if not backfill_plan_job_state_path.is_absolute():
+                raise ValueError("backfill plan job state path must be absolute")
+            if backfill_plan_directory is None:
+                raise ValueError("backfill plan job state requires a plan directory")
+        self.backfill_plan_job_state_path = backfill_plan_job_state_path
+        if (factor_registry is None) != (factor_registry_identity is None):
+            raise ValueError("factor registry and fixed identity require paired configuration")
+        if factor_registry is not None and not isinstance(
+            factor_registry, FactorDefinitionRegistry
+        ):
+            raise TypeError("factor registry must be FactorDefinitionRegistry")
+        if factor_registry_identity is not None and not isinstance(
+            factor_registry_identity, FactorRegistryIdentity
+        ):
+            raise TypeError("factor registry identity must be FactorRegistryIdentity")
+        self.factor_registry = factor_registry
+        self.factor_registry_identity = factor_registry_identity
+        if factor_tracking_identity is not None and factor_registry_identity is None:
+            raise ValueError("tracking projection requires its fixed factor registry")
+        self.factor_tracking_identity = factor_tracking_identity
+        if strategy_authoring_source is not None:
+            from rquant.strategy_authoring_projection import StrategyAuthoringProjectionSource
+
+            if type(strategy_authoring_source) is not StrategyAuthoringProjectionSource:
+                raise TypeError("strategy source must be the concrete committed projection source")
+        self.strategy_authoring_source = strategy_authoring_source
+
+    def _factor_tracking_projections(
+        self, observed: datetime
+    ) -> tuple[ServingProjectionPayload, ...]:
+        from rquant.factor.tracking_serving import (
+            project_factor_tracking_projections,
+            project_factor_tracking_snapshot,
+        )
+
+        if self.factor_tracking_identity is None:
+            return ()
+        return project_factor_tracking_projections(
+            project_factor_tracking_snapshot(
+                self.factor_tracking_identity,
+                registry_identity=self.factor_registry_identity,
+                available_at=observed,
+            )
+        )
+
+    def _backfill_plan_projections(
+        self, observed_at: datetime
+    ) -> tuple[ServingProjectionPayload, ...]:
+        """Seal every discoverable plan in this source generation or refuse it."""
+        directory = self.backfill_plan_directory
+        if directory is None:
+            return ()
+        observed = normalize_aware_utc(observed_at)
+        try:
+            job_snapshot = read_backfill_plan_job_snapshot(
+                self.backfill_plan_job_state_path, observed_at=observed
+            )
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            raise PageProjectionSourceIntegrityError(
+                f"backfill plan job state invalid: {exc}"
+            ) from exc
+        try:
+            binding = _bind_readonly_directory(directory, label="backfill plan directory")
+        except FileNotFoundError:
+            try:
+                os.stat(directory, follow_symlinks=False)
+            except FileNotFoundError:
+                try:
+                    return project_backfill_plans(
+                        (),
+                        available_at=max(_EMPTY_PROJECTION_AVAILABLE_AT, job_snapshot.available_at),
+                        job_snapshot=job_snapshot,
+                    )
+                except ValueError as exc:
+                    raise PageProjectionSourceIntegrityError(
+                        f"backfill plan invalid: {exc}"
+                    ) from exc
+            raise PageProjectionSourceIntegrityError(
+                "backfill plan directory appeared while read"
+            ) from None
+        try:
+            entries = _list_bound_backfill_plan_entries(binding)
+            if sum(entry.identity[2] for entry in entries) > MAX_BACKFILL_CATALOG_READ_BYTES:
+                raise ValueError("backfill plan complete catalogue exceeds read bound")
+            directory_stat = os.fstat(binding.descriptor)
+            if os.name != "posix" or directory_stat.st_ctime_ns <= 0:
+                raise ValueError("backfill plan directory publication time is unavailable")
+            available_ns = max(
+                (directory_stat.st_ctime_ns, *(entry.published_ns for entry in entries))
+            )
+            if available_ns > int(observed.timestamp() * 1_000_000_000):
+                raise ValueError("backfill plan is not yet available")
+            indexed = tuple(
+                (
+                    _read_bound_backfill_plan(binding, entry),
+                    datetime.fromtimestamp(entry.published_ns / 1_000_000_000, tz=UTC),
+                )
+                for entry in entries
+            )
+            _verify_bound_backfill_catalogue(binding, entries)
+            return project_backfill_plans(
+                indexed,
+                available_at=max(
+                    datetime.fromtimestamp(available_ns / 1_000_000_000, tz=UTC),
+                    job_snapshot.available_at,
+                ),
+                job_snapshot=job_snapshot,
+            )
+        except (OSError, ValueError) as exc:
+            raise PageProjectionSourceIntegrityError(f"backfill plan invalid: {exc}") from exc
+        finally:
+            binding.close()
+
+    def _report_projections(
+        self, observed: datetime, *, success: DataAuditReportSuccessfulTask | None = None
+    ) -> tuple[ServingProjectionPayload, ...]:
+        path = self.audit_report_path
+        if self.audit_report_job_state_path is not None:
+            if success is None:
+                return ()
+            assert self.audit_report_job_directory is not None
+            path = data_audit_report_path(
+                self.audit_report_job_directory, success.receipt.report_hash
+            )
+        if path is None:
+            return ()
+        try:
+            binding = _bind_readonly_directory(path.parent, label="audit report directory")
+        except FileNotFoundError:
+            if success is not None:
+                raise PageProjectionSourceIntegrityError(
+                    "audit report directory is missing"
+                ) from None
+            return ()
+        try:
+            found = _read_bound_optional_file(
+                binding,
+                path.name,
+                max_bytes=MAX_REPORT_BYTES,
+                label="audit report",
+            )
+            if found is None:
+                binding.verify()
+                try:
+                    os.stat(path.name, dir_fd=binding.descriptor, follow_symlinks=False)
+                except FileNotFoundError:
+                    if success is not None:
+                        raise PageProjectionSourceIntegrityError(
+                            "successful audit report is missing"
+                        ) from None
+                    return ()
+                raise PageProjectionSourceIntegrityError("audit report appeared while read")
+            raw, identity = found
+            report = parse_data_audit_report_bytes(raw, filename=path.name)
+            if (
+                report.source.mode != "production_unverified"
+                or report.source.namespace != "production"
+            ):
+                raise ValueError("synthetic test audit report cannot enter production Serving")
+            if success is not None and (
+                report.content_hash != success.receipt.report_hash
+                or report.source.snapshot_label != f"sha256:{success.replica_sha256}"
+                or report.audit_start != success.request.audit_start
+                or report.observed_through != success.request.observed_through
+                or report.null_fields
+                != tuple(sorted(success.request.null_fields, key=lambda field: field.field_name))
+                or report.collection_status != ('collection_partial' if success.request.collection_reference is not None else 'collection_unconfirmed')
+                or (success.request.collection_reference is not None and (
+                    report.schema_version!=3 or getattr(report,'collection_reference',None)!=success.request.collection_reference))
+                or (success.request.collection_reference is None and report.schema_version==3)
+            ):
+                raise ValueError("audit report differs from successful task")
+            # mtime is caller-settable. Inode ctime and the containing directory's
+            # ctime bound when this content/name could first have been published;
+            # they do not establish collection completion or replica identity.
+            directory_stat = os.fstat(binding.descriptor)
+            if os.name != "posix" or any(
+                not isinstance(value, int) or value <= 0
+                for value in (
+                    identity.st_mtime_ns,
+                    identity.st_ctime_ns,
+                    directory_stat.st_ctime_ns,
+                )
+            ):
+                raise ValueError("audit report publication time cannot be established")
+            available_ns = max(
+                identity.st_mtime_ns,
+                identity.st_ctime_ns,
+                directory_stat.st_ctime_ns,
+            )
+            report_available = datetime.fromtimestamp(available_ns / 1_000_000_000, tz=UTC)
+            if report_available > observed:
+                raise ValueError("audit report is not yet available")
+            projections = project_data_audit_report(report, available_at=report_available)
+            binding.verify()
+            named = os.stat(path.name, dir_fd=binding.descriptor, follow_symlinks=False)
+            if _copy_identity(named) != _copy_identity(identity):
+                raise PageProjectionSourceIntegrityError("audit report rotated while read")
+            return projections
+        except (OSError, ValueError) as exc:
+            raise PageProjectionSourceIntegrityError(f"audit report invalid: {exc}") from exc
+        finally:
+            binding.close()
+
+    def _audit_report_bundle(
+        self, observed: datetime
+    ) -> tuple[tuple[ServingProjectionPayload, ...], tuple[ServingProjectionPayload, ...]]:
+        if self.audit_report_job_state_path is None:
+            return self._report_projections(observed), ()
+        try:
+            job_snapshot = read_data_audit_report_job_snapshot(
+                self.audit_report_job_state_path, observed_at=observed
+            )
+            report = self._report_projections(observed, success=job_snapshot.successful)
+            available = max((job_snapshot.available_at, *(item.available_at for item in report)))
+            report = tuple(
+                ServingProjectionPayload(
+                    table_name=item.table_name, available_at=available, rows=item.rows
+                )
+                for item in report
+            )
+            job = project_data_audit_report_job(job_snapshot, available_at=available)
+            return report, job
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            raise PageProjectionSourceIntegrityError(
+                f"audit report job state invalid: {exc}"
+            ) from exc
+
+    def _formula_market_projections(
+        self, observed: datetime
+    ) -> tuple[ServingProjectionPayload, ...]:
+        if self.formula_market_job_state_path is None:
+            return ()
+        try:
+            snapshot = read_formula_market_job_snapshot(
+                self.formula_market_job_state_path,
+                self.formula_market_job_directory,
+                observed_at=observed,
+            )
+            return project_formula_market_job(snapshot)
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            raise PageProjectionSourceIntegrityError(
+                f"formula market job source invalid: {exc}"
+            ) from exc
+
+    def _factor_definition_projections(
+        self, observed: datetime
+    ) -> tuple[ServingProjectionPayload, ...]:
+        if self.factor_registry is None or self.factor_registry_identity is None:
+            return ()
+        try:
+            snapshot = project_factor_definition_serving_snapshot(
+                self.factor_registry,
+                expected_identity=self.factor_registry_identity,
+                available_at=observed,
+            )
+            return project_factor_definition_projections(snapshot)
+        except (FactorRegistryError, OSError, sqlite3.Error, ValueError) as exc:
+            raise PageProjectionSourceIntegrityError(
+                f"factor definition source invalid: {exc}"
+            ) from exc
 
     def __call__(self, observed_at: datetime, /) -> LabPageProjectionSnapshot:
         observed = normalize_aware_utc(observed_at)
         stable = _StableReadonlyDuckDB(self.database_path, control_root=self.control_root)
         with stable as connection:
             self._require_tables(connection)
+            audit_status, audit_issues = self._audit_results(connection, observed=observed)
             candidates = connection.execute(
                 """
                 SELECT snapshot.snapshot_id, snapshot.strategy_name, snapshot.code_commit,
@@ -1890,13 +4348,127 @@ class DuckDBLabPageProjectionSource:
                             metadata_ready=research_gate_metadata_ready(decision),
                         )
                     )
-        available_at = (
-            _EMPTY_PROJECTION_AVAILABLE_AT if not rows else max(row.completed_at for row in rows)
+        available_at = max(
+            (
+                _EMPTY_PROJECTION_AVAILABLE_AT,
+                *(row.completed_at for row in rows),
+                *(
+                    time
+                    for time in (
+                        audit_status.latest_observed_at,
+                        audit_status.latest_completed_at,
+                        audit_status.successful_completed_at,
+                    )
+                    if time is not None
+                ),
+            )
         )
+        audit_report, audit_job = self._audit_report_bundle(observed)
         return LabPageProjectionSnapshot.create(
             available_at=available_at,
             rows=tuple(rows),
+            audit_status=audit_status,
+            audit_issues=audit_issues,
+            audit_report_projections=audit_report,
+            audit_job_projections=audit_job,
+            backfill_plan_projections=self._backfill_plan_projections(observed),
+            formula_market_projections=self._formula_market_projections(observed),
+            factor_definition_projections=self._factor_definition_projections(observed),
+            factor_tracking_projections=self._factor_tracking_projections(observed),
+            strategy_definition_projections=()
+            if self.strategy_authoring_source is None
+            else self.strategy_authoring_source(observed),
+            data_center_execution_projections=self._data_center_execution_projections(observed),
         )
+
+    def _data_center_execution_projections(self,observed: datetime) -> tuple[ServingProjectionPayload,...]:
+        if self.data_center_state_path is None:
+            return ()
+        from rquant.backfill_execute_projection import project_data_center_execution
+        return project_data_center_execution(state_path=self.data_center_state_path,
+            policy_path=self.data_center_policy_path,observed_at=observed)
+
+    @staticmethod
+    def _audit_results(
+        connection: duckdb.DuckDBPyConnection, *, observed: datetime
+    ) -> tuple[DataAuditStatusProjectionRow, tuple[DataAuditIssueProjectionRow, ...]]:
+        latest = connection.execute(
+            """
+            SELECT audit_run_id, status, observed_at, completed_at
+            FROM data_audit_run
+            WHERE observed_at <= ? AND (status = 'running' OR completed_at <= ?)
+            ORDER BY observed_at DESC, audit_run_id DESC LIMIT 1
+            """,
+            (observed, observed),
+        ).fetchone()
+        successful = connection.execute(
+            """
+            SELECT audit_run_id, as_of_date, range_start, range_end,
+                   observed_at, completed_at, p0_count,
+                   json_array_length(finding_issue_ids),
+                   json_type(finding_issue_ids),
+                   octet_length(encode(CAST(finding_issue_ids AS VARCHAR)))
+            FROM data_audit_run
+            WHERE status = 'completed' AND observed_at <= ? AND completed_at <= ?
+            ORDER BY observed_at DESC, audit_run_id DESC LIMIT 1
+            """,
+            (observed, observed),
+        ).fetchone()
+        issues: tuple[DataAuditIssueProjectionRow, ...] = ()
+        if successful is not None:
+            if successful[8] != "ARRAY" or int(successful[9]) > _MAX_AUDIT_FINDING_LIST_BYTES:
+                raise PageProjectionSourceIntegrityError("audit finding list is malformed or large")
+            expected = int(successful[7])
+            if expected > _MAX_AUDIT_ISSUES:
+                raise PageProjectionSourceIntegrityError("audit issue limit exceeded")
+            rows = connection.execute(
+                """
+                SELECT json_extract_string(finding.value, '$') AS finding_id,
+                       issue.issue_id, issue.dataset_id, issue.rule_id,
+                       issue.severity, issue.status
+                FROM data_audit_run AS audit,
+                     json_each(audit.finding_issue_ids) AS finding
+                LEFT JOIN data_quality_issue AS issue
+                  ON issue.issue_id = json_extract_string(finding.value, '$')
+                WHERE audit.audit_run_id = ?
+                ORDER BY finding_id LIMIT ?
+                """,
+                (str(successful[0]), _MAX_AUDIT_ISSUES + 1),
+            ).fetchall()
+            if len(rows) != expected or any(row[1] is None for row in rows):
+                raise PageProjectionSourceIntegrityError("audit issue is missing")
+            if len({str(row[0]) for row in rows}) != expected:
+                raise PageProjectionSourceIntegrityError("audit issue ids are duplicated")
+            issues = tuple(
+                DataAuditIssueProjectionRow(
+                    audit_run_id=str(successful[0]),
+                    issue_id=str(issue_id),
+                    dataset_id=str(dataset_id),
+                    rule_id=str(rule_id),
+                    severity=str(severity),
+                    status=str(status),
+                )
+                for _finding_id, issue_id, dataset_id, rule_id, severity, status in rows
+            )
+            # Issue severity can change after this completed run; p0_count is its
+            # historical result, while issue rows show the current classification.
+        status = DataAuditStatusProjectionRow(
+            latest_status="never_run" if latest is None else str(latest[1]),
+            latest_observed_at=None if latest is None else _database_timestamp(latest[2]),
+            latest_completed_at=(
+                None if latest is None or latest[3] is None else _database_timestamp(latest[3])
+            ),
+            successful_audit_id=None if successful is None else str(successful[0]),
+            successful_as_of_date=None if successful is None else successful[1],
+            successful_range_start=None if successful is None else successful[2],
+            successful_range_end=None if successful is None else successful[3],
+            successful_completed_at=(
+                None if successful is None else _database_timestamp(successful[5])
+            ),
+            finding_count=0 if successful is None else int(successful[7]),
+            p0_count=0 if successful is None else int(successful[6]),
+        )
+        return status, issues
 
     @staticmethod
     def _require_tables(connection: duckdb.DuckDBPyConnection) -> None:
@@ -1929,6 +4501,7 @@ class SignalPageProjectionProducer:
         source: DuckDBSignalPageProjectionSource,
         store: NotificationStateStore,
         companion_projections: tuple[ServingProjectionPayload, ...] | None = None,
+        intraday_source: IntradayScreenProjectionSource | None = None,
     ) -> None:
         self.source = source
         self.store = store
@@ -1938,6 +4511,7 @@ class SignalPageProjectionProducer:
         ):
             raise ValueError("signal companion projections are incomplete")
         self.companion_projections = companion_projections
+        self.intraday_source = intraday_source
 
     def publish(self, observed_at: datetime) -> NotificationProjectionPublication:
         """Publish this iteration's page projection, and say whether it wrote anything.
@@ -1949,15 +4523,74 @@ class SignalPageProjectionProducer:
         """
 
         observed = normalize_aware_utc(observed_at)
-        snapshot = self.source(observed)
-        page_source = NotificationProjectionSourceReceipt.create(
-            dataset_id="signal-page-projections",
-            generation_id=snapshot.content_sha256,
-            sequence=int(snapshot.available_at.timestamp() * 1_000_000),
-            event_time=snapshot.available_at,
-            published_at=observed,
-            projections=snapshot.projections,
-        )
+        try:
+            snapshot = self.source(observed)
+        except (PageProjectionSourceIntegrityError, OSError, duckdb.Error, ValueError) as error:
+            if self.source.formula_pool_config is not None:
+                raise
+            previous = self.store.serving_snapshot(observed_at=observed, history_limit=1)
+            if previous.projection_generation_id is None:
+                raise
+            logger.warning("盯盘事件来源暂不可用：{}", error)
+            page_projections = tuple(
+                item
+                for item in previous.payload.projections
+                if item.table_name not in _COMPANION_SIGNAL_TABLES
+                and item.table_name
+                not in {
+                    "surge_event",
+                    "legacy_notification",
+                    "legacy_notification_status",
+                    "pool_definition",
+                    "screen_run_receipt",
+                    "screen_run_evidence",
+                    "intraday_feature_snapshot",
+                    "intraday_screen_source",
+                    "pool_membership",
+                    "pool_member_return",
+                    "formula_pool_state",
+                    "formula_pool_definition",
+                    "formula_pool_latest_result",
+                    "alert_ack_state",
+                    "alert_ack",
+                    "manual_watchlist_state",
+                    "manual_watchlist",
+                    "ai_news_digest", "ai_interpretation", "ai_usage_day",
+                    "price_alert_rule_state",
+                    "price_alert_rule",
+                }
+            )
+            try:
+                surge = _read_surge_event_projection(self.source.surge_live_root, observed=observed)
+            except (PageProjectionSourceIntegrityError, OSError, ValueError) as surge_error:
+                logger.warning("爆量事件来源暂不可用：{}", surge_error)
+                surge = None
+            if surge is not None:
+                page_projections += (surge,)
+            legacy_notification, legacy_status = self.source.legacy_notification_projections(
+                observed
+            )
+            page_projections += tuple(
+                item for item in (legacy_notification, legacy_status) if item is not None
+            )
+            page_projections += build_ack_source_projections(None, observed_at=observed)
+            page_projections += build_manual_watchlist_projections(None, observed_at=observed)
+            page_projections += build_price_alert_rule_projections(
+                None, observed_at=observed, unavailable=True
+            )
+            page_available_at = max(item.available_at for item in page_projections)
+            page_generation_id = canonical_sha256(
+                {"source": "signal-page-projections-partial", "projections": page_projections}
+            )
+        else:
+            page_projections = snapshot.projections
+            page_available_at = snapshot.available_at
+            page_generation_id = snapshot.content_sha256
+        if self.companion_projections is not None:
+            injected_names = {item.table_name for item in self.companion_projections}
+            page_projections = tuple(
+                item for item in page_projections if item.table_name not in injected_names
+            )
         if self.companion_projections is None:
             previous = self.store.serving_snapshot(observed_at=observed, history_limit=1)
             previous_by_name = {
@@ -1966,33 +4599,99 @@ class SignalPageProjectionProducer:
             companion_projections = tuple(
                 previous_by_name.get(table_name)
                 or ServingProjectionPayload(
-                    table_name=table_name,
-                    available_at=_EMPTY_PROJECTION_AVAILABLE_AT,
-                    rows=(),
+                    table_name=table_name, available_at=_EMPTY_PROJECTION_AVAILABLE_AT, rows=()
                 )
-                for table_name in sorted(_COMPANION_SIGNAL_TABLES)
+                for table_name in sorted(_COMPANION_SIGNAL_TABLES - {"monitor_event", "surge_event"})
             )
         else:
             companion_projections = self.companion_projections
-        companion_identity = {
-            "dataset_id": "signal-companion-projections",
-            "projections": companion_projections,
-        }
-        companion_source = NotificationProjectionSourceReceipt.create(
-            dataset_id="signal-companion-projections",
-            generation_id=canonical_sha256(companion_identity),
-            sequence=int(
-                max(item.available_at for item in companion_projections).timestamp() * 1_000_000
-            ),
-            event_time=max(item.available_at for item in companion_projections),
-            published_at=observed,
-            projections=companion_projections,
-        )
-        authority = NotificationProjectionAuthoritySnapshot.create_from_sources(
-            observed_at=observed,
-            sources=(page_source, companion_source),
-        )
+
+
+        def candidate(
+            domain: tuple[ServingProjectionPayload, ...], domain_generation: str | None = None
+        ) -> NotificationProjectionAuthoritySnapshot:
+            dynamic_names = {item.table_name for item in domain}
+            page = tuple(item for item in page_projections if item.table_name not in dynamic_names)
+            companion = tuple(
+                item for item in companion_projections if item.table_name not in dynamic_names
+            )
+            page_source = NotificationProjectionSourceReceipt.create(
+                dataset_id="signal-page-projections",
+                generation_id=page_generation_id,
+                sequence=int(page_available_at.timestamp() * 1_000_000),
+                event_time=page_available_at,
+                published_at=observed,
+                projections=page,
+            )
+            companion_identity = {"dataset_id": "signal-companion-projections", "projections": companion}
+            companion_at = max(item.available_at for item in companion)
+            companion_source = NotificationProjectionSourceReceipt.create(
+                dataset_id="signal-companion-projections",
+                generation_id=canonical_sha256(companion_identity),
+                sequence=int(companion_at.timestamp() * 1_000_000),
+                event_time=companion_at,
+                published_at=observed,
+                projections=companion,
+            )
+            sources = (page_source, companion_source)
+            if domain:
+                sources += (
+                    NotificationProjectionSourceReceipt.create(
+                        dataset_id="intraday-screen-projections",
+                        generation_id=domain_generation,
+                        sequence=int(observed.timestamp() * 1_000_000),
+                        event_time=observed,
+                        published_at=observed,
+                        projections=domain,
+                    ),
+                )
+            return NotificationProjectionAuthoritySnapshot.create_from_sources(
+                observed_at=observed, sources=sources
+            )
+
+
+        def require_budget(value: NotificationProjectionAuthoritySnapshot) -> None:
+            require_projection_owner_budget(
+                tuple(
+                    ServingProjectionInput.bind(
+                        projection, owner_dataset_id="signals", owner_generation_id=value.generation_id
+                    )
+                    for projection in value.projections
+                )
+            )
+
+
+        authority = candidate(())
+        require_budget(authority)
+        if self.intraday_source is not None:
+            from rquant.screen.intraday_source import intraday_projections
+
+            unavailable = tuple(
+                ServingProjectionPayload(table_name=name, available_at=observed, rows=())
+                for name in ("intraday_screen_source", "intraday_feature_snapshot")
+            )
+            unavailable_generation = canonical_sha256({"unavailable": True, "cutoff": observed})
+            try:
+                intraday_snapshot = self.intraday_source(observed)
+                domain = intraday_projections(intraday_snapshot)
+                domain_generation = intraday_snapshot.source.source_identity
+            except (ValueError, RuntimeError, OSError):
+                logger.warning("盘中选股来源暂不可用")
+                domain, domain_generation = unavailable, unavailable_generation
+            proposed = candidate(domain, domain_generation)
+            try:
+                require_budget(proposed)
+            except ServingOwnerProjectionCapacityError:
+                logger.warning("盘中选股出处超过原共享预算，来源暂不可用")
+                proposed = candidate(unavailable, unavailable_generation)
+                try:
+                    require_budget(proposed)
+                except ServingOwnerProjectionCapacityError:
+                    # Even empty optional metadata cannot displace a full valid legacy owner.
+                    proposed = authority
+            authority = proposed
         return self.store.publish_projection_authority(authority)
+
 
 
 class ScreenBoundsProjectionRow(RuntimeContractModel):
@@ -2339,6 +5038,285 @@ def _parse_jsonl_objects(raw: bytes, *, name: str) -> tuple[dict[str, object], .
     return tuple(rows)
 
 
+def _read_surge_event_projection(
+    root: Path | None, *, observed: datetime
+) -> ServingProjectionPayload | None:
+    """Read the writer's complete daily JSONL files for a bounded 30-day window."""
+
+    if root is None:
+        return None
+    try:
+        binding = _bind_readonly_directory(root, label="surge event source")
+    except FileNotFoundError:
+        return None
+    from rquant.runtime_shadow_sources import LegacySurgeEvent
+
+    local_day = observed.astimezone(_SHANGHAI).date()
+    first_day = local_day - timedelta(days=_EVENT_WINDOW_DAYS - 1)
+    remaining = _MAX_SURGE_EVENT_BYTES
+    seen = 0
+    duplicates = 0
+    selected: dict[tuple[str, str, str], dict[str, object]] = {}
+    available = _EMPTY_PROJECTION_AVAILABLE_AT
+    try:
+        for offset in range(_EVENT_WINDOW_DAYS):
+            day = first_day + timedelta(days=offset)
+            name = f"events-{day.isoformat()}.jsonl"
+            file = _read_bound_optional_file(binding, name, max_bytes=remaining)
+            if file is None:
+                continue
+            raw, item = file
+            try:
+                current = os.stat(name, dir_fd=binding.descriptor, follow_symlinks=False)
+            except FileNotFoundError as error:
+                raise PageProjectionSourceIntegrityError(
+                    f"surge event source {name} rotated while read"
+                ) from error
+            if _copy_identity(current) != _copy_identity(item):
+                raise PageProjectionSourceIntegrityError(
+                    f"surge event source {name} changed while read"
+                )
+            binding.verify()
+            remaining -= len(raw)
+            available = max(available, _source_file_time(item, observed=observed, name=name))
+            if raw and not raw.endswith(b"\n"):
+                raise PageProjectionSourceIntegrityError(
+                    f"surge event source {name} has an incomplete line"
+                )
+            try:
+                lines = raw.decode("utf-8").splitlines()
+            except UnicodeDecodeError as error:
+                raise PageProjectionSourceIntegrityError(
+                    f"surge event source {name} is not UTF-8"
+                ) from error
+            for line_number, line in enumerate(lines, start=1):
+                seen += 1
+                if seen > _MAX_EVENT_ROWS:
+                    raise PageProjectionSourceIntegrityError("surge events exceed the row bound")
+                if not line:
+                    raise PageProjectionSourceIntegrityError(
+                        f"surge event source {name} has an empty line"
+                    )
+                try:
+                    value = strict_json_loads(line)
+                    if not isinstance(value, dict):
+                        raise ValueError("event record must be an object")
+                    required = {
+                        "ts_code",
+                        "name",
+                        "theme",
+                        "confirmed_at",
+                        "price",
+                        "pct_chg",
+                        "cum_amount",
+                        "rel_cum",
+                        "room_to_limit_pct",
+                        "status",
+                    }
+                    if not required.issubset(value):
+                        raise ValueError("event fields are incomplete")
+                    if set(value) - (set(LegacySurgeEvent.model_fields) | {"push_count_5d"}):
+                        raise ValueError("event fields are unknown")
+                    event = LegacySurgeEvent.model_validate(
+                        {
+                            field: value[field]
+                            for field in LegacySurgeEvent.model_fields
+                            if field in value
+                        }
+                    )
+                    if (
+                        _STOCK_CODE.fullmatch(event.ts_code) is None
+                        or _SURGE_EVENT_TIME.fullmatch(event.confirmed_at) is None
+                    ):
+                        raise ValueError("event code or time is invalid")
+                    event_at = datetime.combine(
+                        day, time.fromisoformat(event.confirmed_at), tzinfo=_SHANGHAI
+                    ).astimezone(UTC)
+                    if event_at > observed:
+                        raise ValueError("event is from the future")
+                    row: dict[str, object] = {
+                        "trade_date": day.isoformat(),
+                        "confirmed_at": event.confirmed_at,
+                        "ts_code": event.ts_code,
+                        "name": event.name,
+                        "theme": event.theme,
+                        "price": event.price,
+                        "pct_chg": event.pct_chg,
+                        "cum_amount": event.cum_amount,
+                        "rel_cum": event.rel_cum,
+                        "room_to_limit_pct": event.room_to_limit_pct,
+                        "status": event.status,
+                    }
+                except (StrictJsonError, ValueError) as error:
+                    raise PageProjectionSourceIntegrityError(
+                        f"surge event source {name} line {line_number} is invalid"
+                    ) from error
+                key = (day.isoformat(), event.confirmed_at, event.ts_code)
+                old = selected.get(key)
+                if old is not None:
+                    duplicates += 1
+                    if canonical_sha256(row) <= canonical_sha256(old):
+                        continue
+                selected[key] = row
+        binding.verify()
+    finally:
+        binding.close()
+    if duplicates:
+        logger.warning("爆量事件有 {} 条重复记录，已按内容稳定去重", duplicates)
+    return ServingProjectionPayload(
+        table_name="surge_event",
+        available_at=available,
+        rows=tuple(selected[key] for key in sorted(selected)),
+    )
+
+
+def _legacy_notification_status(
+    *, state: str, skipped: int, available_at: datetime
+) -> ServingProjectionPayload:
+    return ServingProjectionPayload(
+        table_name="legacy_notification_status",
+        available_at=available_at,
+        rows=({"snapshot_key": "current", "state": state, "skipped": skipped},),
+    )
+
+
+def _read_legacy_notification_projections(
+    path: Path | None, *, observed: datetime
+) -> tuple[ServingProjectionPayload, ServingProjectionPayload] | None:
+    """Extract only safe submission facts from one bounded, stable legacy JSONL file."""
+
+    if path is None:
+        return None
+    observed = normalize_aware_utc(observed)
+    try:
+        binding = _bind_readonly_directory(path.parent, label="legacy notification source")
+    except FileNotFoundError:
+        return None
+    try:
+        file = _read_bound_optional_file(
+            binding,
+            path.name,
+            max_bytes=_MAX_LEGACY_NOTIFICATION_BYTES,
+            label="legacy notification source",
+        )
+        if file is None:
+            return None
+        raw, item = file
+        if raw and not raw.endswith(b"\n"):
+            raise PageProjectionSourceIntegrityError(
+                "legacy notification source has an incomplete line"
+            )
+        try:
+            lines = raw.decode("utf-8").splitlines()
+        except UnicodeDecodeError:
+            raise PageProjectionSourceIntegrityError(
+                "legacy notification source is not UTF-8"
+            ) from None
+        if len(lines) > _MAX_EVENT_ROWS:
+            raise PageProjectionSourceIntegrityError("legacy notification source exceeds row bound")
+        file_time = datetime.fromtimestamp(item.st_mtime_ns / 1_000_000_000, tz=UTC)
+        if file_time > observed:
+            raise PageProjectionSourceIntegrityError(
+                "legacy notification source has future file time"
+            )
+        local_start = observed.astimezone(_SHANGHAI).date() - timedelta(days=_EVENT_WINDOW_DAYS - 1)
+        window_start = datetime.combine(local_start, time.min, tzinfo=_SHANGHAI).astimezone(UTC)
+        rows: list[dict[str, ProjectionScalar]] = []
+        skipped = 0
+        for line_number, line in enumerate(lines, start=1):
+            try:
+                value = strict_json_loads(line)
+            except (StrictJsonError, ValueError):
+                raise PageProjectionSourceIntegrityError(
+                    "legacy notification source has invalid JSON"
+                ) from None
+            if not isinstance(value, dict):
+                raise PageProjectionSourceIntegrityError(
+                    "legacy notification source row is invalid"
+                )
+            sent_at_raw = value.get("sent_at")
+            if (
+                not isinstance(sent_at_raw, str)
+                or "T" not in sent_at_raw
+                or type(value.get("success")) is not bool
+            ):
+                raise PageProjectionSourceIntegrityError(
+                    "legacy notification source row is invalid"
+                )
+            try:
+                local_time = datetime.fromisoformat(sent_at_raw)
+            except ValueError:
+                raise PageProjectionSourceIntegrityError(
+                    "legacy notification source time is invalid"
+                ) from None
+            if local_time.tzinfo is not None or local_time.utcoffset() is not None:
+                raise PageProjectionSourceIntegrityError(
+                    "legacy notification source time is invalid"
+                )
+            try:
+                event_at = local_time.replace(tzinfo=_SHANGHAI).astimezone(UTC)
+            except (OverflowError, ValueError):
+                raise PageProjectionSourceIntegrityError(
+                    "legacy notification source time is invalid"
+                ) from None
+            if event_at > observed:
+                raise PageProjectionSourceIntegrityError(
+                    "legacy notification source has future event"
+                )
+            scene = value.get("scene")
+            channel = value.get("channel")
+            scene_label = _LEGACY_SCENE_LABELS.get(scene) if isinstance(scene, str) else None
+            channel_label = (
+                _LEGACY_CHANNEL_LABELS.get(channel) if isinstance(channel, str) else None
+            )
+            if scene_label is None or channel_label is None:
+                skipped += 1
+                continue
+            if event_at < window_start:
+                continue
+            sent_at = event_at.isoformat()
+            identity = json.dumps(
+                (line_number, sent_at, scene, channel, value["success"]),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            rows.append(
+                {
+                    "record_key": hashlib.sha256(identity.encode("utf-8")).hexdigest(),
+                    "sent_at": sent_at,
+                    "scene_label": scene_label,
+                    "channel_label": channel_label,
+                    "submitted": value["success"],
+                }
+            )
+        try:
+            named = os.stat(path.name, dir_fd=binding.descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            raise PageProjectionSourceIntegrityError(
+                "legacy notification source rotated while read"
+            ) from None
+        if _copy_identity(named) != _copy_identity(item):
+            raise PageProjectionSourceIntegrityError(
+                "legacy notification source changed while read"
+            )
+        binding.verify()
+    finally:
+        binding.close()
+    available_at = max((file_time, *(datetime.fromisoformat(str(row["sent_at"])) for row in rows)))
+    try:
+        records = ServingProjectionPayload(
+            table_name="legacy_notification", available_at=available_at, rows=tuple(rows)
+        )
+        status = _legacy_notification_status(
+            state="partial" if skipped else "complete", skipped=skipped, available_at=available_at
+        )
+    except ValueError:
+        raise PageProjectionSourceIntegrityError(
+            "legacy notification source exceeds projection bound"
+        ) from None
+    return records, status
+
+
 def _pulse_as_of(trade_date: date, minute: str) -> datetime:
     try:
         parsed_time = time.fromisoformat(minute)
@@ -2571,12 +5549,46 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
             "canvas_hit",
             "canvas_definition",
         }
-        optional_names = {"pulse_history", "pulse_alert", "surge_runtime_config"}
+        optional_names = {
+            "ai_news_digest", "ai_interpretation", "ai_usage_day",
+            "pool_definition",
+            "formula_pool_state",
+            "formula_pool_definition",
+            "formula_pool_latest_result",
+            "screen_run_receipt",
+            "screen_run_evidence",
+            "pool_membership",
+            "pool_member_return",
+            "pulse_history",
+            "pulse_alert",
+            "surge_runtime_config",
+            "monitor_event",
+            "surge_event",
+            "alert_ack_state",
+            "alert_ack",
+            "manual_watchlist_state",
+            "manual_watchlist",
+            "price_alert_rule_state",
+            "price_alert_rule",
+            "condition_alert_rule_state",
+            "condition_alert_rule",
+            "legacy_notification",
+            "legacy_notification_status",
+        }
+        ai_names={item.table_name for item in self.projections if item.table_name.startswith("ai_")}
+        if ai_names and ai_names!={"ai_news_digest","ai_interpretation","ai_usage_day"}:
+            raise ValueError("AI projection group is incomplete")
         published_names = {item.table_name for item in self.projections}
         if not required_names.issubset(published_names) or not published_names.issubset(
             required_names | optional_names
         ):
             raise ValueError("signal page projection snapshot is incomplete")
+        validate_formula_pool_projections({item.table_name: item for item in self.projections})
+        validate_manual_watchlist_projections({item.table_name: item for item in self.projections})
+        validate_price_alert_rule_projections({item.table_name: item for item in self.projections})
+        from rquant.condition_alert_runtime_projection import validate_condition_rule_projections
+
+        validate_condition_rule_projections({item.table_name: item for item in self.projections})
         expected = canonical_sha256(self.model_dump(mode="python", exclude={"content_sha256"}))
         if self.content_sha256 != expected:
             raise ValueError("signal page projection snapshot hash mismatch")
@@ -2593,9 +5605,30 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
         canvas_latest_trade_date: CanvasLatestTradeDateProjectionRow | None = None,
         canvas_hits: tuple[CanvasHitProjectionRow, ...] = (),
         canvas_definitions: tuple[CanvasDefinitionProjectionRow, ...] = (),
+        pool_definition: ServingProjectionPayload | None = None,
+        formula_pool_state: ServingProjectionPayload | None = None,
+        formula_pool_definition: ServingProjectionPayload | None = None,
+        formula_pool_latest_result: ServingProjectionPayload | None = None,
+        screen_run_receipt: ServingProjectionPayload | None = None,
+        screen_run_evidence: ServingProjectionPayload | None = None,
+        pool_membership: ServingProjectionPayload | None = None,
+        pool_member_return: ServingProjectionPayload | None = None,
         pulse_history: PulseHistoryProjectionSource | None = None,
         pulse_alerts: PulseAlertProjectionSource | None = None,
         surge_runtime_config: SurgeRuntimeConfigProjectionSource | None = None,
+        monitor_event: ServingProjectionPayload | None = None,
+        surge_event: ServingProjectionPayload | None = None,
+        alert_ack_state: ServingProjectionPayload | None = None,
+        alert_ack: ServingProjectionPayload | None = None,
+        manual_watchlist_state: ServingProjectionPayload | None = None,
+        manual_watchlist: ServingProjectionPayload | None = None,
+        price_alert_rule_state: ServingProjectionPayload | None = None,
+        price_alert_rule: ServingProjectionPayload | None = None,
+        condition_alert_rule_state: ServingProjectionPayload | None = None,
+        condition_alert_rule: ServingProjectionPayload | None = None,
+        legacy_notification: ServingProjectionPayload | None = None,
+        legacy_notification_status: ServingProjectionPayload | None = None,
+        ai_projections: tuple[ServingProjectionPayload,...] = (),
     ) -> SignalPageProjectionSnapshot:
         available = normalize_aware_utc(available_at)
         rows = {
@@ -2648,6 +5681,40 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
                     rows=(_surge_runtime_config_row(surge_runtime_config.row),),
                 )
             )
+        for table_name, projection in (
+            ("pool_definition", pool_definition),
+            ("formula_pool_state", formula_pool_state),
+            ("formula_pool_definition", formula_pool_definition),
+            ("formula_pool_latest_result", formula_pool_latest_result),
+            ("screen_run_receipt", screen_run_receipt),
+            ("screen_run_evidence", screen_run_evidence),
+            ("pool_membership", pool_membership),
+            ("pool_member_return", pool_member_return),
+            ("monitor_event", monitor_event),
+            ("surge_event", surge_event),
+            ("alert_ack_state", alert_ack_state),
+            ("alert_ack", alert_ack),
+            ("manual_watchlist_state", manual_watchlist_state),
+            ("manual_watchlist", manual_watchlist),
+            ("price_alert_rule_state", price_alert_rule_state),
+            ("price_alert_rule", price_alert_rule),
+            ("condition_alert_rule_state", condition_alert_rule_state),
+            ("condition_alert_rule", condition_alert_rule),
+            ("legacy_notification", legacy_notification),
+            ("legacy_notification_status", legacy_notification_status),
+        ):
+            if projection is not None:
+                if projection.table_name != table_name:
+                    raise ValueError("signal event projection has the wrong table")
+                optional.append(projection)
+        if ai_projections:
+            candidate=(*projections,*optional,*ai_projections)
+            try:
+                require_projection_owner_budget(tuple(ServingProjectionInput(**item.model_dump(mode="python"),owner_dataset_id="signals",owner_generation_id="0"*64) for item in candidate))
+                optional.extend(ai_projections)
+            except ValueError:
+                # Optional new facts cannot displace the accepted complete original owner.
+                pass
         projections = tuple(sorted((*projections, *optional), key=lambda item: item.table_name))
         snapshot_available = max(item.available_at for item in projections)
         identity = {"available_at": snapshot_available, "projections": projections}
@@ -2661,8 +5728,238 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
 
     @model_validator(mode="after")
     def validate_snapshot(self) -> Self:
-        if tuple(item.table_name for item in self.projections) != ("research_gate_metadata",):
+        from rquant.backfill_execute_projection import DATA_CENTER_EXECUTION_TABLES,validate_execution_projections
+        from rquant.factor.result_serving import (
+            FACTOR_RESULT_PROJECTION_TABLES,
+            validate_factor_result_projections,
+        )
+        from rquant.factor.tracking_serving import (
+            FACTOR_TRACKING_PROJECTION_TABLES,
+            validate_factor_tracking_projections,
+        )
+
+        names = {item.table_name for item in self.projections}
+        required = {"data_audit_issue", "data_audit_status", "research_gate_metadata"}
+        optional_groups = (
+            REPORT_PROJECTION_TABLES,
+            {"audit_report_dataset"},
+            {"data_collection_dataset"},
+            DATA_CENTER_EXECUTION_TABLES,
+            REPORT_JOB_PROJECTION_TABLES,
+            BACKFILL_PLAN_PROJECTION_TABLES,
+            FORMULA_MARKET_PROJECTION_TABLES,
+            FACTOR_DEFINITION_PROJECTION_TABLES,
+            FACTOR_RESULT_PROJECTION_TABLES,
+            FACTOR_TRACKING_PROJECTION_TABLES,
+            STRATEGY_TEMPLATE_PROJECTION_TABLES,
+        )
+        if (
+            not required.issubset(names)
+            or any(names & group not in (set(), group) for group in optional_groups)
+            or names - required - set().union(*optional_groups)
+            or len(names) != len(self.projections)
+            or tuple(item.table_name for item in self.projections) != tuple(sorted(names))
+            or ("audit_report_dataset" in names and not names >= REPORT_PROJECTION_TABLES)
+            or ("data_collection_dataset" in names and not names >= REPORT_PROJECTION_TABLES)
+        ):
             raise ValueError("lab page projection snapshot is incomplete")
+        projections = {item.table_name: item for item in self.projections}
+        if names >= DATA_CENTER_EXECUTION_TABLES:
+            validate_execution_projections(projections)
+        if names >= FORMULA_MARKET_PROJECTION_TABLES:
+            validate_formula_market_projections(projections)
+        if names >= FACTOR_DEFINITION_PROJECTION_TABLES:
+            validate_factor_definition_projections(projections)
+        if names >= FACTOR_RESULT_PROJECTION_TABLES:
+            validate_factor_result_projections(projections)
+        if names >= FACTOR_TRACKING_PROJECTION_TABLES:
+            validate_factor_tracking_projections(projections)
+        if names >= STRATEGY_TEMPLATE_PROJECTION_TABLES:
+            from rquant.strategy_authoring_projection import validate_strategy_authoring_projections
+
+            validate_strategy_authoring_projections(projections)
+        status = projections["data_audit_status"].rows
+        issues = projections["data_audit_issue"].rows
+        if len(status) != 1 or len(issues) != status[0]["finding_count"]:
+            raise ValueError("lab audit projection row count differs")
+        if any(item["audit_run_id"] != status[0]["successful_audit_id"] for item in issues):
+            raise ValueError("lab audit projection mixes audit runs")
+        if names >= REPORT_JOB_PROJECTION_TABLES:
+            job_rows = projections["audit_report_job"].rows
+            if len(job_rows) != 1 or (
+                projections["audit_report_job"].available_at
+                != projections["audit_report_job_event"].available_at
+            ):
+                raise ValueError("audit report task projection is incomplete")
+            try:
+                progress = DataAuditReportJobProgress.model_validate(dict(job_rows[0]))
+                events = tuple(
+                    DataAuditReportJobEvent.model_validate(dict(row))
+                    for row in projections["audit_report_job_event"].rows
+                )
+                report_hash = (
+                    projections["audit_report_overview"].rows[0]["report_hash"]
+                    if names >= REPORT_PROJECTION_TABLES
+                    else None
+                )
+                validate_data_audit_report_job_progress(
+                    progress,
+                    events,
+                    available_at=projections["audit_report_job"].available_at,
+                    report_hash=report_hash,
+                )
+                if names >= REPORT_PROJECTION_TABLES and any(
+                    projections[name].available_at != projections["audit_report_job"].available_at
+                    for name in REPORT_PROJECTION_TABLES
+                ):
+                    raise ValueError("audit report and task projection times disagree")
+            except (IndexError, KeyError, TypeError, ValueError) as exc:
+                raise ValueError("audit report task projection is invalid") from exc
+        if names >= REPORT_PROJECTION_TABLES:
+            overview = projections["audit_report_overview"].rows
+            if len(overview) != 1:
+                raise ValueError("audit report overview row is missing")
+            summary = overview[0]
+            if (
+                summary["current"] is not False
+                or summary["collection_status"] != ('collection_partial' if summary['schema_version']==3 else 'collection_unconfirmed')
+                or summary["collection_completed_through"] is not None
+                or summary["coverage_conclusion"] != "unconfirmed"
+                or summary["source_mode"] != "production_unverified"
+                or summary["source_namespace"] != "production"
+            ):
+                raise ValueError("audit report source and completion remain unconfirmed")
+            report_hash = summary["report_hash"]
+            if summary["schema_version"] not in (1, 2, 3) or (
+                ("audit_report_dataset" in names) != (summary["schema_version"] in (2,3))
+            ) or ("data_collection_dataset" in names)!=(summary["schema_version"]==3):
+                raise ValueError("catalog audit schema and projection set disagree")
+            if "data_collection_dataset" in names:
+                from rquant.data_collection_projection import read_data_collection_projection_rows
+                collection=projections['data_collection_dataset']
+                if collection.available_at!=projections['audit_report_overview'].available_at:
+                    raise ValueError('collection source and original report publication times differ')
+                read_data_collection_projection_rows(tuple(dict(row) for row in collection.rows),report_hash=str(report_hash))
+            if "audit_report_dataset" in names:
+                dataset_projection = projections["audit_report_dataset"]
+                if (
+                    dataset_projection.available_at
+                    != projections["audit_report_overview"].available_at
+                ):
+                    raise ValueError("catalog audit and daily report projection times disagree")
+                results = read_catalog_audit_projection_rows(
+                    tuple(dict(row) for row in dataset_projection.rows),
+                    report_hash=str(report_hash),
+                )
+                if any(
+                    result.audit_start.isoformat() != summary["audit_start"]
+                    or result.observed_through.isoformat() != summary["observed_through"]
+                    or result.source_kind != "fixed_replica"
+                    or re.fullmatch(r"sha256:[0-9a-f]{64}", result.source_id) is None
+                    for result in results
+                ):
+                    raise ValueError("catalog audit source or range differs from overview")
+            for name in REPORT_PROJECTION_TABLES - {"audit_report_overview"}:
+                if any(row["report_hash"] != report_hash for row in projections[name].rows):
+                    raise ValueError("audit report projection mixes reports")
+            if (
+                len(projections["audit_report_month"].rows) != summary["monthly_count"]
+                or len(projections["audit_report_rule"].rows) != summary["rule_count"]
+                or len(projections["audit_report_issue"].rows) != summary["indexed_issue_count"]
+                or summary["quality_issue_count"]
+                != summary["indexed_issue_count"] + summary["omitted_issue_count"]
+                or sum(row["issue_count"] for row in projections["audit_report_rule"].rows)
+                != summary["quality_issue_count"]
+            ):
+                raise ValueError("audit report projection row counts disagree")
+        if names >= BACKFILL_PLAN_PROJECTION_TABLES:
+            catalog_rows = projections["backfill_plan_catalog"].rows
+            progress_rows = projections["backfill_plan_progress"].rows
+            job_rows = projections["backfill_plan_job"].rows
+            if (
+                len(catalog_rows) != 1
+                or progress_rows
+                != ({"status_key": "current", "availability": "unavailable", "task_id": None},)
+                or len(job_rows) != 1
+            ):
+                raise ValueError("backfill plan progress is incomplete")
+            catalog = catalog_rows[0]
+            index = projections["backfill_plan_index"].rows
+            preview = projections["backfill_plan_preview"].rows
+            archive = projections["backfill_plan_archive"].rows
+            try:
+                progress = BackfillPlanProgressState.model_validate(dict(job_rows[0]))
+                events = tuple(
+                    BackfillPlanProgressEvent.model_validate(dict(row))
+                    for row in projections["backfill_plan_event"].rows
+                )
+                if (
+                    len(
+                        {projections[name].available_at for name in BACKFILL_PLAN_PROJECTION_TABLES}
+                    )
+                    != 1
+                ):
+                    raise ValueError("backfill plan projection times disagree")
+                validate_backfill_plan_progress(
+                    progress,
+                    events,
+                    available_at=projections["backfill_plan_job"].available_at,
+                    plan_hashes=frozenset(row["plan_hash"] for row in index),
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("backfill plan progress is invalid") from exc
+            if (
+                catalog["catalog_key"] != "current"
+                or catalog["total_plan_count"] != len(index)
+                or catalog["indexed_plan_count"] != len(index)
+                or catalog["preview_plan_count"] != len(preview)
+                or catalog["has_older_plans"] is not False
+                or catalog["oldest_indexed_hash"] != (index[-1]["plan_hash"] if index else None)
+                or [row["rank"] for row in index] != list(range(len(index)))
+                or len(preview) != min(MAX_PREVIEW_BACKFILL_PLANS, len(index))
+                or {row["plan_hash"] for row in preview}
+                != {row["plan_hash"] for row in index[: len(preview)]}
+                or len(archive) != len(index)
+                or {row["plan_hash"] for row in archive} != {row["plan_hash"] for row in index}
+            ):
+                raise ValueError("backfill plan catalog rows disagree")
+            if any(
+                row["source_mode"] != "production_unverified"
+                or row["identity_verified"] is not False
+                or row["collection_complete_verified"] is not False
+                or row["quota_status"] != "unverified"
+                or row["executable"] is not False
+                for row in index
+            ):
+                raise ValueError("backfill plan cannot become verified or executable")
+            try:
+                index_by_hash = {row["plan_hash"]: row for row in index}
+                for row in archive:
+                    detail = decode_backfill_plan_archive_row(dict(row))
+                    summary = index_by_hash[detail.plan_hash]
+                    if (
+                        detail.audit_start.isoformat() != summary["audit_start"]
+                        or detail.completed_through.isoformat() != summary["completed_through"]
+                        or detail.cutoff_observed_at.isoformat() != summary["cutoff_observed_at"]
+                        or detail.published_at.isoformat() != summary["published_at"]
+                        or len(detail.missing_dates) != summary["missing_day_count"]
+                        or str(detail.estimate.estimated_seconds) != summary["estimated_seconds"]
+                        or detail.source.mode != summary["source_mode"]
+                        or detail.source.snapshot_label != summary["snapshot_label"]
+                    ):
+                        raise ValueError("backfill plan archive and index disagree")
+                for row in preview:
+                    source = json.loads(str(row["source_json"]))
+                    estimate = json.loads(str(row["estimate_json"]))
+                    if (
+                        source["mode"] != "production_unverified"
+                        or source["identity_verified"] is not False
+                        or source["collection_complete_verified"] is not False
+                        or estimate["quota_status"] != "unverified"
+                    ):
+                        raise ValueError("backfill plan preview cannot promote trust")
+            except (KeyError, TypeError, json.JSONDecodeError) as exc:
+                raise ValueError("backfill plan preview is invalid") from exc
         expected = canonical_sha256(self.model_dump(mode="python", exclude={"content_sha256"}))
         if self.content_sha256 != expected:
             raise ValueError("lab page projection snapshot hash mismatch")
@@ -2674,14 +5971,102 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
         *,
         available_at: datetime,
         rows: tuple[ResearchGateProjectionRow, ...] = (),
+        audit_status: DataAuditStatusProjectionRow | None = None,
+        audit_issues: tuple[DataAuditIssueProjectionRow, ...] = (),
+        audit_report_projections: tuple[ServingProjectionPayload, ...] = (),
+        audit_job_projections: tuple[ServingProjectionPayload, ...] = (),
+        backfill_plan_projections: tuple[ServingProjectionPayload, ...] = (),
+        formula_market_projections: tuple[ServingProjectionPayload, ...] = (),
+        factor_definition_projections: tuple[ServingProjectionPayload, ...] = (),
+        factor_result_projections: tuple[ServingProjectionPayload, ...] = (),
+        factor_tracking_projections: tuple[ServingProjectionPayload, ...] = (),
+        strategy_definition_projections: tuple[ServingProjectionPayload, ...] = (),
+        data_center_execution_projections: tuple[ServingProjectionPayload,...] = (),
     ) -> LabPageProjectionSnapshot:
+        from rquant.factor.result_serving import FACTOR_RESULT_PROJECTION_TABLES
+
         available = normalize_aware_utc(available_at)
-        projection = ServingProjectionPayload(
-            table_name="research_gate_metadata",
-            available_at=available,
-            rows=tuple(_research_gate_row(row) for row in rows),
+        status = audit_status or DataAuditStatusProjectionRow(
+            latest_status="never_run", finding_count=0, p0_count=0
         )
-        identity = {"available_at": available, "projections": (projection,)}
+        projections = (
+            ServingProjectionPayload(
+                table_name="data_audit_issue",
+                available_at=available,
+                rows=tuple(item.model_dump(mode="json") for item in audit_issues),
+            ),
+            ServingProjectionPayload(
+                table_name="data_audit_status",
+                available_at=available,
+                rows=({"status_key": "current", **status.model_dump(mode="json")},),
+            ),
+            ServingProjectionPayload(
+                table_name="research_gate_metadata",
+                available_at=available,
+                rows=tuple(_research_gate_row(row) for row in rows),
+            ),
+        )
+        if audit_report_projections and {
+            item.table_name for item in audit_report_projections
+        } not in (REPORT_PROJECTION_TABLES, REPORT_PROJECTION_TABLES | {"audit_report_dataset"},
+            REPORT_PROJECTION_TABLES | {'audit_report_dataset','data_collection_dataset'}):
+            raise ValueError("audit report projections must be complete")
+        if (
+            audit_job_projections
+            and {item.table_name for item in audit_job_projections} != REPORT_JOB_PROJECTION_TABLES
+        ):
+            raise ValueError("audit report task projections must be complete")
+        if (
+            backfill_plan_projections
+            and {item.table_name for item in backfill_plan_projections}
+            != BACKFILL_PLAN_PROJECTION_TABLES
+        ):
+            raise ValueError("backfill plan projections must be complete")
+        if (
+            formula_market_projections
+            and {item.table_name for item in formula_market_projections}
+            != FORMULA_MARKET_PROJECTION_TABLES
+        ):
+            raise ValueError("formula market projections must be complete")
+        if (
+            factor_definition_projections
+            and {item.table_name for item in factor_definition_projections}
+            != FACTOR_DEFINITION_PROJECTION_TABLES
+        ):
+            raise ValueError("factor definition projections must be complete")
+        if (
+            factor_result_projections
+            and {item.table_name for item in factor_result_projections}
+            != FACTOR_RESULT_PROJECTION_TABLES
+        ):
+            raise ValueError("factor result projections must be complete")
+        if (
+            strategy_definition_projections
+            and {p.table_name for p in strategy_definition_projections}
+            != STRATEGY_TEMPLATE_PROJECTION_TABLES
+        ):
+            raise ValueError("strategy projections are incomplete")
+        projections = tuple(
+            sorted(
+                (
+                    *projections,
+                    *audit_report_projections,
+                    *audit_job_projections,
+                    *backfill_plan_projections,
+                    *formula_market_projections,
+                    *factor_definition_projections,
+                    *factor_result_projections,
+                    *factor_tracking_projections,
+                    *strategy_definition_projections,
+                    *data_center_execution_projections,
+                ),
+                key=lambda item: item.table_name,
+            )
+        )
+        identity = {
+            "available_at": max(item.available_at for item in projections),
+            "projections": projections,
+        }
         return cls(**identity, content_sha256=canonical_sha256(identity))
 
 

@@ -40,7 +40,7 @@ StrategyId = Literal["n_shape", "growth_board_surge", "auction_gap"]
 #: minutes old is refused.
 EXECUTION_LIFECYCLE_MAX_DELAY_SECONDS = 2 * MARKET_MINUTE_FEATURE_MAX_DELAY_SECONDS
 _FEATURE_CONTRACT_ID = "intraday-pit"
-_FEATURE_CONTRACT_VERSIONS = (1, 2, 3)
+_FEATURE_CONTRACT_VERSIONS = (1, 2, 3, 4)
 _LIFECYCLE_FEATURES = frozenset(
     {
         "entry_fill_status",
@@ -114,7 +114,10 @@ def _feature_contracts(
     *,
     producer_commit: str,
 ) -> tuple[FeatureContract, ...]:
-    definitions = tuple(registry.definitions.values())
+    definitions = tuple(
+        registry.load_definition(strategy_id, 1)
+        for strategy_id in ("auction_gap", "growth_board_surge", "n_shape")
+    )
     feature_names = sorted(
         {
             requirement.name
@@ -173,11 +176,24 @@ def _feature_contracts(
                 },
             )
         )
+    additional_features = tuple(FeatureDefinition(
+        name=name,dtype="float",source_datasets=("market_minute",),lookback=20 if name != "speed_5m_pct" else 5,
+        pit_rule="closed source bars and all available_at values <= decision_time",
+        price_basis="raw",availability_contract={
+            "source_available_at_basis":"per_candidate_source_available_at",
+            "max_delay_seconds":MARKET_MINUTE_FEATURE_MAX_DELAY_SECONDS,
+            "missing_policy":"mark_unavailable","late_policy":"mark_stale",
+            "decision_visibility_gate":"available_at_lte_decision_time",
+        },
+    ) for name in ("speed_5m_pct","hist_cumulative_volume_median","cumulative_volume_ratio"))
     return tuple(
         FeatureContract(
             contract_id=_FEATURE_CONTRACT_ID,
             version=version,
-            features=tuple(features),
+            features=tuple(sorted(
+                (*features, *(additional_features if version == 4 else ())),
+                key=lambda feature: feature.name,
+            )),
             producer_commit=producer_commit,
         )
         for version in _FEATURE_CONTRACT_VERSIONS
@@ -202,10 +218,14 @@ def plan_builtin_definitions(*, producer_commit: str) -> BuiltinDefinitionBootst
         parent_fingerprint = fingerprint
     if parent_fingerprint is None:  # pragma: no cover - fixed built-in contract set
         raise ValueError("built-in feature contract plan is empty")
+    strategy_feature_fingerprint = feature_fingerprints[2]
 
     strategies: list[BuiltinDefinitionStrategyBinding] = []
     for definition in sorted(
-        registry.definitions.values(),
+        (
+            registry.load_definition(strategy_id, 1)
+            for strategy_id in ("auction_gap", "growth_board_surge", "n_shape")
+        ),
         key=lambda item: item.strategy_id,
     ):
         spec = _canonical_strategy_spec(definition.spec)
@@ -217,7 +237,7 @@ def plan_builtin_definitions(*, producer_commit: str) -> BuiltinDefinitionBootst
                 registration_fingerprint=_strategy_definition_fingerprint(
                     spec,
                     execution_binding,
-                    feature_contract_fingerprint=parent_fingerprint,
+                    feature_contract_fingerprint=strategy_feature_fingerprint,
                     parent_fingerprint=None,
                     supersedes=None,
                     replacement_reason=None,
@@ -282,12 +302,15 @@ def bootstrap_builtin_definitions(
 
     planned_by_id = {binding.strategy_id: binding for binding in plan.strategies}
     for definition in sorted(
-        evaluator_registry.definitions.values(),
+        (
+            evaluator_registry.load_definition(strategy_id, 1)
+            for strategy_id in ("auction_gap", "growth_board_surge", "n_shape")
+        ),
         key=lambda item: item.strategy_id,
     ):
         record = definition_registry.register_strategy_spec(
             definition.spec,
-            feature_contract_fingerprint=parent.fingerprint,
+            feature_contract_fingerprint=plan.feature_contract_fingerprints[2],
             registered_at=registered_at,
             available_at=available_at,
             producer_commit=producer_commit,

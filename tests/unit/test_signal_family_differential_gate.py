@@ -690,10 +690,10 @@ def test_python311_normalizer_runs_when_local_runtime_is_usable_or_records_ci_ne
 
 def test_normative_baseline_pair_and_candidate_repository_identity() -> None:
     # Each pull request refreezes the baseline to the merge commit its predecessor left on
-    # main; this one moves it from PR #303's to PR #309's. It is the merge base of the
-    # endpoints an R07 run states, not something rediscovered from a ref.
-    assert BASELINE_COMMIT_SHA == "df621ef2eaaec3a3fc929d9be8a84d1bfa1249bd"
-    assert BASELINE_TREE_SHA == "7c4d17c98344f96c5c63c8858b323336abf9c5d9"
+    # main; this React platform candidate binds to that exact merge commit. It is the
+    # merge base of the endpoints an R07 run states, not rediscovered from a ref.
+    assert BASELINE_COMMIT_SHA == "793092fa11a963b044314ee134865748d8bb5530"
+    assert BASELINE_TREE_SHA == "f238a41b438940b18d85e4197bb09969c56c3ff0"
     assert HISTORICAL_BASELINE_COMMIT_SHA == "45d0b57c4c5cbab1700fa5e3c386c6756892a7d6"
     candidate = subprocess.run(
         ["git", "-C", str(ROOT), "rev-parse", "HEAD"],

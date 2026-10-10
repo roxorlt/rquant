@@ -1,0 +1,12 @@
+{
+  "origin": "actual DuckDB BIGINT through product scalar and QueryResult JSON",
+  "wire_json": "{\"status\":\"ready\",\"columns\":[{\"name\":\"n\",\"data_type\":\"BIGINT\"}],\"rows\":[[-9007199254740993],[-9007199254740992],[-9007199254740991],[9007199254740991],[9007199254740992],[9007199254740993]],\"elapsed_ms\":1.0,\"source_at\":null,\"snapshot_sha256\":null,\"message\":\"\"}",
+  "expected_text": [
+    "-9007199254740993",
+    "-9007199254740992",
+    "-9007199254740991",
+    "9007199254740991",
+    "9007199254740992",
+    "9007199254740993"
+  ]
+}

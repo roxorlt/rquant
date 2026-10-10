@@ -1,0 +1,112 @@
+"""The committed OpenAPI snapshot is exactly what the API generates.
+
+The front end's TypeScript types (``web/src/api/schema.d.ts``) are generated from
+``web/src/api/openapi.json``; this test is the Python half of the chain, ``web.yml`` checks
+the TypeScript half. Regenerate with ``uv run rquant web-openapi > web/src/api/openapi.json``.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from rquant.web.app import create_app, openapi_document
+from rquant.web.settings import WebSettings
+
+SNAPSHOT = Path(__file__).resolve().parents[2] / "web" / "src" / "api" / "openapi.json"
+
+
+def test_openapi_snapshot_matches_the_app_byte_for_byte() -> None:
+    app = create_app(WebSettings(serving_root=Path("data/runtime/serving")), background=False)
+    assert SNAPSHOT.read_text(encoding="utf-8") == openapi_document(app)
+
+
+def test_every_api_path_is_versioned_and_only_defined_mutations_use_post() -> None:
+    app = create_app(WebSettings(serving_root=Path("data/runtime/serving")), background=False)
+    paths = app.openapi()["paths"]
+    assert paths
+    for path, operations in paths.items():
+        assert path.startswith("/api/v1/")
+        assert set(operations) == (
+            {"get", "post"}
+            if path in {
+                "/api/v1/backtests/portfolio/runs",
+                "/api/v1/backtests/minute-runtime/runs",
+                "/api/v1/backtests/minute-runtime/studies",
+            }
+            else {"post"}
+            if path
+            in {
+                "/api/v1/collaboration/roles/commands",
+                "/api/v1/collaboration/roles/lookup",
+                "/api/v1/collaboration/roles/prepare",
+                "/api/v1/strategy-promotions/commands",
+                "/api/v1/strategy-promotions/commands/lookup",
+                "/api/v1/strategy-promotions/commands/resume",
+                "/api/v1/screen/run",
+                "/api/v1/ai/backtests/confirm",
+                "/api/v1/ai/backtests/prepare",
+                "/api/v1/ai/backtests/prepare/lookup",
+                "/api/v1/ai/interpretations/read",
+                "/api/v1/ai/requests",
+                "/api/v1/ai/requests/lookup",
+                "/api/v1/screen/query/execute",
+                "/api/v1/screen/query/lookup",
+                "/api/v1/screen/query/resume",
+                "/api/v1/screen/query/presets/save",
+                "/api/v1/screen/query/alert-draft",
+                "/api/v1/screen/nl-preview",
+                "/api/v1/screen/tdx/parse",
+                "/api/v1/screen/tdx/preview",
+                "/api/v1/pools/editor/commands",
+                "/api/v1/pools/editor/nl-preview",
+                "/api/v1/monitor/ack",
+                "/api/v1/monitor/price-rules/commands",
+                "/api/v1/monitor/price-rules/commands/resume",
+                "/api/v1/monitor/condition-rules/commands",
+                "/api/v1/monitor/condition-rules/commands/resume",
+                "/api/v1/backtests/portfolio/exports",
+                "/api/v1/backtests/minute-runtime/exports",
+                "/api/v1/watchlist/commands",
+                "/api/v1/data/backfill-plans/commands",
+                "/api/v1/data/audit-report/commands",
+                "/api/v1/data/executions/commands",
+                "/api/v1/screen/tdx/market/commands",
+                "/api/v1/pools/formula/commands",
+                "/api/v1/tasks/jobs/commands",
+                "/api/v1/tasks/controls/lookup",
+                "/api/v1/tasks/controls/resume",
+                "/api/v1/tasks/scheduling/commands",
+                "/api/v1/tasks/units/{unit}/run",
+                "/api/v1/tasks/units/{unit}/run/prepare",
+                "/api/v1/tasks/notifications/mode/prepare",
+                "/api/v1/tasks/notifications/mode",
+                "/api/v1/tasks/monitor/builtins/commands",
+                "/api/v1/paper-portfolios/{account_id}/configuration",
+                "/api/v1/paper-portfolios/{account_id}/pause/prepare",
+                "/api/v1/paper-portfolios/{account_id}/pause/confirm",
+                "/api/v1/paper-portfolios/{account_id}/recover",
+                "/api/v1/paper-portfolios/{account_id}/reconcile",
+                "/api/v1/paper-portfolios/{account_id}/band",
+                "/api/v1/tasks/jobs/commands",
+                "/api/v1/factors/definitions/{factor_id}/archive",
+                "/api/v1/factors/definitions/{factor_id}/archive/resume",
+                "/api/v1/factors/definitions/save",
+                "/api/v1/factors/definitions/save/resume",
+                "/api/v1/factors/definitions/save/retry",
+                "/api/v1/factors/runs",
+                "/api/v1/factors/runs/resume",
+                "/api/v1/factors/runs/retry",
+                "/api/v1/factors/tracking/commands",
+                "/api/v1/factors/tracking/commands/resume",
+                "/api/v1/factors/tracking/commands/retry",
+                "/api/v1/research/query",
+                "/api/v1/research/queries/save",
+                "/api/v1/research/queries/resume",
+                "/api/v1/experiments/commands",
+                "/api/v1/strategy-templates/commands",
+                "/api/v1/strategy-templates/commands/resume",
+                "/api/v1/strategy-templates/{strategy_id}/runs",
+                "/api/v1/strategy-templates/{strategy_id}/runs/resume",
+            }
+            else {"get"}
+        )

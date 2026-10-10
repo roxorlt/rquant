@@ -202,7 +202,9 @@ def test_the_configuration_free_set_is_exactly_the_route_a_commands() -> None:
 
     from rquant.cli import CONFIGURATION_FREE_COMMANDS
 
-    assert set(CONFIGURATION_FREE_COMMANDS) == {command for command, _flag in ROUTE_A_COMMANDS}
+    assert set(CONFIGURATION_FREE_COMMANDS) == (
+        {command for command, _flag in ROUTE_A_COMMANDS} | {"ops-task-snapshot"}
+    )
 
 
 def test_the_configuration_free_handlers_never_name_the_configuration_module() -> None:

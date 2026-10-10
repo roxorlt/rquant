@@ -925,7 +925,7 @@ class TestRunMonitor:
             mock_store.query_monitor_events.return_value = pd.DataFrame()
             run_monitor(interval=5)
 
-        assert "40" not in item.triggered
+        assert item.triggered["40"] is False
         mock_store.upsert_monitor_event.assert_not_called()
 
         scenes = [c.args[0] for c in mock_notify.call_args_list]

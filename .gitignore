@@ -122,3 +122,13 @@ id_rsa*
 tmp/
 temp/
 .cache/
+
+# Web front end (web/, React + Vite). The build output web/dist/ is committed on
+# purpose (the server has no Node), so it is excepted from the dist/ rule above;
+# web/scripts/verify-dist.mjs fails on any other ignored file under web/.
+web/node_modules/
+web/.vite/
+web/coverage/
+web/playwright-report/
+web/test-results/
+!web/dist/

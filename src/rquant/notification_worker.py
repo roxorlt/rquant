@@ -242,6 +242,383 @@ def _release_not_attempted(
     )
 
 
+def _run_price_notification_item(
+    store: object,
+    provider: object,
+    event: object,
+    record: OutboxRecord,
+    *,
+    activation: object,
+    worker_id: str,
+    now: datetime,
+    clock: Callable[[], datetime],
+) -> NotificationItemResult:
+    from rquant.price_alert_runtime_projection import (
+        PriceAlertAuthorityConflict,
+        PriceAlertAuthorityUnavailable,
+        PriceAlertDeliveryRejected,
+    )
+    from rquant.runtime_notification_providers import (
+        RecipientScopedNotificationProvider,
+        SuppressedNotificationProvider,
+    )
+
+    try:
+        authority = store.price_alert_delivery_authority()
+        if authority is None:
+            raise PriceAlertAuthorityUnavailable("price authority has not been applied")
+        if type(provider) not in {
+            RecipientScopedNotificationProvider,
+            SuppressedNotificationProvider,
+        }:
+            raise TypeError("price delivery requires an actual recipient-scoped provider")
+        prepared = provider.prepare_price(event, record)
+    except Exception:
+        return _release_not_attempted(
+            store,
+            record,
+            worker_id=worker_id,
+            observed_at=now,
+            reason="price notification static preparation is unavailable",
+        )
+    admitted_at = max(now, _utc(clock()))
+    try:
+        admitted = store.admit_price_alert_delivery(
+            record,
+            activation=activation,
+            worker_id=worker_id,
+            expected_revision=authority.authority_revision,
+            admitted_at=admitted_at,
+        )
+    except (
+        PriceAlertAuthorityConflict,
+        PriceAlertDeliveryRejected,
+        PriceAlertAuthorityUnavailable,
+    ):
+        try:
+            current = store.price_alert_delivery_authority()
+            cancelled = (
+                None
+                if current is None
+                else store.cancel_price_unadmitted(
+                    record.outbox_id,
+                    worker_id=worker_id,
+                    expected_revision=current.authority_revision,
+                    cancelled_at=admitted_at,
+                )
+            )
+        except (PriceAlertAuthorityConflict, PriceAlertAuthorityUnavailable):
+            cancelled = None
+        except Exception:
+            cancelled = None
+        if cancelled is not None:
+            return _result(
+                record,
+                outcome=NotificationItemOutcome.NOT_ATTEMPTED,
+                observed_at=admitted_at,
+                error="price event cancelled before admission",
+            )
+        return _release_not_attempted(
+            store,
+            record,
+            worker_id=worker_id,
+            observed_at=admitted_at,
+            reason="price authority changed or is unavailable",
+        )
+    except Exception:
+        try:
+            committed = store.price_alert_send_admission(record.outbox_id, record.attempt_count)
+        except Exception:
+            committed = True
+        if committed is not None:
+            return _record_unknown(
+                store,
+                record,
+                worker_id=worker_id,
+                observed_at=admitted_at,
+                error="price admission commit outcome is uncertain; no automatic resend",
+            )
+        return _release_not_attempted(
+            store,
+            record,
+            worker_id=worker_id,
+            observed_at=admitted_at,
+            reason="price admission was not committed",
+        )
+    if admitted is None:
+        return _record_unknown(
+            store,
+            record,
+            worker_id=worker_id,
+            observed_at=admitted_at,
+            error="persisted price admission cannot authorize another provider call",
+        )
+    try:
+        receipt = provider.deliver_price(
+            prepared, admitted, store=store, record=record, now=max(admitted_at, _utc(clock()))
+        )
+    except ConfirmedDeliveryFailureError:
+        return _complete_known_failure(
+            store,
+            record,
+            worker_id=worker_id,
+            completed_at=max(admitted_at, _utc(clock())),
+            error="provider rejected price delivery",
+        )
+    except Exception:
+        return _record_unknown(
+            store,
+            record,
+            worker_id=worker_id,
+            observed_at=max(admitted_at, _utc(clock())),
+            error="price notification delivery outcome is unknown",
+        )
+    completed_at = max(admitted_at, _utc(clock()))
+    if not isinstance(receipt, str) or not receipt.strip():
+        return _record_unknown(
+            store,
+            record,
+            worker_id=worker_id,
+            observed_at=completed_at,
+            error="provider returned an invalid price receipt",
+        )
+    try:
+        store.complete_success(
+            record.outbox_id,
+            worker_id=worker_id,
+            attempt_no=record.attempt_count,
+            completed_at=completed_at,
+            provider_receipt=receipt,
+        )
+    except Exception:
+        return _record_unknown(
+            store,
+            record,
+            worker_id=worker_id,
+            observed_at=completed_at,
+            error="price success write-back is unknown",
+            provider_receipt=receipt,
+        )
+    return _result(
+        record,
+        outcome=NotificationItemOutcome.SUCCEEDED,
+        observed_at=completed_at,
+        provider_receipt=receipt,
+    )
+
+
+def _run_condition_notification_item(
+    store: object,
+    provider: object,
+    event: object,
+    record: OutboxRecord,
+    *,
+    activation: object,
+    worker_id: str,
+    now: datetime,
+    clock: Callable[[], datetime],
+) -> NotificationItemResult:
+    from rquant.condition_alert_runtime_projection import (
+        ConditionAlertAuthorityConflict,
+        ConditionAlertAuthorityUnavailable,
+        ConditionAlertDeliveryRejected,
+    )
+    from rquant.runtime_notification_providers import (
+        RecipientScopedNotificationProvider,
+        SuppressedNotificationProvider,
+    )
+
+    try:
+        authority = store.condition_alert_delivery_authority()
+        if authority is None:
+            raise ConditionAlertAuthorityUnavailable("condition authority has not been applied")
+        if type(provider) not in {
+            RecipientScopedNotificationProvider,
+            SuppressedNotificationProvider,
+        }:
+            raise TypeError("condition delivery requires an actual recipient-scoped provider")
+        prepared = provider.prepare_condition(event, record)
+    except Exception:
+        return _release_not_attempted(
+            store,
+            record,
+            worker_id=worker_id,
+            observed_at=now,
+            reason="condition notification static preparation is unavailable",
+        )
+    admitted_at = max(now, _utc(clock()))
+    try:
+        admitted = store.admit_condition_alert_delivery(
+            record,
+            activation=activation,
+            worker_id=worker_id,
+            expected_revision=authority.authority_revision,
+            admitted_at=admitted_at,
+        )
+    except (
+        ConditionAlertAuthorityConflict,
+        ConditionAlertDeliveryRejected,
+        ConditionAlertAuthorityUnavailable,
+    ):
+        try:
+            current = store.condition_alert_delivery_authority()
+            cancelled = (
+                None
+                if current is None
+                else store.cancel_condition_unadmitted(
+                    record.outbox_id,
+                    worker_id=worker_id,
+                    expected_revision=current.authority_revision,
+                    cancelled_at=admitted_at,
+                )
+            )
+        except (ConditionAlertAuthorityConflict, ConditionAlertAuthorityUnavailable):
+            cancelled = None
+        except Exception:
+            cancelled = None
+        if cancelled is not None:
+            return _result(
+                record,
+                outcome=NotificationItemOutcome.NOT_ATTEMPTED,
+                observed_at=admitted_at,
+                error="condition event cancelled before admission",
+            )
+        return _release_not_attempted(
+            store,
+            record,
+            worker_id=worker_id,
+            observed_at=admitted_at,
+            reason="condition authority changed or is unavailable",
+        )
+    except Exception:
+        try:
+            committed = store.condition_alert_send_admission(record.outbox_id, record.attempt_count)
+        except Exception:
+            committed = True
+        if committed is not None:
+            return _record_unknown(
+                store,
+                record,
+                worker_id=worker_id,
+                observed_at=admitted_at,
+                error="condition admission commit outcome is uncertain; no automatic resend",
+            )
+        return _release_not_attempted(
+            store,
+            record,
+            worker_id=worker_id,
+            observed_at=admitted_at,
+            reason="condition admission was not committed",
+        )
+    if admitted is None:
+        return _record_unknown(
+            store,
+            record,
+            worker_id=worker_id,
+            observed_at=admitted_at,
+            error="persisted condition admission cannot authorize another provider call",
+        )
+    try:
+        receipt = provider.deliver_condition(
+            prepared, admitted, store=store, record=record, now=max(admitted_at, _utc(clock()))
+        )
+    except ConfirmedDeliveryFailureError:
+        return _complete_known_failure(
+            store,
+            record,
+            worker_id=worker_id,
+            completed_at=max(admitted_at, _utc(clock())),
+            error="provider rejected condition delivery",
+        )
+    except Exception:
+        return _record_unknown(
+            store,
+            record,
+            worker_id=worker_id,
+            observed_at=max(admitted_at, _utc(clock())),
+            error="condition notification delivery outcome is unknown",
+        )
+    completed_at = max(admitted_at, _utc(clock()))
+    if not isinstance(receipt, str) or not receipt.strip():
+        return _record_unknown(
+            store,
+            record,
+            worker_id=worker_id,
+            observed_at=completed_at,
+            error="provider returned an invalid condition receipt",
+        )
+    try:
+        store.complete_success(
+            record.outbox_id,
+            worker_id=worker_id,
+            attempt_no=record.attempt_count,
+            completed_at=completed_at,
+            provider_receipt=receipt,
+        )
+    except Exception:
+        return _record_unknown(
+            store,
+            record,
+            worker_id=worker_id,
+            observed_at=completed_at,
+            error="condition success write-back is unknown",
+            provider_receipt=receipt,
+        )
+    return _result(
+        record,
+        outcome=NotificationItemOutcome.SUCCEEDED,
+        observed_at=completed_at,
+        provider_receipt=receipt,
+    )
+
+
+def _run_merged_notification_group(
+    store: object, provider: object, group: object, records: tuple[OutboxRecord, ...], *,
+    worker_id: str, now: datetime, clock: Callable[[], datetime],
+    price_activation: object | None, condition_activation: object | None,
+) -> tuple[NotificationItemResult, ...]:
+    from rquant.runtime_notification_providers import (
+        deliver_merged_notification, prepare_merged_notification,
+    )
+
+    try:
+        prepared, binding = prepare_merged_notification(
+            provider, store=store, group=group, records=records, worker_id=worker_id,
+            now=now, price_activation=price_activation, condition_activation=condition_activation,
+        )
+    except Exception:
+        try:
+            uncertain = store.merge_preparation_committed(group, records)
+        except Exception:
+            uncertain = True
+        if uncertain:
+            return tuple(_record_unknown(store, r, worker_id=worker_id, observed_at=now,
+                                         error="merge admission commit is unresolved; no automatic resend") for r in records)
+        return tuple(_release_not_attempted(store, r, worker_id=worker_id, observed_at=now,
+                                            reason="merge preparation or current authority is unavailable") for r in records)
+    try:
+        current = max(now, _utc(clock()))
+        deliver_merged_notification(provider, prepared, store=store, now=current, clock=clock)
+    except Exception:
+        # A committed send intent has no proof of non-submission. It cannot be
+        # converted into an ordinary provider rejection or a fresh send right.
+        pass
+    completed = max(now, _utc(clock()))
+    try:
+        disposition = store.complete_merge(binding, records, worker_id=worker_id, completed_at=completed)
+    except Exception:
+        disposition = "unknown"
+    if disposition == "unknown":
+        return tuple(_record_unknown(store, r, worker_id=worker_id, observed_at=completed,
+                                     error="merge physical request or result writeback is unresolved; no automatic resend") for r in records)
+    if disposition == "rejected":
+        return tuple(_result(r, outcome=NotificationItemOutcome.FAILED, observed_at=completed,
+                             error="channel definitely rejected group request") for r in records)
+    receipt = ("shadow:" if group.binding.mode == "shadow" else "channel:") + binding.physical_id()
+    return tuple(_result(r, outcome=NotificationItemOutcome.SUCCEEDED, observed_at=completed,
+                         provider_receipt=receipt) for r in records)
+
+
 def run_notification_batch(
     store: SignalBusStore,
     providers: Mapping[DeliveryChannel, NotificationProvider],
@@ -251,22 +628,79 @@ def run_notification_batch(
     lease_for: timedelta,
     limit: int,
     clock: Callable[[], datetime] | None = None,
+    price_activation: object | None = None,
+    condition_activation: object | None = None,
 ) -> NotificationRunSummary:
     """Claim and deliver one bounded batch without owning provider or retry policy."""
 
     started_at = _utc(now)
     provider_by_channel = dict(providers)
     current_time = clock or (lambda: datetime.now(UTC))
-    claimed = store.claim_due(
-        worker_id,
-        now=started_at,
-        lease_for=lease_for,
-        limit=limit,
-    )
+    if condition_activation is not None:
+        from rquant.notification_state import NotificationStateStore
+
+        if type(store) is not NotificationStateStore:
+            raise TypeError("condition execution requires the original notifier store")
+        include_price = False
+        if price_activation is not None:
+            from rquant.price_alert_runtime_contracts import require_verified_price_alert_activation
+            from rquant.price_alert_runtime_projection import (
+                PriceAlertAuthorityUnavailable,
+                _fresh_authority,
+            )
+
+            binding = require_verified_price_alert_activation(price_activation, "notifier")
+            if binding.delivery_enabled:
+                try:
+                    _fresh_authority(store.price_alert_delivery_authority(), started_at)
+                    include_price = True
+                except PriceAlertAuthorityUnavailable:
+                    pass
+        claimed = store.claim_due_with_condition_activation(
+            worker_id,
+            activation=condition_activation,
+            now=started_at,
+            lease_for=lease_for,
+            limit=limit,
+            include_price=include_price,
+        )
+    elif price_activation is None:
+        claimed = store.claim_due(worker_id, now=started_at, lease_for=lease_for, limit=limit)
+    else:
+        from rquant.notification_state import NotificationStateStore
+
+        if type(store) is not NotificationStateStore:
+            raise TypeError("price notification execution requires the original notifier store")
+        claimed = store.claim_due_with_price_activation(
+            worker_id, activation=price_activation, now=started_at, lease_for=lease_for, limit=limit
+        )
     items: list[NotificationItemResult] = []
     cursor_time = started_at
 
+    merged_ids: set[str] = set()
+    if getattr(store, "merge_binding", None) is not None:
+        from rquant.notification_state import NotificationStateStore
+
+        if type(store) is not NotificationStateStore:
+            raise TypeError("merge execution requires the original notifier store")
+        by_id = {row.outbox_id: row for row in claimed}
+        for group in store.merge_groups():
+            members = tuple(by_id[item] for item in group.members if item in by_id)
+            if not members:
+                continue
+            cursor_time = max(cursor_time, _utc(current_time()))
+            outcomes = _run_merged_notification_group(
+                store, provider_by_channel.get(group.target.channel), group, members,
+                worker_id=worker_id, now=cursor_time, clock=current_time,
+                price_activation=price_activation, condition_activation=condition_activation,
+            )
+            items.extend(outcomes)
+            merged_ids.update(row.outbox_id for row in members)
+            cursor_time = max(cursor_time, *(item.observed_at for item in outcomes))
+
     for record in claimed:
+        if record.outbox_id in merged_ids:
+            continue
         cursor_time = max(cursor_time, _utc(current_time()))
         assert record.lease_until is not None
         if cursor_time >= record.lease_until or cursor_time >= record.expires_at:
@@ -280,6 +714,42 @@ def run_notification_batch(
                 )
             )
             continue
+        if condition_activation is not None:
+            from rquant.condition_alert_route import ConditionAlertBusEventRecord
+
+            event = store.notification_event(record.signal_id)
+            if type(event) is ConditionAlertBusEventRecord:
+                result = _run_condition_notification_item(
+                    store,
+                    provider_by_channel.get(record.target.channel),
+                    event,
+                    record,
+                    activation=condition_activation,
+                    worker_id=worker_id,
+                    now=cursor_time,
+                    clock=current_time,
+                )
+                items.append(result)
+                cursor_time = max(cursor_time, result.observed_at)
+                continue
+        if price_activation is not None:
+            from rquant.price_alert_route import PriceAlertBusEventRecord
+
+            event = store.notification_event(record.signal_id)
+            if type(event) is PriceAlertBusEventRecord:
+                result = _run_price_notification_item(
+                    store,
+                    provider_by_channel.get(record.target.channel),
+                    event,
+                    record,
+                    activation=price_activation,
+                    worker_id=worker_id,
+                    now=cursor_time,
+                    clock=current_time,
+                )
+                items.append(result)
+                cursor_time = max(cursor_time, result.observed_at)
+                continue
         try:
             signal = store.signal(record.signal_id)
             if signal is None:

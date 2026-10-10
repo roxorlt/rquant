@@ -1,0 +1,18 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.13.12, pytest-9.0.3, pluggy-1.6.0
+rootdir: /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk
+configfile: pyproject.toml
+plugins: mock-3.15.1, anyio-4.13.0
+collected 69 items
+
+tests/unit/test_research_query.py ......................                 [ 31%]
+tests/unit/test_research_query_review.py .....................           [ 62%]
+tests/unit/test_research_query_executor.py .......ss                     [ 75%]
+tests/unit/test_research_query_service.py ..                             [ 78%]
+tests/unit/test_research_query_saved.py ...                              [ 82%]
+tests/unit/test_research_query_cli.py ..                                 [ 85%]
+tests/unit/test_web_research_query.py .......                            [ 95%]
+tests/unit/test_web_openapi_snapshot.py ..                               [ 98%]
+tests/unit/test_web_proxy_identity.py .                                  [100%]
+
+======================== 67 passed, 2 skipped in 6.68s =========================

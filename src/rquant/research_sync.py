@@ -25,7 +25,7 @@ data/rquant.duckdb。盘中本地 monitor 持旧 inode 写分钟线，文件被�
   d) trade_calendar 按 updated_at 单调合并，等时事实冲突整表回滚
   灾后恢复（restore_research_tables）改用 INSERT OR IGNORE：只补本地
   缺失的行，主键冲突时保留本地现值，绝不用旧副本覆盖本地已更新的行
-- LOCAL_ONLY_TABLES：只描述本机状态，不从云端备份导入
+- LOCAL_ONLY_TABLES：本机权威状态或本地观察证据，不从云端备份导入
 
 错误语义：顶层失败（备份缺失 / 主库打不开 / ATTACH 失败）不抛异常，
 转成 has_errors 的报告返回——告警由 sync-from-cloud.sh 统一推，避免
@@ -67,11 +67,14 @@ from rquant.storage.duckdb import (
 )
 from rquant.storage.migrations import initialize_schema
 from rquant.trade_calendar import TradeCalendarConflictError
+from rquant.storage.primary_writer_gate import PrimaryWriterGate, PrimaryWriterLease, configured_primary_gate
 
 # 云端 daily/monitor 流水线权威产出，本地无独立增量 → 整表替换
 REPLACE_TABLES: tuple[str, ...] = (
     "stock_basic",
     "screen_result",
+    "screen_run_receipt",
+    "screen_run_evidence",
     "pool2_watch",
     "risk_blacklist",
 )
@@ -132,6 +135,17 @@ LOCAL_ONLY_TABLES: tuple[str, ...] = (
     "data_audit_run",
     "data_repair_audit",
     "limit_up_pool_write_guard",
+    "ingestion_commit_receipt",
+    "backfill_day_commit_receipt",
+    # 财务 PIT 首次观察、导入游标与基本面版本 head 均以本地主库为权威。
+    "financial_observation",
+    "financial_import_batch",
+    "financial_import_cursor",
+    "data_center_financial_runtime_receipt",
+    "daily_basic_valuation_observation",
+    "daily_basic_valuation_batch",
+    "fundamental_daily_version",
+    "fundamental_daily_head",
 )
 
 DATA_METADATA_TABLES: tuple[str, ...] = (
@@ -1179,6 +1193,25 @@ def _sync_table(
         [table],
     ).fetchone()[0]
     if not src_exists:
+        if table == "screen_run_receipt" and mode == "replace":
+            started = False
+            try:
+                if manage_transaction:
+                    conn.execute("BEGIN")
+                    started = True
+                conn.execute("DELETE FROM screen_run_receipt")
+                if started:
+                    conn.execute("COMMIT")
+                    started = False
+            except Exception as exc:
+                if started:
+                    conn.execute("ROLLBACK")
+                return TableSyncResult(table=table, mode="error", detail=str(exc)[:200])
+            return TableSyncResult(
+                table=table,
+                mode="skipped",
+                detail="legacy source has no screen_run_receipt; local proofs cleared",
+            )
         if mode == "replace":
             return TableSyncResult(
                 table=table,
@@ -1195,6 +1228,24 @@ def _sync_table(
         )
 
     cols, pk_cols = _common_columns(conn, table, alias)
+    if table == "screen_run_receipt":
+        required = {
+            "trade_date", "preset_name", "definition_version", "parent_trade_date",
+            "parent_result_version", "hit_count", "member_digest", "lineage_complete",
+            "completed_at", "result_version",
+        }
+        if not required <= set(cols):
+            return TableSyncResult(
+                table=table,
+                mode="error",
+                detail=f"screen_run_receipt missing columns: {sorted(required - set(cols))}",
+            )
+        if ("contract" in cols) != ("price_digest" in cols):
+            return TableSyncResult(
+                table=table,
+                mode="error",
+                detail="screen_run_receipt has incomplete price proof columns",
+            )
     if not cols:
         return TableSyncResult(table=table, mode="skipped", detail="无共同列")
     if mode in ("merge", "restore") and any(pk not in cols for pk in pk_cols):
@@ -1504,8 +1555,23 @@ def _sync_table(
     return TableSyncResult(table=table, mode=mode, rows=src_rows)
 
 
+def _snapshot_writer_lease(db_path: Path, borrowed: PrimaryWriterLease | None = None) -> tuple[PrimaryWriterLease | None,bool]:
+    config=configured_primary_gate(db_path,getattr(settings,'primary_writer_gate_path',None))
+    if borrowed is not None:
+        borrowed.verify(db_path)
+        if config is not None and config!=borrowed.config:
+            raise ValueError('borrowed writer lease differs from configured original profile')
+        return borrowed,False
+    return (None,False) if config is None else (PrimaryWriterGate(config).acquire(),True)
+
+
+def _publish_replica_generation_sidecar(temporary_path: Path, generation_path: Path) -> None:
+    os.replace(temporary_path, generation_path)
+
+
 def refresh_readonly_replica(
-    db_path: Path | None = None, replica_path: Path | None = None
+    db_path: Path | None = None, replica_path: Path | None = None, *,
+    primary_writer_lease: PrimaryWriterLease | None = None,
 ) -> tuple[bool, str]:
     """把主库原子复制成只读副本（cp → 只读验证 → os.replace）。
 
@@ -1522,7 +1588,12 @@ def refresh_readonly_replica(
     wal_path = db_path.with_name(db_path.name + ".wal")
     guard: duckdb.DuckDBPyConnection | None = None
     verify: duckdb.DuckDBPyConnection | None = None
+    lease: PrimaryWriterLease | None = None
+    owns_lease=False
+    operation_started=False
     try:
+        lease,owns_lease=_snapshot_writer_lease(db_path,primary_writer_lease)
+        operation_started=True
         guard = duckdb.connect(str(db_path), read_only=True)
         if wal_path.exists():
             raise RuntimeError(
@@ -1548,17 +1619,22 @@ def refresh_readonly_replica(
             output_path=generation_tmp,
             source_before=source_before,
         )
+        if lease is not None:
+            lease.verify(db_path)
         os.replace(tmp, replica_path)
-        os.replace(generation_tmp, generation_path)
+        _publish_replica_generation_sidecar(generation_tmp, generation_path)
     except Exception as e:
-        _remove_replica_temp_safely(tmp)
-        _remove_replica_temp_safely(generation_tmp)
+        if operation_started:
+            _remove_replica_temp_safely(tmp)
+            _remove_replica_temp_safely(generation_tmp)
         return False, f"副本刷新失败：{e}"
     finally:
         if verify is not None:
             _close_replica_connection_safely(verify, "verify")
         if guard is not None:
             _close_replica_connection_safely(guard, "guard")
+        if owns_lease and lease is not None:
+            lease.close()
     return True, "副本已刷新"
 
 
@@ -1580,9 +1656,14 @@ def sync_from_backup(
             backup_path, db_path, f"云端备份不存在：{backup_path}"
         )
 
+    lease=None
+    owns_lease=False
     try:
+        lease,owns_lease=_snapshot_writer_lease(db_path)
         conn = _rescue_stale_wal(db_path)
     except Exception as e:
+        if owns_lease and lease is not None:
+            lease.close()
         logger.exception("research-sync 打开主库失败")
         return _failure_report(backup_path, db_path, f"打开主库失败：{e}")
 
@@ -1673,7 +1754,11 @@ def sync_from_backup(
                 )
             )
     finally:
-        conn.close()
+        try:
+            conn.close()
+        finally:
+            if owns_lease and lease is not None:
+                lease.close()
 
     report = ResearchSyncReport(
         backup_path=str(backup_path),
@@ -1736,9 +1821,14 @@ def restore_research_tables(
             source_path, db_path, f"恢复源不存在：{source_path}"
         )
 
+    lease=None
+    owns_lease=False
     try:
+        lease,owns_lease=_snapshot_writer_lease(db_path)
         conn = _rescue_stale_wal(db_path)
     except Exception as e:
+        if owns_lease and lease is not None:
+            lease.close()
         logger.exception("research-restore 打开主库失败")
         return _failure_report(source_path, db_path, f"打开主库失败：{e}")
 
@@ -1776,7 +1866,11 @@ def restore_research_tables(
             TableSyncResult(table="<sync>", mode="error", detail=str(e)[:200])
         )
     finally:
-        conn.close()
+        try:
+            conn.close()
+        finally:
+            if owns_lease and lease is not None:
+                lease.close()
 
     report = ResearchSyncReport(
         backup_path=str(source_path),

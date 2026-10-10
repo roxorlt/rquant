@@ -172,6 +172,29 @@ CREATE TABLE IF NOT EXISTS screen_result (
 );
 """
 
+SCREEN_RUN_RECEIPT_DDL = """
+CREATE TABLE IF NOT EXISTS screen_run_receipt (
+    trade_date             DATE        NOT NULL,
+    preset_name            VARCHAR     NOT NULL,
+    definition_version     VARCHAR     NOT NULL,
+    parent_trade_date      DATE,
+    parent_result_version  VARCHAR,
+    hit_count              INTEGER     NOT NULL CHECK (hit_count >= 0),
+    member_digest          VARCHAR     NOT NULL,
+    lineage_complete       BOOLEAN     NOT NULL,
+    completed_at           TIMESTAMPTZ NOT NULL,
+    result_version         VARCHAR     NOT NULL,
+    PRIMARY KEY (trade_date, preset_name),
+    CHECK ((parent_trade_date IS NULL) = (parent_result_version IS NULL))
+);
+"""
+
+SCREEN_RUN_PRICE_RECEIPT_MIGRATION_DDLS: tuple[str, ...] = (
+    "ALTER TABLE screen_run_receipt ADD COLUMN IF NOT EXISTS "
+    "contract VARCHAR DEFAULT 'screen-run-receipt/v1';",
+    "ALTER TABLE screen_run_receipt ADD COLUMN IF NOT EXISTS price_digest VARCHAR;",
+)
+
 POOL2_WATCH_DDL = """
 CREATE TABLE IF NOT EXISTS pool2_watch (
     ts_code       VARCHAR   PRIMARY KEY,
@@ -1073,6 +1096,128 @@ DATA_METADATA_TABLE_DDLS: tuple[str, ...] = (
     DATA_QUALITY_ISSUE_DDL,
 )
 
+FINANCIAL_PIT_OBSERVATION_DDLS: tuple[str, ...] = (
+    """
+    CREATE TABLE financial_import_batch (
+        archive_id VARCHAR NOT NULL,
+        request_id VARCHAR NOT NULL,
+        query_json VARCHAR NOT NULL,
+        observed_at TIMESTAMPTZ NOT NULL,
+        status VARCHAR NOT NULL CHECK (status IN ('observed', 'empty', 'possibly_truncated')),
+        row_count INTEGER NOT NULL CHECK (row_count >= 0),
+        relative_path VARCHAR NOT NULL,
+        file_sha256 VARCHAR NOT NULL,
+        byte_count INTEGER NOT NULL CHECK (byte_count > 0),
+        PRIMARY KEY (archive_id, request_id),
+        UNIQUE (archive_id, observed_at)
+    );
+    """,
+    """
+    CREATE TABLE financial_observation (
+        archive_id VARCHAR NOT NULL,
+        request_id VARCHAR NOT NULL,
+        row_index INTEGER NOT NULL CHECK (row_index >= 0),
+        source_api VARCHAR NOT NULL,
+        ts_code VARCHAR NOT NULL,
+        observed_at TIMESTAMPTZ NOT NULL,
+        report_period DATE,
+        report_type VARCHAR,
+        ann_date DATE,
+        f_ann_date DATE,
+        raw_json VARCHAR NOT NULL,
+        row_sha256 VARCHAR NOT NULL,
+        pit_usable BOOLEAN NOT NULL,
+        conflicted BOOLEAN NOT NULL,
+        PRIMARY KEY (archive_id, request_id, row_index)
+    );
+    """,
+    """
+    CREATE TABLE financial_import_cursor (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        archive_id VARCHAR NOT NULL,
+        last_observed_at TIMESTAMPTZ,
+        anchor_generation BIGINT NOT NULL CHECK (anchor_generation >= 0),
+        anchor_record_sha256 VARCHAR NOT NULL
+    );
+    """,
+)
+
+DAILY_BASIC_VALUATION_OBSERVATION_DDLS: tuple[str, ...] = (
+    """
+    CREATE TABLE daily_basic_valuation_batch (
+        candidate_generation_id VARCHAR PRIMARY KEY,
+        source_generation_id VARCHAR NOT NULL,
+        source_sequence BIGINT NOT NULL CHECK (source_sequence >= 0),
+        source_batch_id VARCHAR NOT NULL,
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        trade_date DATE NOT NULL,
+        observed_at TIMESTAMPTZ NOT NULL,
+        valuation_observed BOOLEAN NOT NULL,
+        UNIQUE (source_generation_id, source_sequence)
+    );
+    """,
+    """
+    CREATE TABLE daily_basic_valuation_observation (
+        candidate_generation_id VARCHAR NOT NULL,
+        ts_code VARCHAR NOT NULL,
+        trade_date DATE NOT NULL,
+        observed_at TIMESTAMPTZ NOT NULL,
+        first_observed_at TIMESTAMPTZ NOT NULL,
+        row_sha256 VARCHAR NOT NULL,
+        pe_ttm DOUBLE,
+        pb DOUBLE,
+        dv_ttm DOUBLE,
+        PRIMARY KEY (candidate_generation_id, ts_code, trade_date),
+        CHECK (first_observed_at <= observed_at)
+    );
+    """,
+)
+
+FUNDAMENTAL_DAILY_VERSION_DDLS: tuple[str, ...] = (
+    """
+    CREATE TABLE fundamental_daily_version (
+        version_id VARCHAR PRIMARY KEY,
+        ts_code VARCHAR NOT NULL,
+        trade_date DATE NOT NULL,
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        decision_at TIMESTAMPTZ NOT NULL,
+        target_report_period DATE,
+        target_period_reason VARCHAR NOT NULL,
+        financial_source_json VARCHAR NOT NULL,
+        valuation_source_json VARCHAR NOT NULL,
+        fields_json VARCHAR NOT NULL,
+        pe_ttm DOUBLE,
+        pb DOUBLE,
+        dv_ttm DOUBLE,
+        roe DOUBLE,
+        or_yoy DOUBLE,
+        netprofit_yoy DOUBLE,
+        UNIQUE (ts_code, trade_date, revision),
+        UNIQUE (ts_code, trade_date, version_id)
+    );
+    """,
+    """
+    CREATE TABLE fundamental_daily_head (
+        ts_code VARCHAR NOT NULL,
+        trade_date DATE NOT NULL,
+        version_id VARCHAR NOT NULL,
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        PRIMARY KEY (ts_code, trade_date)
+    );
+    """,
+)
+
+SCREEN_RUN_EVIDENCE_DDL = """
+CREATE TABLE screen_run_evidence (
+    trade_date DATE NOT NULL,
+    preset_name VARCHAR NOT NULL,
+    result_version VARCHAR NOT NULL,
+    evidence_version VARCHAR NOT NULL,
+    payload_json VARCHAR NOT NULL,
+    PRIMARY KEY (trade_date, preset_name)
+);
+"""
+
 BASE_DDL = [
     DAILY_BAR_DDL, INDEX_DAILY_BAR_DDL, STOCK_BASIC_DDL, ADJ_FACTOR_DDL,
     DAILY_INDICATOR_DDL, DAILY_STATE_DDL, DAILY_BASIC_DDL,
@@ -1116,8 +1261,30 @@ VERSIONED_COMPATIBILITY_DDL = [
     STOCK_SUSPEND_EVENT_DDL,
     STOCK_SUSPEND_COVERAGE_DDL,
     DATASET_SNAPSHOT_BINDING_DDL,
+    SCREEN_RUN_RECEIPT_DDL,
+    *SCREEN_RUN_PRICE_RECEIPT_MIGRATION_DDLS,
+    *FINANCIAL_PIT_OBSERVATION_DDLS,
+    *DAILY_BASIC_VALUATION_OBSERVATION_DDLS,
 ]
 
 # Compatibility export for callers outside rQuant; schema initialization uses
 # BASE_DDL plus the versioned registry in storage.migrations.
 ALL_DDL = [*BASE_DDL, *VERSIONED_COMPATIBILITY_DDL]
+DATA_CENTER_COMPLETION_DDLS = (
+    '''CREATE TABLE IF NOT EXISTS ingestion_commit_receipt (
+        event_id VARCHAR PRIMARY KEY, receipt_id VARCHAR NOT NULL UNIQUE,
+        sequence BIGINT NOT NULL UNIQUE, trade_date DATE NOT NULL,
+        collector_id VARCHAR NOT NULL, run_id VARCHAR NOT NULL,
+        payload_json VARCHAR NOT NULL, committed_at TIMESTAMPTZ NOT NULL
+    )''',
+    '''CREATE TABLE IF NOT EXISTS backfill_day_commit_receipt (
+        execution_id VARCHAR NOT NULL, task_id VARCHAR NOT NULL, receipt_id VARCHAR NOT NULL UNIQUE,
+        trade_date DATE NOT NULL, payload_json VARCHAR NOT NULL,
+        committed_at TIMESTAMPTZ NOT NULL, PRIMARY KEY(execution_id,task_id)
+    )''',
+    '''CREATE TABLE IF NOT EXISTS data_center_financial_runtime_receipt (
+        execution_id VARCHAR NOT NULL, task_id VARCHAR NOT NULL, receipt_id VARCHAR NOT NULL UNIQUE,
+        payload_json VARCHAR NOT NULL, committed_at TIMESTAMPTZ NOT NULL,
+        PRIMARY KEY(execution_id,task_id)
+    )''',
+)

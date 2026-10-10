@@ -1,0 +1,16 @@
+{
+  "argv": [
+    "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/.venv/bin/python",
+    "-I",
+    "-B",
+    "-c",
+    "import ast,hashlib,json;from pathlib import Path;p=Path(\"data/verification/research-query-20261005/linux-review-boundaries-r07.py\");ast.parse(p.read_text());d=json.loads(Path(\"data/verification/research-query-20261005/linux-backend-freeze-r06.json\").read_text());print(json.dumps({\"proof_parsed\":True,\"old_expected\":d[\"bundle_binding_sha256\"],\"canonical_entries\":hashlib.sha256(json.dumps(d[\"src_files\"],sort_keys=True,separators=(\",\",\":\")).encode()).hexdigest()}))"
+  ],
+  "cwd": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk",
+  "started_utc": "2026-10-04T22:16:38.348010+00:00",
+  "elapsed_seconds": 0.022782666001148755,
+  "exit_code": 0,
+  "stdout_sha256": "e73c39c20b4b7705501a1a0579aa81dfc4c0d83e956cdb1e1176ef88fa0d7814",
+  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "starting_candidate": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb"
+}

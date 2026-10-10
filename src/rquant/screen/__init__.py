@@ -1,7 +1,7 @@
 """筛选引擎：积木函数 + screen() 入口。"""
 
-from rquant.screen.core import screen
-from rquant.screen.loader import load_universe
+from typing import Any
+
 from rquant.screen.rules import (
     AggregateRequest,
     above_ma,
@@ -44,3 +44,17 @@ __all__ = [
     "has_lower_shadow",
     "no_consec_ups_in_window", "no_limit_down_in_window", "has_prior_limit_up",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    # Rule factories are pure; only the legacy database-backed entry points
+    # need storage. Import them when asked so Serving readers stay isolated.
+    if name == "screen":
+        from rquant.screen.core import screen
+
+        return screen
+    if name == "load_universe":
+        from rquant.screen.loader import load_universe
+
+        return load_universe
+    raise AttributeError(name)

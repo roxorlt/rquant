@@ -131,6 +131,10 @@ def available_at_for_input(value: VisibilityInput) -> datetime | None:
     """Compute an event's earliest usable time from its registered contract."""
 
     contract = _contract_for(value.dataset_id)
+    if contract.visibility is VisibilityRule.FINANCIAL_PIT:
+        raise ValueError("financial PIT requires query_financial_pit")
+    if contract.visibility is VisibilityRule.DAILY_VALUATION_PIT:
+        raise ValueError("daily valuation PIT requires query_daily_valuation_pit")
     if contract.visibility is VisibilityRule.UNKNOWN:
         return None
     if contract.visibility is VisibilityRule.MINUTE_AS_OF:
@@ -166,6 +170,10 @@ def evaluate_visibility(
 
     local_as_of = _aware_exchange_time(as_of_time, field_name="as_of_time")
     contract = _contract_for(value.dataset_id)
+    if contract.visibility is VisibilityRule.FINANCIAL_PIT:
+        raise ValueError("financial PIT requires query_financial_pit")
+    if contract.visibility is VisibilityRule.DAILY_VALUATION_PIT:
+        raise ValueError("daily valuation PIT requires query_daily_valuation_pit")
     available_at = available_at_for_input(value)
 
     if contract.visibility is VisibilityRule.UNKNOWN:
@@ -476,6 +484,10 @@ def query_visible_rows(
 
     local_as_of = _aware_exchange_time(as_of_time, field_name="as_of_time")
     contract = _contract_for(dataset_id)
+    if contract.visibility is VisibilityRule.FINANCIAL_PIT:
+        raise ValueError("financial PIT requires query_financial_pit")
+    if contract.visibility is VisibilityRule.DAILY_VALUATION_PIT:
+        raise ValueError("daily valuation PIT requires query_daily_valuation_pit")
     conn = _connection(target)
     query_scope = scope or VisibilityQueryScope()
     physical_columns = _table_columns(conn, contract)
