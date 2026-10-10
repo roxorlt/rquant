@@ -11,8 +11,9 @@ from pathlib import Path
 from typing import Annotated, Any, TypeVar
 
 import pandas as pd
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
+from rquant.backtest.band import bootstrap_band
 from rquant.backtest.exposure import industry_exposure
 from rquant.backtest.store import list_runs, read_run
 from rquant.backtest.strategy import list_strategies
@@ -36,6 +37,7 @@ from rquant.web.models import (
     BacktestListData,
     BacktestRun,
     BacktestTrade,
+    BandData,
     BoardItem,
     CommandReceipt,
     ConditionListData,
@@ -335,6 +337,17 @@ def portfolio_compare(a: str, b: str, request: Request, source: SourceDep,
                                  method="组合回测逐日净值")
         sides.append(PortfolioCompareSide(run=_portfolio_summary(run), perf=perf))
     return _envelope(source, PortfolioCompareData(a=sides[0], b=sides[1]))
+
+
+@router.get("/portfolio-backtests/{run_id}/band", response_model=Envelope[BandData],
+            summary="回测自助抽样区间")
+def portfolio_band(run_id: str, request: Request, source: SourceDep,
+                   days: int = Query(20, ge=1, le=500)) -> Envelope[BandData]:
+    run = read_run(run_id, _research_root(request))
+    if run is None:
+        raise HTTPException(404, "portfolio backtest not found")
+    return _envelope(source, BandData(run_id=run_id, days=days,
+                                      points=bootstrap_band(_nav_returns(run), days)))
 
 
 @router.get("/portfolio-backtests/{run_id}", response_model=Envelope[PortfolioRunDetailData],

@@ -7,6 +7,7 @@ from typing import Generic, Literal, TypeVar
 
 from pydantic import BaseModel, Field
 
+from rquant.backtest.band import BandPoint
 from rquant.backtest.exposure import IndustryExposure
 from rquant.data_catalog.audit import AuditReport
 from rquant.data_catalog.models import CatalogDataset
@@ -415,3 +416,9 @@ class TranslateData(BaseModel):
 
 class ConditionListData(BaseModel):
     runs: list[ConditionRun]
+
+
+class BandData(BaseModel):
+    run_id: str
+    days: int
+    points: list[BandPoint]

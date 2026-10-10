@@ -4,6 +4,7 @@ import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
 import { EmptyState, KpiStrip, PageHeader, Panel } from "@/ui";
 import { QueryView } from "../shared";
+import { PaperBand } from "./Band";
 
 export default function PaperPage() {
   const query = usePaper();
@@ -81,6 +82,7 @@ export default function PaperPage() {
           )
         }
       </QueryView>
+      <PaperBand />
     </>
   );
 }

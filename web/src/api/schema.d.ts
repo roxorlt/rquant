@@ -329,6 +329,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/portfolio-backtests/{run_id}/band": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 回测自助抽样区间 */
+        get: operations["portfolio_band_api_v1_portfolio_backtests__run_id__band_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/screen": {
         parameters: {
             query?: never;
@@ -614,6 +631,26 @@ export interface components {
             /** Trade Id */
             trade_id: string;
         };
+        /** BandData */
+        BandData: {
+            /** Days */
+            days: number;
+            /** Points */
+            points: components["schemas"]["BandPoint"][];
+            /** Run Id */
+            run_id: string;
+        };
+        /** BandPoint */
+        BandPoint: {
+            /** Day */
+            day: number;
+            /** P5 */
+            p5: number;
+            /** P50 */
+            p50: number;
+            /** P95 */
+            p95: number;
+        };
         /** BenchmarkStats */
         BenchmarkStats: {
             /** Alpha */
@@ -788,6 +825,11 @@ export interface components {
         /** Envelope[BacktestListData] */
         Envelope_BacktestListData_: {
             data: components["schemas"]["BacktestListData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[BandData] */
+        Envelope_BandData_: {
+            data: components["schemas"]["BandData"];
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[ConditionListData] */
@@ -1952,6 +1994,39 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_PortfolioRunDetailData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    portfolio_band_api_v1_portfolio_backtests__run_id__band_get: {
+        parameters: {
+            query?: {
+                days?: number;
+            };
+            header?: never;
+            path: {
+                run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_BandData_"];
                 };
             };
             /** @description Validation Error */

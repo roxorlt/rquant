@@ -73,3 +73,11 @@ test("tdx formula translates and condition hits are listed", async ({ page }) =>
   await expect(page.getByLabel("翻译结果")).toContainText("ts_mean(close,5)");
   await expect(page.getByText("演示条件：站上5日线且上涨")).toBeVisible();
 });
+
+test("paper page compares against a backtest band", async ({ page }) => {
+  await page.goto("./#/paper");
+  await page.getByLabel("对照回测").selectOption({ label: "演示组合回测" });
+  const start = new Date(Date.now() - 20 * 86400000).toISOString().slice(0, 10);
+  await page.getByLabel("模拟起始日").fill(start);
+  await expect(page.getByRole("table", { name: "区间对照" })).toBeVisible();
+});

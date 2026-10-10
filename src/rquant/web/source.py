@@ -209,7 +209,7 @@ def write_demo_research(root: Path) -> None:
     from rquant.portfolio import PortfolioCandidate, PortfolioWeightRule
 
     today = date.today()
-    days = [today - timedelta(days=k) for k in (4, 3, 2, 1)]
+    days = [today - timedelta(days=k) for k in range(10, 0, -1)]
     bars = {
         d: {"600519.SH": Bar(open=1500 + 5 * i, close=1505 + 5 * i, pre_close=1500 + 5 * i),
             "000001.SZ": Bar(open=10 + 0.1 * i, close=10.05 + 0.1 * i, pre_close=10 + 0.1 * i)}
