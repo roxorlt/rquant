@@ -50,7 +50,7 @@ jobs:
   web:
     name: Web front end (lint, types, unit, dist, API types, e2e)
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: web

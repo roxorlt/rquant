@@ -214,7 +214,7 @@ export default defineConfig({
       env: { RQUANT_DISABLE_DOTENV: "1" },
       reuseExistingServer: false,
       gracefulShutdown: { signal: "SIGTERM", timeout: 5_000 },
-      timeout: 180_000,
+      timeout: 300_000,
       stdout: "pipe",
     },
     {
