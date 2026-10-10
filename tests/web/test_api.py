@@ -1,0 +1,105 @@
+"""Lean web API: every read route answers from the fixture; writes go through page_control."""
+
+from __future__ import annotations
+
+import pytest
+from fastapi.testclient import TestClient
+
+from rquant.web import page_control
+from rquant.web.app import create_app
+from rquant.web.source import FixtureSource, SourceUnavailableError
+
+
+@pytest.fixture
+def sent() -> list[dict]:
+    return []
+
+
+@pytest.fixture
+def client(sent: list[dict]) -> TestClient:
+    app = create_app(FixtureSource(), dist=None)
+
+    def transport(payload: dict) -> dict:
+        sent.append(payload)
+        return {"command_id": payload["command_id"], "status": "accepted"}
+
+    app.state.page_control_transport = transport
+    return TestClient(app)
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/api/v1/meta", "/api/v1/overview", "/api/v1/health", "/api/v1/panorama", "/api/v1/screen",
+     "/api/v1/pools", "/api/v1/backtests", "/api/v1/alerts", "/api/v1/paper"],
+)
+def test_read_routes(client: TestClient, path: str) -> None:
+    response = client.get(path)
+    assert response.status_code == 200
+    assert response.json()["serving"]["state"] == "ready"
+
+
+def test_screen_filter_and_ranking(client: TestClient) -> None:
+    rows = client.get("/api/v1/screen").json()["data"]["rows"]
+    assert [r["pct_chg"] for r in rows] == sorted((r["pct_chg"] for r in rows), reverse=True)
+    assert client.get("/api/v1/screen", params={"preset": "nope"}).json()["data"]["rows"] == []
+
+
+def test_pool_members_follow_refs(client: TestClient) -> None:
+    pool = client.get("/api/v1/pools").json()["data"]["pools"][0]
+    assert pool["pool_refs"] == ["breakout"] and len(pool["members"]) == 4
+
+
+def test_backtest_detail(client: TestClient) -> None:
+    detail = client.get("/api/v1/backtests/run-demo").json()["data"]
+    assert len(detail["trades"]) == 4
+    assert client.get("/api/v1/backtests/missing").status_code == 404
+
+
+def test_panorama_pulse(client: TestClient) -> None:
+    data = client.get("/api/v1/panorama").json()["data"]
+    assert data["pulse"] == {"up": 2, "down": 1, "flat": 1, "limit_up": 0, "limit_down": 0}
+    assert {b["board_name"] for b in data["boards"]} == {"白酒", "银行"}
+
+
+def test_writes_forward_one_command_each(client: TestClient, sent: list[dict]) -> None:
+    alert = client.get("/api/v1/alerts").json()["data"]["items"][0]["alert_id"]
+    assert client.post("/api/v1/alerts/ack", json={"alert_id": alert}).json()["status"] == (
+        "accepted")
+    client.post("/api/v1/pools", json={"name": "p1", "pool_refs": ["breakout"]})
+    client.post("/api/v1/watchlist", json={"code": "600519.SH"})
+    assert [p["kind"] for p in sent] == ["ack_alert", "save_canvas", "add_watchlist_item"]
+    assert sent[0]["alert_id"] == alert and len(sent[0]["generation_id"]) == 64
+
+
+def test_write_validation(client: TestClient, sent: list[dict]) -> None:
+    assert client.post("/api/v1/watchlist", json={"code": "bad"}).status_code == 422
+    assert client.post("/api/v1/alerts/ack", json={"alert_id": "x"}).status_code == 422
+    assert sent == []
+
+
+def test_page_control_down_is_503() -> None:
+    app = create_app(FixtureSource(), dist=None)
+
+    def down(_: dict) -> dict:
+        raise OSError("connection refused")
+
+    app.state.page_control_transport = down
+    response = TestClient(app).post("/api/v1/watchlist", json={"code": "600519.SH"})
+    assert response.status_code == 503
+
+
+def test_source_unavailable_is_503() -> None:
+    class Broken(FixtureSource):
+        def query(self, sql, params=()):  # noqa: ANN001, ANN201
+            raise SourceUnavailableError("no generation")
+
+    response = TestClient(create_app(Broken(), dist=None)).get("/api/v1/overview")
+    assert response.status_code == 503
+
+
+def test_forward_builds_command() -> None:
+    seen: list[dict] = []
+    receipt = page_control.forward("save_canvas", {"name": "x"},
+                                   lambda p: seen.append(p) or {"status": "accepted"})
+    assert receipt == {"status": "accepted"}
+    assert seen[0]["kind"] == "save_canvas" and seen[0]["command_id"] and seen[0]["requested_at"]
