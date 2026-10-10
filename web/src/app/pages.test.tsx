@@ -54,6 +54,7 @@ const BODIES: Record<string, unknown> = {
   strategies: { strategies: [] },
   "alert-rules": { rules: [] },
   conditions: { runs: [] },
+  operations: { items: [] },
   "data-center": {
     datasets: [
       {
@@ -104,6 +105,7 @@ describe("MVP pages render from the API", () => {
     ["/paper", "没有模拟账户"],
     ["/data", "股票日线"],
     ["/factor", "还没有因子检验结果"],
+    ["/ops", "还没有网页操作"],
   ])("%s", async (path, text) => {
     stubApi();
     renderApp(path);

@@ -67,6 +67,10 @@ test("an alert rule saved through page control shows up", async ({ page }) => {
   await page.getByLabel("规则名称").fill("二号池一档");
   await page.getByRole("button", { name: "保存规则" }).click();
   await expect(page.getByLabel("告警规则", { exact: true })).toContainText("二号池一档");
+  await page.goto("./#/ops");
+  await expect(
+    page.getByRole("grid", { name: "操作记录" }).or(page.getByRole("table", { name: "操作记录" })),
+  ).toContainText("启用告警规则 二号池一档");
 });
 
 test("tdx formula translates and condition hits are listed", async ({ page }) => {

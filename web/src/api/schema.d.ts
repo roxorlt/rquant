@@ -209,6 +209,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/operations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 操作记录
+         * @description Web writes as page control recorded them (read back from their Serving projections).
+         */
+        get: operations["operations_api_v1_operations_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/overview": {
         parameters: {
             query?: never;
@@ -879,6 +899,11 @@ export interface components {
             data: components["schemas"]["MetaData"];
             serving: components["schemas"]["ServingMeta"];
         };
+        /** Envelope[OperationsData] */
+        Envelope_OperationsData_: {
+            data: components["schemas"]["OperationsData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
         /** Envelope[OverviewData] */
         Envelope_OverviewData_: {
             data: components["schemas"]["OverviewData"];
@@ -1129,6 +1154,14 @@ export interface components {
             generation: components["schemas"]["ServingMeta"];
             /** Notice */
             notice?: string | null;
+            /**
+             * Role
+             * @default admin
+             * @enum {string}
+             */
+            role: "admin" | "viewer";
+            /** User */
+            user?: string | null;
             /** Version */
             version: string;
         };
@@ -1154,6 +1187,27 @@ export interface components {
             drawdown: number;
             /** Nav */
             nav: number;
+        };
+        /** OperationRow */
+        OperationRow: {
+            /** Actor */
+            actor: string | null;
+            /** At */
+            at: string | null;
+            /** Command Id */
+            command_id: string;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "ack_alert" | "add_watchlist_item" | "save_alert_rule";
+            /** Summary */
+            summary: string;
+        };
+        /** OperationsData */
+        OperationsData: {
+            /** Items */
+            items: components["schemas"]["OperationRow"][];
         };
         /** OverfitStats */
         OverfitStats: {
@@ -1834,6 +1888,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_MetaData_"];
+                };
+            };
+        };
+    };
+    operations_api_v1_operations_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_OperationsData_"];
                 };
             };
         };

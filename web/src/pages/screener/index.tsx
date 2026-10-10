@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { type ScreenRow, useAddWatch, useSavePool, useScreen } from "@/api/endpoints";
+import { useReadOnlyReason } from "@/api/useMeta";
 import { formatPrice } from "@/format/number";
 import { DataTable } from "@/table/DataTable";
 import { Button, ChangeText, PageHeader, Panel, Segmented, useToast } from "@/ui";
@@ -9,6 +10,7 @@ import { Conditions } from "./Conditions";
 const ALL = "__all__";
 
 export default function ScreenerPage() {
+  const readOnly = useReadOnlyReason();
   const [preset, setPreset] = useState<string>(ALL);
   const query = useScreen(preset === ALL ? null : preset);
   const savePool = useSavePool();
@@ -40,7 +42,10 @@ export default function ScreenerPage() {
         title="选股与排序"
         note={query.data?.trade_date ?? undefined}
         actions={
-          <Button onClick={save} disabledReason={presets.length ? undefined : "没有可保存的结果"}>
+          <Button
+            onClick={save}
+            disabledReason={readOnly ?? (presets.length ? undefined : "没有可保存的结果")}
+          >
             保存为池子
           </Button>
         }
@@ -85,7 +90,12 @@ export default function ScreenerPage() {
                   sortable: false,
                   value: () => null,
                   cell: (row) => (
-                    <Button size="sm" variant="ghost" onClick={() => watch(row)}>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => watch(row)}
+                      disabledReason={readOnly}
+                    >
                       加自选
                     </Button>
                   ),

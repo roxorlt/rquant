@@ -17,6 +17,7 @@ const PAGE_COMPONENTS: Record<PageId, LazyPage> = {
   panorama: lazy(() => import("@/pages/panorama")),
   health: lazy(() => import("@/pages/health")),
   data: lazy(() => import("@/pages/data")),
+  ops: lazy(() => import("@/pages/ops")),
   factor: lazy(() => import("@/pages/factor")),
 };
 

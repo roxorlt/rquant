@@ -53,6 +53,8 @@ from rquant.web.models import (
     Kpi,
     MarketPulse,
     MetaData,
+    OperationRow,
+    OperationsData,
     OverviewData,
     PanoramaData,
     PaperAccount,
@@ -122,6 +124,8 @@ def meta(request: Request, source: SourceDep) -> Envelope[MetaData]:
             version=request.app.version,
             generation=gen,
             notice=os.environ.get("RQUANT_WEB_NOTICE") or None,
+            user=_user(request),
+            role=_role(request),
         ),
         serving=gen,
     )
@@ -508,7 +512,23 @@ def paper(source: SourceDep) -> Envelope[PaperData]:
 # ---- writes: all through page_control.forward --------------------------------
 
 
+def _user(request: Request) -> str | None:
+    return request.headers.get("X-Forwarded-User") or None
+
+
+def _role(request: Request) -> str:
+    """``RQUANT_WEB_ADMINS`` (comma list) unset = everyone is admin (single-user default).
+
+    Set, only those basic-auth users may write; everyone else is a viewer. nginx must
+    pass ``proxy_set_header X-Forwarded-User $remote_user;`` for this to mean anything.
+    """
+    admins = {a.strip() for a in os.environ.get("RQUANT_WEB_ADMINS", "").split(",") if a.strip()}
+    return "admin" if not admins or _user(request) in admins else "viewer"
+
+
 def _send(request: Request, kind: str, fields: dict[str, Any]) -> CommandReceipt:
+    if _role(request) != "admin":
+        raise HTTPException(403, "只读账号不能执行写操作")
     transport: Callable | None = getattr(request.app.state, "page_control_transport", None)
     try:
         receipt = page_control.forward(kind, fields, transport)
@@ -533,6 +553,37 @@ def ack_alert(body: AckAlertRequest, request: Request, source: SourceDep) -> Com
     actor = request.headers.get("X-Forwarded-User", "owner")
     return _send(request, "ack_alert",
                  {"alert_id": body.alert_id, "generation_id": gen, "actor_id": actor})
+
+
+def _optional_rows(source: Source, sql: str) -> list[dict[str, Any]]:
+    try:
+        return source.query(sql)
+    except Exception as exc:  # noqa: BLE001 - optional projection
+        if not table_missing(exc):
+            raise
+        return []
+
+
+@router.get("/operations", response_model=Envelope[OperationsData], summary="操作记录")
+def operations(source: SourceDep) -> Envelope[OperationsData]:
+    """Web writes as page control recorded them (read back from their Serving projections)."""
+    items = [OperationRow(at=r["acked_at"], kind="ack_alert",
+                          summary=f"确认告警 {r['alert_id'][:12]}",
+                          actor=r["actor_id"], command_id=r["command_id"])
+             for r in _optional_rows(source, "SELECT alert_id, acked_at, actor_id, command_id "
+                                     "FROM alert_ack ORDER BY acked_at DESC LIMIT 200")]
+    items += [OperationRow(at=r["added_at"], kind="add_watchlist_item",
+                           summary=f"加自选 {r['ts_code']} {r['note']}".strip(), actor=None,
+                           command_id=r["command_id"])
+              for r in _optional_rows(source, "SELECT ts_code, note, added_at, command_id "
+                                      "FROM manual_watchlist ORDER BY added_at DESC LIMIT 200")]
+    items += [OperationRow(at=r["saved_at"], kind="save_alert_rule",
+                           summary=f"{'启用' if r['enabled'] else '停用'}告警规则 {r['title']}",
+                           actor=None, command_id=r["command_id"])
+              for r in _optional_rows(source, "SELECT title, enabled, saved_at, command_id "
+                                      "FROM alert_rule ORDER BY saved_at DESC LIMIT 200")]
+    items.sort(key=lambda i: i.at.timestamp() if i.at else 0, reverse=True)
+    return _envelope(source, OperationsData(items=items[:300]))
 
 
 @router.get("/alert-rules", response_model=Envelope[AlertRulesData], summary="告警规则")
