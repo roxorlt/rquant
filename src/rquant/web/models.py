@@ -172,12 +172,22 @@ class NavPoint(BaseModel):
     date: date
     nav: float
     drawdown: float
+    benchmark_nav: float | None = None
 
 
 class MonthlyReturn(BaseModel):
     year: int
     month: int
     ret: float
+
+
+class BenchmarkStats(BaseModel):
+    code: str
+    total_return: float
+    excess_return: float | None
+    alpha: float | None
+    beta: float | None
+    information_ratio: float | None
 
 
 class BacktestPerf(BaseModel):
@@ -197,6 +207,7 @@ class BacktestPerf(BaseModel):
     payoff_ratio: float | None
     nav: list[NavPoint]
     monthly: list[MonthlyReturn]
+    benchmark: BenchmarkStats | None = None
 
 
 class BacktestDetailData(BaseModel):

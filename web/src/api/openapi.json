@@ -246,6 +246,16 @@
             ],
             "title": "Annualized Volatility"
           },
+          "benchmark": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BenchmarkStats"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "calmar": {
             "anyOf": [
               {
@@ -625,6 +635,72 @@
           "ret_pct"
         ],
         "title": "BacktestTrade",
+        "type": "object"
+      },
+      "BenchmarkStats": {
+        "properties": {
+          "alpha": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Alpha"
+          },
+          "beta": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Beta"
+          },
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "excess_return": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Excess Return"
+          },
+          "information_ratio": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Information Ratio"
+          },
+          "total_return": {
+            "title": "Total Return",
+            "type": "number"
+          }
+        },
+        "required": [
+          "code",
+          "total_return",
+          "excess_return",
+          "alpha",
+          "beta",
+          "information_ratio"
+        ],
+        "title": "BenchmarkStats",
         "type": "object"
       },
       "BoardItem": {
@@ -1164,6 +1240,17 @@
       },
       "NavPoint": {
         "properties": {
+          "benchmark_nav": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Benchmark Nav"
+          },
           "date": {
             "format": "date",
             "title": "Date",
@@ -1901,6 +1988,16 @@
                 }
               ],
               "title": "Entry Mode"
+            }
+          },
+          {
+            "in": "query",
+            "name": "benchmark",
+            "required": false,
+            "schema": {
+              "default": "000300.SH",
+              "title": "Benchmark",
+              "type": "string"
             }
           }
         ],

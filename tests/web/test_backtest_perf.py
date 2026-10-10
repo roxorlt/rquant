@@ -23,3 +23,13 @@ def test_trades_on_one_day_are_averaged_then_compounded() -> None:
 
 def test_open_or_empty_ledger_has_no_perf() -> None:
     assert backtest_perf([{"exit_time": None, "ret_pct": 1.0}]) is None
+
+
+def test_benchmark_excess_on_shared_days() -> None:
+    closes = [(5, 100), (6, 101), (7, 99.99)]
+    bench = [{"trade_date": f"2026-01-0{d}", "close": c} for d, c in closes]
+    perf = backtest_perf([_t("2026-01-06", 2), _t("2026-01-07", 0)], ("000300.SH", bench))
+    assert perf is not None and perf.benchmark is not None
+    assert perf.benchmark.total_return == pytest.approx(-0.0001)
+    assert perf.benchmark.excess_return == pytest.approx(1.02 / 0.9999 - 1)
+    assert perf.nav[-1].benchmark_nav == pytest.approx(0.9999)

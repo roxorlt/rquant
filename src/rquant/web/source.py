@@ -66,6 +66,8 @@ CREATE TABLE strategy_summary(run_id VARCHAR, computed_at TIMESTAMP, start_date 
   candidates INTEGER, trades INTEGER, trigger_rate_pct DOUBLE, mean_ret_pct DOUBLE,
   median_ret_pct DOUBLE, win_rate_pct DOUBLE, best_ret_pct DOUBLE, worst_ret_pct DOUBLE,
   gap_stop_rate_pct DOUBLE);
+CREATE TABLE benchmark_daily(ts_code VARCHAR, trade_date DATE, close DOUBLE,
+  pct_chg DOUBLE);
 CREATE TABLE strategy_trade(run_id VARCHAR, trade_id VARCHAR, entry_mode VARCHAR,
   profile_variant VARCHAR, signal_date DATE, ts_code VARCHAR, name VARCHAR,
   entry_time TIMESTAMP, entry_price DOUBLE, exit_time TIMESTAMP, exit_price DOUBLE,
@@ -122,8 +124,13 @@ def _seed(con: duckdb.DuckDBPyConnection, today: date) -> None:
     con.executemany(
         "INSERT INTO strategy_trade VALUES ('run-demo', ?, 'open', 'base', ?, ?, ?, "
         "?::TIMESTAMP, 10, ?::TIMESTAMP, ?, 'take_profit', ?)",
-        [(f"t{i}", d, c, n, f"{d} 09:35:00", f"{d} 14:55:00", 10 + r / 10, r)
+        [(f"t{i}", d, c, n, f"{d} 09:35:00", f"{today - timedelta(days=3 - i)} 14:55:00",
+          10 + r / 10, r)
          for i, ((c, n, _), r) in enumerate(zip(stocks, [3.0, -1.5, 2.2, 0.4], strict=True))],
+    )
+    con.executemany(
+        "INSERT INTO benchmark_daily VALUES ('000300.SH', ?, ?, NULL)",
+        [(today - timedelta(days=k), 4000 + 10 * (5 - k)) for k in range(5, -1, -1)],
     )
     con.executemany(
         "INSERT INTO market_overview VALUES (?, 'dc_industry', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
