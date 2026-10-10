@@ -138,7 +138,7 @@ def test_portfolio_backtests_are_read_from_result_files(tmp_path) -> None:
     runs = client.get("/api/v1/portfolio-backtests").json()["data"]["runs"]
     assert [r["title"] for r in runs] == ["演示组合回测"]
     detail = client.get(f"/api/v1/portfolio-backtests/{runs[0]['run_id']}").json()["data"]
-    assert detail["perf"]["days"] == 4
+    assert detail["perf"]["days"] == 10
     assert {o["code"] for o in detail["orders"]} == {"600519.SH", "000001.SZ"}
     assert client.get("/api/v1/portfolio-backtests/nope").status_code == 404
 
@@ -243,3 +243,17 @@ def test_tdx_translate_and_condition_results(tmp_path) -> None:
     assert bad["expression"] is None and "CROSS" in bad["error"]
     (run,) = client.get("/api/v1/conditions").json()["data"]["runs"]
     assert run["source_formula"].startswith("C>MA")
+
+
+def test_band_endpoint(tmp_path) -> None:
+    from fastapi.testclient import TestClient
+
+    from rquant.web.app import create_app
+    from rquant.web.source import FixtureSource, write_demo_research
+
+    write_demo_research(tmp_path)
+    client = TestClient(create_app(FixtureSource(), dist=None, research_root=tmp_path))
+    run_id = client.get("/api/v1/portfolio-backtests").json()["data"]["runs"][0]["run_id"]
+    band = client.get(f"/api/v1/portfolio-backtests/{run_id}/band?days=10").json()["data"]
+    assert band["days"] == 10
+    assert client.get(f"/api/v1/portfolio-backtests/{run_id}/band?days=0").status_code == 422

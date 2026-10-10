@@ -240,3 +240,20 @@ export function useTranslateTdx() {
     },
   });
 }
+
+export function usePortfolioBand(
+  runId: string | null,
+  days: number,
+): ServingQueryResult<Schemas["BandData"]> {
+  return useServingQuery(
+    ["portfolio-backtests", runId, "band", days],
+    async () => {
+      const { data, response } = await apiClient().GET(
+        "/api/v1/portfolio-backtests/{run_id}/band",
+        { params: { path: { run_id: runId ?? "" }, query: { days } } },
+      );
+      return unwrap(data, response);
+    },
+    { enabled: runId !== null && days > 0 },
+  );
+}

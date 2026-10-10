@@ -814,6 +814,60 @@
         "title": "BacktestTrade",
         "type": "object"
       },
+      "BandData": {
+        "properties": {
+          "days": {
+            "title": "Days",
+            "type": "integer"
+          },
+          "points": {
+            "items": {
+              "$ref": "#/components/schemas/BandPoint"
+            },
+            "title": "Points",
+            "type": "array"
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id",
+          "days",
+          "points"
+        ],
+        "title": "BandData",
+        "type": "object"
+      },
+      "BandPoint": {
+        "properties": {
+          "day": {
+            "title": "Day",
+            "type": "integer"
+          },
+          "p5": {
+            "title": "P5",
+            "type": "number"
+          },
+          "p50": {
+            "title": "P50",
+            "type": "number"
+          },
+          "p95": {
+            "title": "P95",
+            "type": "number"
+          }
+        },
+        "required": [
+          "day",
+          "p5",
+          "p50",
+          "p95"
+        ],
+        "title": "BandPoint",
+        "type": "object"
+      },
       "BenchmarkStats": {
         "properties": {
           "alpha": {
@@ -1429,6 +1483,22 @@
           "serving"
         ],
         "title": "Envelope[BacktestListData]",
+        "type": "object"
+      },
+      "Envelope_BandData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/BandData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[BandData]",
         "type": "object"
       },
       "Envelope_ConditionListData_": {
@@ -4026,6 +4096,57 @@
           }
         },
         "summary": "组合回测详情"
+      }
+    },
+    "/api/v1/portfolio-backtests/{run_id}/band": {
+      "get": {
+        "operationId": "portfolio_band_api_v1_portfolio_backtests__run_id__band_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "days",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 500,
+              "minimum": 1,
+              "title": "Days",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_BandData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "回测自助抽样区间"
       }
     },
     "/api/v1/screen": {
