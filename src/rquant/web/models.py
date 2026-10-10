@@ -8,6 +8,8 @@ from typing import Generic, Literal, TypeVar
 from pydantic import BaseModel, Field
 
 from rquant.backtest.exposure import IndustryExposure
+from rquant.data_catalog.audit import AuditReport
+from rquant.data_catalog.models import CatalogDataset
 from rquant.web.overfit_stats import OverfitStats
 
 T = TypeVar("T")
@@ -332,3 +334,8 @@ class CommandReceipt(BaseModel):
     command_id: str | None = None
     status: str
     detail: str | None = None
+
+
+class DataCenterData(BaseModel):
+    datasets: list[CatalogDataset]
+    audit: AuditReport | None

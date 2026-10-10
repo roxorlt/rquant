@@ -8,7 +8,8 @@ export type PageId =
   | "paper"
   | "monitor"
   | "panorama"
-  | "health";
+  | "health"
+  | "data";
 
 export type NavGroup = "概览" | "研究" | "策略与验证" | "跟踪与告警" | "运维";
 
@@ -33,6 +34,7 @@ export const PAGES: readonly PageDef[] = [
   { id: "monitor", path: "/monitor", title: "告警", group: "跟踪与告警", phoneTab: "告警" },
   { id: "panorama", path: "/panorama", title: "市场全景", group: "跟踪与告警", phoneTab: "全景" },
   { id: "health", path: "/health", title: "系统健康", group: "运维", phoneTab: "健康" },
+  { id: "data", path: "/data", title: "数据中心", group: "运维" },
 ];
 
 export function pagesInGroup(group: NavGroup): PageDef[] {

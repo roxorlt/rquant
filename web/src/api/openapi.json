@@ -175,6 +175,45 @@
         "title": "AlertsData",
         "type": "object"
       },
+      "AuditReport": {
+        "properties": {
+          "datasets": {
+            "items": {
+              "$ref": "#/components/schemas/DatasetCoverage"
+            },
+            "title": "Datasets",
+            "type": "array"
+          },
+          "generated_at": {
+            "format": "date-time",
+            "title": "Generated At",
+            "type": "string"
+          },
+          "open_days": {
+            "title": "Open Days",
+            "type": "integer"
+          },
+          "window_end": {
+            "format": "date",
+            "title": "Window End",
+            "type": "string"
+          },
+          "window_start": {
+            "format": "date",
+            "title": "Window Start",
+            "type": "string"
+          }
+        },
+        "required": [
+          "generated_at",
+          "window_start",
+          "window_end",
+          "open_days",
+          "datasets"
+        ],
+        "title": "AuditReport",
+        "type": "object"
+      },
       "BacktestDetailData": {
         "properties": {
           "perf": {
@@ -798,6 +837,130 @@
         "title": "BoardItem",
         "type": "object"
       },
+      "CatalogDataset": {
+        "additionalProperties": false,
+        "properties": {
+          "category": {
+            "title": "Category",
+            "type": "string"
+          },
+          "dataset_id": {
+            "title": "Dataset Id",
+            "type": "string"
+          },
+          "fields": {
+            "items": {
+              "$ref": "#/components/schemas/CatalogField"
+            },
+            "title": "Fields",
+            "type": "array"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "primary_key": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Primary Key",
+            "type": "array"
+          },
+          "purpose": {
+            "title": "Purpose",
+            "type": "string"
+          },
+          "sample_available": {
+            "default": false,
+            "title": "Sample Available",
+            "type": "boolean"
+          },
+          "schema_available": {
+            "title": "Schema Available",
+            "type": "boolean"
+          },
+          "sources": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Sources",
+            "type": "array"
+          },
+          "table_name": {
+            "title": "Table Name",
+            "type": "string"
+          },
+          "update_note": {
+            "title": "Update Note",
+            "type": "string"
+          },
+          "visibility_note": {
+            "title": "Visibility Note",
+            "type": "string"
+          }
+        },
+        "required": [
+          "dataset_id",
+          "table_name",
+          "name",
+          "purpose",
+          "category",
+          "sources",
+          "update_note",
+          "visibility_note",
+          "primary_key",
+          "schema_available",
+          "fields"
+        ],
+        "title": "CatalogDataset",
+        "type": "object"
+      },
+      "CatalogField": {
+        "additionalProperties": false,
+        "properties": {
+          "data_type": {
+            "title": "Data Type",
+            "type": "string"
+          },
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "is_primary_key": {
+            "title": "Is Primary Key",
+            "type": "boolean"
+          },
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "unit": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unit"
+          }
+        },
+        "required": [
+          "key",
+          "name",
+          "description",
+          "data_type",
+          "unit",
+          "is_primary_key"
+        ],
+        "title": "CatalogField",
+        "type": "object"
+      },
       "CommandReceipt": {
         "properties": {
           "command_id": {
@@ -831,6 +994,94 @@
           "status"
         ],
         "title": "CommandReceipt",
+        "type": "object"
+      },
+      "DataCenterData": {
+        "properties": {
+          "audit": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AuditReport"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "datasets": {
+            "items": {
+              "$ref": "#/components/schemas/CatalogDataset"
+            },
+            "title": "Datasets",
+            "type": "array"
+          }
+        },
+        "required": [
+          "datasets",
+          "audit"
+        ],
+        "title": "DataCenterData",
+        "type": "object"
+      },
+      "DatasetCoverage": {
+        "properties": {
+          "dataset_id": {
+            "title": "Dataset Id",
+            "type": "string"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "latest_date": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Latest Date"
+          },
+          "missing_open_days": {
+            "items": {
+              "format": "date",
+              "type": "string"
+            },
+            "title": "Missing Open Days",
+            "type": "array"
+          },
+          "required_on_open_day": {
+            "title": "Required On Open Day",
+            "type": "boolean"
+          },
+          "rows_in_window": {
+            "title": "Rows In Window",
+            "type": "integer"
+          },
+          "table_name": {
+            "title": "Table Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "dataset_id",
+          "table_name",
+          "latest_date",
+          "rows_in_window",
+          "missing_open_days",
+          "required_on_open_day"
+        ],
+        "title": "DatasetCoverage",
         "type": "object"
       },
       "Envelope_AlertsData_": {
@@ -879,6 +1130,22 @@
           "serving"
         ],
         "title": "Envelope[BacktestListData]",
+        "type": "object"
+      },
+      "Envelope_DataCenterData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/DataCenterData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[DataCenterData]",
         "type": "object"
       },
       "Envelope_HealthData_": {
@@ -2412,6 +2679,24 @@
           }
         },
         "summary": "回测详情"
+      }
+    },
+    "/api/v1/data-center": {
+      "get": {
+        "operationId": "data_center_api_v1_data_center_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_DataCenterData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "数据中心"
       }
     },
     "/api/v1/health": {

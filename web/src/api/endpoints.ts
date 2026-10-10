@@ -170,3 +170,10 @@ export function useAddWatch() {
     },
   });
 }
+
+export function useDataCenter(): ServingQueryResult<Schemas["DataCenterData"]> {
+  return useServingQuery(["data-center"], async () => {
+    const { data, response } = await apiClient().GET("/api/v1/data-center");
+    return unwrap(data, response);
+  });
+}

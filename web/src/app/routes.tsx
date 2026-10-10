@@ -16,6 +16,7 @@ const PAGE_COMPONENTS: Record<PageId, LazyPage> = {
   monitor: lazy(() => import("@/pages/monitor")),
   panorama: lazy(() => import("@/pages/panorama")),
   health: lazy(() => import("@/pages/health")),
+  data: lazy(() => import("@/pages/data")),
 };
 
 export const appRoutes: RouteObject[] = [

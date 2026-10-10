@@ -209,3 +209,11 @@ def write_demo_research(root: Path) -> None:
          end=days[-1], root=root, title="演示组合回测",
          industries={"600519.SH": "白酒", "000001.SZ": "银行"},
          pool_last=["600519.SH", "000001.SZ"])
+    from rquant.data_catalog.audit import AuditReport, DatasetCoverage, write_report
+
+    write_report(AuditReport(
+        generated_at=datetime.now(UTC), window_start=days[0], window_end=days[-1], open_days=4,
+        datasets=[DatasetCoverage(dataset_id="daily_bar", table_name="daily_bar",
+                                  latest_date=days[-2], rows_in_window=15000,
+                                  missing_open_days=[days[-1]], required_on_open_day=True)],
+    ), root)
