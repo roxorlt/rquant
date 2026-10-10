@@ -977,6 +977,22 @@
         "title": "Envelope[PoolsData]",
         "type": "object"
       },
+      "Envelope_PortfolioCompareData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/PortfolioCompareData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[PortfolioCompareData]",
+        "type": "object"
+      },
       "Envelope_PortfolioRunDetailData_": {
         "properties": {
           "data": {
@@ -1305,6 +1321,65 @@
         "title": "NavPoint",
         "type": "object"
       },
+      "OverfitStats": {
+        "properties": {
+          "dsr": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dsr"
+          },
+          "min_track_record_days": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Min Track Record Days"
+          },
+          "observations": {
+            "title": "Observations",
+            "type": "integer"
+          },
+          "psr": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Psr"
+          },
+          "sharpe_per_day": {
+            "title": "Sharpe Per Day",
+            "type": "number"
+          },
+          "trials": {
+            "title": "Trials",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "observations",
+          "sharpe_per_day",
+          "psr",
+          "min_track_record_days",
+          "dsr",
+          "trials"
+        ],
+        "title": "OverfitStats",
+        "type": "object"
+      },
       "OverviewData": {
         "properties": {
           "kpis": {
@@ -1556,6 +1631,45 @@
         "title": "PoolsData",
         "type": "object"
       },
+      "PortfolioCompareData": {
+        "properties": {
+          "a": {
+            "$ref": "#/components/schemas/PortfolioCompareSide"
+          },
+          "b": {
+            "$ref": "#/components/schemas/PortfolioCompareSide"
+          }
+        },
+        "required": [
+          "a",
+          "b"
+        ],
+        "title": "PortfolioCompareData",
+        "type": "object"
+      },
+      "PortfolioCompareSide": {
+        "properties": {
+          "perf": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BacktestPerf"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "run": {
+            "$ref": "#/components/schemas/PortfolioRunSummary"
+          }
+        },
+        "required": [
+          "run",
+          "perf"
+        ],
+        "title": "PortfolioCompareSide",
+        "type": "object"
+      },
       "PortfolioOrder": {
         "properties": {
           "code": {
@@ -1634,6 +1748,16 @@
             },
             "title": "Orders",
             "type": "array"
+          },
+          "overfit": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OverfitStats"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "perf": {
             "anyOf": [
@@ -2409,6 +2533,64 @@
           }
         },
         "summary": "组合回测列表"
+      }
+    },
+    "/api/v1/portfolio-backtests/compare": {
+      "get": {
+        "operationId": "portfolio_compare_api_v1_portfolio_backtests_compare_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "a",
+            "required": true,
+            "schema": {
+              "title": "A",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "b",
+            "required": true,
+            "schema": {
+              "title": "B",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "benchmark",
+            "required": false,
+            "schema": {
+              "default": "000300.SH",
+              "title": "Benchmark",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_PortfolioCompareData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "组合回测对比"
       }
     },
     "/api/v1/portfolio-backtests/{run_id}": {

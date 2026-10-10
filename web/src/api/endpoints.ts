@@ -89,6 +89,22 @@ export function usePortfolioBacktest(
   );
 }
 
+export function usePortfolioCompare(
+  a: string | null,
+  b: string | null,
+): ServingQueryResult<Schemas["PortfolioCompareData"]> {
+  return useServingQuery(
+    ["portfolio-backtests", "compare", a, b],
+    async () => {
+      const { data, response } = await apiClient().GET("/api/v1/portfolio-backtests/compare", {
+        params: { query: { a: a ?? "", b: b ?? "" } },
+      });
+      return unwrap(data, response);
+    },
+    { enabled: a !== null && b !== null },
+  );
+}
+
 export function useBacktestDetail(
   runId: string | null,
 ): ServingQueryResult<Schemas["BacktestDetailData"]> {

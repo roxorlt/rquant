@@ -1,18 +1,90 @@
 import { useState } from "react";
-import { usePortfolioBacktest, usePortfolioBacktests } from "@/api/endpoints";
+import { usePortfolioBacktest, usePortfolioBacktests, usePortfolioCompare } from "@/api/endpoints";
+import type { components } from "@/api/schema";
 import { formatPrice } from "@/format/number";
 import { DataTable } from "@/table/DataTable";
-import { Panel, Pill } from "@/ui";
+import { Button, KpiStrip, Panel, Pill } from "@/ui";
 import { QueryView } from "../shared";
 import { PerfPanel } from "./Perf";
 
-function Detail({ runId }: { runId: string }) {
+type Perf = components["schemas"]["BacktestPerf"];
+const pct = (v: number | null | undefined) => (v == null ? "—" : `${(v * 100).toFixed(2)}%`);
+const num = (v: number | null | undefined, d = 2) => (v == null ? "—" : v.toFixed(d));
+
+function Compare({ a, b }: { a: string; b: string }) {
+  const query = usePortfolioCompare(a, b);
+  const rows: [string, (p: Perf | null | undefined) => string][] = [
+    ["总收益", (p) => pct(p?.total_return)],
+    ["年化", (p) => pct(p?.annualized_return)],
+    ["夏普", (p) => num(p?.sharpe)],
+    ["最大回撤", (p) => pct(p?.max_drawdown)],
+    ["超额", (p) => pct(p?.benchmark?.excess_return)],
+  ];
+  return (
+    <QueryView query={query}>
+      {(data) => (
+        <Panel title="对比" sub={`${data.a.run.title} vs ${data.b.run.title}`}>
+          <table className="tbl" aria-label="回测对比">
+            <thead>
+              <tr>
+                <th>指标</th>
+                <th>{data.a.run.title}</th>
+                <th>{data.b.run.title}</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>参数</td>
+                <td>{`${data.a.run.max_positions} 只 / 每 ${data.a.run.rebalance_every} 次调仓`}</td>
+                <td>{`${data.b.run.max_positions} 只 / 每 ${data.b.run.rebalance_every} 次调仓`}</td>
+              </tr>
+              {rows.map(([label, f]) => (
+                <tr key={label}>
+                  <td>{label}</td>
+                  <td className="num">{f(data.a.perf)}</td>
+                  <td className="num">{f(data.b.perf)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </Panel>
+      )}
+    </QueryView>
+  );
+}
+
+function Detail({ runId, onCompare }: { runId: string; onCompare: () => void }) {
   const query = usePortfolioBacktest(runId);
   return (
     <QueryView query={query}>
       {(data) => (
         <>
           {data.perf ? <PerfPanel perf={data.perf} /> : null}
+          <Panel
+            title="过拟合检查"
+            sub={`同一预设已存 ${data.overfit?.trials ?? 0} 次回测，按试验数计 DSR（下限估计）`}
+            actions={
+              <Button size="sm" variant="ghost" onClick={onCompare}>
+                加入对比
+              </Button>
+            }
+          >
+            <KpiStrip
+              label="过拟合指标"
+              compact
+              items={[
+                { key: "psr", label: "PSR(>0)", value: pct(data.overfit?.psr) },
+                { key: "dsr", label: "DSR", value: pct(data.overfit?.dsr) },
+                {
+                  key: "trl",
+                  label: "最短样本(95%)",
+                  value: data.overfit?.min_track_record_days ?? "—",
+                  unit: "天",
+                },
+                { key: "obs", label: "样本天数", value: data.overfit?.observations ?? "—" },
+              ]}
+            />
+          </Panel>
           <Panel title={`委托 · ${data.orders.length}`} sub="含拒单原因" flush>
             <DataTable
               label="组合回测委托"
@@ -60,6 +132,9 @@ function Detail({ runId }: { runId: string }) {
 export function PortfolioRuns() {
   const query = usePortfolioBacktests();
   const [runId, setRunId] = useState<string | null>(null);
+  const [picked, setPicked] = useState<string[]>([]);
+  const addCompare = (id: string) =>
+    setPicked((list) => (list.includes(id) ? list : [...list, id].slice(-2)));
   return (
     <QueryView query={query}>
       {(data) => (
@@ -99,7 +174,12 @@ export function PortfolioRuns() {
               ]}
             />
           </Panel>
-          {runId ? <Detail runId={runId} /> : null}
+          {runId ? <Detail runId={runId} onCompare={() => addCompare(runId)} /> : null}
+          {picked.length === 2 && picked[0] && picked[1] ? (
+            <Compare a={picked[0]} b={picked[1]} />
+          ) : picked.length === 1 ? (
+            <Panel title="对比">再选一条回测，点「加入对比」</Panel>
+          ) : null}
         </>
       )}
     </QueryView>

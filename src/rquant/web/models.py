@@ -7,6 +7,8 @@ from typing import Generic, Literal, TypeVar
 
 from pydantic import BaseModel, Field
 
+from rquant.web.overfit_stats import OverfitStats
+
 T = TypeVar("T")
 ServingState = Literal["ready", "stale", "degraded", "unavailable"]
 
@@ -250,6 +252,17 @@ class PortfolioRunDetailData(BaseModel):
     perf: BacktestPerf | None
     orders: list[PortfolioOrder]
     holdings: dict[str, int]
+    overfit: OverfitStats | None = None
+
+
+class PortfolioCompareSide(BaseModel):
+    run: PortfolioRunSummary
+    perf: BacktestPerf | None
+
+
+class PortfolioCompareData(BaseModel):
+    a: PortfolioCompareSide
+    b: PortfolioCompareSide
 
 
 class AlertItem(BaseModel):
