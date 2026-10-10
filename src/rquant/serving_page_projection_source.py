@@ -10,7 +10,7 @@ import stat
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from tempfile import mkdtemp
 from types import MappingProxyType
@@ -969,6 +969,13 @@ class _DatabaseProjection:
     canvas_diagnostics: tuple[CanvasDiagnosticProjectionRow, ...]
     canvas_hits: tuple[CanvasHitProjectionRow, ...]
     available_at: datetime
+    #: benchmark index closes (``index_daily_bar``), empty when the table is absent
+    benchmarks: tuple[dict[str, object], ...] = ()
+
+
+#: Benchmarks published for backtest excess returns; ~3 years each.
+BENCHMARK_CODES = ("000300.SH", "000852.SH", "399006.SZ")
+_BENCHMARK_DAYS = 3 * 366
 
 
 class DuckDBSignalPageProjectionSource:
@@ -1132,6 +1139,7 @@ class DuckDBSignalPageProjectionSource:
             manual_watchlist=read_manual_watchlist_projection_source(
                 self.watchlist_log, observed=observed
             ),
+            benchmark_daily=database.benchmarks,
         )
 
     def _read_database_projection(
@@ -1277,9 +1285,30 @@ class DuckDBSignalPageProjectionSource:
                 """,
                 (cutoff.date(), cutoff, cutoff, cutoff),
             ).fetchone()
+            benchmarks: tuple[dict[str, object], ...] = ()
+            has_index = connection.execute(
+                "SELECT count(*) FROM information_schema.tables "
+                "WHERE table_schema = 'main' AND table_name = 'index_daily_bar'"
+            ).fetchone()
+            if has_index and has_index[0]:
+                benchmarks = tuple(
+                    {"ts_code": code, "trade_date": day.isoformat(), "close": float(close),
+                     "pct_chg": None if pct is None else float(pct)}
+                    for code, day, close, pct in connection.execute(
+                        f"""
+                        SELECT ts_code, trade_date, close, pct_chg FROM index_daily_bar
+                        WHERE ts_code IN ({",".join("?" * len(BENCHMARK_CODES))})
+                          AND trade_date <= ? AND trade_date > ? AND close IS NOT NULL
+                        ORDER BY ts_code, trade_date
+                        """,
+                        (*BENCHMARK_CODES, cutoff.date(),
+                         cutoff.date() - timedelta(days=_BENCHMARK_DAYS)),
+                    ).fetchall()
+                )
         if available_row is None or available_row[0] is None:
             raise PageProjectionSourceIntegrityError("projection database has no PIT evidence")
         return _DatabaseProjection(
+            benchmarks=benchmarks,
             screen_bounds=screen_bounds,
             minute_coverage=minute_coverage,
             latest_trade_date=latest_date,
@@ -2679,7 +2708,7 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
             "canvas_definition",
         }
         optional_names = {"pulse_history", "pulse_alert", "surge_runtime_config", "alert_ack",
-                          "manual_watchlist"}
+                          "manual_watchlist", "benchmark_daily"}
         published_names = {item.table_name for item in self.projections}
         if not required_names.issubset(published_names) or not published_names.issubset(
             required_names | optional_names
@@ -2706,6 +2735,7 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
         surge_runtime_config: SurgeRuntimeConfigProjectionSource | None = None,
         alert_acks: AlertAckProjectionSource | None = None,
         manual_watchlist: ManualWatchlistProjectionSource | None = None,
+        benchmark_daily: tuple[dict[str, object], ...] = (),
     ) -> SignalPageProjectionSnapshot:
         available = normalize_aware_utc(available_at)
         rows = {
@@ -2788,6 +2818,19 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
                         }
                         for row in manual_watchlist.rows
                     ),
+                )
+            )
+        # Index closes dated after this snapshot's evidence would be "future" rows;
+        # strict < keeps the check zone-safe at the cost of at most the latest day.
+        benchmark_daily = tuple(
+            r for r in benchmark_daily if str(r["trade_date"]) < available_at.date().isoformat()
+        )
+        if benchmark_daily:
+            optional.append(
+                ServingProjectionPayload(
+                    table_name="benchmark_daily",
+                    available_at=available_at,
+                    rows=tuple(benchmark_daily),
                 )
             )
         projections = tuple(sorted((*projections, *optional), key=lambda item: item.table_name))

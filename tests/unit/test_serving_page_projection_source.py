@@ -3174,3 +3174,25 @@ def test_duckdb_signal_source_publishes_manual_watchlist(tmp_path: Path) -> None
 
     table = {item.table_name: item for item in snapshot.projections}["manual_watchlist"]
     assert [row["ts_code"] for row in table.rows] == ["600519.SH"]
+
+
+def test_duckdb_signal_source_publishes_benchmarks_when_index_table_exists(tmp_path: Path) -> None:
+    database = tmp_path / "rquant_ro.duckdb"
+    _signal_projection_database(database)
+    connection = duckdb.connect(str(database))
+    connection.execute(
+        "CREATE TABLE index_daily_bar(ts_code VARCHAR, trade_date DATE, close DOUBLE, "
+        "pct_chg DOUBLE)"
+    )
+    day = NOW.date()
+    connection.execute(
+        "INSERT INTO index_daily_bar VALUES ('000300.SH', ?, 4000, 0.1), "
+        "('000300.SH', ?, 4010, 0.25), ('999999.SH', ?, 1, 0)",
+        [day - timedelta(days=6), day - timedelta(days=5), day - timedelta(days=6)],
+    )
+    connection.close()
+
+    snapshot = DuckDBSignalPageProjectionSource(database)(NOW)
+
+    table = {item.table_name: item for item in snapshot.projections}["benchmark_daily"]
+    assert [row["close"] for row in table.rows] == [4000.0, 4010.0]

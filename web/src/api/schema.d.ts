@@ -284,6 +284,7 @@ export interface components {
             annualized_return: number | null;
             /** Annualized Volatility */
             annualized_volatility: number | null;
+            benchmark?: components["schemas"]["BenchmarkStats"] | null;
             /** Calmar */
             calmar: number | null;
             /** Days */
@@ -358,6 +359,21 @@ export interface components {
             signal_date: string | null;
             /** Trade Id */
             trade_id: string;
+        };
+        /** BenchmarkStats */
+        BenchmarkStats: {
+            /** Alpha */
+            alpha: number | null;
+            /** Beta */
+            beta: number | null;
+            /** Code */
+            code: string;
+            /** Excess Return */
+            excess_return: number | null;
+            /** Information Ratio */
+            information_ratio: number | null;
+            /** Total Return */
+            total_return: number;
         };
         /** BoardItem */
         BoardItem: {
@@ -525,6 +541,8 @@ export interface components {
         };
         /** NavPoint */
         NavPoint: {
+            /** Benchmark Nav */
+            benchmark_nav?: number | null;
             /**
              * Date
              * Format: date
@@ -804,6 +822,7 @@ export interface operations {
         parameters: {
             query?: {
                 entry_mode?: string | null;
+                benchmark?: string;
             };
             header?: never;
             path: {

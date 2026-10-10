@@ -28,4 +28,6 @@ test("a backtest run shows its performance block", async ({ page }) => {
   await page.getByText("run-demo").first().click();
   await expect(page.getByLabel("绩效指标")).toBeVisible();
   await expect(page.getByRole("table", { name: "月度收益" })).toBeVisible();
+  await expect(page.getByRole("img", { name: "净值与回撤" })).toBeVisible();
+  await expect(page.getByText("超额 vs 000300.SH")).toBeVisible();
 });

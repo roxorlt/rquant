@@ -14,8 +14,8 @@ from typing import Any
 
 import pandas as pd
 
-from rquant.perf import equity_curve, monthly_returns, performance_summary
-from rquant.web.models import BacktestPerf, MonthlyReturn, NavPoint
+from rquant.perf import equity_curve, monthly_returns, performance_summary, relative_metrics
+from rquant.web.models import BacktestPerf, BenchmarkStats, MonthlyReturn, NavPoint
 
 METHOD = "逐笔等权复利（按卖出日聚合，近似）"
 
@@ -38,14 +38,52 @@ def _num(value: float | None) -> float | None:
     return None if value is None or pd.isna(value) else float(value)
 
 
-def backtest_perf(trades: Iterable[dict[str, Any]]) -> BacktestPerf | None:
+def benchmark_returns(rows: Iterable[dict[str, Any]]) -> pd.Series:
+    """Daily close-to-close returns of one benchmark from ``benchmark_daily`` rows."""
+    closes = pd.Series(
+        {pd.Timestamp(r["trade_date"]): float(r["close"]) for r in rows}, dtype="float64"
+    ).sort_index()
+    return closes.pct_change().dropna()
+
+
+def backtest_perf(
+    trades: Iterable[dict[str, Any]],
+    benchmark: tuple[str, Iterable[dict[str, Any]]] | None = None,
+) -> BacktestPerf | None:
     returns = daily_returns(trades)
     if returns.empty:
         return None
+    bench_stats: BenchmarkStats | None = None
+    bench_nav: pd.Series | None = None
+    if benchmark is not None:
+        code, rows = benchmark
+        bench = benchmark_returns(rows)
+        window = bench.loc[returns.index.min() : returns.index.max()]
+        if len(window) >= 2:
+            # A trade-ledger NAV is flat on days nothing closed.
+            returns = returns.reindex(window.index.union(returns.index), fill_value=0.0)
+            rel = relative_metrics(returns, window)
+            bench_nav = (1 + window).cumprod()
+            bench_stats = BenchmarkStats(
+                code=code,
+                total_return=float(bench_nav.iloc[-1] - 1),
+                excess_return=_num(rel.excess_total_return),
+                alpha=_num(rel.alpha),
+                beta=_num(rel.beta),
+                information_ratio=_num(rel.information_ratio),
+            )
     summary = performance_summary(returns)
     curve = equity_curve(returns)
     nav = [
-        NavPoint(date=day.date(), nav=float(n), drawdown=float(d))
+        NavPoint(
+            date=day.date(),
+            nav=float(n),
+            drawdown=float(d),
+            benchmark_nav=(
+                None if bench_nav is None or day not in bench_nav.index
+                else float(bench_nav.loc[day])
+            ),
+        )
         for day, n, d in zip(curve.nav.index, curve.nav, curve.drawdown, strict=True)
     ]
     months = monthly_returns(returns)
@@ -70,4 +108,5 @@ def backtest_perf(trades: Iterable[dict[str, Any]]) -> BacktestPerf | None:
         payoff_ratio=_num(summary.payoff_ratio),
         nav=nav,
         monthly=monthly,
+        benchmark=bench_stats,
     )

@@ -14,13 +14,17 @@ function NavChart({ nav }: { nav: BacktestPerf["nav"] }) {
   const h = 200;
   const dd = 60;
   if (nav.length < 2) return null;
-  const values = nav.map((p) => p.nav);
+  const values = nav.flatMap((p) => (p.benchmark_nav == null ? [p.nav] : [p.nav, p.benchmark_nav]));
   const lo = Math.min(1, ...values);
   const hi = Math.max(1, ...values);
   const minDd = Math.min(-0.0001, ...nav.map((p) => p.drawdown));
   const x = (i: number) => (i / (nav.length - 1)) * w;
   const y = (v: number) => h - ((v - lo) / (hi - lo || 1)) * (h - 8) - 4;
   const line = nav.map((p, i) => `${x(i).toFixed(1)},${y(p.nav).toFixed(1)}`).join(" ");
+  const benchLine = nav
+    .filter((p) => p.benchmark_nav != null)
+    .map((p) => `${x(nav.indexOf(p)).toFixed(1)},${y(p.benchmark_nav ?? 1).toFixed(1)}`)
+    .join(" ");
   const band = nav
     .map((p, i) => `${x(i).toFixed(1)},${(h + (p.drawdown / minDd) * dd).toFixed(1)}`)
     .join(" ");
@@ -33,6 +37,15 @@ function NavChart({ nav }: { nav: BacktestPerf["nav"] }) {
       style={{ display: "block" }}
     >
       <line x1={0} x2={w} y1={y(1)} y2={y(1)} stroke="var(--line, #ccc)" strokeDasharray="3 3" />
+      {benchLine ? (
+        <polyline
+          points={benchLine}
+          fill="none"
+          stroke="var(--text-3, #999)"
+          strokeWidth={1}
+          strokeDasharray="4 2"
+        />
+      ) : null}
       <polyline points={line} fill="none" stroke="var(--accent)" strokeWidth={1.5} />
       <polygon points={`0,${h} ${band} ${w},${h}`} fill="var(--down, #2a9d5c)" opacity={0.25} />
     </svg>
@@ -98,6 +111,18 @@ export function PerfPanel({ perf }: { perf: BacktestPerf }) {
           },
           { key: "win", label: "日胜率", value: pct(perf.win_rate, 1) },
           { key: "payoff", label: "盈亏比", value: num(perf.payoff_ratio) },
+          ...(perf.benchmark
+            ? [
+                {
+                  key: "excess",
+                  label: `超额 vs ${perf.benchmark.code}`,
+                  value: pct(perf.benchmark.excess_return),
+                  sub: `基准 ${pct(perf.benchmark.total_return)}`,
+                },
+                { key: "beta", label: "Beta", value: num(perf.benchmark.beta) },
+                { key: "ir", label: "信息比率", value: num(perf.benchmark.information_ratio) },
+              ]
+            : []),
         ]}
       />
       <NavChart nav={perf.nav} />

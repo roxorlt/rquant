@@ -223,8 +223,8 @@ def backtests(source: SourceDep) -> Envelope[BacktestListData]:
 
 @router.get("/backtests/{run_id}", response_model=Envelope[BacktestDetailData],
             summary="回测详情")
-def backtest_detail(run_id: str, source: SourceDep,
-                    entry_mode: str | None = None) -> Envelope[BacktestDetailData]:
+def backtest_detail(run_id: str, source: SourceDep, entry_mode: str | None = None,
+                    benchmark: str = "000300.SH") -> Envelope[BacktestDetailData]:
     runs = [r for r in source.query(_RUN_SQL + " WHERE run_id = ? LIMIT 50", [run_id])
             if entry_mode is None or r["entry_mode"] == entry_mode]
     if not runs:
@@ -236,7 +236,15 @@ def backtest_detail(run_id: str, source: SourceDep,
         "WHERE run_id = ? AND entry_mode = ? AND profile_variant = ? "
         "ORDER BY entry_time LIMIT 10000",
         [run_id, run["entry_mode"], run["profile_variant"]])
-    perf = backtest_perf(raw)
+    try:
+        bench_rows = source.query(
+            "SELECT trade_date, close FROM benchmark_daily WHERE ts_code = ? "
+            "ORDER BY trade_date LIMIT 1200", [benchmark])
+    except Exception as exc:  # noqa: BLE001 - optional projection
+        if not table_missing(exc):
+            raise
+        bench_rows = []
+    perf = backtest_perf(raw, (benchmark, bench_rows) if bench_rows else None)
     trades = [BacktestTrade(code=t.pop("ts_code"), **t) for t in raw]
     return _envelope(
         source, BacktestDetailData(run=BacktestRun(**run), trades=trades, perf=perf))
