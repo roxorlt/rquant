@@ -984,6 +984,7 @@ class DuckDBSignalPageProjectionSource:
         page_control_outbox: PageControlOutbox | Path | None = None,
         surge_live_root: Path | None = None,
         alert_ack_log: Path | None = None,
+        watchlist_log: Path | None = None,
         control_root: Path | None = None,
         atomically_published: bool = False,
         read_profile: ReplicaReadProfile = UNLIMITED_READ_PROFILE,
@@ -1008,6 +1009,8 @@ class DuckDBSignalPageProjectionSource:
         )
         #: page control's append-only ack log (web 告警确认); None publishes no alert_ack
         self.alert_ack_log = None if alert_ack_log is None else Path(os.path.abspath(alert_ack_log))
+        #: page control's append-only manual watchlist (web 加自选), read by the monitor
+        self.watchlist_log = None if watchlist_log is None else Path(os.path.abspath(watchlist_log))
         if page_control_outbox is None:
             self.page_control_outbox = None
         else:
@@ -1126,6 +1129,9 @@ class DuckDBSignalPageProjectionSource:
             pulse_alerts=pulse_alerts,
             surge_runtime_config=runtime_config,
             alert_acks=read_alert_ack_projection_source(self.alert_ack_log, observed=observed),
+            manual_watchlist=read_manual_watchlist_projection_source(
+                self.watchlist_log, observed=observed
+            ),
         )
 
     def _read_database_projection(
@@ -2323,6 +2329,65 @@ def read_alert_ack_projection_source(
     acks newer than ``observed`` are left for the next generation.
     """
 
+    records = _read_page_control_log(path, label="alert ack log")
+    if records is None:
+        return None
+    latest: dict[str, AlertAckProjectionRow] = {}
+    for record in records:
+        row = AlertAckProjectionRow(
+            alert_id=record["alert_id"],
+            acked_at=datetime.fromisoformat(record["ts"]),
+            actor_id=record["actor_id"],
+            command_id=record["command_id"],
+        )
+        if row.acked_at <= observed:
+            latest[row.alert_id] = row
+    rows = tuple(sorted(latest.values(), key=lambda r: r.alert_id))
+    available = max((r.acked_at for r in rows), default=observed)
+    return AlertAckProjectionSource(available_at=available, rows=rows)
+
+
+class ManualWatchlistProjectionRow(RuntimeContractModel):
+    ts_code: str = Field(pattern=r"^\d{6}\.(SH|SZ|BJ)$")
+    note: str
+    added_at: AwareUtcDatetime
+    command_id: str
+
+
+class ManualWatchlistProjectionSource(RuntimeContractModel):
+    available_at: AwareUtcDatetime
+    rows: tuple[ManualWatchlistProjectionRow, ...] = Field(max_length=500)
+
+
+def read_manual_watchlist_projection_source(
+    path: Path | None,
+    *,
+    observed: datetime,
+) -> ManualWatchlistProjectionSource | None:
+    """Current manual watchlist from page control's append-only ``watchlist/items.jsonl``.
+
+    One row per ts_code (latest add wins). There is no remove command yet.
+    """
+
+    records = _read_page_control_log(path, label="watchlist log")
+    if records is None:
+        return None
+    latest: dict[str, ManualWatchlistProjectionRow] = {}
+    for record in records:
+        row = ManualWatchlistProjectionRow(
+            ts_code=record["ts_code"],
+            note=record.get("note", ""),
+            added_at=datetime.fromisoformat(record["ts"]),
+            command_id=record["command_id"],
+        )
+        if row.added_at <= observed:
+            latest[row.ts_code] = row
+    rows = tuple(sorted(latest.values(), key=lambda r: r.ts_code))
+    available = max((r.added_at for r in rows), default=observed)
+    return ManualWatchlistProjectionSource(available_at=available, rows=rows)
+
+
+def _read_page_control_log(path: Path | None, *, label: str) -> list[dict] | None:
     if path is None:
         return None
     try:
@@ -2330,24 +2395,9 @@ def read_alert_ack_projection_source(
     except FileNotFoundError:
         return None
     if not stat.S_ISREG(item.st_mode) or item.st_size > _MAX_ALERT_ACK_LOG_BYTES:
-        raise PageProjectionSourceIntegrityError("alert ack log is not a bounded regular file")
-    latest: dict[str, AlertAckProjectionRow] = {}
+        raise PageProjectionSourceIntegrityError(f"{label} is not a bounded regular file")
     with open(path, encoding="utf-8") as handle:
-        for line in handle:
-            if not line.strip():
-                continue
-            record = json.loads(line)
-            row = AlertAckProjectionRow(
-                alert_id=record["alert_id"],
-                acked_at=datetime.fromisoformat(record["ts"]),
-                actor_id=record["actor_id"],
-                command_id=record["command_id"],
-            )
-            if row.acked_at <= observed:
-                latest[row.alert_id] = row
-    rows = tuple(sorted(latest.values(), key=lambda r: r.alert_id))
-    available = max((r.acked_at for r in rows), default=observed)
-    return AlertAckProjectionSource(available_at=available, rows=rows)
+        return [json.loads(line) for line in handle if line.strip()]
 
 
 class SurgeRuntimeConfigProjectionSource(RuntimeContractModel):
@@ -2628,7 +2678,8 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
             "canvas_hit",
             "canvas_definition",
         }
-        optional_names = {"pulse_history", "pulse_alert", "surge_runtime_config", "alert_ack"}
+        optional_names = {"pulse_history", "pulse_alert", "surge_runtime_config", "alert_ack",
+                          "manual_watchlist"}
         published_names = {item.table_name for item in self.projections}
         if not required_names.issubset(published_names) or not published_names.issubset(
             required_names | optional_names
@@ -2654,6 +2705,7 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
         pulse_alerts: PulseAlertProjectionSource | None = None,
         surge_runtime_config: SurgeRuntimeConfigProjectionSource | None = None,
         alert_acks: AlertAckProjectionSource | None = None,
+        manual_watchlist: ManualWatchlistProjectionSource | None = None,
     ) -> SignalPageProjectionSnapshot:
         available = normalize_aware_utc(available_at)
         rows = {
@@ -2719,6 +2771,22 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
                             "command_id": row.command_id,
                         }
                         for row in alert_acks.rows
+                    ),
+                )
+            )
+        if manual_watchlist is not None:
+            optional.append(
+                ServingProjectionPayload(
+                    table_name="manual_watchlist",
+                    available_at=manual_watchlist.available_at,
+                    rows=tuple(
+                        {
+                            "ts_code": row.ts_code,
+                            "note": row.note,
+                            "added_at": row.added_at.isoformat(),
+                            "command_id": row.command_id,
+                        }
+                        for row in manual_watchlist.rows
                     ),
                 )
             )

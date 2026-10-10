@@ -305,6 +305,19 @@ PAGE_PROJECTION_CONTRACTS: Mapping[str, ServingProjectionContract] = MappingProx
             event_date_columns=("trade_date",),
             event_time_columns=("as_of",),
         ),
+        "manual_watchlist": _contract(
+            "signals",
+            (
+                ("ts_code", "string"),
+                ("note", "string"),
+                ("added_at", "timestamp"),
+                ("command_id", "string"),
+            ),
+            ("ts_code",),
+            max_rows=500,
+            max_bytes=256 * 1024,
+            event_time_columns=("added_at",),
+        ),
         "alert_ack": _contract(
             "signals",
             (

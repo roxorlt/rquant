@@ -38,3 +38,22 @@ def test_latest_ack_per_alert_and_future_rows_wait(tmp_path: Path) -> None:
     snapshot = SignalPageProjectionSnapshot.create(available_at=NOW, alert_acks=source)
     table = {p.table_name: p for p in snapshot.projections}["alert_ack"]
     assert table.rows[0]["actor_id"] == "bob"
+
+
+def test_manual_watchlist_latest_per_code(tmp_path: Path) -> None:
+    from rquant.serving_page_projection_source import read_manual_watchlist_projection_source
+
+    log = tmp_path / "watchlist" / "items.jsonl"
+    log.parent.mkdir(parents=True)
+    log.write_text("".join(json.dumps(r) + "\n" for r in [
+        {"ts_code": "600519.SH", "note": "a", "ts": "2026-10-09T01:00:00+00:00", "command_id": "1"},
+        {"ts_code": "600519.SH", "note": "b", "ts": "2026-10-09T02:00:00+00:00", "command_id": "2"},
+        {"ts_code": "000001.SZ", "note": "", "ts": "2026-10-09T09:00:00+00:00", "command_id": "3"},
+    ]))
+    source = read_manual_watchlist_projection_source(log, observed=NOW)
+    assert source is not None
+    assert [(r.ts_code, r.note) for r in source.rows] == [("600519.SH", "b")]
+    snapshot = SignalPageProjectionSnapshot.create(available_at=NOW, manual_watchlist=source)
+    table = {p.table_name: p for p in snapshot.projections}["manual_watchlist"]
+    assert table.rows[0]["ts_code"] == "600519.SH"
+    assert read_manual_watchlist_projection_source(tmp_path / "x", observed=NOW) is None

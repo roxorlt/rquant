@@ -3158,3 +3158,19 @@ def test_duckdb_signal_source_publishes_alert_acks_from_page_control_log(tmp_pat
     assert "alert_ack" not in {item.table_name for item in without.projections}
     acks = {item.table_name: item for item in with_acks.projections}["alert_ack"]
     assert [row["alert_id"] for row in acks.rows] == ["c" * 64]
+
+
+def test_duckdb_signal_source_publishes_manual_watchlist(tmp_path: Path) -> None:
+    database = tmp_path / "rquant_ro.duckdb"
+    _signal_projection_database(database)
+    log = tmp_path / "page-control" / "watchlist" / "items.jsonl"
+    log.parent.mkdir(parents=True)
+    log.write_text(
+        json.dumps({"ts_code": "600519.SH", "note": "", "command_id": "w",
+                    "ts": (NOW - timedelta(minutes=1)).isoformat()}) + "\n"
+    )
+
+    snapshot = DuckDBSignalPageProjectionSource(database, watchlist_log=log)(NOW)
+
+    table = {item.table_name: item for item in snapshot.projections}["manual_watchlist"]
+    assert [row["ts_code"] for row in table.rows] == ["600519.SH"]

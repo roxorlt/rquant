@@ -6,7 +6,7 @@ import re
 import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Protocol
@@ -277,11 +277,67 @@ def _get_latest_screen_date(store: DuckDBStore) -> str | None:
     return row[0] if row and row[0] else None
 
 
+def load_manual_watchlist_codes(serving_root: str | Path | None = None) -> list[str]:
+    """网页「加自选」的股票（Serving ``manual_watchlist``）。读不到时返回空，不影响盯盘。"""
+    from rquant.dashboard.serving_only_page_data import ServingFrameState, query_serving_frame
+    from rquant.serving_paths import serving_root_from_env
+
+    try:
+        result = query_serving_frame(
+            serving_root or serving_root_from_env(),
+            "SELECT ts_code FROM manual_watchlist ORDER BY ts_code LIMIT 500",
+            stale_after=timedelta(days=3650),
+        )
+    except Exception as exc:  # noqa: BLE001 - optional input
+        logger.info(f"手动自选不可用：{type(exc).__name__}: {exc}")
+        return []
+    if result.state is ServingFrameState.UNAVAILABLE:
+        logger.info(f"手动自选未发布：{result.detail[:120]}")
+        return []
+    return [str(row[0]) for row in result.rows]
+
+
+def _limit_up_item(store: DuckDBStore, code: str, pool: str) -> WatchItem | None:
+    """以最近一次首板涨停日的实体计算价位（Pool 1 与手动自选共用）。"""
+    state_df = store._conn.execute(
+        """
+        SELECT trade_date, body_upper, body_lower
+        FROM daily_state
+        WHERE ts_code = ? AND is_first_limit_up = true
+        ORDER BY trade_date DESC
+        LIMIT 1
+        """,
+        [code],
+    ).fetchdf()
+    if state_df.empty:
+        return None
+    bu = float(state_df.iloc[0]["body_upper"])
+    bl = float(state_df.iloc[0]["body_lower"])
+    levels = _compute_levels(bu, bl)
+    lu_raw = state_df.iloc[0]["trade_date"]
+    lu_date = lu_raw.date() if hasattr(lu_raw, "date") else lu_raw
+    return WatchItem(
+        ts_code=code,
+        pool=pool,
+        limit_up_date=lu_date,
+        body_upper=bu,
+        body_lower=bl,
+        body=bu - bl,
+        level_40=levels["level_40"],
+        level_30=levels["level_30"],
+        level_20=levels["level_20"],
+        stop_strong=levels["stop_strong"],
+        stop_weak=levels["stop_weak"],
+        entry_date=lu_date,
+    )
+
+
 def build_watchlist(
     store: DuckDBStore,
     screen_date: str | None = None,
+    manual_codes: Sequence[str] = (),
 ) -> list[WatchItem]:
-    """加载 Pool 2 active + 指定日期 Pool 1，去重后返回 watchlist。"""
+    """加载 Pool 2 active + 指定日期 Pool 1 + 网页手动自选，去重后返回 watchlist。"""
     items: dict[str, WatchItem] = {}
 
     # 1. Pool 2 active（优先级高）
@@ -317,42 +373,21 @@ def build_watchlist(
             if code in items:
                 continue  # Pool 2 优先
 
-            # 查涨停日 body
-            state_df = store._conn.execute(
-                """
-                SELECT trade_date, body_upper, body_lower
-                FROM daily_state
-                WHERE ts_code = ? AND is_first_limit_up = true
-                ORDER BY trade_date DESC
-                LIMIT 1
-                """,
-                [code],
-            ).fetchdf()
-
-            if state_df.empty:
+            item = _limit_up_item(store, code, "pool1")
+            if item is None:
                 logger.warning(f"跳过 Pool 1 {code}：找不到涨停日")
                 continue
+            items[code] = item
 
-            bu = float(state_df.iloc[0]["body_upper"])
-            bl = float(state_df.iloc[0]["body_lower"])
-            levels = _compute_levels(bu, bl)
-
-            lu_raw = state_df.iloc[0]["trade_date"]
-            lu_date = lu_raw.date() if hasattr(lu_raw, "date") else lu_raw
-            items[code] = WatchItem(
-                ts_code=code,
-                pool="pool1",
-                limit_up_date=lu_date,
-                body_upper=bu,
-                body_lower=bl,
-                body=bu - bl,
-                level_40=levels["level_40"],
-                level_30=levels["level_30"],
-                level_20=levels["level_20"],
-                stop_strong=levels["stop_strong"],
-                stop_weak=levels["stop_weak"],
-                entry_date=lu_date,  # pool1 用涨停日做参考
-            )
+    # 3. 网页手动自选（池子优先；没有首板涨停实体的无法计算价位，跳过）
+    for code in manual_codes:
+        if code in items:
+            continue
+        item = _limit_up_item(store, code, "manual")
+        if item is None:
+            logger.warning(f"跳过手动自选 {code}：找不到首板涨停日，无法计算价位")
+            continue
+        items[code] = item
 
     _hydrate_attack_references(store, items, screen_date=sd)
 
@@ -384,7 +419,8 @@ def build_watchlist(
     logger.info(
         f"Watchlist: {len(items)} 只 "
         f"(pool2={sum(1 for i in items.values() if i.pool == 'pool2')}, "
-        f"pool1={sum(1 for i in items.values() if i.pool == 'pool1')})"
+        f"pool1={sum(1 for i in items.values() if i.pool == 'pool1')}, "
+        f"manual={sum(1 for i in items.values() if i.pool == 'manual')})"
     )
     return list(items.values())
 
@@ -408,7 +444,11 @@ def _publish_research_watchlist(items: Sequence[WatchItem], trade_date: date) ->
     return write_research_watchlist_snapshot(
         settings.research_staging_dir_resolved,
         trade_date=trade_date,
-        items=tuple(ResearchWatchlistItem(ts_code=item.ts_code, pool=item.pool) for item in items),
+        items=tuple(
+            ResearchWatchlistItem(ts_code=item.ts_code, pool=item.pool)
+            for item in items
+            if item.pool in ("pool1", "pool2")  # 手动自选不进研究预期清单
+        ),
         captured_at=captured_at,
         code_commit=commit,
     )
@@ -889,7 +929,7 @@ def run_monitor(interval: int = 5) -> int:
         return 0
 
     with DuckDBStore() as store:
-        watchlist = build_watchlist(store)
+        watchlist = build_watchlist(store, manual_codes=load_manual_watchlist_codes())
 
         if not watchlist:
             logger.warning("Watchlist 为空，退出")
