@@ -185,4 +185,5 @@ def test_factor_results_are_listed_and_read(tmp_path) -> None:
     assert [f["name"] for f in items] == ["演示动量因子"]
     detail = client.get(f"/api/v1/factors/{items[0]['factor_id']}").json()["data"]
     assert len(detail["result"]["decay"]) == 6
+    assert detail["tracking"]["points"] and items[0]["tracked_to"]
     assert client.get("/api/v1/factors/x").status_code == 404

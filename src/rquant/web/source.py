@@ -232,5 +232,8 @@ def write_demo_research(root: Path) -> None:
     panel |= {"pct_chg": close.pct_change() * 100, "vol": close * 0 + 1, "amount": close * 0 + 1}
     expr = "cs_rank(ts_delta(close, 5))"
     start = idx[30].date()
-    save_factor("演示动量因子", expr, start, today,
-                run_factor(panel, expr, start, today), root=root)
+    demo = save_factor("演示动量因子", expr, start, today,
+                       run_factor(panel, expr, start, today), root=root)
+    from rquant.factor.store import save_tracking, track
+
+    save_tracking(track(demo, panel, today, lookback_days=60), root)

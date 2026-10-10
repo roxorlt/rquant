@@ -7,14 +7,20 @@ import { QueryView } from "../shared";
 const num = (v: number | null | undefined, d = 3) => (v == null ? "—" : v.toFixed(d));
 const pct = (v: number | null | undefined) => (v == null ? "—" : `${(v * 100).toFixed(2)}%`);
 
-function IcBars({ points }: { points: { date: string; ic: number }[] }) {
+function IcBars({
+  points,
+  label = "每日 IC",
+}: {
+  points: { date: string; ic: number }[];
+  label?: string;
+}) {
   if (points.length < 2) return null;
   const w = 640;
   const h = 120;
   const max = Math.max(0.05, ...points.map((p) => Math.abs(p.ic)));
   const bw = w / points.length;
   return (
-    <svg viewBox={`0 0 ${w} ${h}`} width="100%" height={h} role="img" aria-label="每日 IC">
+    <svg viewBox={`0 0 ${w} ${h}`} width="100%" height={h} role="img" aria-label={label}>
       <line x1={0} x2={w} y1={h / 2} y2={h / 2} stroke="var(--line, #ddd)" />
       {points.map((p, i) => {
         const bar = (Math.abs(p.ic) / max) * (h / 2 - 4);
@@ -37,8 +43,36 @@ function Detail({ id }: { id: string }) {
   const query = useFactor(id);
   return (
     <QueryView query={query}>
-      {({ factor, result }) => (
+      {({ factor, result, tracking }) => (
         <>
+          {tracking ? (
+            <Panel
+              title="近期跟踪"
+              sub={`${tracking.window_start} ~ ${tracking.latest_date ?? "—"}，python -m rquant.factor track 更新`}
+            >
+              <KpiStrip
+                label="跟踪指标"
+                compact
+                items={[
+                  { key: "recent", label: "近 20 日 IC", value: num(tracking.recent_ic) },
+                  { key: "research", label: "检验期 IC", value: num(tracking.research_ic) },
+                  {
+                    key: "state",
+                    label: "状态",
+                    value:
+                      tracking.recent_ic == null || tracking.research_ic == null
+                        ? "—"
+                        : Math.sign(tracking.recent_ic) !== Math.sign(tracking.research_ic)
+                          ? "方向反转"
+                          : Math.abs(tracking.recent_ic) < Math.abs(tracking.research_ic) / 2
+                            ? "衰减"
+                            : "正常",
+                  },
+                ]}
+              />
+              <IcBars points={tracking.points} label="跟踪 IC" />
+            </Panel>
+          ) : null}
           <Panel title={factor.name} sub={factor.expression}>
             <KpiStrip
               label="因子检验指标"
@@ -129,6 +163,13 @@ export default function FactorPage() {
                   numeric: true,
                   value: (row) => row.mean_ic ?? null,
                   cell: (row) => num(row.mean_ic),
+                },
+                {
+                  id: "recent",
+                  header: "近期 IC",
+                  numeric: true,
+                  value: (row) => row.recent_ic ?? null,
+                  cell: (row) => num(row.recent_ic),
                 },
                 {
                   id: "ir",

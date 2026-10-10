@@ -688,6 +688,7 @@ export interface components {
         FactorDetailData: {
             factor: components["schemas"]["FactorSummary"];
             result: components["schemas"]["FactorTestResult"];
+            tracking?: components["schemas"]["FactorTracking"] | null;
         };
         /** FactorListData */
         FactorListData: {
@@ -717,11 +718,15 @@ export interface components {
             mean_ic: number | null;
             /** Name */
             name: string;
+            /** Recent Ic */
+            recent_ic?: number | null;
             /**
              * Start
              * Format: date
              */
             start: string;
+            /** Tracked To */
+            tracked_to?: string | null;
         };
         /** FactorTestResult */
         FactorTestResult: {
@@ -747,6 +752,34 @@ export interface components {
             quantiles: components["schemas"]["QuantileReturn"][];
             /** T Stat */
             t_stat: number | null;
+        };
+        /** FactorTracking */
+        FactorTracking: {
+            /** Factor Id */
+            factor_id: string;
+            /** Latest Date */
+            latest_date: string | null;
+            /** Points */
+            points: components["schemas"]["TrackingPoint"][];
+            /** Recent Ic */
+            recent_ic: number | null;
+            /** Research Ic */
+            research_ic: number | null;
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
+            /**
+             * Window End
+             * Format: date
+             */
+            window_end: string;
+            /**
+             * Window Start
+             * Format: date
+             */
+            window_start: string;
         };
         /** FreshnessItem */
         FreshnessItem: {
@@ -1137,6 +1170,18 @@ export interface components {
             sequence: number;
             /** Strategy Id */
             strategy_id: string;
+        };
+        /** TrackingPoint */
+        TrackingPoint: {
+            /**
+             * Date
+             * Format: date
+             */
+            date: string;
+            /** Ic */
+            ic: number;
+            /** Rolling */
+            rolling: number | null;
         };
         /** ValidationError */
         ValidationError: {
