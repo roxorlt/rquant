@@ -14,6 +14,27 @@
 | 盯盘 / Streamlit | `rquant-monitor`（由 timer 触发）和所有 Streamlit 都跑在 `~/rquant` 这份 checkout 上，**版本停在 e4e303b（2026-08-04）**，`.venv` 是 Python 3.14 |
 | 工具 | 有 python3.11、node **18**（版本太低，前端构建不了）、htpasswd；没有 uv、pnpm。lighthouse 有 sudo 免密 ALL 权限 |
 
+## 一期实际上线状态（2026-10-10 20:10）
+- `rquant-web.service` 读 `EnvironmentFile=/etc/rquant-web.env`：`RQUANT_SERVING_ROOT`（**唯一的数据源开关**）+ 可选 `RQUANT_WEB_NOTICE`（顶栏提示）。当前指向 replay `~/replay/runs/20260925T173059-13cb88/host/data/runtime/serving`，提示“回放数据 2026-09-25（非实时）”。
+- 切生产：改 `RQUANT_SERVING_ROOT=/home/lighthouse/rquant/data/runtime/serving`、删 NOTICE 行、`sudo systemctl restart rquant-web`。
+- 备份：`/home/lighthouse/backup-web-202610101942`；旧静态 `~/rquant-web/app.old`；Codex 临时 API 启动命令在备份的 `interim-launcher.cmd`。
+
+## 生产 Serving 为何从未发布（只读诊断）
+链路：`rquant-runtime-reference-slow-publisher@svc-62c9…` → 产出 `live/reference-slow/serving-authority` → `rquant-runtime-serving@svc-63af…` 汇总 signals/paper_accounts/runtime_health/reference_slow_authority → `data/runtime/serving`。
+- serving 发布者：`last_success_at=null`，连续失败 27553 次：`reference_slow_authority reader failed: current authority is unavailable`（该目录不存在）。
+- reference-slow 发布者：连续失败 65967 次：`reference slow publisher started after 09:25`。它是常驻服务，**只接受 09:25 前启动**；本实例自 2026-09-25 11:29 起一直运行、从未重启，所以每天都拒绝工作。reference-slow source 本身健康。
+- 其它三个来源（signals、paper、runtime_health）都有 current.json，正常。
+
+## 恢复生产发布（需单独批准；交易日 09:25 前执行）
+1. 交易日 08:45 前备份：`tar czf ~/backup-refslow-$(date +%F).tgz -C ~/rquant/data/runtime control/reference-slow-publishers control/serving-publishers live/reference-slow`
+2. 08:50：`sudo systemctl restart rquant-runtime-reference-slow-publisher@svc-62c9061740150340b1f1e3a8a54323e26794caf9616d34047546383cdc027abd`
+3. 看心跳：`control/reference-slow-publishers/svc-62c9…/heartbeats/*.json` 的 `last_success_at` 非空、`generation_published` 出现；`ls live/reference-slow/serving-authority/current.json`
+4. 看 serving 心跳 `control/serving-publishers/svc-63af…/heartbeats/*.json`：`last_success_at` 非空；`ls data/runtime/serving/generations` 出现代、有 current 指针
+5. 切 web 数据源（见上），`curl 127.0.0.1:8768/api/v1/meta` 返回 ready 且 generated_at 为当天
+6. 长期：该服务每日需在 09:25 前重启——应由 production profile 加启动 timer（走 `rquant-production-deploy.pyz` 发布），不要手工加 unit
+- 风险：只重启一个已失败的常驻实例，不改代码/凭据/unit；若 09:25 前没起来则当天仍失败（无副作用）。首次发布 Serving 可能暴露下一环问题（schema 合同、配额），需逐个看心跳。
+- 回滚：web 改回 replay 路径并重启；reference-slow 状态目录可用第 1 步备份还原（先停该实例再解包再启动）。
+
 ## 一期前置条件（2026-10-10 实测拦截）
 生产 Serving（`~/rquant/data/runtime/serving/generations`）**从未发布过任何代**（自 9/5 起为空，无 current 指针），`rquant-web` 指向它只会返回“current pointer is missing”。一期必须先让 runtime 的 serving 发布者产出生产代，或经批准临时指向 replay Serving（现状临时进程即如此）。pip 安装需用腾讯镜像 `-i https://mirrors.cloud.tencent.com/pypi/simple/`（pypi.org 实测极慢）。
 
