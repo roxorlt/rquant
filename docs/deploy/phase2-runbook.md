@@ -55,4 +55,4 @@ bash scripts/deploy-production.sh --target <release-tag> --dry-run       # 只�
 2. `bash scripts/deploy-production.sh --target <release-tag>`（部署器自带两次 preflight、失败自动 reset 回 previous）。
 3. 验证：page-control 收到网页 `ack_alert` → Serving 下一代出现 alert_ack；`add_watchlist_item` → monitor 日志出现手工自选；
    告警规则关闭某池后该池不再推送；所有 `rquant-runtime-*` active；28080 ok。
-4. 回滚：`bash scripts/deploy-production.sh --target df621ef`（同样过 R07 表：enforced→enforced 允许）或部署器 recovery。
+4. 回滚：只能用部署器 recovery 的 rollback（重放已记录 intent 的 previous）；显式 `--target df621ef` 会被 R07 表拒绝（enforced→disabled_for_bootstrap）。
