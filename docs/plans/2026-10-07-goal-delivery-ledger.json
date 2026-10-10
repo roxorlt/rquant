@@ -1,14 +1,14 @@
 {
   "schema_version": 1,
-  "revision": 187,
-  "updated_at": "2026-10-10T09:35:00+08:00",
+  "revision": 188,
+  "updated_at": "2026-10-10T10:03:04+08:00",
   "thread_id": "01a0dd53-e9c9-7b73-a7b5-843473fcd6ac",
   "worktree": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration",
   "branch": "cdx/20260929-factor-source-integration",
   "goal_state": {
     "reported_status": "active",
-    "last_updated_at": "2026-10-10T09:35:00+08:00",
-    "current_turn": "R12_WEB_expiry_fixture_single_clock_fixed10P_self_checked",
+    "last_updated_at": "2026-10-10T10:03:04+08:00",
+    "current_turn": "R12_original_backend_node_evidence_frozen_and_grouped_fixture_candidate",
     "stored_block_reason": "正式指数来源及32日资料仍缺；生产安装切流授权和实际开市日观察按固定6项处理。",
     "explicit_goal_token_budget": null,
     "resume_control": "get_goal已实际返回active；当前无需再点Target继续。",
@@ -17,10 +17,10 @@
     "previous_goal_turn_evidence": "r12-auction-python311312-accepted-20261009-01.json：两版本原54节点通过并核原记录；集中审查形成唯一FCR-001并交原实现者。",
     "last_observation": {
       "classification": "actual_progress",
-      "observed_at": "2026-10-10T09:35:00+08:00",
-      "actual": "前端CI38012489178实际1207通过、1失败，报告和浏览器阶段未执行。仅测试数据签发与到期双时钟问题可复现：跨1ms生成120001ms而被原120000ms上限拒绝；未取得CI当次时间。单叶改为同一签发起点，原10项通过、0跳过，格式与自检通过，产品校验、断言和超时不变。原18项、141.785秒普通启动、构建和独立审查复用，元数据不重算。后端20作业通过、完整分片仍运行。只提交补修至原PR并完成必要正式CI。固定25项、19本地完成、6剩余、生产0/15，Target active，授权不扩大范围。",
-      "evidence": "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-f982-web-failure-01/macro-startup-diagnosis-01/sql-text-reuse-implementation-01/root-candidate-01/published-candidate-01/web-expiry-fixture-01/EV.json",
-      "next": "提交这处已自检的单叶测试补修和现有3个进度文档，由原PR的修后精确候选完成必要CI；保存原失败和取消，不增审查或完整本地重跑。"
+      "observed_at": "2026-10-10T10:03:04+08:00",
+      "actual": "候选f7dd4e0a前端正式CI为1207通过、1失败；首份晋级测试原10项正式通过。第二份仅改测试数据共用签发起点，原33项通过、0跳过，拒绝断言、产品和超时保持，已自检待集中发布。旧5435后端20通过、9取消、3失败、1跳过；其中一个分片在取消前实际退出245。原作者只复跑原停住的一个节点，在Linux3.11.16/ARM/UID0/12CPU诊断环境完整1P278.07秒，环境不同，不替代CI分片；原245未复现，源码补修为空。首次401及原245保留，45份证据、8份直接输入及清理回执已核，自有资源全清、作者停写。当前后端正式CI20作业通过、10分片运行、1跳过。先冻结必要测试单叶及进度文档，等现有CI结束后集中发布；原18项、141.785秒启动、构建与审查复用。规则已同步，Target实际active；固定25项、19本地完成、6剩余、生产0/15，无追加范围。",
+      "evidence": "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-f982-web-failure-01/macro-startup-diagnosis-01/sql-text-reuse-implementation-01/root-candidate-01/published-candidate-01/web-expiry-fixture-01/published-f7dd-01/promotion-fixture-01/EV.json",
+      "next": "冻结已自检的测试单叶和现有进度文档；等当前后端正式CI实际结束后集中发布必要补修至原PR。仅处理实际阻断，保留失败、取消和已有工作，复用有效验证，不新增诊断、审计、重构、完整本地重跑或审查阶段。"
     },
     "previous_blocked_audit": {
       "consecutive_goal_turns_without_available_safe_implementation": 3,
@@ -30,7 +30,7 @@
     },
     "blocked_audit": {
       "consecutive_goal_turns_without_available_safe_implementation": 0,
-      "condition": "测试单叶实际补修通过，继续必要提交和同候选正式CI。",
+      "condition": "原33项补修与原后端单节点证据已冻结，当前正式CI继续；执行必要候选收尾。",
       "update_goal_blocked_threshold": 3
     }
   },
@@ -65,7 +65,7 @@
       1,
       3
     ],
-    "confidence": "原10项测试补修通过，正式精确候选CI仍待；原18项、普通141.79秒启动、构建和独立审查复用。正式资料、生产授权与20个实际开市日另计。",
+    "confidence": "第二份测试单叶原33项补修通过；后端原一个节点在所记录的诊断环境完整通过，原245未复现、源码补修为空。正式同候选CI仍待，不据此承诺完成时间。正式资料、生产授权和20个开市日另计。",
     "assumptions": [
       "本地19项已验收，14个模块已本地验证；正式市场资料不由合成资料替代。",
       "唯一集中候选审查及原19叶CI补修复核已通过；本批实际阻断修复已冻；只作组合增量复核，复用有效测试。",
@@ -2430,7 +2430,7 @@
       "title": "整体候选最终验收",
       "category": "acceptance",
       "status": "in_progress",
-      "owner": "Root整合；原实现者局部补修和Linux启动验证；原审查者定向复核",
+      "owner": "Root测试数据局部补修与整合；原作者定向诊断已收尾；正式CI继续",
       "modules": [
         "M1",
         "M2",
@@ -2559,10 +2559,18 @@
         "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-f982-web-failure-01/macro-startup-diagnosis-01/sql-text-reuse-implementation-01/EV.json",
         "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-f982-web-failure-01/macro-startup-diagnosis-01/sql-text-reuse-implementation-01/reviewer-final-01/EV.json",
         "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-f982-web-failure-01/macro-startup-diagnosis-01/sql-text-reuse-implementation-01/root-candidate-01/published-candidate-01/RUNS.json",
-        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-f982-web-failure-01/macro-startup-diagnosis-01/sql-text-reuse-implementation-01/root-candidate-01/published-candidate-01/web-expiry-fixture-01/EV.json"
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-f982-web-failure-01/macro-startup-diagnosis-01/sql-text-reuse-implementation-01/root-candidate-01/published-candidate-01/web-expiry-fixture-01/EV.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-f982-web-failure-01/macro-startup-diagnosis-01/sql-text-reuse-implementation-01/root-candidate-01/published-candidate-01/web-expiry-fixture-01/PUBLISHED.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-f982-web-failure-01/macro-startup-diagnosis-01/sql-text-reuse-implementation-01/root-candidate-01/published-candidate-01/web-expiry-fixture-01/published-f7dd-01/web-failed-run.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-f982-web-failure-01/macro-startup-diagnosis-01/sql-text-reuse-implementation-01/root-candidate-01/published-candidate-01/web-expiry-fixture-01/published-f7dd-01/web-failed-job.log",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-f982-web-failure-01/macro-startup-diagnosis-01/sql-text-reuse-implementation-01/root-candidate-01/published-candidate-01/web-expiry-fixture-01/published-f7dd-01/promotion-fixture-01/EV.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-f982-web-failure-01/macro-startup-diagnosis-01/sql-text-reuse-implementation-01/root-candidate-01/published-candidate-01/web-expiry-fixture-01/published-f7dd-01/previous-shard0-failed-job.log",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-f982-web-failure-01/macro-startup-diagnosis-01/sql-text-reuse-implementation-01/root-candidate-01/published-candidate-01/web-expiry-fixture-01/published-f7dd-01/ci-watch.stdout",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/backend-shard0-exit245-01/docker-process-result.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/backend-shard0-exit245-01/EV.json"
       ],
       "closure_level": "pending",
-      "last_progress": "前端CI38012489178实际1207通过、1失败，报告和浏览器阶段未执行。仅测试数据签发与到期双时钟问题可复现：跨1ms生成120001ms而被原120000ms上限拒绝；未取得CI当次时间。单叶改为同一签发起点，原10项通过、0跳过，格式与自检通过，产品校验、断言和超时不变。原18项、141.785秒普通启动、构建和独立审查复用，元数据不重算。后端20作业通过、完整分片仍运行。只提交补修至原PR并完成必要正式CI。固定25项、19本地完成、6剩余、生产0/15，Target active，授权不扩大范围。",
+      "last_progress": "候选f7dd4e0a前端正式CI为1207通过、1失败；首份晋级测试原10项正式通过。第二份仅改测试数据共用签发起点，原33项通过、0跳过，拒绝断言、产品和超时保持，已自检待集中发布。旧5435后端20通过、9取消、3失败、1跳过；其中一个分片在取消前实际退出245。原作者只复跑原停住的一个节点，在Linux3.11.16/ARM/UID0/12CPU诊断环境完整1P278.07秒，环境不同，不替代CI分片；原245未复现，源码补修为空。首次401及原245保留，45份证据、8份直接输入及清理回执已核，自有资源全清、作者停写。当前后端正式CI20作业通过、10分片运行、1跳过。先冻结必要测试单叶及进度文档，等现有CI结束后集中发布；原18项、141.785秒启动、构建与审查复用。规则已同步，Target实际active；固定25项、19本地完成、6剩余、生产0/15，无追加范围。",
       "submilestones": [
         {
           "name": "网页最终候选准备门禁",
@@ -2714,9 +2722,9 @@
         }
       ],
       "pull_request": "https://github.com/roxorlt/rquant/pull/323",
-      "candidate_commit": "5435fcb17a49a8797f9cd738e5070282486788b5",
-      "remaining_hours_note": "只提交已自检的测试单叶和完成正式CI，未取得整体通过耗时。外部条件仍待。",
-      "published_candidate_commit": "5435fcb17a49a8797f9cd738e5070282486788b5"
+      "candidate_commit": "f7dd4e0a80c4e7a9234c22b945b2cb8a856bf2d6",
+      "remaining_hours_note": "必要测试单叶原33项已自检；后端产品补修为空，当前正式CI仍运行。收齐后集中发布，不追加验收阶段。",
+      "published_candidate_commit": "f7dd4e0a80c4e7a9234c22b945b2cb8a856bf2d6"
     },
     {
       "id": "R13",
@@ -4016,6 +4024,13 @@
       "delivery_unit_added": false,
       "actual": "前端CI38012489178实际1207通过、1失败，报告和浏览器阶段未执行。仅测试数据签发与到期双时钟问题可复现：跨1ms生成120001ms而被原120000ms上限拒绝；未取得CI当次时间。单叶改为同一签发起点，原10项通过、0跳过，格式与自检通过，产品校验、断言和超时不变。原18项、141.785秒普通启动、构建和独立审查复用，元数据不重算。后端20作业通过、完整分片仍运行。只提交补修至原PR并完成必要正式CI。固定25项、19本地完成、6剩余、生产0/15，Target active，授权不扩大范围。",
       "scope": "只改builtinPromotion.test.tsx同一签发起点；不改产品、守卫、断言、超时或工作流，不新增审查或测试组。"
+    },
+    {
+      "at": "2026-10-10T10:03:04+08:00",
+      "task_id": "R12",
+      "delivery_unit_added": false,
+      "actual": "候选f7dd4e0a前端正式CI为1207通过、1失败；首份晋级测试原10项正式通过。第二份仅改测试数据共用签发起点，原33项通过、0跳过，拒绝断言、产品和超时保持，已自检待集中发布。旧5435后端20通过、9取消、3失败、1跳过；其中一个分片在取消前实际退出245。原作者只复跑原停住的一个节点，在Linux3.11.16/ARM/UID0/12CPU诊断环境完整1P278.07秒，环境不同，不替代CI分片；原245未复现，源码补修为空。首次401及原245保留，45份证据、8份直接输入及清理回执已核，自有资源全清、作者停写。当前后端正式CI20作业通过、10分片运行、1跳过。先冻结必要测试单叶及进度文档，等现有CI结束后集中发布；原18项、141.785秒启动、构建与审查复用。规则已同步，Target实际active；固定25项、19本地完成、6剩余、生产0/15，无追加范围。",
+      "scope": "仅promotion.test.tsx两处准备记录共用签发起点；原作者证据写入已收尾，产品补修为空。不改产品、断言、超时或门禁，不新增诊断、审查、全量重跑或任务。"
     }
   ],
   "update_policy": [
@@ -4138,8 +4153,8 @@
           "R12"
         ],
         "status": "frozen_completed_or_waiting_final_candidate",
-        "work": "两行既有scope补修冻结，原7节点通过，交集中审查。",
-        "baseline_commit": "308708b4dbf6cdd722a5a45be93ba1c84924dcba"
+        "work": "原一个节点在Linux3.11.16 ARM UID0/12CPU完整1P278.07秒；原245未复现，源码补修为空。45份证据及8份直接输入已核，全部自有资源全清、写权归还，不追加诊断。",
+        "baseline_commit": "f7dd4e0a80c4e7a9234c22b945b2cb8a856bf2d6"
       },
       {
         "agent": "/root/ci_native_family_inputs",
@@ -4166,10 +4181,10 @@
       "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/.codex/config.toml"
     ],
     "live_reload_verified": true,
-    "root_work": "仅一测试数据叶补修、自检与必要候选提交；保持固定25项，复用原有效测试、审查和构建。",
+    "root_work": "冻结已自检的单叶测试数据补修及必要进度记录，保留当前正式CI；本轮原作者自有资源已全清、停写。",
     "waiting_subagents": 0,
     "runtime_capacity_evidence": "本轮app运行环境重新初始化后的原生元数据明确提供16个并发槽位，包含Root；不是修改配置后推断即时生效。",
     "active_subagents": [],
-    "next": "提交这处已自检的单叶测试补修和现有3个进度文档，由原PR的修后精确候选完成必要CI；保存原失败和取消，不增审查或完整本地重跑。"
+    "next": "冻结已自检的测试单叶和现有进度文档；等当前后端正式CI实际结束后集中发布必要补修至原PR。仅处理实际阻断，保留失败、取消和已有工作，复用有效验证，不新增诊断、审计、重构、完整本地重跑或审查阶段。"
   }
 }

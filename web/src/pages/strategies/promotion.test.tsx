@@ -163,14 +163,15 @@ function setup(initial = data(), role = currentRole()) {
         result = { ...result, review: lastReview, message: "评估完成，请核对证据。" };
       } else if (body.kind === "prepare_promotion_approval") {
         if (!lastReview) throw new Error("评估在确认前");
+        const issuedAt = Date.now();
         prepared = {
           actor_id: "tester",
           preparation_id: body.command_id,
           review: lastReview,
           role_revision: 1,
           role_state_hash: roleHash,
-          issued_at: new Date().toISOString(),
-          expires_at: new Date(Date.now() + 120_000).toISOString(),
+          issued_at: new Date(issuedAt).toISOString(),
+          expires_at: new Date(issuedAt + 120_000).toISOString(),
           issuance_proof: "4".repeat(64),
         };
         result = { ...result, preparation: prepared, message: "请核对阶段，并输入策略名称确认。" };
@@ -390,14 +391,15 @@ describe("原版本的阶段评估和手动晋级", () => {
             expected_revision: 0,
             selection: candidate.selection,
           });
+          const issuedAt = Date.now();
           const issued: Schemas["PreparedPromotionApproval-Output"] = {
             actor_id: change === "操作人" ? "other" : "tester",
             role_revision: change === "角色版本" ? 2 : 1,
             role_state_hash: change === "角色摘要" ? "a".repeat(64) : roleHash,
             preparation_id: body.command_id,
             issuance_proof: "4".repeat(64),
-            issued_at: new Date().toISOString(),
-            expires_at: new Date(Date.now() + (change === "过期" ? -1 : 120_000)).toISOString(),
+            issued_at: new Date(issuedAt).toISOString(),
+            expires_at: new Date(issuedAt + (change === "过期" ? -1 : 120_000)).toISOString(),
             review:
               change === "策略版本"
                 ? { ...prior, target: { ...target, head: { ...templateHead, version: 2 } } }
