@@ -1134,6 +1134,126 @@
         "title": "CommandReceipt",
         "type": "object"
       },
+      "ConditionHit": {
+        "properties": {
+          "close": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Close"
+          },
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "pct_chg": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pct Chg"
+          }
+        },
+        "required": [
+          "code",
+          "close",
+          "pct_chg"
+        ],
+        "title": "ConditionHit",
+        "type": "object"
+      },
+      "ConditionListData": {
+        "properties": {
+          "runs": {
+            "items": {
+              "$ref": "#/components/schemas/ConditionRun"
+            },
+            "title": "Runs",
+            "type": "array"
+          }
+        },
+        "required": [
+          "runs"
+        ],
+        "title": "ConditionListData",
+        "type": "object"
+      },
+      "ConditionRun": {
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "expression": {
+            "title": "Expression",
+            "type": "string"
+          },
+          "hits": {
+            "items": {
+              "$ref": "#/components/schemas/ConditionHit"
+            },
+            "title": "Hits",
+            "type": "array"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          },
+          "source_formula": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Formula"
+          },
+          "trade_date": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trade Date"
+          },
+          "universe": {
+            "title": "Universe",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "run_id",
+          "name",
+          "source_formula",
+          "expression",
+          "trade_date",
+          "created_at",
+          "universe",
+          "hits"
+        ],
+        "title": "ConditionRun",
+        "type": "object"
+      },
       "DataCenterData": {
         "properties": {
           "audit": {
@@ -1309,6 +1429,22 @@
           "serving"
         ],
         "title": "Envelope[BacktestListData]",
+        "type": "object"
+      },
+      "Envelope_ConditionListData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/ConditionListData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[ConditionListData]",
         "type": "object"
       },
       "Envelope_DataCenterData_": {
@@ -3182,6 +3318,53 @@
         "title": "TrackingPoint",
         "type": "object"
       },
+      "TranslateData": {
+        "properties": {
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "expression": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expression"
+          }
+        },
+        "required": [
+          "expression",
+          "error"
+        ],
+        "title": "TranslateData",
+        "type": "object"
+      },
+      "TranslateRequest": {
+        "properties": {
+          "tdx": {
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "Tdx",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tdx"
+        ],
+        "title": "TranslateRequest",
+        "type": "object"
+      },
       "ValidationError": {
         "properties": {
           "ctx": {
@@ -3445,6 +3628,24 @@
         "summary": "回测详情"
       }
     },
+    "/api/v1/conditions": {
+      "get": {
+        "operationId": "conditions_api_v1_conditions_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_ConditionListData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "条件选股结果"
+      }
+    },
     "/api/v1/data-center": {
       "get": {
         "operationId": "data_center_api_v1_data_center_get",
@@ -3518,6 +3719,44 @@
           }
         },
         "summary": "因子检验详情"
+      }
+    },
+    "/api/v1/formula/translate": {
+      "post": {
+        "operationId": "translate_formula_api_v1_formula_translate_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TranslateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TranslateData"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "通达信公式翻译（只校验，不执行）"
       }
     },
     "/api/v1/health": {

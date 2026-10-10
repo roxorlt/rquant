@@ -4,6 +4,7 @@ import { formatPrice } from "@/format/number";
 import { DataTable } from "@/table/DataTable";
 import { Button, ChangeText, PageHeader, Panel, Segmented, useToast } from "@/ui";
 import { QueryView } from "../shared";
+import { Conditions } from "./Conditions";
 
 const ALL = "__all__";
 
@@ -94,6 +95,7 @@ export default function ScreenerPage() {
           </Panel>
         )}
       </QueryView>
+      <Conditions />
     </>
   );
 }

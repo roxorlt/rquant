@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 from rquant.backtest.exposure import IndustryExposure
 from rquant.data_catalog.audit import AuditReport
 from rquant.data_catalog.models import CatalogDataset
+from rquant.factor.condition import ConditionRun
 from rquant.factor.evaluation import FactorTestResult
 from rquant.factor.store import FactorTracking
 from rquant.web.overfit_stats import OverfitStats
@@ -401,3 +402,16 @@ class StrategyRow(BaseModel):
 
 class StrategyListData(BaseModel):
     strategies: list[StrategyRow]
+
+
+class TranslateRequest(BaseModel):
+    tdx: str = Field(min_length=1, max_length=2000)
+
+
+class TranslateData(BaseModel):
+    expression: str | None
+    error: str | None
+
+
+class ConditionListData(BaseModel):
+    runs: list[ConditionRun]

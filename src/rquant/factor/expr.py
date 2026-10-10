@@ -48,6 +48,13 @@ FUNCS: Mapping[str, tuple[int, Callable[..., pd.DataFrame]]] = {
 }
 
 _BIN = {ast.Add: np.add, ast.Sub: np.subtract, ast.Mult: np.multiply, ast.Div: np.divide}
+_CMP = {ast.Gt: np.greater, ast.GtE: np.greater_equal, ast.Lt: np.less,
+        ast.LtE: np.less_equal, ast.Eq: np.equal, ast.NotEq: np.not_equal}
+
+
+def _as_float(x: object) -> object:
+    """Booleans become 1.0/0.0; NaN inputs stay NaN so warm-up rows don't pass."""
+    return x.astype("float64") if isinstance(x, pd.DataFrame) else float(x)  # type: ignore[arg-type]
 
 
 def validate(expression: str) -> ast.Expression:
@@ -71,7 +78,8 @@ def validate(expression: str) -> ast.Expression:
             if node.id not in FIELDS and node.id not in FUNCS:
                 raise FactorExpressionError(f"未知字段：{node.id}")
         elif not isinstance(node, (ast.Expression, ast.BinOp, ast.UnaryOp, ast.Constant,
-                                   ast.Load, ast.USub, *_BIN)):
+                                   ast.Load, ast.USub, ast.Not, ast.Compare, ast.BoolOp,
+                                   ast.And, ast.Or, *_BIN, *_CMP)):
             raise FactorExpressionError(f"不支持的语法：{type(node).__name__}")
         if isinstance(node, ast.Constant) and not isinstance(node.value, (int, float)):
             raise FactorExpressionError("只允许数字常量")
@@ -89,7 +97,28 @@ def evaluate(expression: str, panel: Mapping[str, pd.DataFrame]) -> pd.DataFrame
         if isinstance(node, ast.Name):
             return panel[node.id]
         if isinstance(node, ast.UnaryOp):
+            if isinstance(node.op, ast.Not):
+                return 1.0 - ev(node.operand)  # type: ignore[operator]
             return -ev(node.operand)  # type: ignore[operator]
+        if isinstance(node, ast.Compare):
+            left = ev(node.left)
+            out: object = None
+            for op, comparator in zip(node.ops, node.comparators, strict=True):
+                right = ev(comparator)
+                part = _as_float(_CMP[type(op)](left, right))
+                for side in (left, right):
+                    if isinstance(side, pd.DataFrame):
+                        part = part.where(side.notna())  # type: ignore[union-attr]
+                out = part if out is None else out * part  # type: ignore[operator]
+                left = right
+            return out
+        if isinstance(node, ast.BoolOp):
+            values = [ev(v) for v in node.values]
+            acc = values[0]
+            for v in values[1:]:
+                is_and = isinstance(node.op, ast.And)
+                acc = acc * v if is_and else np.maximum(acc, v)  # type: ignore[operator]
+            return acc
         if isinstance(node, ast.BinOp):
             return _BIN[type(node.op)](ev(node.left), ev(node.right))
         assert isinstance(node, ast.Call) and isinstance(node.func, ast.Name)

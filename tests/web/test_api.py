@@ -227,3 +227,19 @@ def test_alert_rules_save_through_page_control_and_read_back() -> None:
     (rule,) = client.get("/api/v1/alert-rules").json()["data"]["rules"]
     assert (rule["rule_id"], rule["pools"], rule["cooldown_minutes"]) == ("p2", ["pool2"], 15)
     assert client.post("/api/v1/alert-rules", json={**body, "rule_id": "Bad"}).status_code == 422
+
+
+def test_tdx_translate_and_condition_results(tmp_path) -> None:
+    from fastapi.testclient import TestClient
+
+    from rquant.web.app import create_app
+    from rquant.web.source import FixtureSource, write_demo_research
+
+    write_demo_research(tmp_path)
+    client = TestClient(create_app(FixtureSource(), dist=None, research_root=tmp_path))
+    ok = client.post("/api/v1/formula/translate", json={"tdx": "C>MA(C,5)"}).json()
+    assert ok == {"expression": "close>ts_mean(close,5)", "error": None}
+    bad = client.post("/api/v1/formula/translate", json={"tdx": "CROSS(C,1)"}).json()
+    assert bad["expression"] is None and "CROSS" in bad["error"]
+    (run,) = client.get("/api/v1/conditions").json()["data"]["runs"]
+    assert run["source_formula"].startswith("C>MA")

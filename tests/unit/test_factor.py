@@ -77,3 +77,46 @@ def test_tracking_recomputes_recent_ic(tmp_path) -> None:
     assert tracking.points and tracking.research_ic == run.result.mean_ic
     save_tracking(tracking, tmp_path)
     assert read_tracking(run.factor_id, tmp_path) == tracking
+
+
+def test_comparisons_and_boolean_ops() -> None:
+    panel = _panel(30, 5)
+    hit = evaluate("close > ts_mean(close, 5) and not vol < 0", panel)
+    assert set(hit.iloc[-1].unique()) <= {0.0, 1.0}
+    assert hit.iloc[:4].isna().all().all()  # warm-up stays NaN, never a "hit"
+
+
+@pytest.mark.parametrize(("tdx", "expr"), [
+    ("C>MA(C,5)", "close>ts_mean(close,5)"),
+    ("MA5:=MA(C,5);MA10:=MA(C,10);CROSS1:=MA5>MA10;CROSS1 AND V>REF(V,1)*2",
+     "((ts_mean(close,5))>(ts_mean(close,10))) and vol>delay(vol,1)*2"),
+    ("C=HHV(H,20) OR C<>REF(C,1)", "close==ts_max(high,20) or close!=delay(close,1)"),
+])
+def test_tdx_translation(tdx: str, expr: str) -> None:
+    from rquant.factor.tdx import translate
+
+    assert translate(tdx) == expr
+    evaluate(expr, _panel(30, 5))
+
+
+@pytest.mark.parametrize("bad", ["CROSS(C,MA(C,5))", "C>MA(C,N)", "DRAWTEXT(1,2,'x')", ""])
+def test_tdx_unsupported_is_explicit(bad: str) -> None:
+    from rquant.factor.tdx import TdxFormulaError, translate
+
+    with pytest.raises(TdxFormulaError):
+        translate(bad)
+
+
+def test_condition_screen_uses_last_day_only(tmp_path) -> None:
+    from rquant.factor.condition import list_conditions, save, screen
+    from rquant.factor.tdx import translate
+
+    panel = _panel(40, 20)
+    expr = translate("C>MA(C,5)")
+    trade_date, universe, hits = screen(panel, expr)
+    last = panel["close"].iloc[-1]
+    ma = panel["close"].rolling(5).mean().iloc[-1]
+    assert trade_date == panel["close"].index[-1].date() and universe == 20
+    assert [h.code for h in hits] == sorted(last[last > ma].index)
+    run = save("站上5日线", expr, "C>MA(C,5)", (trade_date, universe, hits), root=tmp_path)
+    assert list_conditions(tmp_path)[0].run_id == run.run_id

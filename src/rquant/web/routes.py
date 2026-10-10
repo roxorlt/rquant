@@ -18,7 +18,10 @@ from rquant.backtest.store import list_runs, read_run
 from rquant.backtest.strategy import list_strategies
 from rquant.data_catalog.audit import read_report
 from rquant.data_catalog.models import CatalogDocument
+from rquant.factor.condition import list_conditions
 from rquant.factor.store import list_factors, read_factor, read_tracking
+from rquant.factor.tdx import TdxFormulaError
+from rquant.factor.tdx import translate as translate_tdx
 from rquant.web import page_control
 from rquant.web.backtest_perf import backtest_perf, perf_from_returns
 from rquant.web.models import (
@@ -35,6 +38,7 @@ from rquant.web.models import (
     BacktestTrade,
     BoardItem,
     CommandReceipt,
+    ConditionListData,
     DataCenterData,
     Envelope,
     FactorDetailData,
@@ -67,6 +71,8 @@ from rquant.web.models import (
     SignalItem,
     StrategyListData,
     StrategyRow,
+    TranslateData,
+    TranslateRequest,
 )
 from rquant.web.overfit_stats import overfit_stats, sharpe_per_period
 from rquant.web.source import Source, table_missing
@@ -391,6 +397,21 @@ def factor_detail(factor_id: str, request: Request,
     return _envelope(source, FactorDetailData(factor=_factor_summary(run, root),
                                               result=run.result,
                                               tracking=read_tracking(factor_id, root)))
+
+
+@router.post("/formula/translate", response_model=TranslateData,
+             summary="通达信公式翻译（只校验，不执行）")
+def translate_formula(body: TranslateRequest) -> TranslateData:
+    try:
+        return TranslateData(expression=translate_tdx(body.tdx), error=None)
+    except TdxFormulaError as exc:
+        return TranslateData(expression=None, error=str(exc))
+
+
+@router.get("/conditions", response_model=Envelope[ConditionListData], summary="条件选股结果")
+def conditions(request: Request, source: SourceDep) -> Envelope[ConditionListData]:
+    return _envelope(source, ConditionListData(
+        runs=list_conditions(_research_root(request))[:50]))
 
 
 _CATALOG = Path(__file__).resolve().parents[1] / "data_catalog" / "catalog-v1.json"

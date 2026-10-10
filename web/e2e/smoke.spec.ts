@@ -66,3 +66,10 @@ test("an alert rule saved through page control shows up", async ({ page }) => {
   await page.getByRole("button", { name: "保存规则" }).click();
   await expect(page.getByLabel("告警规则", { exact: true })).toContainText("二号池一档");
 });
+
+test("tdx formula translates and condition hits are listed", async ({ page }) => {
+  await page.goto("./#/screener");
+  await page.getByRole("button", { name: "翻译" }).click();
+  await expect(page.getByLabel("翻译结果")).toContainText("ts_mean(close,5)");
+  await expect(page.getByText("演示条件：站上5日线且上涨")).toBeVisible();
+});
