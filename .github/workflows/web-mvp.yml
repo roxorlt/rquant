@@ -41,7 +41,7 @@ jobs:
       - name: Python lint + API tests
         run: |
           uv run ruff check src/rquant/web src/rquant/backtest src/rquant/factor \
-            src/rquant/data_catalog src/rquant/alert_rules.py tests/web
+            src/rquant/data_catalog src/rquant/alert_rules.py src/rquant/fundamentals.py tests/web
           uv run pytest -q tests/web
       - name: Roadmap module unit tests
         run: |

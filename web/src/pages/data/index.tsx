@@ -1,16 +1,56 @@
 import { useState } from "react";
-import { useDataCenter } from "@/api/endpoints";
+import { useDataCenter, useFundamentals } from "@/api/endpoints";
 import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
 import { PageHeader, Panel, Pill } from "@/ui";
 import { QueryView } from "../shared";
+
+function Fundamentals() {
+  const query = useFundamentals();
+  const doc = query.data;
+  if (!doc) {
+    return (
+      <Panel title="财务指标" sub="尚无数据：python -m rquant.fundamentals --codes 600519.SH,…">
+        <p className="hint">Tushare fina_indicator，每只股票取最近报告期</p>
+      </Panel>
+    );
+  }
+  const keys = Object.keys(doc.fields);
+  return (
+    <Panel
+      title={`财务指标 · ${doc.rows.length}`}
+      sub={`Tushare fina_indicator，更新于 ${formatShanghaiDateTime(doc.fetched_at)}`}
+      flush
+    >
+      <DataTable
+        label="财务指标"
+        rows={doc.rows}
+        rowKey={(r) => r.code}
+        columns={[
+          { id: "code", header: "代码", value: (r) => r.code },
+          { id: "end", header: "报告期", value: (r) => r.end_date },
+          ...keys.map((k) => ({
+            id: k,
+            header: doc.fields[k] ?? k,
+            numeric: true,
+            value: (r: (typeof doc.rows)[number]) => r.values[k] ?? null,
+            cell: (r: (typeof doc.rows)[number]) => {
+              const v = r.values[k];
+              return v === null || v === undefined ? "—" : v.toFixed(2);
+            },
+          })),
+        ]}
+      />
+    </Panel>
+  );
+}
 
 export default function DataCenterPage() {
   const query = useDataCenter();
   const [picked, setPicked] = useState<string | null>(null);
   return (
     <>
-      <PageHeader eyebrow="运维" title="数据中心" />
+      <PageHeader eyebrow="数据" title="数据中心" />
       <QueryView query={query}>
         {(data) => {
           const coverage = new Map((data.audit?.datasets ?? []).map((c) => [c.dataset_id, c]));
@@ -88,6 +128,7 @@ export default function DataCenterPage() {
           );
         }}
       </QueryView>
+      <Fundamentals />
     </>
   );
 }

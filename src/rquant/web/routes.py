@@ -23,7 +23,11 @@ from rquant.factor.condition import list_conditions
 from rquant.factor.store import list_factors, read_factor, read_tracking
 from rquant.factor.tdx import TdxFormulaError
 from rquant.factor.tdx import translate as translate_tdx
+from rquant.fundamentals import FundamentalsDoc
+from rquant.fundamentals import read as read_fundamentals
 from rquant.web import page_control
+from rquant.web import query as sql_query
+from rquant.web import tasks as task_view
 from rquant.web.ai_explain import Explanation, build_facts, deepseek_complete, explain
 from rquant.web.backtest_perf import backtest_perf, perf_from_returns
 from rquant.web.health_layers import build_layers
@@ -81,7 +85,7 @@ from rquant.web.models import (
     TranslateRequest,
 )
 from rquant.web.overfit_stats import overfit_stats, sharpe_per_period
-from rquant.web.source import Source, table_missing
+from rquant.web.source import Source, SourceUnavailableError, table_missing
 
 router = APIRouter(prefix="/api/v1")
 T = TypeVar("T")
@@ -615,3 +619,50 @@ def save_alert_rule(body: AlertRuleBody, request: Request) -> CommandReceipt:
 def add_watch(body: AddWatchRequest, request: Request) -> CommandReceipt:
     return _send(request, "add_watchlist_item", {"item": {"ts_code": body.code,
                                                            "note": body.note}})
+
+
+@router.get("/tasks", response_model=Envelope[list[task_view.TaskRow]],
+            summary="任务与调度（只读）")
+def tasks(request: Request, source: SourceDep) -> Envelope[list[task_view.TaskRow]]:
+    runner = getattr(request.app.state, "task_runner", None) or task_view.run
+    try:
+        rows = task_view.list_tasks(runner)
+    except Exception as exc:  # noqa: BLE001 - no systemd (dev box) is not an API failure
+        raise HTTPException(503, f"读取 systemd 失败：{type(exc).__name__}") from exc
+    return _envelope(source, rows)
+
+
+@router.get("/tasks/{unit}/log", response_model=Envelope[task_view.TaskLog], summary="任务日志")
+def task_log(request: Request, source: SourceDep, unit: str,
+             lines: int = 200) -> Envelope[task_view.TaskLog]:
+    runner = getattr(request.app.state, "task_runner", None) or task_view.run
+    return _envelope(source, task_view.tail(unit, lines, runner))
+
+
+@router.post("/query", response_model=Envelope[sql_query.QueryResult], summary="只读查询")
+def run_query(request: Request, source: SourceDep,
+              body: sql_query.QueryRequest) -> Envelope[sql_query.QueryResult]:
+    if _role(request) != "admin":
+        raise HTTPException(403, "只读账号不能执行查询")
+    try:
+        sql = sql_query.guard(body.sql)
+        rows = source.query(sql)
+    except sql_query.QueryError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except SourceUnavailableError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - SQL errors go back to the user verbatim
+        raise HTTPException(400, f"{type(exc).__name__}: {str(exc)[:300]}") from exc
+    return _envelope(source, sql_query.shape(rows))
+
+
+@router.get("/query/tables", response_model=Envelope[list[str]], summary="可查询的表")
+def query_tables(source: SourceDep) -> Envelope[list[str]]:
+    rows = source.query("SELECT table_name FROM information_schema.tables ORDER BY 1")
+    return _envelope(source, [r["table_name"] for r in rows])
+
+
+@router.get("/fundamentals", response_model=Envelope[FundamentalsDoc | None], summary="财务指标")
+def fundamentals(request: Request, source: SourceDep) -> Envelope[FundamentalsDoc | None]:
+    root = _research_root(request) or research_root()
+    return _envelope(source, read_fundamentals(Path(root)))

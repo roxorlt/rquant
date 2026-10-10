@@ -276,3 +276,55 @@ export function useOperations(): ServingQueryResult<Schemas["OperationsData"]> {
     return unwrap(data, response);
   });
 }
+
+export function useTasks(): ServingQueryResult<Schemas["TaskRow"][]> {
+  return useServingQuery(["tasks"], async () => {
+    const { data, response } = await apiClient().GET("/api/v1/tasks");
+    return unwrap(data, response);
+  });
+}
+
+export function useTaskLog(unit: string | null): ServingQueryResult<Schemas["TaskLog"]> {
+  return useServingQuery(
+    ["tasks", unit],
+    async () => {
+      const { data, response } = await apiClient().GET("/api/v1/tasks/{unit}/log", {
+        params: { path: { unit: unit ?? "" } },
+      });
+      return unwrap(data, response);
+    },
+    { enabled: unit !== null },
+  );
+}
+
+export function useQueryTables(): ServingQueryResult<string[]> {
+  return useServingQuery(["query-tables"], async () => {
+    const { data, response } = await apiClient().GET("/api/v1/query/tables");
+    return unwrap(data, response);
+  });
+}
+
+export function useRunQuery() {
+  return useMutation({
+    mutationFn: async (sql: string) => {
+      const { data, error, response } = await apiClient().POST("/api/v1/query", {
+        body: { sql },
+      });
+      if (data === undefined) {
+        const detail = (error as { detail?: unknown } | undefined)?.detail;
+        throw new ApiError(
+          response.status,
+          typeof detail === "string" ? detail : `HTTP ${response.status}`,
+        );
+      }
+      return data.data;
+    },
+  });
+}
+
+export function useFundamentals(): ServingQueryResult<Schemas["FundamentalsDoc"] | null> {
+  return useServingQuery(["fundamentals"], async () => {
+    const { data, response } = await apiClient().GET("/api/v1/fundamentals");
+    return unwrap(data, response);
+  });
+}
