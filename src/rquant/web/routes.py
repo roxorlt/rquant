@@ -12,6 +12,7 @@ from typing import Annotated, Any, TypeVar
 import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, Request
 
+from rquant.backtest.exposure import industry_exposure
 from rquant.backtest.store import list_runs, read_run
 from rquant.web import page_control
 from rquant.web.backtest_perf import backtest_perf, perf_from_returns
@@ -317,7 +318,7 @@ def portfolio_backtest(run_id: str, request: Request, source: SourceDep,
     holdings = run.result.days[-1].positions if run.result.days else {}
     return _envelope(source, PortfolioRunDetailData(
         run=_portfolio_summary(run), perf=perf, orders=orders, holdings=holdings,
-        overfit=overfit_stats(returns, family)))
+        overfit=overfit_stats(returns, family), exposure=industry_exposure(run)))
 
 
 def _benchmark_rows(source: Source, code: str) -> list[dict[str, Any]]:

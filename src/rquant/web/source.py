@@ -206,4 +206,6 @@ def write_demo_research(root: Path) -> None:
                          PortfolioCandidate(ts_code="000001.SZ")]}
     config = BacktestConfig(weights=PortfolioWeightRule(max_positions=2))
     save(run_backtest(days, bars, signals, config), preset="breakout", start=days[0],
-         end=days[-1], root=root, title="演示组合回测")
+         end=days[-1], root=root, title="演示组合回测",
+         industries={"600519.SH": "白酒", "000001.SZ": "银行"},
+         pool_last=["600519.SH", "000001.SZ"])

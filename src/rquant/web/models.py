@@ -7,6 +7,7 @@ from typing import Generic, Literal, TypeVar
 
 from pydantic import BaseModel, Field
 
+from rquant.backtest.exposure import IndustryExposure
 from rquant.web.overfit_stats import OverfitStats
 
 T = TypeVar("T")
@@ -253,6 +254,7 @@ class PortfolioRunDetailData(BaseModel):
     orders: list[PortfolioOrder]
     holdings: dict[str, int]
     overfit: OverfitStats | None = None
+    exposure: list[IndustryExposure] = []
 
 
 class PortfolioCompareSide(BaseModel):

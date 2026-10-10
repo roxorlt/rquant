@@ -85,6 +85,32 @@ function Detail({ runId, onCompare }: { runId: string; onCompare: () => void }) 
               ]}
             />
           </Panel>
+          {data.exposure.length ? (
+            <Panel title="行业暴露" sub="期末权重 vs 最后一次候选池等权" flush>
+              <table className="tbl" aria-label="行业暴露">
+                <thead>
+                  <tr>
+                    <th>行业</th>
+                    <th className="num">期末</th>
+                    <th className="num">平均</th>
+                    <th className="num">候选池</th>
+                    <th className="num">偏离</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {data.exposure.map((row) => (
+                    <tr key={row.industry}>
+                      <td>{row.industry}</td>
+                      <td className="num">{pct(row.weight)}</td>
+                      <td className="num">{pct(row.avg_weight)}</td>
+                      <td className="num">{pct(row.pool_weight)}</td>
+                      <td className="num">{pct(row.deviation)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </Panel>
+          ) : null}
           <Panel title={`委托 · ${data.orders.length}`} sub="含拒单原因" flush>
             <DataTable
               label="组合回测委托"

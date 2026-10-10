@@ -559,6 +559,19 @@ export interface components {
             /** Unrealized Pnl */
             unrealized_pnl: number;
         };
+        /** IndustryExposure */
+        IndustryExposure: {
+            /** Avg Weight */
+            avg_weight: number;
+            /** Deviation */
+            deviation: number;
+            /** Industry */
+            industry: string;
+            /** Pool Weight */
+            pool_weight: number;
+            /** Weight */
+            weight: number;
+        };
         /** Kpi */
         Kpi: {
             /** Key */
@@ -740,6 +753,11 @@ export interface components {
         };
         /** PortfolioRunDetailData */
         PortfolioRunDetailData: {
+            /**
+             * Exposure
+             * @default []
+             */
+            exposure: components["schemas"]["IndustryExposure"][];
             /** Holdings */
             holdings: {
                 [key: string]: number;

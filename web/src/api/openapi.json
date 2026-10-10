@@ -1158,6 +1158,39 @@
         "title": "HoldingItem",
         "type": "object"
       },
+      "IndustryExposure": {
+        "properties": {
+          "avg_weight": {
+            "title": "Avg Weight",
+            "type": "number"
+          },
+          "deviation": {
+            "title": "Deviation",
+            "type": "number"
+          },
+          "industry": {
+            "title": "Industry",
+            "type": "string"
+          },
+          "pool_weight": {
+            "title": "Pool Weight",
+            "type": "number"
+          },
+          "weight": {
+            "title": "Weight",
+            "type": "number"
+          }
+        },
+        "required": [
+          "industry",
+          "weight",
+          "avg_weight",
+          "pool_weight",
+          "deviation"
+        ],
+        "title": "IndustryExposure",
+        "type": "object"
+      },
       "Kpi": {
         "properties": {
           "key": {
@@ -1735,6 +1768,14 @@
       },
       "PortfolioRunDetailData": {
         "properties": {
+          "exposure": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/IndustryExposure"
+            },
+            "title": "Exposure",
+            "type": "array"
+          },
           "holdings": {
             "additionalProperties": {
               "type": "integer"

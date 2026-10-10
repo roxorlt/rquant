@@ -77,6 +77,8 @@ class DayRecord(BaseModel):
     market_value: float
     nav: float
     positions: dict[str, int]
+    #: market value per held code at the close
+    values: dict[str, float] = {}
 
 
 class BacktestResult(BaseModel):
@@ -171,7 +173,9 @@ def run_backtest(
         value = sum(q * last_close.get(c, 0.0) for c, q in held.items())
         records.append(DayRecord(trade_date=day, cash=round(cash, 2),
                                  market_value=round(value, 2),
-                                 nav=(cash + value) / config.capital, positions=dict(held)))
+                                 nav=(cash + value) / config.capital, positions=dict(held),
+                                 values={c: round(q * last_close.get(c, 0.0), 2)
+                                         for c, q in held.items()}))
         if day in signals:
             if signal_count % config.rebalance_every == 0:
                 pending = signals[day]
