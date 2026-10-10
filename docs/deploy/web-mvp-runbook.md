@@ -14,6 +14,9 @@
 | 盯盘 / Streamlit | `rquant-monitor`（由 timer 触发）和所有 Streamlit 都跑在 `~/rquant` 这份 checkout 上，**版本停在 e4e303b（2026-08-04）**，`.venv` 是 Python 3.14 |
 | 工具 | 有 python3.11、node **18**（版本太低，前端构建不了）、htpasswd；没有 uv、pnpm。lighthouse 有 sudo 免密 ALL 权限 |
 
+## 一期前置条件（2026-10-10 实测拦截）
+生产 Serving（`~/rquant/data/runtime/serving/generations`）**从未发布过任何代**（自 9/5 起为空，无 current 指针），`rquant-web` 指向它只会返回“current pointer is missing”。一期必须先让 runtime 的 serving 发布者产出生产代，或经批准临时指向 replay Serving（现状临时进程即如此）。pip 安装需用腾讯镜像 `-i https://mirrors.cloud.tencent.com/pypi/simple/`（pypi.org 实测极慢）。
+
 ## 一期：只上网页（安全，不碰 runtime、`~/rquant` 和市场全景）
 在 box 上：
 1. `cd /workspace/rQuant && git rev-parse --short HEAD`，记下来作为 `$REL`
