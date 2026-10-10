@@ -11,6 +11,7 @@ from rquant.backtest.exposure import IndustryExposure
 from rquant.data_catalog.audit import AuditReport
 from rquant.data_catalog.models import CatalogDataset
 from rquant.factor.evaluation import FactorTestResult
+from rquant.factor.store import FactorTracking
 from rquant.web.overfit_stats import OverfitStats
 
 T = TypeVar("T")
@@ -353,6 +354,8 @@ class FactorSummary(BaseModel):
     mean_ic: float | None
     ic_ir: float | None
     long_short: float | None
+    recent_ic: float | None = None
+    tracked_to: date | None = None
 
 
 class FactorListData(BaseModel):
@@ -362,3 +365,4 @@ class FactorListData(BaseModel):
 class FactorDetailData(BaseModel):
     factor: FactorSummary
     result: FactorTestResult
+    tracking: FactorTracking | None = None

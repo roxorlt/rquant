@@ -62,3 +62,18 @@ def test_store_round_trip(tmp_path) -> None:
     assert result.ic_series[0].date >= date(2026, 2, 2)
     assert read_factor(run.factor_id, tmp_path) == run
     assert [r.factor_id for r in list_factors(tmp_path)] == [run.factor_id]
+
+
+def test_tracking_recomputes_recent_ic(tmp_path) -> None:
+    from rquant.factor.store import read_tracking, save_tracking, track
+
+    panel = _panel(days=120)
+    end = panel["close"].index[-1].date()
+    run = save("动量5", "ts_delta(close, 5)", date(2026, 2, 2), date(2026, 3, 2),
+               run_factor(panel, "ts_delta(close, 5)", date(2026, 2, 2), date(2026, 3, 2)),
+               root=tmp_path)
+    tracking = track(run, panel, end, lookback_days=60)
+    assert tracking.latest_date is not None and tracking.latest_date <= end
+    assert tracking.points and tracking.research_ic == run.result.mean_ic
+    save_tracking(tracking, tmp_path)
+    assert read_tracking(run.factor_id, tmp_path) == tracking

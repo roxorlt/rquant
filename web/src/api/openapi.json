@@ -1372,6 +1372,16 @@
           },
           "result": {
             "$ref": "#/components/schemas/FactorTestResult"
+          },
+          "tracking": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FactorTracking"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -1457,10 +1467,33 @@
             "title": "Name",
             "type": "string"
           },
+          "recent_ic": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recent Ic"
+          },
           "start": {
             "format": "date",
             "title": "Start",
             "type": "string"
+          },
+          "tracked_to": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tracked To"
           }
         },
         "required": [
@@ -1583,6 +1616,82 @@
           "decay"
         ],
         "title": "FactorTestResult",
+        "type": "object"
+      },
+      "FactorTracking": {
+        "properties": {
+          "factor_id": {
+            "title": "Factor Id",
+            "type": "string"
+          },
+          "latest_date": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Latest Date"
+          },
+          "points": {
+            "items": {
+              "$ref": "#/components/schemas/TrackingPoint"
+            },
+            "title": "Points",
+            "type": "array"
+          },
+          "recent_ic": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recent Ic"
+          },
+          "research_ic": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Research Ic"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          },
+          "window_end": {
+            "format": "date",
+            "title": "Window End",
+            "type": "string"
+          },
+          "window_start": {
+            "format": "date",
+            "title": "Window Start",
+            "type": "string"
+          }
+        },
+        "required": [
+          "factor_id",
+          "updated_at",
+          "window_start",
+          "window_end",
+          "latest_date",
+          "recent_ic",
+          "research_ic",
+          "points"
+        ],
+        "title": "FactorTracking",
         "type": "object"
       },
       "FreshnessItem": {
@@ -2784,6 +2893,37 @@
           "action"
         ],
         "title": "SignalItem",
+        "type": "object"
+      },
+      "TrackingPoint": {
+        "properties": {
+          "date": {
+            "format": "date",
+            "title": "Date",
+            "type": "string"
+          },
+          "ic": {
+            "title": "Ic",
+            "type": "number"
+          },
+          "rolling": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rolling"
+          }
+        },
+        "required": [
+          "date",
+          "ic",
+          "rolling"
+        ],
+        "title": "TrackingPoint",
         "type": "object"
       },
       "ValidationError": {
