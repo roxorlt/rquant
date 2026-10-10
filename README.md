@@ -218,13 +218,10 @@ bash scripts/check-core-quality.sh
 .venv/bin/rquant daily-indicator-backfill \
   --start-date 2026-03-31 --end-date 2026-07-16 --apply
 
-# 健康看板
-.venv/bin/streamlit run src/rquant/dashboard/app.py --server.port 8501
+# 网页（React MVP，只读 + 3 个写操作，见 web/README.md）
+uv run python -m rquant.web serve            # http://127.0.0.1:8768/app/
 
-# Strategy Lab（提交到持久 Job Center；关闭页面或切换页签不影响后台任务）
-.venv/bin/streamlit run src/rquant/dashboard/strategy_lab.py --server.port 8504
-
-# 盘中全景
+# 盘中全景（唯一保留的 Streamlit 页面；健康看板 / NL 选股 / 画布 / Strategy Lab 已下线）
 .venv/bin/streamlit run src/rquant/dashboard/market_panorama.py --server.port 8506
 
 # 生成可恢复的策略分钟回补计划（只读副本；截止日自动移动到完整 B/S 窗口可观测上限）

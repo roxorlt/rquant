@@ -1341,7 +1341,7 @@ def test_monitor_runner_invokes_shadow_export_after_the_close(
 
     monkeypatch.setattr(monitor_module, "DuckDBStore", _Store)
     monkeypatch.setattr(monitor_module, "is_trading_day", lambda _day: True)
-    monkeypatch.setattr(monitor_module, "build_watchlist", lambda _store: [item])
+    monkeypatch.setattr(monitor_module, "build_watchlist", lambda _store, **_: [item])
     monkeypatch.setattr(monitor_module, "IntradayMinuteQuoteProvider", lambda **_kwargs: object())
     monkeypatch.setattr(monitor_module, "_publish_research_watchlist", lambda *_args: None)
     monkeypatch.setattr(monitor_module, "_wait_for_market_open", lambda: None)

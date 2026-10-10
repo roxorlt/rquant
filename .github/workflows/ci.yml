@@ -1,9 +1,8 @@
 name: CI
 
+# Legacy heavy suite disabled (user decision 2026-10-10); web-mvp.yml is the only gate.
 on:
-  pull_request:
-  push:
-    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read

@@ -1039,6 +1039,7 @@ def notifier_builder(
                 )
             if settings.page_projection_database_path is not None:
                 from rquant.canvas_publication_receipt import Ed25519CanvasPublicationKeyring
+                from rquant.page_control import ALERT_ACK_LOG, WATCHLIST_LOG
                 from rquant.readside_replica_gate import NOTIFIER_PAGE_PROJECTION_PROFILE
                 from rquant.serving_page_projection_source import (
                     DuckDBSignalPageProjectionSource,
@@ -1074,6 +1075,20 @@ def notifier_builder(
                         clock=clock,
                         surge_live_root=settings.page_projection_surge_live_root,
                         canvas_catalog_root=settings.page_projection_canvas_catalog_root,
+                        #: web 告警确认: page control appends acks beside the canvas catalog
+                        #: (<page-control data dir>/alert_acks/acks.jsonl).
+                        alert_ack_log=(
+                            None
+                            if settings.page_projection_canvas_catalog_root is None
+                            else Path(settings.page_projection_canvas_catalog_root).parent
+                            / ALERT_ACK_LOG
+                        ),
+                        watchlist_log=(
+                            None
+                            if settings.page_projection_canvas_catalog_root is None
+                            else Path(settings.page_projection_canvas_catalog_root).parent
+                            / WATCHLIST_LOG
+                        ),
                         canvas_receipt_root=settings.page_projection_canvas_receipt_root,
                         canvas_publication_keyring=canvas_keyring,
                         #: #241: the outbox belongs to the page-control service and its
