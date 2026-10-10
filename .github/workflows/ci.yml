@@ -1,9 +1,56 @@
 name: CI
 
 on:
+  # Heavy legacy suite: only when legacy/core paths change. New lean code is gated by web-mvp.yml.
   pull_request:
+    paths-ignore:
+      - "web/**"
+      - "src/rquant/web/**"
+      - "tests/web/**"
+      - "docs/**"
+      - ".github/workflows/web-mvp.yml"
+      - "src/rquant/perf/**"
+      - "src/rquant/portfolio/**"
+      - "src/rquant/backtest/**"
+      - "src/rquant/factor/**"
+      - "src/rquant/data_catalog/**"
+      - "src/rquant/overfit.py"
+      - "src/rquant/overfit_pbo.py"
+      - "src/rquant/alert_rules.py"
+      - "tests/unit/test_perf*.py"
+      - "tests/unit/test_portfolio_*.py"
+      - "tests/unit/test_backtest_*.py"
+      - "tests/unit/test_factor.py"
+      - "tests/unit/test_data_catalog.py"
+      - "tests/unit/test_data_audit.py"
+      - "tests/unit/test_overfit*.py"
+      - "tests/unit/test_alert_rules.py"
+      - "tests/unit/fixtures/perf_reference_v1.json"
   push:
     branches: [main]
+    paths-ignore:
+      - "web/**"
+      - "src/rquant/web/**"
+      - "tests/web/**"
+      - "docs/**"
+      - ".github/workflows/web-mvp.yml"
+      - "src/rquant/perf/**"
+      - "src/rquant/portfolio/**"
+      - "src/rquant/backtest/**"
+      - "src/rquant/factor/**"
+      - "src/rquant/data_catalog/**"
+      - "src/rquant/overfit.py"
+      - "src/rquant/overfit_pbo.py"
+      - "src/rquant/alert_rules.py"
+      - "tests/unit/test_perf*.py"
+      - "tests/unit/test_portfolio_*.py"
+      - "tests/unit/test_backtest_*.py"
+      - "tests/unit/test_factor.py"
+      - "tests/unit/test_data_catalog.py"
+      - "tests/unit/test_data_audit.py"
+      - "tests/unit/test_overfit*.py"
+      - "tests/unit/test_alert_rules.py"
+      - "tests/unit/fixtures/perf_reference_v1.json"
 
 permissions:
   contents: read

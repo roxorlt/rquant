@@ -4,15 +4,8 @@ name: Web MVP
 # no full suite, no R07 regeneration.
 on:
   pull_request:
-    paths:
-      - "src/rquant/web/**"
-      - "tests/web/**"
-      - "web/**"
-      - "pyproject.toml"
-      - "uv.lock"
-      - ".github/workflows/web-mvp.yml"
   push:
-    branches: [mvp/react-readonly]
+    branches: [main, mvp/react-readonly]
 
 permissions:
   contents: read
