@@ -87,6 +87,11 @@ class BacktestResult(BaseModel):
     orders: list[Order]
 
 
+def _lots(amount: float, price: float) -> int:
+    """Board lots nearest to `amount` (not floor: floor silently drops pricey names)."""
+    return LOT * round(amount / price / LOT) if price > 0 else 0
+
+
 def _limit_price(pre_close: float, pct: float, up: bool) -> float:
     return round(pre_close * (1 + pct if up else 1 - pct) + 1e-9, 2)
 
@@ -124,7 +129,7 @@ def run_backtest(
                                             quantity=held[code], price=None, fee=0,
                                             status="rejected", reason="停牌"))
                     continue
-                qty = held[code] - LOT * int(want.get(code, 0.0) / bar.open // LOT)
+                qty = held[code] - _lots(want.get(code, 0.0), bar.open)
                 if qty <= 0:
                     continue
                 if bar.open <= _limit_price(bar.pre_close, bar.limit_pct, up=False):
@@ -146,7 +151,7 @@ def run_backtest(
                     orders.append(Order(trade_date=day, ts_code=code, side="buy", quantity=0,
                                         price=None, fee=0, status="rejected", reason="停牌"))
                     continue
-                qty = LOT * int(amount / bar.open // LOT) - held.get(code, 0)
+                qty = _lots(amount, bar.open) - held.get(code, 0)
                 if qty <= 0:
                     continue
                 if bar.open >= _limit_price(bar.pre_close, bar.limit_pct, up=True):
@@ -166,6 +171,31 @@ def run_backtest(
                 cash -= notional + fee
                 held[code] = held.get(code, 0) + qty
                 orders.append(Order(trade_date=day, ts_code=code, side="buy", quantity=qty,
+                                    price=bar.open, fee=fee, status="filled"))
+            # leftover cash (rounding, blocked picks): one lot at a time to the most
+            # filled (vs target) tradable pick, never above 1.5x its target
+            while True:
+                best, fill = None, 1.5
+                for code, amount in want.items():
+                    bar = today.get(code)
+                    if amount <= 0 or bar is None or bar.open >= _limit_price(
+                            bar.pre_close, bar.limit_pct,
+                                                               up=True):
+                        continue
+                    lot = LOT * bar.open
+                    have = held.get(code, 0) * bar.open
+                    if have + lot > 1.5 * amount or lot + config.costs.fee("buy", lot) > cash:
+                        continue
+                    if have / amount < fill:
+                        best, fill = code, have / amount
+                if best is None:
+                    break
+                bar = today[best]
+                notional = LOT * bar.open
+                fee = config.costs.fee("buy", notional)
+                cash -= notional + fee
+                held[best] = held.get(best, 0) + LOT
+                orders.append(Order(trade_date=day, ts_code=best, side="buy", quantity=LOT,
                                     price=bar.open, fee=fee, status="filled"))
             pending = None
         for code, bar in today.items():
