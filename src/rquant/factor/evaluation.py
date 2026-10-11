@@ -25,6 +25,13 @@ class QuantileReturn(BaseModel):
     mean_return: float
 
 
+class QuantileDay(BaseModel):
+    """Mean forward return per quantile on one day, scaled to one day (fwd / horizon)."""
+
+    date: date
+    returns: list[float | None]
+
+
 class DecayPoint(BaseModel):
     horizon: int
     mean_ic: float | None
@@ -42,6 +49,9 @@ class FactorTestResult(BaseModel):
     ic_series: list[IcPoint]
     quantiles: list[QuantileReturn]
     decay: list[DecayPoint]
+    # Added later; older stored results load with the defaults.
+    quantile_series: list[QuantileDay] = []
+    top_turnover: float | None = None
 
 
 def forward_returns(close: pd.DataFrame, horizon: int) -> pd.DataFrame:
@@ -66,14 +76,26 @@ def factor_test(factor: pd.DataFrame, close: pd.DataFrame, horizon: int = 5,
     std = float(ic.std(ddof=1)) if n > 1 else 0.0
     mean = float(ic.mean()) if n else None
     groups: dict[int, list[float]] = {q: [] for q in range(1, quantiles + 1)}
+    qseries: list[QuantileDay] = []
+    turnovers: list[float] = []
+    prev_top: set | None = None
     for day in ic.index:
         f, r = factor.loc[day], fwd.loc[day]
         ok = f.notna() & r.notna()
         if ok.sum() < quantiles * 2:
             continue
         labels = pd.qcut(f[ok].rank(method="first"), quantiles, labels=False) + 1
-        for q, value in r[ok].groupby(labels).mean().items():
+        means = r[ok].groupby(labels).mean()
+        for q, value in means.items():
             groups[int(q)].append(float(value))
+        qseries.append(QuantileDay(
+            date=day.date() if hasattr(day, "date") else day,
+            returns=[float(means[q]) / horizon if q in means.index else None
+                     for q in range(1, quantiles + 1)]))
+        top = set(labels[labels == quantiles].index)
+        if prev_top:
+            turnovers.append(1 - len(top & prev_top) / len(prev_top))
+        prev_top = top
     quantile_rows = [QuantileReturn(quantile=q, mean_return=sum(v) / len(v))
                      for q, v in groups.items() if v]
     long_short = (quantile_rows[-1].mean_return - quantile_rows[0].mean_return
@@ -92,5 +114,6 @@ def factor_test(factor: pd.DataFrame, close: pd.DataFrame, horizon: int = 5,
         coverage=float(factor.notna().sum().sum() / total) if total else 0.0,
         ic_series=[IcPoint(date=d.date() if hasattr(d, "date") else d, ic=float(v))
                    for d, v in ic.items()],
-        quantiles=quantile_rows, decay=decay,
+        quantiles=quantile_rows, decay=decay, quantile_series=qseries,
+        top_turnover=sum(turnovers) / len(turnovers) if turnovers else None,
     )

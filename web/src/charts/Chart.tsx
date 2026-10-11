@@ -12,6 +12,8 @@ export interface LineSeries {
   dashed?: boolean;
   /** Fill between the line and the baseline (drawdown style). */
   area?: boolean;
+  /** Bars in the series colour instead of red-up / green-down (counts, histograms). */
+  neutral?: boolean;
 }
 
 interface Frame {
@@ -224,7 +226,9 @@ export function TimeChart({
                     width={bw}
                     y={top}
                     height={Math.max(0.5, Math.abs(y(v) - y(base)))}
-                    fill={v >= base ? "var(--up)" : "var(--down)"}
+                    fill={
+                      series[0]?.neutral ? series[0].color : v >= base ? "var(--up)" : "var(--down)"
+                    }
                     opacity={hi_ === null || hi_ === i ? 0.9 : 0.55}
                   />
                 );
