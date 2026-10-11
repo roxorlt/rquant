@@ -20,6 +20,7 @@ import pandas as pd
 from pydantic import BaseModel
 
 from rquant.backtest.store import research_root
+from rquant.factor.chips import CHIP_FIELDS, chip_fields
 from rquant.factor.evaluation import FactorTestResult, factor_test
 from rquant.factor.expr import FIELDS, evaluate, validate
 
@@ -45,13 +46,40 @@ def load_panel(con: duckdb.DuckDBPyConnection, start: date, end: date,
         [start - timedelta(days=WARMUP_DAYS), end + timedelta(days=45)],
     ).df()
     frame["trade_date"] = pd.to_datetime(frame["trade_date"])
-    return {f: frame.pivot(index="trade_date", columns="ts_code", values=f).sort_index()
-            for f in FIELDS}
+    panel = {f: frame.pivot(index="trade_date", columns="ts_code", values=f).sort_index()
+             for f in FIELDS}
+    turnover = _turnover(con, start, end)
+    if turnover is not None:
+        panel["turnover"] = turnover.reindex_like(panel["close"])
+    return panel
+
+
+def _turnover(con: duckdb.DuckDBPyConnection, start: date, end: date) -> pd.DataFrame | None:
+    """Free-float turnover (%), total-share turnover where the former is missing."""
+    sql = ("SELECT trade_date, ts_code, {t} AS v FROM daily_basic WHERE trade_date BETWEEN ? AND ?")
+    span = [start - timedelta(days=WARMUP_DAYS), end + timedelta(days=45)]
+    for t in ("COALESCE(turnover_rate_f, turnover_rate)", "turnover_rate"):
+        try:
+            frame = con.execute(sql.format(t=t), span).df()
+            break
+        except duckdb.Error:
+            continue
+    else:
+        return None
+    frame["trade_date"] = pd.to_datetime(frame["trade_date"])
+    return frame.pivot(index="trade_date", columns="ts_code", values="v").sort_index()
+
+
+def with_chips(panel: dict[str, pd.DataFrame], expression: str) -> dict[str, pd.DataFrame]:
+    """Compute the chip fields once per panel, only when an expression uses them."""
+    if "chip_" in expression and not any(f in panel for f in CHIP_FIELDS):
+        panel.update(chip_fields(panel))
+    return panel
 
 
 def run_factor(panel: dict[str, pd.DataFrame], expression: str, start: date, end: date,
                horizon: int = 5) -> FactorTestResult:
-    factor = evaluate(expression, panel)
+    factor = evaluate(expression, with_chips(panel, expression))
     window = (factor.index >= pd.Timestamp(start)) & (factor.index <= pd.Timestamp(end))
     # forward returns may look past `end` (that is what a forward return is); the
     # factor itself is only scored inside the window
@@ -192,7 +220,7 @@ def _test_main(argv: list[str]) -> int:
 def save_latest(run: FactorRun, panel: dict[str, pd.DataFrame], root: Path | None = None) -> None:
     """Cross-sectional percentile (0-100) of the factor on the last panel day, per code,
     so the screener can filter / rank on factor values without recomputing them."""
-    factor = evaluate(run.expression, panel)
+    factor = evaluate(run.expression, with_chips(panel, run.expression))
     if factor.empty:
         return
     last = factor.index[-1]

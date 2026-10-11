@@ -23,6 +23,9 @@ FACTORS = {
     "成交额放大": "cs_rank(ts_mean(amount, 5) / ts_mean(amount, 60))",
     "距 60 日高点": "cs_rank(close / ts_max(high, 60))",
     "均线偏离": "cs_rank(close / ts_mean(close, 20) - 1)",
+    "筹码获利比例": "cs_rank(chip_profit)",
+    "筹码成本乖离": "cs_rank(chip_cost_dev)",
+    "筹码集中度": "cs_rank(0 - chip_conc90)",
 }
 
 STRATEGIES = [
