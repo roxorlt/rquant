@@ -243,6 +243,20 @@ def write_demo_research(root: Path) -> None:
          end=days[-1], root=root, title="演示组合回测", strategy=f"demo-breakout@{version.version}",
          industries={"600519.SH": "白酒", "000001.SZ": "银行"},
          pool_last=["600519.SH", "000001.SZ"])
+    from rquant.research.paper import _nav_series
+    from rquant.research.paper import save as save_paper
+    from rquant.web.models import HoldingItem, PaperAccount
+
+    sim = run_backtest(days, bars, signals, config)
+    save_paper(root, [PaperAccount(
+        account_id="sim-demo-breakout", as_of=datetime.combine(days[-1], datetime.min.time(), UTC),
+        nav=sim.days[-1].nav, cash=sim.days[-1].cash, unrealized_pnl=0.0, realized_pnl=0.0,
+        holdings=[HoldingItem(code=c, name=None, quantity=q, average_cost=0.0,
+                              market_price=round(sim.days[-1].values.get(c, 0.0) / q, 3),
+                              market_value=sim.days[-1].values.get(c, 0.0), unrealized_pnl=0.0,
+                              industry={"600519.SH": "白酒", "000001.SZ": "银行"}.get(c))
+                  for c, q in sim.days[-1].positions.items()],
+        nav_series=_nav_series(sim.days))])
     from rquant.data_catalog.audit import AuditReport, DatasetCoverage, write_report
 
     write_report(AuditReport(

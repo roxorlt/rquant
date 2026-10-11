@@ -1251,6 +1251,8 @@ export interface components {
             average_cost: number;
             /** Code */
             code: string;
+            /** Industry */
+            industry?: string | null;
             /** Market Price */
             market_price: number;
             /** Market Value */
@@ -1418,6 +1420,11 @@ export interface components {
             holdings: components["schemas"]["HoldingItem"][];
             /** Nav */
             nav: number;
+            /**
+             * Nav Series
+             * @default []
+             */
+            nav_series: components["schemas"]["NavPoint"][];
             /** Realized Pnl */
             realized_pnl: number;
             /** Unrealized Pnl */

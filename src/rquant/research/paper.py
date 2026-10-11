@@ -9,7 +9,7 @@ from pathlib import Path
 
 from rquant.backtest import run_backtest
 from rquant.backtest.store import load_delisted, load_inputs
-from rquant.web.models import HoldingItem, PaperAccount
+from rquant.web.models import HoldingItem, NavPoint, PaperAccount
 
 
 def simulate(con, slug: str, preset: str, config, last: date, days: int = 60,
@@ -29,6 +29,16 @@ def simulate(con, slug: str, preset: str, config, last: date, days: int = 60,
         elif qty:
             keep = qty - o.quantity
             cost[o.ts_code] = (amt * keep / qty, keep)
+    industries: dict[str, str] = {}
+    if rec.positions:
+        try:
+            codes = list(rec.positions)
+            marks = ",".join("?" * len(codes))
+            industries = dict(con.execute(
+                f"SELECT ts_code, industry FROM stock_basic WHERE ts_code IN ({marks})",
+                codes).fetchall())
+        except Exception:  # noqa: BLE001 - industry is decoration; never fail the account
+            industries = {}
     holdings = []
     for code, q in rec.positions.items():
         amt, qty = cost.get(code, (0.0, q))
@@ -36,14 +46,25 @@ def simulate(con, slug: str, preset: str, config, last: date, days: int = 60,
         mv = rec.values.get(code, 0.0)
         holdings.append(HoldingItem(code=code, name=(names or {}).get(code), quantity=q,
                                     average_cost=round(avg, 3), market_price=round(mv / q, 3),
-                                    market_value=mv, unrealized_pnl=round(mv - avg * q, 2)))
+                                    market_value=mv, unrealized_pnl=round(mv - avg * q, 2),
+                                    industry=industries.get(code)))
     unreal = sum(h.unrealized_pnl for h in holdings)
     equity = rec.cash + rec.market_value
     return PaperAccount(
         account_id=f"sim-{slug}", as_of=datetime.combine(rec.trade_date, datetime.min.time(), UTC),
         nav=round(rec.nav, 4), cash=rec.cash, unrealized_pnl=round(unreal, 2),
         realized_pnl=round(equity - config.capital - unreal, 2),
-        holdings=sorted(holdings, key=lambda h: -h.market_value))
+        holdings=sorted(holdings, key=lambda h: -h.market_value),
+        nav_series=_nav_series(result.days))
+
+
+def _nav_series(days) -> list[NavPoint]:
+    out, peak = [], 0.0
+    for d in days:
+        peak = max(peak, d.nav)
+        out.append(NavPoint(date=d.trade_date, nav=round(d.nav, 6),
+                            drawdown=round(d.nav / peak - 1, 6) if peak else 0.0))
+    return out
 
 
 def path(root: Path) -> Path:
