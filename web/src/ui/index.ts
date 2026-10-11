@@ -10,6 +10,7 @@ export { DatePicker, type DatePickerProps } from "./DatePicker";
 export { BottomSheet, type BottomSheetProps, SideDrawer, type SideDrawerProps } from "./Drawer";
 export { DropdownMenu, type DropdownMenuItem } from "./DropdownMenu";
 export { EmptyState } from "./EmptyState";
+export { FlowSteps } from "./FlowSteps";
 export { type Kpi, KpiStrip } from "./KpiStrip";
 export { PageHeader, type PageHeaderProps } from "./PageHeader";
 export { PagePlaceholder, type PagePlaceholderProps } from "./PagePlaceholder";

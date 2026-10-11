@@ -3,7 +3,7 @@ import { useBacktestDetail, useBacktests } from "@/api/endpoints";
 import { formatPercent, formatPrice } from "@/format/number";
 import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
-import { ChangeText, PageHeader, Panel } from "@/ui";
+import { ChangeText, FlowSteps, PageHeader, Panel } from "@/ui";
 import { QueryView } from "../shared";
 import { PerfPanel } from "./Perf";
 import { PortfolioRuns } from "./Portfolio";
@@ -61,7 +61,7 @@ export default function BacktestPage() {
   const [runId, setRunId] = useState<string | null>(null);
   return (
     <>
-      <PageHeader eyebrow="策略与验证" title="回测" />
+      <PageHeader eyebrow="策略与验证" title="回测" actions={<FlowSteps />} />
       <QueryView query={query}>
         {(data) => (
           <Panel title="已发布回测" sub="点一行看逐笔交易" flush>

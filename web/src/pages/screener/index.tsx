@@ -4,7 +4,7 @@ import { type ScreenRow, useAddWatch, useSavePool, useScreen } from "@/api/endpo
 import { useReadOnlyReason } from "@/api/useMeta";
 import { formatPrice } from "@/format/number";
 import { DataTable } from "@/table/DataTable";
-import { Button, ChangeText, PageHeader, Panel, Segmented, useToast } from "@/ui";
+import { Button, ChangeText, FlowSteps, PageHeader, Panel, Segmented, useToast } from "@/ui";
 import { QueryView } from "../shared";
 import { applyFilters, FIELDS, type Field, type Filter, type Rank, score } from "./Builder";
 import { Conditions } from "./Conditions";
@@ -170,12 +170,15 @@ export default function ScreenerPage() {
         title="选股器"
         note={query.data?.trade_date ?? undefined}
         actions={
-          <Button
-            onClick={save}
-            disabledReason={readOnly ?? (presets.length ? undefined : "没有可保存的结果")}
-          >
-            保存为池子
-          </Button>
+          <>
+            <FlowSteps />
+            <Button
+              onClick={save}
+              disabledReason={readOnly ?? (presets.length ? undefined : "没有可保存的结果")}
+            >
+              保存为池子
+            </Button>
+          </>
         }
       />
       <Segmented
