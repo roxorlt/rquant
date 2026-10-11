@@ -15,7 +15,10 @@ export default function PaperPage() {
       <QueryView query={query}>
         {(data) =>
           data.accounts.length === 0 ? (
-            <EmptyState title="没有模拟账户" />
+            <EmptyState
+              title="没有模拟账户"
+              hint="模拟盘账户由 paper 服务创建；创建并运行一次调仓后，这里显示净值与持仓。"
+            />
           ) : (
             data.accounts.map((account) => (
               <Panel

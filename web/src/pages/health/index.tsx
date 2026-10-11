@@ -38,7 +38,7 @@ export default function HealthPage() {
                 </ul>
               </Panel>
             ) : null}
-            <Panel title="服务" flush>
+            <Panel title={`服务 · ${data.services.length}`} flush>
               <DataTable
                 label="服务"
                 rows={data.services}

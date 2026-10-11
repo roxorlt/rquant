@@ -129,7 +129,11 @@ export default function FactorPage() {
       <PageHeader eyebrow="研究" title="因子研究" />
       <QueryView query={query}>
         {(data) => (
-          <Panel title="因子" sub="python -m rquant.factor --name … --expr … 产出" flush>
+          <Panel
+            title={`因子 · ${data.factors.length}`}
+            sub="python -m rquant.factor --name … --expr … 产出"
+            flush
+          >
             <DataTable
               label="因子列表"
               rows={data.factors}

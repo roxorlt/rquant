@@ -26,7 +26,7 @@ export default function OpsPage() {
               label="操作记录"
               rows={data.items}
               rowKey={(row) => `${row.kind}:${row.command_id}`}
-              emptyText="还没有网页操作"
+              emptyText="还没有网页操作：保存池子、确认告警、加自选等写操作会记录在这里。"
               height={600}
               columns={[
                 {

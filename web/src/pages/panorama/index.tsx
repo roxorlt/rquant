@@ -28,13 +28,13 @@ export default function PanoramaPage() {
                 { key: "ld", label: "跌停", value: formatCount(data.pulse.limit_down) },
               ]}
             />
-            <Panel title="板块" flush>
+            <Panel title={`板块 · ${data.boards.length}`} flush>
               <DataTable
                 label="板块"
                 rows={data.boards}
                 rowKey={(row) => `${row.system}:${row.board_code}`}
                 initialSort={{ id: "amount", desc: true }}
-                emptyText="没有板块快照"
+                emptyText="没有板块快照：盘中快照尚未生成（非交易时段或采集未运行），开盘后自动出现。"
                 columns={[
                   { id: "name", header: "板块", value: (row) => row.board_name },
                   { id: "system", header: "体系", value: (row) => row.system, secondary: true },

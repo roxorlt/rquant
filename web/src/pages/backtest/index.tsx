@@ -64,7 +64,7 @@ export default function BacktestPage() {
       <PageHeader eyebrow="策略与验证" title="回测" actions={<FlowSteps />} />
       <QueryView query={query}>
         {(data) => (
-          <Panel title="已发布回测" sub="点一行看逐笔交易" flush>
+          <Panel title={`已发布回测 · ${data.runs.length}`} sub="点一行看逐笔交易" flush>
             <DataTable
               label="回测列表"
               rows={data.runs}
