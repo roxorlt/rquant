@@ -1,0 +1,81 @@
+name: Web release
+
+# After "Web MVP" goes green on main, package a deployable web release:
+#   rquant-web-<sha8>.tar.gz = git archive of the commit (code + uv.lock) + web/dist (built)
+# published as GitHub release "web-<sha8>" (prerelease, so it never becomes "Latest" for
+# the main product). Deploy with deploy/web/rquant-web-deploy.sh on the server.
+on:
+  workflow_run:
+    workflows: ["Web MVP"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "commit sha on main to package"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: web-release-${{ github.event.workflow_run.head_sha || inputs.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      SHA: ${{ github.event.workflow_run.head_sha || inputs.ref }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # actions/checkout@v4
+        with:
+          ref: ${{ env.SHA }}
+
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: web/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: web/.nvmrc
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Build frontend
+        working-directory: web
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run build
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          full="$(git rev-parse HEAD)"; short="${full:0:8}"
+          echo "SHORT=$short" >> "$GITHUB_ENV"
+          stage="$RUNNER_TEMP/rquant-web-$short"; mkdir -p "$stage"
+          git archive "$full" | tar -x -C "$stage"
+          test -f "$stage/uv.lock"
+          rm -rf "$stage/web/dist"; cp -a web/dist "$stage/web/dist"
+          test -f "$stage/web/dist/index.html"
+          printf '{"commit":"%s","short":"%s","built_at":"%s","run_id":"%s"}\n' \
+            "$full" "$short" "$(date -u +%FT%TZ)" "$GITHUB_RUN_ID" > "$stage/RELEASE.json"
+          tar -C "$stage" -czf "$RUNNER_TEMP/rquant-web-$short.tar.gz" .
+          (cd "$RUNNER_TEMP" && sha256sum "rquant-web-$short.tar.gz" > "rquant-web-$short.tar.gz.sha256")
+
+      - name: Publish GitHub release
+        run: |
+          set -euo pipefail
+          tag="web-$SHORT"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" --clobber "$RUNNER_TEMP/rquant-web-$SHORT.tar.gz" \
+              "$RUNNER_TEMP/rquant-web-$SHORT.tar.gz.sha256"
+          else
+            gh release create "$tag" --target "$SHA" --prerelease \
+              --title "web $SHORT" --notes "Web release of $SHA (built after Web MVP passed)." \
+              "$RUNNER_TEMP/rquant-web-$SHORT.tar.gz" "$RUNNER_TEMP/rquant-web-$SHORT.tar.gz.sha256"
+          fi
