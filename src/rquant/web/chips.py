@@ -145,16 +145,21 @@ def volume_profile(bars: list[tuple[float, float, float, float]], edges: np.ndar
                          vah=round(float(edges[b + 1]), 3))
 
 
-LETTERS = "ABCDEFGH"
+LETTERS = "ABCDEFGHIJKLMNOP"
+TPO_PERIODS = (15, 30, 60)
+TPO_DEFAULT = 30
 
 
-def _period(t: datetime) -> int:
-    """30-minute TPO period of a 5-minute bar *end* time (A..D morning, E..H afternoon)."""
+def _period(t: datetime, minutes: int = 30) -> int:
+    """TPO period index of a 5-minute bar *end* time; the morning session is 120 minutes."""
     m = t.hour * 60 + t.minute - 1
-    return (m - 570) // 30 if m < 720 else 4 + (m - 780) // 30
+    n = 120 // minutes
+    p = (m - 570) // minutes if m < 720 else n + (m - 780) // minutes
+    return min(max(p, 0), 2 * n - 1)
 
 
-def tpo_days(mins: list[tuple], k: dict, days: int = 5, rows: int = 28) -> list[TpoDay]:
+def tpo_days(mins: list[tuple], k: dict, days: int = 5, rows: int = 28,
+             period: int = TPO_DEFAULT) -> list[TpoDay]:
     """Market profile (TPO letters) per day from 5-minute bars ``(time, date, h, l, o, c)``."""
     by: dict[date, list[tuple]] = {}
     for m in mins:
@@ -168,7 +173,7 @@ def tpo_days(mins: list[tuple], k: dict, days: int = 5, rows: int = 28) -> list[
         n = int((hi - lo) / step) + 1
         sets: list[set[int]] = [set() for _ in range(n)]
         for t, _, h, low, _o, _c in bars:
-            p = min(max(_period(t), 0), 7)
+            p = _period(t, period)
             for j in range(int((low * f - lo) / step), min(int((h * f - lo) / step), n - 1) + 1):
                 sets[j].add(p)
         counts = np.array([len(x) for x in sets], dtype=float)
@@ -195,7 +200,7 @@ def tpo_days(mins: list[tuple], k: dict, days: int = 5, rows: int = 28) -> list[
 
 
 def load_chips(con: duckdb.DuckDBPyConnection, code: str, show: int = 250, warmup: int = 250,
-               profile_days: int = 20) -> ChipsData | None:
+               profile_days: int = 20, tpo_period: int = TPO_DEFAULT) -> ChipsData | None:
     """Forward-adjusted daily bars (+turnover) → chips for the last ``show`` days and a volume
     profile of the last ``profile_days`` days on the same price grid."""
     try:
@@ -239,7 +244,7 @@ def load_chips(con: duckdb.DuckDBPyConnection, code: str, show: int = 250, warmu
             "SELECT trade_time, trade_date, high, low, open, close FROM minute_bar "
             "WHERE ts_code = ? AND freq = '5min' AND trade_date >= ? ORDER BY trade_time",
             [code, min(recent)]).fetchall()
-        tpo = tpo_days(five, k)
+        tpo = tpo_days(five, k, period=tpo_period)
     except duckdb.Error:
         pass
     if mins:
