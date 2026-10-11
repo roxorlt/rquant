@@ -21,7 +21,7 @@ from rquant.backtest.strategy import list_strategies
 from rquant.data_catalog.audit import read_report
 from rquant.data_catalog.models import CatalogDocument
 from rquant.factor.condition import list_conditions
-from rquant.factor.store import list_factors, read_factor, read_tracking
+from rquant.factor.store import list_factors, read_factor, read_latest, read_tracking
 from rquant.factor.tdx import TdxFormulaError
 from rquant.factor.tdx import translate as translate_tdx
 from rquant.fundamentals import FundamentalsDoc
@@ -88,7 +88,7 @@ from rquant.web.models import (
 )
 from rquant.web.overfit_stats import overfit_stats, sharpe_per_period
 from rquant.web.source import Source, SourceUnavailableError, table_missing
-from rquant.web.stocks import CODE_RE, StockProfile, load_profile, market
+from rquant.web.stocks import CODE_RE, StockProfile, enrich, load_profile, market
 
 router = APIRouter(prefix="/api/v1")
 T = TypeVar("T")
@@ -251,9 +251,23 @@ def screen(request: Request, source: SourceDep, trade_date: date | None = None,
     if day is None:
         return _envelope(source, ScreenData(trade_date=None, presets=[], rows=[]))
     presets = sorted({r["preset_name"] for r in rows})
-    items = [ScreenRow(trade_date=r["trade_date"], code=r["ts_code"], name=r["name"],
-                       preset=r["preset_name"], close=_f(r["close"]), pct_chg=_f(r["pct_chg"]))
-             for r in rows if preset is None or r["preset_name"] == preset]
+    rows = [r for r in rows if preset is None or r["preset_name"] == preset]
+    root = Path(_research_root(request) or research_root())
+    codes = sorted({r["ts_code"] for r in rows})
+    with market(root) as con:
+        extra = enrich(con, codes, day)
+    doc = read_fundamentals(root)
+    fund = {f.code: f.values for f in doc.rows} if doc else {}
+    factor_pct = read_latest(root)
+    items = []
+    for r in rows:
+        code = r["ts_code"]
+        f = fund.get(code, {})
+        items.append(ScreenRow(
+            trade_date=r["trade_date"], code=code, name=r["name"], preset=r["preset_name"],
+            close=_f(r["close"]), pct_chg=_f(r["pct_chg"]), **extra.get(code, {}),
+            roe=f.get("roe"), netprofit_yoy=f.get("netprofit_yoy"), or_yoy=f.get("or_yoy"),
+            factors={n: v[code] for n, v in factor_pct.items() if code in v}))
     return _envelope(source, ScreenData(trade_date=day, presets=presets, rows=items))
 
 

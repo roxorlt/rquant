@@ -3720,6 +3720,24 @@
             "title": "Code",
             "type": "string"
           },
+          "factors": {
+            "additionalProperties": {
+              "type": "number"
+            },
+            "title": "Factors",
+            "type": "object"
+          },
+          "industry": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Industry"
+          },
           "name": {
             "anyOf": [
               {
@@ -3730,6 +3748,39 @@
               }
             ],
             "title": "Name"
+          },
+          "netprofit_yoy": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Netprofit Yoy"
+          },
+          "or_yoy": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Or Yoy"
+          },
+          "pb": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pb"
           },
           "pct_chg": {
             "anyOf": [
@@ -3742,14 +3793,58 @@
             ],
             "title": "Pct Chg"
           },
+          "pe_ttm": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pe Ttm"
+          },
           "preset": {
             "title": "Preset",
             "type": "string"
+          },
+          "roe": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Roe"
+          },
+          "total_mv": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total Mv"
           },
           "trade_date": {
             "format": "date",
             "title": "Trade Date",
             "type": "string"
+          },
+          "turnover_rate": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Turnover Rate"
           }
         },
         "required": [

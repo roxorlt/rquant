@@ -45,7 +45,15 @@ def run(years: int = 5, minutes: int = 300, ingest: bool = True, end: date | Non
     from rquant.backtest.store import run_and_save
     from rquant.backtest.strategy import StrategySpec, resolve, save_version
     from rquant.data_catalog.audit import audit, write_report
-    from rquant.factor.store import list_factors, load_panel, run_factor, save, save_tracking, track
+    from rquant.factor.store import (
+        list_factors,
+        load_panel,
+        run_factor,
+        save,
+        save_latest,
+        save_tracking,
+        track,
+    )
     from rquant.portfolio import PortfolioWeightRule
     from rquant.research import ingest as ing
     from rquant.research import screens
@@ -89,6 +97,7 @@ def run(years: int = 5, minutes: int = 300, ingest: bool = True, end: date | Non
             shutil.rmtree(root / "factor" / old.factor_id, ignore_errors=True)
         run = save(name, expr, f_start, last, run_factor(panel, expr, f_start, last), root=root)
         existing[name] = run
+        save_latest(run, panel, root)
         log.info("factor %s done", name)
     for run in existing.values():
         save_tracking(track(run, panel, last, lookback_days=60), root)

@@ -113,6 +113,25 @@ def load_profile(con: duckdb.DuckDBPyConnection | None, code: str, days: int = 2
     return out
 
 
+def enrich(con: duckdb.DuckDBPyConnection | None, codes: list[str], day: date) -> dict[str, dict]:
+    """Industry and latest-on-or-before-``day`` valuation per code (total_mv in 亿元)."""
+    if con is None or not codes:
+        return {}
+    marks = ",".join("?" * len(codes))
+    out: dict[str, dict] = {c: {} for c in codes}
+    for r in _rows(con, f"SELECT ts_code, industry FROM stock_basic WHERE ts_code IN ({marks})",
+                   codes):
+        out[r["ts_code"]]["industry"] = r["industry"]
+    for r in _rows(con, f"""
+            SELECT ts_code, pe_ttm, pb, total_mv, turnover_rate FROM daily_basic
+            WHERE ts_code IN ({marks}) AND trade_date = (
+              SELECT max(trade_date) FROM daily_basic WHERE trade_date <= ?)""", [*codes, day]):
+        out[r["ts_code"]].update(
+            pe_ttm=r["pe_ttm"], pb=r["pb"], turnover_rate=r["turnover_rate"],
+            total_mv=None if r["total_mv"] is None else round(r["total_mv"] / 1e4, 2))
+    return out
+
+
 def write_demo_market(root: Path, today: date) -> None:
     """A small market.duckdb for fixture mode: a few stocks, ~300 days of bars and valuation."""
     import numpy as np

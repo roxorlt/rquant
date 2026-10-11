@@ -128,6 +128,16 @@ class ScreenRow(BaseModel):
     preset: str
     close: float | None
     pct_chg: float | None
+    # enrichment from the research DB / fundamentals / factor files (None when unavailable)
+    industry: str | None = None
+    pe_ttm: float | None = None
+    pb: float | None = None
+    total_mv: float | None = None  # 亿元
+    turnover_rate: float | None = None
+    roe: float | None = None
+    netprofit_yoy: float | None = None
+    or_yoy: float | None = None
+    factors: dict[str, float] = Field(default_factory=dict)  # name -> cross-section pct 0-100
 
 
 class ScreenData(BaseModel):
