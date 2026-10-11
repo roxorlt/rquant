@@ -1,4 +1,5 @@
 import { usePaper } from "@/api/endpoints";
+import { kpiTone, toneClass, toneOf } from "@/format/color";
 import { formatAmount, formatCount, formatPrice } from "@/format/number";
 import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
@@ -28,8 +29,18 @@ export default function PaperPage() {
                   items={[
                     { key: "nav", label: "净值", value: formatAmount(account.nav) },
                     { key: "cash", label: "现金", value: formatAmount(account.cash) },
-                    { key: "upnl", label: "浮动盈亏", value: formatAmount(account.unrealized_pnl) },
-                    { key: "rpnl", label: "已实现", value: formatAmount(account.realized_pnl) },
+                    {
+                      key: "upnl",
+                      label: "浮动盈亏",
+                      value: formatAmount(account.unrealized_pnl),
+                      tone: kpiTone(account.unrealized_pnl),
+                    },
+                    {
+                      key: "rpnl",
+                      label: "已实现",
+                      value: formatAmount(account.realized_pnl),
+                      tone: kpiTone(account.realized_pnl),
+                    },
                   ]}
                 />
                 <DataTable
@@ -73,7 +84,11 @@ export default function PaperPage() {
                       header: "浮盈",
                       numeric: true,
                       value: (row) => row.unrealized_pnl,
-                      cell: (row) => formatAmount(row.unrealized_pnl),
+                      cell: (row) => (
+                        <span className={toneClass(toneOf(row.unrealized_pnl))}>
+                          {formatAmount(row.unrealized_pnl)}
+                        </span>
+                      ),
                     },
                   ]}
                 />

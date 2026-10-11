@@ -1,5 +1,6 @@
 import type { components } from "@/api/schema";
 import { TimeChart } from "@/charts/Chart";
+import { kpiTone } from "@/format/color";
 import { formatPercent } from "@/format/number";
 import { KpiStrip, Panel } from "@/ui";
 
@@ -94,8 +95,18 @@ export function PerfPanel({ perf }: { perf: BacktestPerf }) {
         label="绩效指标"
         compact
         items={[
-          { key: "total", label: "总收益", value: pct(perf.total_return) },
-          { key: "annual", label: "年化", value: pct(perf.annualized_return) },
+          {
+            key: "total",
+            label: "总收益",
+            value: pct(perf.total_return),
+            tone: kpiTone(perf.total_return),
+          },
+          {
+            key: "annual",
+            label: "年化",
+            value: pct(perf.annualized_return),
+            tone: kpiTone(perf.annualized_return),
+          },
           { key: "vol", label: "年化波动", value: pct(perf.annualized_volatility) },
           { key: "sharpe", label: "夏普", value: num(perf.sharpe) },
           { key: "sortino", label: "索提诺", value: num(perf.sortino) },
@@ -114,6 +125,7 @@ export function PerfPanel({ perf }: { perf: BacktestPerf }) {
                   key: "excess",
                   label: `超额 vs ${perf.benchmark.code}`,
                   value: pct(perf.benchmark.excess_return),
+                  tone: kpiTone(perf.benchmark.excess_return),
                   sub: `基准 ${pct(perf.benchmark.total_return)}`,
                 },
                 { key: "beta", label: "Beta", value: num(perf.benchmark.beta) },
