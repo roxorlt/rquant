@@ -1,8 +1,30 @@
 import type { ScreenRow } from "@/api/endpoints";
 
 /** Prototype-style condition builder over the published screen rows (client side). */
-export type Field = "pct_chg" | "close";
-export const FIELDS: Record<Field, string> = { pct_chg: "涨跌幅 %", close: "收盘价" };
+/** A built-in numeric column, or "f:<factor name>" for a factor's cross-section percentile. */
+export type Field = string;
+export const BASE_FIELDS: Record<string, string> = {
+  pct_chg: "涨跌幅 %",
+  close: "收盘价",
+  pe_ttm: "PE(TTM)",
+  pb: "PB",
+  total_mv: "总市值(亿)",
+  turnover_rate: "换手率 %",
+  roe: "ROE %",
+  netprofit_yoy: "净利同比 %",
+  or_yoy: "营收同比 %",
+};
+
+/** Built-in fields plus one per factor seen in the rows. */
+export function fieldsFor(rows: readonly ScreenRow[]): Record<string, string> {
+  const out = { ...BASE_FIELDS };
+  for (const r of rows)
+    for (const name of Object.keys(r.factors ?? {})) out[`f:${name}`] = `因子·${name} 分位`;
+  return out;
+}
+
+/** Kept for callers that only need labels of the built-ins. */
+export const FIELDS = BASE_FIELDS;
 
 export interface Filter {
   field: Field;
@@ -15,7 +37,11 @@ export interface Rank {
   weight: number;
 }
 
-const val = (row: ScreenRow, f: Field) => (f === "pct_chg" ? row.pct_chg : row.close) ?? null;
+export const val = (row: ScreenRow, f: Field): number | null => {
+  if (f.startsWith("f:")) return row.factors?.[f.slice(2)] ?? null;
+  const v = (row as unknown as Record<string, unknown>)[f];
+  return typeof v === "number" ? v : null;
+};
 
 export function applyFilters(rows: ScreenRow[], filters: Filter[]) {
   const steps: number[] = [rows.length];

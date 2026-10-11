@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -186,3 +187,33 @@ def _test_main(argv: list[str]) -> int:
                                                            a.horizon))
     print(f"{run.factor_id} days={run.result.days} IC={run.result.mean_ic}")
     return 0
+
+
+def save_latest(run: FactorRun, panel: dict[str, pd.DataFrame], root: Path | None = None) -> None:
+    """Cross-sectional percentile (0-100) of the factor on the last panel day, per code,
+    so the screener can filter / rank on factor values without recomputing them."""
+    factor = evaluate(run.expression, panel)
+    if factor.empty:
+        return
+    last = factor.index[-1]
+    pct = factor.loc[last].dropna().rank(pct=True) * 100
+    doc = {"date": str(last.date() if hasattr(last, "date") else last),
+           "values": {str(k): round(float(v), 2) for k, v in pct.items()}}
+    folder = (root or research_root()) / KIND / run.factor_id
+    folder.mkdir(parents=True, exist_ok=True)
+    tmp = folder / "latest.json.tmp"
+    tmp.write_text(json.dumps(doc))
+    tmp.replace(folder / "latest.json")
+
+
+def read_latest(root: Path | None = None) -> dict[str, dict[str, float]]:
+    """factor name -> {code: percentile} for every factor that has a latest.json."""
+    out: dict[str, dict[str, float]] = {}
+    for run in list_factors(root):
+        p = (root or research_root()) / KIND / run.factor_id / "latest.json"
+        if p.exists():
+            try:
+                out[run.name] = json.loads(p.read_text())["values"]
+            except (ValueError, KeyError):
+                continue
+    return out

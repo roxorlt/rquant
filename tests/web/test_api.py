@@ -316,3 +316,18 @@ def test_brinson_effects_add_up_to_excess(tmp_path) -> None:
     total = b["allocation"] + b["selection"] + b["interaction"]
     assert total == pytest.approx(b["portfolio_return"] - b["benchmark_return"], abs=1e-9)
     assert {r["industry"] for r in b["rows"]} >= {"白酒", "银行", "现金"}
+
+
+def test_screen_rows_carry_valuation_fundamentals_and_factor_pct(tmp_path) -> None:
+    from fastapi.testclient import TestClient
+
+    from rquant.web.app import create_app
+    from rquant.web.source import FixtureSource, write_demo_research
+
+    write_demo_research(tmp_path)
+    client = TestClient(create_app(FixtureSource(), dist=None, research_root=tmp_path))
+    rows = {r["code"]: r for r in client.get("/api/v1/screen").json()["data"]["rows"]}
+    moutai = rows["600519.SH"]
+    assert moutai["industry"] == "白酒" and moutai["pe_ttm"] is not None
+    assert moutai["roe"] == 18.9
+    assert 0 < moutai["factors"]["演示动量因子"] <= 100

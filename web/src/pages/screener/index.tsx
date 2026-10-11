@@ -7,16 +7,34 @@ import { DataTable } from "@/table/DataTable";
 import { Button, ChangeText, FlowSteps, PageHeader, Panel, Segmented, useToast } from "@/ui";
 import { StockLink } from "@/ui/StockLink";
 import { QueryView } from "../shared";
-import { applyFilters, FIELDS, type Field, type Filter, type Rank, score } from "./Builder";
+import {
+  applyFilters,
+  BASE_FIELDS,
+  type Field,
+  type Filter,
+  fieldsFor,
+  type Rank,
+  score,
+} from "./Builder";
 import { Conditions } from "./Conditions";
 import { Schemes } from "./Schemes";
 
 function stepLabel(filters: Filter[], i: number): string {
   const f = filters[i - 1];
-  return f ? `${FIELDS[f.field]} ${f.op} ${f.value}` : "股票池";
+  return f
+    ? `${BASE_FIELDS[f.field] ?? f.field.replace(/^f:/, "因子·")} ${f.op} ${f.value}`
+    : "股票池";
 }
 
-function FilterRows({ filters, onChange }: { filters: Filter[]; onChange: (f: Filter[]) => void }) {
+function FilterRows({
+  filters,
+  onChange,
+  fields,
+}: {
+  filters: Filter[];
+  onChange: (f: Filter[]) => void;
+  fields: Record<string, string>;
+}) {
   const set = (i: number, patch: Partial<Filter>) =>
     onChange(filters.map((f, j) => (j === i ? { ...f, ...patch } : f)));
   return (
@@ -30,7 +48,7 @@ function FilterRows({ filters, onChange }: { filters: Filter[]; onChange: (f: Fi
             value={f.field}
             onChange={(e) => set(i, { field: e.target.value as Field })}
           >
-            {Object.entries(FIELDS).map(([k, v]) => (
+            {Object.entries(fields).map(([k, v]) => (
               <option key={k} value={k}>
                 {v}
               </option>
@@ -70,7 +88,15 @@ function FilterRows({ filters, onChange }: { filters: Filter[]; onChange: (f: Fi
   );
 }
 
-function RankRows({ ranks, onChange }: { ranks: Rank[]; onChange: (r: Rank[]) => void }) {
+function RankRows({
+  ranks,
+  onChange,
+  fields,
+}: {
+  ranks: Rank[];
+  onChange: (r: Rank[]) => void;
+  fields: Record<string, string>;
+}) {
   const set = (i: number, patch: Partial<Rank>) =>
     onChange(ranks.map((r, j) => (j === i ? { ...r, ...patch } : r)));
   return (
@@ -84,7 +110,7 @@ function RankRows({ ranks, onChange }: { ranks: Rank[]; onChange: (r: Rank[]) =>
             value={r.field}
             onChange={(e) => set(i, { field: e.target.value as Field })}
           >
-            {Object.entries(FIELDS).map(([k, v]) => (
+            {Object.entries(fields).map(([k, v]) => (
               <option key={k} value={k}>
                 {v}
               </option>
@@ -146,6 +172,10 @@ export default function ScreenerPage() {
     [query.data, q],
   );
   const filtered = useMemo(() => applyFilters(base, filters), [base, filters]);
+  const fields = useMemo(() => fieldsFor(query.data?.rows ?? []), [query.data]);
+  const factorNames = Object.keys(fields)
+    .filter((k) => k.startsWith("f:"))
+    .map((k) => k.slice(2));
   const scores = useMemo(() => score(filtered.rows, ranks), [filtered, ranks]);
 
   const save = () => {
@@ -194,12 +224,12 @@ export default function ScreenerPage() {
           <div>
             <h3 className="sub">筛选（门槛）</h3>
             {filters.length === 0 ? <p className="cond-none">无门槛，全部股票进入排名</p> : null}
-            <FilterRows filters={filters} onChange={setFilters} />
+            <FilterRows filters={filters} onChange={setFilters} fields={fields} />
           </div>
           <div>
             <h3 className="sub">排名（权重）</h3>
             {ranks.length === 0 ? <p className="cond-none">未设排名，按原顺序输出</p> : null}
-            <RankRows ranks={ranks} onChange={setRanks} />
+            <RankRows ranks={ranks} onChange={setRanks} fields={fields} />
           </div>
         </div>
         <Schemes
@@ -254,6 +284,54 @@ export default function ScreenerPage() {
                   value: (row) => row.pct_chg ?? null,
                   cell: (row) => <ChangeText value={row.pct_chg ?? null} />,
                 },
+                {
+                  id: "industry",
+                  header: "行业",
+                  value: (row) => row.industry ?? null,
+                  secondary: true,
+                },
+                {
+                  id: "pe",
+                  header: "PE",
+                  numeric: true,
+                  value: (row) => row.pe_ttm ?? null,
+                  cell: (row) => (row.pe_ttm == null ? "—" : row.pe_ttm.toFixed(1)),
+                },
+                {
+                  id: "pb",
+                  header: "PB",
+                  numeric: true,
+                  value: (row) => row.pb ?? null,
+                  cell: (row) => (row.pb == null ? "—" : row.pb.toFixed(2)),
+                },
+                {
+                  id: "mv",
+                  header: "市值(亿)",
+                  numeric: true,
+                  value: (row) => row.total_mv ?? null,
+                  cell: (row) => (row.total_mv == null ? "—" : row.total_mv.toFixed(0)),
+                },
+                {
+                  id: "roe",
+                  header: "ROE%",
+                  numeric: true,
+                  value: (row) => row.roe ?? null,
+                  cell: (row) => (row.roe == null ? "—" : row.roe.toFixed(1)),
+                },
+                {
+                  id: "npyoy",
+                  header: "净利同比",
+                  numeric: true,
+                  value: (row) => row.netprofit_yoy ?? null,
+                  cell: (row) => <ChangeText value={row.netprofit_yoy ?? null} />,
+                },
+                ...factorNames.map((name) => ({
+                  id: `f:${name}`,
+                  header: `${name}分位`,
+                  numeric: true,
+                  value: (row: ScreenRow) => row.factors?.[name] ?? null,
+                  cell: (row: ScreenRow) => row.factors?.[name]?.toFixed(0) ?? "—",
+                })),
                 {
                   id: "score",
                   header: "排名分",

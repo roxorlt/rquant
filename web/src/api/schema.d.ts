@@ -1717,17 +1717,37 @@ export interface components {
             close: number | null;
             /** Code */
             code: string;
+            /** Factors */
+            factors?: {
+                [key: string]: number;
+            };
+            /** Industry */
+            industry?: string | null;
             /** Name */
             name: string | null;
+            /** Netprofit Yoy */
+            netprofit_yoy?: number | null;
+            /** Or Yoy */
+            or_yoy?: number | null;
+            /** Pb */
+            pb?: number | null;
             /** Pct Chg */
             pct_chg: number | null;
+            /** Pe Ttm */
+            pe_ttm?: number | null;
             /** Preset */
             preset: string;
+            /** Roe */
+            roe?: number | null;
+            /** Total Mv */
+            total_mv?: number | null;
             /**
              * Trade Date
              * Format: date
              */
             trade_date: string;
+            /** Turnover Rate */
+            turnover_rate?: number | null;
         };
         /** ServiceItem */
         ServiceItem: {

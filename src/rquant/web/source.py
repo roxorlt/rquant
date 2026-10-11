@@ -288,6 +288,12 @@ def write_demo_research(root: Path) -> None:
     from rquant.factor.store import save_tracking, track
 
     save_tracking(track(demo, panel, today, lookback_days=60), root)
+    from rquant.factor.store import save_latest
+
+    save_latest(demo, {k: v.rename(columns=dict(zip(v.columns[:4], ["600519.SH", "000001.SZ",
+                                                                      "300750.SZ", "601318.SH"],
+                                                     strict=True)))
+                       for k, v in panel.items()}, root)
 
     from rquant.factor.condition import save as save_condition
     from rquant.factor.condition import screen
