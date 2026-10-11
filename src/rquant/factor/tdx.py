@@ -1,6 +1,6 @@
 """Translate a subset of 通达信 (TDX) formulas into the factor expression language.
 
-Supported: C/O/H/L/V/CLOSE/OPEN/HIGH/LOW/VOL/AMOUNT, MA/REF/HHV/LLV/SUM/STD/ABS/CROSS,
+Supported: C/O/H/L/V/CLOSE/OPEN/HIGH/LOW/VOL/AMOUNT, MA/EMA/REF/HHV/LLV/SUM/STD/ABS/CROSS,
 + − × ÷, > >= < <= = <>, AND/OR/NOT, and a final condition line. ``X:=expr;``
 assignments are inlined. Anything else raises ``TdxFormulaError`` with the
 offending token, so nothing unrecognised is silently dropped.
@@ -17,7 +17,7 @@ FIELD = {"C": "close", "CLOSE": "close", "O": "open", "OPEN": "open", "H": "high
          "HIGH": "high", "L": "low", "LOW": "low", "V": "vol", "VOL": "vol",
          "AMOUNT": "amount", "AMO": "amount"}
 FUNC = {"MA": "ts_mean", "REF": "delay", "HHV": "ts_max", "LLV": "ts_min",
-        "SUM": "ts_sum", "STD": "ts_std", "ABS": "abs", "CROSS": "cross"}
+        "SUM": "ts_sum", "STD": "ts_std", "ABS": "abs", "CROSS": "cross", "EMA": "ts_ema"}
 WORD = {"AND": " and ", "OR": " or ", "NOT": " not "}
 
 _TOKEN = re.compile(r"\s*(?:(\d+\.?\d*)|([A-Za-z_][A-Za-z0-9_]*)|(<>|>=|<=|:=|[-+*/(),<>=;:]))")
