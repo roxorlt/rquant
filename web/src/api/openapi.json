@@ -2162,6 +2162,14 @@
             "title": "Horizons",
             "type": "object"
           },
+          "notes": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Notes",
+            "type": "array"
+          },
           "per_year": {
             "additionalProperties": {
               "type": "integer"
@@ -2177,6 +2185,14 @@
           "slug": {
             "title": "Slug",
             "type": "string"
+          },
+          "tables": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/StudyTable"
+            },
+            "title": "Tables",
+            "type": "array"
           },
           "title": {
             "title": "Title",
@@ -4478,6 +4494,38 @@
           "note"
         ],
         "title": "StrategyRow",
+        "type": "object"
+      },
+      "StudyTable": {
+        "properties": {
+          "columns": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Columns",
+            "type": "array"
+          },
+          "rows": {
+            "items": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "title": "Rows",
+            "type": "array"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "title",
+          "columns",
+          "rows"
+        ],
+        "title": "StudyTable",
         "type": "object"
       },
       "TaskLog": {

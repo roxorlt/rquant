@@ -1287,6 +1287,11 @@ export interface components {
                 [key: string]: components["schemas"]["EventHorizon"];
             };
             /**
+             * Notes
+             * @default []
+             */
+            notes: string[];
+            /**
              * Per Year
              * @default {}
              */
@@ -1297,6 +1302,11 @@ export interface components {
             signals: number;
             /** Slug */
             slug: string;
+            /**
+             * Tables
+             * @default []
+             */
+            tables: components["schemas"]["StudyTable"][];
             /** Title */
             title: string;
             /** Window */
@@ -2020,6 +2030,15 @@ export interface components {
             version: number;
             /** Versions */
             versions: number;
+        };
+        /** StudyTable */
+        StudyTable: {
+            /** Columns */
+            columns: string[];
+            /** Rows */
+            rows: string[][];
+            /** Title */
+            title: string;
         };
         /** TaskLog */
         TaskLog: {
