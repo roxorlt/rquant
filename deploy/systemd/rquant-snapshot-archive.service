@@ -1,0 +1,28 @@
+[Unit]
+Description=rQuant L1 snapshot archive: tar.gz day dirs -> R2 rquant-snapshots, verify, prune >14d (verified only)
+After=network-online.target rquant-snapshot-collector.service
+Wants=network-online.target
+
+[Service]
+# Research-only. Reads $RQUANT_RESEARCH_ROOT/snapshots/YYYY-MM-DD; skips today while the
+# collector is still active; deletes local dirs only after HEAD-verifying size+sha256 in R2.
+# R2 creds: /etc/rquant-r2.env (600, lighthouse). Fetch back:
+#   .venv/bin/python -m rquant.research.snapshot_archive fetch YYYY-MM-DD --dest /tmp/x
+Type=oneshot
+Slice=rquant-research.slice
+User=lighthouse
+Group=lighthouse
+WorkingDirectory=/home/lighthouse/rquant-web-rel/current
+EnvironmentFile=/etc/rquant-web.env
+EnvironmentFile=/etc/rquant-r2.env
+Environment=RQUANT_DISABLE_DOTENV=1 TZ=Asia/Shanghai PYTHONWARNINGS=ignore
+ExecStart=/home/lighthouse/rquant-web-rel/current/.venv/bin/python -m rquant.research.snapshot_archive run
+TimeoutStartSec=2h
+Nice=15
+CPUQuota=30%
+MemoryMax=300M
+IOWeight=30
+NoNewPrivileges=yes
+PrivateTmp=yes
+StandardOutput=journal
+StandardError=journal
