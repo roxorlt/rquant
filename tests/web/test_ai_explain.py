@@ -41,3 +41,13 @@ def test_explain_without_key_is_503(tmp_path, monkeypatch) -> None:
     client = TestClient(create_app(FixtureSource(), dist=None, research_root=tmp_path))
     run_id = client.get("/api/v1/portfolio-backtests").json()["data"]["runs"][0]["run_id"]
     assert client.post(f"/api/v1/portfolio-backtests/{run_id}/explain").status_code == 503
+
+
+def test_deepseek_complete_reads_env_only(monkeypatch) -> None:
+    from rquant.web.ai_explain import deepseek_complete
+
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    assert deepseek_complete() is None
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "x")
+    monkeypatch.setenv("DEEPSEEK_MODEL", "m")
+    assert deepseek_complete()[1] == "m"
