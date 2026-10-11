@@ -356,3 +356,19 @@ export function useStock(code: string | undefined): ServingQueryResult<Schemas["
     { enabled: Boolean(code) },
   );
 }
+
+export function useBrinson(
+  runId: string | null,
+): ServingQueryResult<Schemas["BrinsonData"] | null> {
+  return useServingQuery(
+    ["portfolio-backtests", runId, "brinson"],
+    async () => {
+      const { data, response } = await apiClient().GET(
+        "/api/v1/portfolio-backtests/{run_id}/brinson",
+        { params: { path: { run_id: runId ?? "" } } },
+      );
+      return unwrap(data, response);
+    },
+    { enabled: runId !== null },
+  );
+}

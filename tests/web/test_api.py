@@ -300,3 +300,19 @@ def test_stock_profile_reads_the_research_market(tmp_path) -> None:
     assert set(body["returns"]) >= {"5日", "20日", "年初至今"}
     assert client.get("/api/v1/stocks/bad").status_code == 422
     assert client.get("/api/v1/stocks/999999.SH").status_code == 404
+
+
+def test_brinson_effects_add_up_to_excess(tmp_path) -> None:
+    from fastapi.testclient import TestClient
+
+    from rquant.web.app import create_app
+    from rquant.web.source import FixtureSource, write_demo_research
+
+    write_demo_research(tmp_path)
+    client = TestClient(create_app(FixtureSource(), dist=None, research_root=tmp_path))
+    run_id = client.get("/api/v1/portfolio-backtests").json()["data"]["runs"][0]["run_id"]
+    b = client.get(f"/api/v1/portfolio-backtests/{run_id}/brinson").json()["data"]
+    assert b is not None and b["days"] > 0
+    total = b["allocation"] + b["selection"] + b["interaction"]
+    assert total == pytest.approx(b["portfolio_return"] - b["benchmark_return"], abs=1e-9)
+    assert {r["industry"] for r in b["rows"]} >= {"白酒", "银行", "现金"}

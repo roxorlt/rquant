@@ -10,6 +10,7 @@ from datetime import date
 from pathlib import Path
 from typing import Annotated, Any, TypeVar
 
+import duckdb
 import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
@@ -30,6 +31,7 @@ from rquant.web import query as sql_query
 from rquant.web import tasks as task_view
 from rquant.web.ai_explain import Explanation, build_facts, deepseek_complete, explain
 from rquant.web.backtest_perf import backtest_perf, perf_from_returns
+from rquant.web.brinson import BrinsonData, brinson
 from rquant.web.health_layers import build_layers
 from rquant.web.models import (
     AckAlertRequest,
@@ -390,6 +392,21 @@ def portfolio_band(run_id: str, request: Request, source: SourceDep,
         raise HTTPException(404, "portfolio backtest not found")
     return _envelope(source, BandData(run_id=run_id, days=days,
                                       points=bootstrap_band(_nav_returns(run), days)))
+
+
+@router.get("/portfolio-backtests/{run_id}/brinson", response_model=Envelope[BrinsonData | None],
+            summary="行业 Brinson 归因")
+def portfolio_brinson(run_id: str, request: Request, source: SourceDep
+                      ) -> Envelope[BrinsonData | None]:
+    run = read_run(run_id, _research_root(request))
+    if run is None:
+        raise HTTPException(404, f"没有回测 {run_id}")
+    with market(Path(_research_root(request) or research_root())) as con:
+        try:
+            data = brinson(con, run.result.days, run.industries) if con is not None else None
+        except duckdb.Error:
+            data = None
+    return _envelope(source, data)
 
 
 @router.post("/portfolio-backtests/{run_id}/explain", response_model=Explanation,

@@ -16,6 +16,7 @@ import { DataTable } from "@/table/DataTable";
 import { Button, ChangeText, KpiStrip, Panel, Pill } from "@/ui";
 import { StockLink } from "@/ui/StockLink";
 import { QueryView } from "../shared";
+import { BrinsonPanel } from "./Brinson";
 import { PerfPanel } from "./Perf";
 
 type Perf = components["schemas"]["BacktestPerf"];
@@ -179,6 +180,7 @@ function Detail({ runId, onCompare }: { runId: string; onCompare: () => void }) 
             />
           </Panel>
           <Explain runId={runId} />
+          <BrinsonPanel runId={runId} />
           {data.exposure.length ? (
             <Panel title="行业暴露" sub="期末权重 vs 最后一次候选池等权" flush>
               <table className="tbl" aria-label="行业暴露">

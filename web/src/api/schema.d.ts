@@ -383,6 +383,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/portfolio-backtests/{run_id}/brinson": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 行业 Brinson 归因 */
+        get: operations["portfolio_brinson_api_v1_portfolio_backtests__run_id__brinson_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/portfolio-backtests/{run_id}/explain": {
         parameters: {
             query?: never;
@@ -846,6 +863,40 @@ export interface components {
             /** System */
             system: string;
         };
+        /** BrinsonData */
+        BrinsonData: {
+            /** Allocation */
+            allocation: number;
+            /** Benchmark */
+            benchmark: string;
+            /** Benchmark Return */
+            benchmark_return: number;
+            /** Days */
+            days: number;
+            /** Interaction */
+            interaction: number;
+            /** Portfolio Return */
+            portfolio_return: number;
+            /** Rows */
+            rows: components["schemas"]["BrinsonRow"][];
+            /** Selection */
+            selection: number;
+        };
+        /** BrinsonRow */
+        BrinsonRow: {
+            /** Allocation */
+            allocation: number;
+            /** Industry */
+            industry: string;
+            /** Interaction */
+            interaction: number;
+            /** Selection */
+            selection: number;
+            /** Weight Benchmark */
+            weight_benchmark: number;
+            /** Weight Portfolio */
+            weight_portfolio: number;
+        };
         /** CatalogDataset */
         CatalogDataset: {
             /** Category */
@@ -1084,6 +1135,11 @@ export interface components {
         /** Envelope[TaskLog] */
         Envelope_TaskLog_: {
             data: components["schemas"]["TaskLog"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[Union[BrinsonData, NoneType]] */
+        Envelope_Union_BrinsonData__NoneType__: {
+            data: components["schemas"]["BrinsonData"] | null;
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[Union[FundamentalsDoc, NoneType]] */
@@ -2472,6 +2528,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_BandData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    portfolio_brinson_api_v1_portfolio_backtests__run_id__brinson_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_Union_BrinsonData__NoneType__"];
                 };
             };
             /** @description Validation Error */
