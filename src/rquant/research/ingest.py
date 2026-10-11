@@ -42,6 +42,8 @@ CREATE TABLE IF NOT EXISTS moneyflow(ts_code VARCHAR, trade_date DATE,
   buy_sm_amount DOUBLE, sell_sm_amount DOUBLE, buy_md_amount DOUBLE, sell_md_amount DOUBLE,
   buy_lg_amount DOUBLE, sell_lg_amount DOUBLE, buy_elg_amount DOUBLE, sell_elg_amount DOUBLE,
   net_mf_amount DOUBLE, PRIMARY KEY (ts_code, trade_date));
+CREATE TABLE IF NOT EXISTS namechange(ts_code VARCHAR, name VARCHAR, start_date DATE,
+  end_date DATE, PRIMARY KEY (ts_code, start_date, name));
 CREATE TABLE IF NOT EXISTS daily_state(ts_code VARCHAR, trade_date DATE, limit_pct DOUBLE,
   PRIMARY KEY (ts_code, trade_date));
 CREATE TABLE IF NOT EXISTS index_daily(ts_code VARCHAR, trade_date DATE, close DOUBLE,
@@ -137,6 +139,28 @@ def refresh_reference(con: duckdb.DuckDBPyConnection, pro: Pro, start: date, end
     sb["delist_date"] = pd.to_datetime(sb["delist_date"], format="%Y%m%d", errors="coerce").dt.date
     _upsert(con, "stock_basic",
             sb[["ts_code", "name", "industry", "market", "list_date", "delist_date"]])
+    refresh_namechange(con, pro)
+
+
+def refresh_namechange(con: duckdb.DuckDBPyConnection, pro: Pro, page: int = 5000) -> int:
+    """Full name history (point-in-time ST/退 status). Paged; replaces the table."""
+    frames, off = [], 0
+    while True:
+        f = pro("namechange", fields="ts_code,name,start_date,end_date", limit=page, offset=off)
+        if f is None or f.empty:
+            break
+        frames.append(f)
+        if len(f) < page:
+            break
+        off += page
+    if not frames:
+        return 0
+    nc = pd.concat(frames, ignore_index=True)
+    nc["start_date"] = pd.to_datetime(nc["start_date"], format="%Y%m%d", errors="coerce").dt.date
+    nc["end_date"] = pd.to_datetime(nc["end_date"], format="%Y%m%d", errors="coerce").dt.date
+    nc = nc.dropna(subset=["start_date"]).drop_duplicates(["ts_code", "start_date", "name"])
+    con.execute("DELETE FROM namechange")
+    return _upsert(con, "namechange", nc[["ts_code", "name", "start_date", "end_date"]])
 
 
 def missing_days(con: duckdb.DuckDBPyConnection, table: str, start: date, end: date) -> list[date]:

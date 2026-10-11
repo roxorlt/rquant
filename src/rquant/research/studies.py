@@ -92,14 +92,16 @@ def intraday_study(root: Path, slug: str, title: str, formula: str, eod_preset: 
                      [w0, end], f).reindex_like(C) for f in ("pre_close", "vol", "amount")}
     lim = _panel(con, f"SELECT trade_date, ts_code, limit_pct {q.format(t='daily_state')}",
                  [w0, end], "limit_pct").reindex_like(C).fillna(0.1)
-    st = {c for (c,) in con.execute(
-        "SELECT ts_code FROM stock_basic WHERE name LIKE '%ST%' OR name LIKE '%退%'").fetchall()}
+    from rquant.research.pit import st_mask
+
+    stm = st_mask(con, C.index, C.columns)
     idx = _panel(con, "SELECT trade_date, ts_code, close FROM index_daily "
                  "WHERE trade_date BETWEEN ? AND ?", [w0, end], "close").reindex(C.index)
     eod = con.execute("SELECT trade_date, ts_code FROM screen_result WHERE preset_name = ?",
                       [eod_preset]).df()
     con.close()
-    panel["vol"], panel["amount"] = raw["vol"], raw["amount"]  # volume is not adjusted
+    # volume: raw / adj_factor (送转-neutral); amount stays raw
+    panel["vol"], panel["amount"] = raw["vol"] / A.where(A > 0), raw["amount"]
 
     def piv(col: str) -> pd.DataFrame:
         return b.pivot(index="trade_date", columns="ts_code", values=col).reindex_like(C)
@@ -111,7 +113,7 @@ def intraday_study(root: Path, slug: str, title: str, formula: str, eod_preset: 
     frac = frac.fillna(float(np.nanmedian(share.to_numpy())))
     vunit = float(np.nanmedian((vday / raw["vol"]).to_numpy()))
     aunit = float(np.nanmedian((amt / share / raw["amount"]).to_numpy()))
-    proxy = {"close": p * A, "high": h * A, "low": lo * A, "vol": v / frac / vunit,
+    proxy = {"close": p * A, "high": h * A, "low": lo * A, "vol": v / frac / vunit / A.where(A > 0),
              "amount": amt / frac / aunit}
     proxy["pct_chg"] = (p / raw["pre_close"] - 1) * 100
     sealed = p >= _limit(raw["pre_close"], lim) - 1e-6
@@ -126,7 +128,7 @@ def intraday_study(root: Path, slug: str, title: str, formula: str, eod_preset: 
             sl[f].iloc[-1] = x.loc[d].where(have)
         row = evaluate(expr, sl).iloc[-1]
         ok = row[(row > 0.5) & have & ~sealed.loc[d].fillna(False)]
-        fired += [(d, c) for c in ok.index if c not in st]
+        fired += [(d, c) for c in ok.index if not stm.at[d, c]]
     hits = pd.DataFrame(fired, columns=["trade_date", "ts_code"])
     rows = []
     for d, code in fired:
@@ -171,9 +173,9 @@ def intraday_study(root: Path, slug: str, title: str, formula: str, eod_preset: 
                   "量能代理：14:50 累计量 ÷ 该股前 20 日（滞后一日）14:50 累计量占全天比例中位数",
                   f"与收盘版信号重合：{both}/{len(hits)}（收盘版同期 {len(in_window)} 个）",
                   "14:50 已封涨停的样本剔除（买不进）"],
-        "caveats": ["ST/退市按当前名称过滤（前视/幸存者偏差）",
+        "caveats": ["ST/退 按 namechange 时点名称过滤，含已退市股",
                     "按 14:50 收盘价成交，未计冲击成本与费用",
-                    "指数超额以信号日收盘为基准", "成交量未复权",
+                    "指数超额以信号日收盘为基准", "成交量按复权因子调整",
                     f"EMA 每次只用最近 {WINDOW_ROWS} 根日线预热"]})
 
 
@@ -227,8 +229,12 @@ def auction_frame(root: Path) -> pd.DataFrame:
     df = auc.merge(bars, on=["ts_code", "trade_date"], how="inner").merge(basic, on="ts_code")
     df = df[(df["y_close"] >= df["y_limit"] - 1e-6) & (df["y_high"] > df["y_low"])
             & (df["price"] / df["y_close"] - 1 > 0.04)
-            & ~df["name"].str.contains("ST|退", na=False)
             & ~df["ts_code"].str.endswith(".BJ")]
+    from rquant.research.pit import is_st
+
+    con = duckdb.connect(str(db_path(root)), read_only=True)
+    df = df[~is_st(con, df["ts_code"], df["trade_date"]).to_numpy()]
+    con.close()
     ll["first_min"] = pd.to_numeric(ll["first_time"].astype(str).str[:4].where(
         ll["first_time"].notna()), errors="coerce")
     ll["first_min"] = (ll["first_min"] // 100) * 60 + ll["first_min"] % 100 - 570
@@ -365,7 +371,8 @@ def auction_study(root: Path) -> dict:
                    "test": r["test"]} for r in rules],
         "notes": ["竞价数据：Tushare stk_auction（09:25 集合竞价真实成交）",
                   "连板/封板时间/封单/开板：limit_list_d", "开→收 当日不可卖（T+1），仅作参考"],
-        "caveats": ["ST/退市按当前名称过滤", "未计费用与冲击成本（竞价量小的股票尤其明显）",
+        "caveats": ["ST/退 按 namechange 时点名称过滤",
+                    "未计费用与冲击成本（竞价量小的股票尤其明显）",
                     "阈值在训练期选出，测试期只看一次；候选规则数多，仍有数据挖掘偏差",
                     "开盘价=竞价价，一字开盘视为买不进"]})
 

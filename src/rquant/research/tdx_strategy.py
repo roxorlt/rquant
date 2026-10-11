@@ -54,16 +54,16 @@ def hits(con: duckdb.DuckDBPyConnection, formula: str, start: date, end: date) -
     from rquant.factor.expr import evaluate
     from rquant.factor.store import load_panel
     from rquant.factor.tdx import translate
+    from rquant.research.pit import adjust_volume, st_mask
 
     panel = load_panel(con, start, end, table="daily_bar_hfq")
+    adjust_volume(con, panel)
     out = evaluate(translate(formula), panel)
     out = out.loc[(out.index >= pd.Timestamp(start)) & (out.index <= pd.Timestamp(end))]
-    st = {c for (c,) in con.execute("SELECT ts_code FROM stock_basic WHERE name LIKE '%ST%'")
-          .fetchall()}
+    out = out.where(~st_mask(con, out.index, out.columns), 0)
     s = out.stack()
     s = s[s > 0.5]
     df = s.reset_index()[["trade_date", "ts_code"]]
-    df = df[~df["ts_code"].isin(st)]
     amount = panel["amount"].stack().rename("amount").reset_index()
     return df.merge(amount, on=["trade_date", "ts_code"], how="left")
 
@@ -145,8 +145,8 @@ def run(root: Path, db: Path, first: date, last: date) -> list[tuple]:
             study = event_study(con, df) | {
                 "slug": slug, "title": title, "formula": formula,
                 "window": [str(start), str(last)], "generated_at": datetime.now(UTC).isoformat(),
-                "caveats": ["ST 用当前名称过滤（存在前视/幸存者偏差）",
-                            "成交量未复权，送转日可能影响量能条件",
+                "caveats": ["ST/退 按 namechange 时点名称过滤，含已退市股",
+                            "成交量按复权因子调整（送转中性）",
                             "指数超额以信号日收盘为基准（index_daily 无开盘价）",
                             "进出场日停牌的样本被跳过"]}
             p = study_path(root, slug)
