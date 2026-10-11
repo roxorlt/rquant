@@ -372,3 +372,10 @@ export function useBrinson(
     { enabled: runId !== null },
   );
 }
+
+export function useFactorCorrelation(): ServingQueryResult<Schemas["FactorCorrData"]> {
+  return useServingQuery(["factors", "correlation"], async () => {
+    const { data, response } = await apiClient().GET("/api/v1/factors/correlation");
+    return unwrap(data, response);
+  });
+}

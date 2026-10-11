@@ -13,6 +13,7 @@ from typing import Annotated, Any, TypeVar
 import duckdb
 import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from pydantic import BaseModel
 
 from rquant.backtest.band import bootstrap_band
 from rquant.backtest.exposure import industry_exposure
@@ -485,6 +486,33 @@ def factors(request: Request, source: SourceDep) -> Envelope[FactorListData]:
     root = _research_root(request)
     runs = list_factors(root)[:200]
     return _envelope(source, FactorListData(factors=[_factor_summary(r, root) for r in runs]))
+
+
+class FactorCorrData(BaseModel):
+    names: list[str]
+    value_corr: list[list[float | None]]  # Spearman of latest cross-section values
+    ic_corr: list[list[float | None]]  # Pearson of daily IC series on common dates
+
+
+@router.get("/factors/correlation", response_model=Envelope[FactorCorrData],
+            summary="因子相关性")
+def factor_correlation(request: Request, source: SourceDep) -> Envelope[FactorCorrData]:
+    root = _research_root(request)
+    runs = list_factors(root)[:30]
+    names = [r.name for r in runs]
+    latest = read_latest(root)
+    values = pd.DataFrame({n: pd.Series(latest.get(n, {}), dtype=float) for n in names})
+    ics = pd.DataFrame({r.name: pd.Series({p.date: p.ic for p in r.result.ic_series})
+                        for r in runs})
+
+    def mat(frame: pd.DataFrame, method: str) -> list[list[float | None]]:
+        if frame.empty:
+            return [[None] * len(names) for _ in names]
+        c = frame.corr(method=method, min_periods=10).reindex(index=names, columns=names)
+        return [[None if pd.isna(v) else round(float(v), 3) for v in row] for row in c.values]
+
+    return _envelope(source, FactorCorrData(names=names, value_corr=mat(values, "spearman"),
+                                            ic_corr=mat(ics, "pearson")))
 
 
 @router.get("/factors/{factor_id}", response_model=Envelope[FactorDetailData],

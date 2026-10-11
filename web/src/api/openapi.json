@@ -1680,6 +1680,22 @@
         "title": "Envelope[DataCenterData]",
         "type": "object"
       },
+      "Envelope_FactorCorrData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/FactorCorrData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[FactorCorrData]",
+        "type": "object"
+      },
       "Envelope_FactorDetailData_": {
         "properties": {
           "data": {
@@ -2070,6 +2086,58 @@
           "model"
         ],
         "title": "Explanation",
+        "type": "object"
+      },
+      "FactorCorrData": {
+        "properties": {
+          "ic_corr": {
+            "items": {
+              "items": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "type": "array"
+            },
+            "title": "Ic Corr",
+            "type": "array"
+          },
+          "names": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Names",
+            "type": "array"
+          },
+          "value_corr": {
+            "items": {
+              "items": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "type": "array"
+            },
+            "title": "Value Corr",
+            "type": "array"
+          }
+        },
+        "required": [
+          "names",
+          "value_corr",
+          "ic_corr"
+        ],
+        "title": "FactorCorrData",
         "type": "object"
       },
       "FactorDetailData": {
@@ -4804,6 +4872,24 @@
           }
         },
         "summary": "因子检验列表"
+      }
+    },
+    "/api/v1/factors/correlation": {
+      "get": {
+        "operationId": "factor_correlation_api_v1_factors_correlation_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_FactorCorrData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "因子相关性"
       }
     },
     "/api/v1/factors/{factor_id}": {

@@ -331,3 +331,16 @@ def test_screen_rows_carry_valuation_fundamentals_and_factor_pct(tmp_path) -> No
     assert moutai["industry"] == "白酒" and moutai["pe_ttm"] is not None
     assert moutai["roe"] == 18.9
     assert 0 < moutai["factors"]["演示动量因子"] <= 100
+
+
+def test_factor_correlation_matrix(tmp_path) -> None:
+    from fastapi.testclient import TestClient
+
+    from rquant.web.app import create_app
+    from rquant.web.source import FixtureSource, write_demo_research
+
+    write_demo_research(tmp_path)
+    client = TestClient(create_app(FixtureSource(), dist=None, research_root=tmp_path))
+    body = client.get("/api/v1/factors/correlation").json()["data"]
+    assert body["names"] == ["演示动量因子"]
+    assert body["ic_corr"] == [[1.0]]

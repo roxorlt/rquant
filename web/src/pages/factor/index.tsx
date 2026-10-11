@@ -4,6 +4,7 @@ import { TimeChart } from "@/charts/Chart";
 import { DataTable } from "@/table/DataTable";
 import { KpiStrip, PageHeader, Panel } from "@/ui";
 import { QueryView } from "../shared";
+import { CorrelationPanel } from "./Correlation";
 
 const num = (v: number | null | undefined, d = 3) => (v == null ? "—" : v.toFixed(d));
 const pct = (v: number | null | undefined) => (v == null ? "—" : `${(v * 100).toFixed(2)}%`);
@@ -274,6 +275,7 @@ export default function FactorPage() {
           </Panel>
         )}
       </QueryView>
+      <CorrelationPanel />
       {id ? <Detail id={id} /> : null}
     </>
   );
