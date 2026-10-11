@@ -26,6 +26,7 @@ class Bar(BaseModel):
     low: float
     close: float
     pct_chg: float | None
+    vol: float | None = None  # 手
     amount: float | None
 
 
@@ -102,8 +103,9 @@ def load_profile(con: duckdb.DuckDBPyConnection | None, code: str, days: int = 2
                        "WHERE ts_code = ?", [code])
     if basic:
         out.update(basic[0])
-    raw = _rows(con, "SELECT trade_date, open, high, low, close, pct_chg, amount FROM daily_bar "
-                     "WHERE ts_code = ? ORDER BY trade_date DESC LIMIT ?", [code, days])
+    raw = _rows(con, "SELECT trade_date, open, high, low, close, pct_chg, vol, amount "
+                     "FROM daily_bar WHERE ts_code = ? ORDER BY trade_date DESC LIMIT ?",
+                [code, days])
     adj = {r["trade_date"]: r["adj_factor"] for r in _rows(
         con, "SELECT trade_date, adj_factor FROM adj_factor WHERE ts_code = ?", [code])}
     last_adj = (adj.get(raw[0]["trade_date"]) if raw else None) or 1.0
@@ -113,7 +115,8 @@ def load_profile(con: duckdb.DuckDBPyConnection | None, code: str, days: int = 2
 
     bars = [Bar(date=r["trade_date"], open=r["open"] * k(r["trade_date"]),
                 high=r["high"] * k(r["trade_date"]), low=r["low"] * k(r["trade_date"]),
-                close=r["close"] * k(r["trade_date"]), pct_chg=r["pct_chg"], amount=r["amount"])
+                close=r["close"] * k(r["trade_date"]), pct_chg=r["pct_chg"], vol=r["vol"],
+                amount=r["amount"])
             for r in reversed(raw) if None not in (r["close"], r["open"], r["high"], r["low"])]
     out["bars"] = bars
     val = _rows(con, "SELECT trade_date, pe_ttm, pb, total_mv, circ_mv, turnover_rate "
@@ -163,7 +166,9 @@ def write_demo_market(root: Path, today: date) -> None:
               ("600036.SH", "招商银行", "银行", 35.0), ("000858.SZ", "五粮液", "白酒", 140.0)]
     days = pd.bdate_range(end=pd.Timestamp(today), periods=300)
     rng = np.random.default_rng(11)
-    bars, basic, flows = [], [], []
+    bars, basic, flows, mins = [], [], [], []
+    slots = ([pd.Timedelta(hours=9, minutes=30 + 5 * i) for i in range(1, 25)]
+             + [pd.Timedelta(hours=13, minutes=5 * i) for i in range(1, 25)])
     for k, (code, _, _, p0) in enumerate(stocks):
         rets = rng.normal(0.0004, 0.018, len(days))
         close = p0 * np.exp(np.cumsum(rets))
@@ -172,7 +177,18 @@ def write_demo_market(root: Path, today: date) -> None:
             o = pc * (1 + rng.normal(0, 0.004))
             hi = max(o, c) * (1 + abs(rng.normal(0, 0.006)))
             lo = min(o, c) * (1 - abs(rng.normal(0, 0.006)))
-            bars.append((code, d.date(), o, hi, lo, c, pc, (c / pc - 1) * 100, 1e5, c * 1e5))
+            vol = 1e5 * (1 + abs(rng.normal(0, 0.6)))
+            bars.append((code, d.date(), o, hi, lo, c, pc, (c / pc - 1) * 100, vol, c * vol / 10))
+            if d >= days[-5]:  # a week of 5-minute bars (a bridge from open to close)
+                walk = np.cumsum(rng.normal(0, 1, len(slots)))
+                path = o + (c - o) * np.linspace(0, 1, len(slots)) + (walk - walk[-1] * np.linspace(
+                    0, 1, len(slots))) * (hi - lo) / 12
+                path = np.clip(path, lo, hi)
+                prev_p = o
+                for t, p in zip(slots, path, strict=True):
+                    mins.append((code, d + t, "5min", d.date(), prev_p, max(prev_p, p),
+                                 min(prev_p, p), p, vol / 48, p * vol / 480))
+                    prev_p = p
             basic.append((code, d.date(), 0.5 + k * 0.2, 10 + 5 * k + c / p0, 1 + k * 0.5,
                           c * 1e6 * (k + 1), c * 8e5 * (k + 1), 1.5 + k * 0.5))
             main = (c / pc - 1) * 5e4 + rng.normal(0, 800)
@@ -200,5 +216,10 @@ def write_demo_market(root: Path, today: date) -> None:
                     "buy_elg_amount DOUBLE, sell_elg_amount DOUBLE, net_mf_amount DOUBLE)")
         flow_df = pd.DataFrame(flows)  # noqa: F841
         con.execute("INSERT INTO moneyflow SELECT * FROM flow_df")
+        con.execute("CREATE TABLE minute_bar(ts_code VARCHAR, trade_time TIMESTAMP, freq VARCHAR, "
+                    "trade_date DATE, open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE, "
+                    "vol DOUBLE, amount DOUBLE)")
+        min_df = pd.DataFrame(mins)  # noqa: F841
+        con.execute("INSERT INTO minute_bar SELECT * FROM min_df")
     finally:
         con.close()

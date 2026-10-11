@@ -9,6 +9,42 @@ type Bar = Schemas["StockProfile"]["bars"][number];
 const pct = (v: number) => `${(v * 100).toFixed(1)}%`;
 const band = (b: readonly number[]) => `${(b[0] ?? 0).toFixed(2)}–${(b[1] ?? 0).toFixed(2)}`;
 
+const fmt = (v: number | null | undefined) => (v == null ? "—" : v.toFixed(2));
+
+/**
+ * Anchored VWAP from ``from`` on: volume-weighted typical price (H+L+C)/3 of the
+ * forward-adjusted daily bars, with volume-weighted standard-deviation bands.
+ */
+export function anchoredVwap(bars: readonly Bar[], from: number) {
+  const mid: (number | null)[] = [];
+  const u1: (number | null)[] = [];
+  const l1: (number | null)[] = [];
+  const u2: (number | null)[] = [];
+  const l2: (number | null)[] = [];
+  let sv = 0;
+  let spv = 0;
+  let sp2v = 0;
+  bars.forEach((b, i) => {
+    if (i < from) {
+      for (const s of [mid, u1, l1, u2, l2]) s.push(null);
+      return;
+    }
+    const v = b.vol ?? (b.amount ?? 0) / b.close;
+    const p = (b.high + b.low + b.close) / 3;
+    sv += v;
+    spv += p * v;
+    sp2v += p * p * v;
+    const m = sv > 0 ? spv / sv : p;
+    const sd = sv > 0 ? Math.sqrt(Math.max(sp2v / sv - m * m, 0)) : 0;
+    mid.push(m);
+    u1.push(m + sd);
+    l1.push(m - sd);
+    u2.push(m + 2 * sd);
+    l2.push(m - 2 * sd);
+  });
+  return { mid, u1, l1, u2, l2 };
+}
+
 /** K-line with a chip distribution column that follows the mouse, plus a volume-profile overlay. */
 export function KlinePanel({ code, bars }: { code: string; bars: readonly Bar[] }) {
   const chips = useChips(code);
@@ -20,6 +56,19 @@ export function KlinePanel({ code, bars }: { code: string; bars: readonly Bar[] 
   const day = bars[hover ?? bars.length - 1];
   const chip = day ? byDate.get(day.date) : undefined;
   const range: [number, number] | undefined = c ? [c.lo, c.hi] : undefined;
+  const [showVwap, setShowVwap] = useState(true);
+  const [anchor, setAnchor] = useState<number | null>(null);
+  const a = anchor ?? Math.max(0, bars.length - 60);
+  const vwap = useMemo(() => anchoredVwap(bars, a), [bars, a]);
+  const overlays = showVwap
+    ? [
+        { key: "vwap", values: vwap.mid, color: "#c792ea" },
+        { key: "u1", values: vwap.u1, color: "#c792ea", dash: true },
+        { key: "l1", values: vwap.l1, color: "#c792ea", dash: true },
+        { key: "u2", values: vwap.u2, color: "#7f6a99", dash: true },
+        { key: "l2", values: vwap.l2, color: "#7f6a99", dash: true },
+      ]
+    : [];
   return (
     <Panel
       title="日K线 · 筹码"
@@ -33,6 +82,14 @@ export function KlinePanel({ code, bars }: { code: string; bars: readonly Bar[] 
               onChange={(e) => setShowChips(e.target.checked)}
             />{" "}
             筹码分布
+          </label>
+          <label title="点击 K 线设置锚点">
+            <input
+              type="checkbox"
+              checked={showVwap}
+              onChange={(e) => setShowVwap(e.target.checked)}
+            />{" "}
+            锚定 VWAP ±1σ/2σ
           </label>
           <label>
             <input type="checkbox" checked={showVp} onChange={(e) => setShowVp(e.target.checked)} />{" "}
@@ -48,6 +105,9 @@ export function KlinePanel({ code, bars }: { code: string; bars: readonly Bar[] 
         bars={bars}
         range={range}
         onHover={setHover}
+        overlays={overlays}
+        anchor={showVwap ? a : null}
+        onPick={showVwap ? setAnchor : undefined}
         side={showChips && chip ? { dist: chip.dist, close: chip.close, avg: chip.avg_cost } : null}
         profile={showVp ? (c?.profile ?? null) : null}
       />
@@ -66,6 +126,14 @@ export function KlinePanel({ code, bars }: { code: string; bars: readonly Bar[] 
           <span>
             70% 成本 <b>{band(chip.cost70)}</b> 集中度 <b>{pct(chip.conc70)}</b>
           </span>
+          {showVwap ? (
+            <span title="点击 K 线可移动锚点">
+              VWAP 自 {bars[a]?.date} <b>{fmt(vwap.mid[vwap.mid.length - 1])}</b> ±1σ{" "}
+              <b>
+                {fmt(vwap.l1[vwap.l1.length - 1])}–{fmt(vwap.u1[vwap.u1.length - 1])}
+              </b>
+            </span>
+          ) : null}
           {showVp && c?.profile ? (
             <span>
               POC <b>{c.profile.poc.toFixed(2)}</b> 价值区{" "}
