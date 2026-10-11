@@ -9,7 +9,7 @@ export interface Candle {
   amount?: number | null;
 }
 
-const PAD = { left: 52, right: 10, top: 8, bottom: 20 };
+const PAD = { left: 8, right: 58, top: 8, bottom: 20 };
 
 function ma(values: number[], n: number): (number | null)[] {
   let sum = 0;
@@ -20,11 +20,44 @@ function ma(values: number[], n: number): (number | null)[] {
   });
 }
 
-/** Daily K-line (red up / green down, A-share convention) with MA5/20/60 and amount bars. */
-export function Candles({ bars, height = 300 }: { bars: readonly Candle[]; height?: number }) {
+export interface SideDist {
+  /** Bins from low to high price over ``range``. */
+  dist: readonly number[];
+  close: number;
+  avg: number;
+}
+
+export interface ProfileOverlay {
+  dist: readonly number[];
+  poc: number;
+  val: number;
+  vah: number;
+}
+
+/**
+ * Daily K-line (red up / green down, A-share convention) with MA5/20/60 and amount bars.
+ * Optional: a fixed price ``range`` (to share a grid with distributions), a chip
+ * distribution column on the right (``side``), a volume-profile overlay, and ``onHover``.
+ */
+export function Candles({
+  bars,
+  height = 300,
+  range,
+  side,
+  profile,
+  onHover,
+}: {
+  bars: readonly Candle[];
+  height?: number;
+  range?: [number, number];
+  side?: SideDist | null;
+  profile?: ProfileOverlay | null;
+  onHover?: (i: number | null) => void;
+}) {
   const ref = useRef<HTMLDivElement>(null);
   const [w, setW] = useState(800);
   const [hover, setHover] = useState<number | null>(null);
+  const [hy, setHy] = useState<number | null>(null);
   useEffect(() => {
     const el = ref.current;
     if (!el) return;
@@ -37,9 +70,11 @@ export function Candles({ bars, height = 300 }: { bars: readonly Candle[]; heigh
   if (bars.length === 0) return <p className="hint">没有日线数据。</p>;
   const volH = 50;
   const priceH = height - volH - PAD.top - PAD.bottom - 8;
-  const lo = Math.min(...bars.map((b) => b.low));
-  const hi = Math.max(...bars.map((b) => b.high));
-  const step = (w - PAD.left - PAD.right) / bars.length;
+  const lo = range ? range[0] : Math.min(...bars.map((b) => b.low));
+  const hi = range ? range[1] : Math.max(...bars.map((b) => b.high));
+  const plotR = w - PAD.right;
+  const chipW = (plotR - PAD.left) * 0.28;
+  const step = (plotR - PAD.left) / bars.length;
   const x = (i: number) => PAD.left + step * (i + 0.5);
   const y = (v: number) => PAD.top + ((hi - v) / (hi - lo || 1)) * priceH;
   const maxAmt = Math.max(...bars.map((b) => b.amount ?? 0), 1);
@@ -77,17 +112,25 @@ export function Candles({ bars, height = 300 }: { bars: readonly Candle[]; heigh
         viewBox={`0 0 ${w} ${height}`}
         role="img"
         aria-label="日K线"
-        onMouseLeave={() => setHover(null)}
+        onMouseLeave={() => {
+          setHover(null);
+          setHy(null);
+          onHover?.(null);
+        }}
         onMouseMove={(e) => {
           const r = e.currentTarget.getBoundingClientRect();
           const i = Math.floor((e.clientX - r.left - PAD.left) / step);
-          setHover(i >= 0 && i < bars.length ? i : null);
+          const next = i >= 0 && i < bars.length ? i : null;
+          const yy = e.clientY - r.top;
+          setHy(yy >= PAD.top && yy <= PAD.top + priceH ? yy : null);
+          setHover(next);
+          onHover?.(next);
         }}
       >
         {ticks.map((t) => (
           <g key={t}>
-            <line className="chart-grid" x1={PAD.left} x2={w - PAD.right} y1={y(t)} y2={y(t)} />
-            <text className="chart-axis" x={PAD.left - 6} y={y(t) + 3} textAnchor="end">
+            <line className="chart-grid" x1={PAD.left} x2={plotR} y1={y(t)} y2={y(t)} />
+            <text className="chart-axis" x={plotR + 6} y={y(t) + 3} textAnchor="start">
               {t.toFixed(2)}
             </text>
           </g>
@@ -114,6 +157,85 @@ export function Candles({ bars, height = 300 }: { bars: readonly Candle[]; heigh
             </g>
           );
         })}
+        {profile ? (
+          <g className="vp" aria-label="成交量分布">
+            {profile.dist.map((v, k) => {
+              const bh = (hi - lo) / profile.dist.length;
+              const top = y(lo + bh * (k + 1));
+              const inVa = lo + bh * (k + 0.5) >= profile.val && lo + bh * (k + 0.5) <= profile.vah;
+              return (
+                <rect
+                  // biome-ignore lint/suspicious/noArrayIndexKey: bins are positional.
+                  key={k}
+                  x={PAD.left}
+                  y={top}
+                  width={(v / 1000) * (plotR - PAD.left) * 0.3}
+                  height={Math.max(0.5, y(lo + bh * k) - top - 0.5)}
+                  className={inVa ? "vp-bin va" : "vp-bin"}
+                />
+              );
+            })}
+            <line
+              className="vp-poc"
+              x1={PAD.left}
+              x2={plotR}
+              y1={y(profile.poc)}
+              y2={y(profile.poc)}
+            />
+            <line
+              className="vp-va"
+              x1={PAD.left}
+              x2={plotR}
+              y1={y(profile.vah)}
+              y2={y(profile.vah)}
+            />
+            <line
+              className="vp-va"
+              x1={PAD.left}
+              x2={plotR}
+              y1={y(profile.val)}
+              y2={y(profile.val)}
+            />
+          </g>
+        ) : null}
+        {side ? (
+          <g aria-label="筹码分布">
+            {side.dist.map((v, k) => {
+              const bh = (hi - lo) / side.dist.length;
+              const top = y(lo + bh * (k + 1));
+              const mid = lo + bh * (k + 0.5);
+              const len = (v / 1000) * chipW;
+              return (
+                <rect
+                  // biome-ignore lint/suspicious/noArrayIndexKey: bins are positional.
+                  key={k}
+                  x={plotR - len}
+                  y={top}
+                  width={len}
+                  height={Math.max(0.5, y(lo + bh * k) - top - 0.3)}
+                  className={mid <= side.close ? "chip win" : "chip lose"}
+                />
+              );
+            })}
+            <line
+              className="chip-avg"
+              x1={plotR - chipW}
+              x2={plotR}
+              y1={y(side.avg)}
+              y2={y(side.avg)}
+            />
+            <rect
+              className="axis-tag avg"
+              x={plotR + 1}
+              y={y(side.avg) - 8}
+              width={PAD.right - 2}
+              height={16}
+            />
+            <text className="axis-tag-t" x={plotR + 5} y={y(side.avg) + 4}>
+              {side.avg.toFixed(2)}
+            </text>
+          </g>
+        ) : null}
         {lines.map(([color, vals]) => (
           <path key={color} d={path(vals)} fill="none" stroke={color} strokeWidth={1.2} />
         ))}
@@ -126,8 +248,23 @@ export function Candles({ bars, height = 300 }: { bars: readonly Candle[]; heigh
             y2={volTop + volH}
           />
         ) : null}
+        {hy != null ? (
+          <g>
+            <line className="chart-cross" x1={PAD.left} x2={plotR} y1={hy} y2={hy} />
+            <rect className="axis-tag" x={plotR + 1} y={hy - 8} width={PAD.right - 2} height={16} />
+            <text className="axis-tag-t" x={plotR + 5} y={hy + 4}>
+              {(hi - ((hy - PAD.top) / priceH) * (hi - lo)).toFixed(2)}
+            </text>
+          </g>
+        ) : null}
         {[0, Math.floor(bars.length / 2), bars.length - 1].map((i) => (
-          <text key={i} className="chart-axis" x={x(i)} y={height - 4} textAnchor="middle">
+          <text
+            key={i}
+            className="chart-axis"
+            x={x(i)}
+            y={height - 4}
+            textAnchor={i === 0 ? "start" : i === bars.length - 1 ? "end" : "middle"}
+          >
             {bars[i]?.date}
           </text>
         ))}

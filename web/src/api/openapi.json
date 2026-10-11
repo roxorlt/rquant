@@ -1300,6 +1300,111 @@
         "title": "CatalogField",
         "type": "object"
       },
+      "ChipDay": {
+        "properties": {
+          "avg_cost": {
+            "title": "Avg Cost",
+            "type": "number"
+          },
+          "close": {
+            "title": "Close",
+            "type": "number"
+          },
+          "conc70": {
+            "title": "Conc70",
+            "type": "number"
+          },
+          "conc90": {
+            "title": "Conc90",
+            "type": "number"
+          },
+          "cost70": {
+            "items": {
+              "type": "number"
+            },
+            "title": "Cost70",
+            "type": "array"
+          },
+          "cost90": {
+            "items": {
+              "type": "number"
+            },
+            "title": "Cost90",
+            "type": "array"
+          },
+          "date": {
+            "format": "date",
+            "title": "Date",
+            "type": "string"
+          },
+          "dist": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Dist",
+            "type": "array"
+          },
+          "profit_ratio": {
+            "title": "Profit Ratio",
+            "type": "number"
+          }
+        },
+        "required": [
+          "date",
+          "close",
+          "dist",
+          "avg_cost",
+          "profit_ratio",
+          "conc90",
+          "conc70",
+          "cost90",
+          "cost70"
+        ],
+        "title": "ChipDay",
+        "type": "object"
+      },
+      "ChipsData": {
+        "properties": {
+          "bins": {
+            "title": "Bins",
+            "type": "integer"
+          },
+          "days": {
+            "items": {
+              "$ref": "#/components/schemas/ChipDay"
+            },
+            "title": "Days",
+            "type": "array"
+          },
+          "hi": {
+            "title": "Hi",
+            "type": "number"
+          },
+          "lo": {
+            "title": "Lo",
+            "type": "number"
+          },
+          "profile": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/VolumeProfile"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "lo",
+          "hi",
+          "bins",
+          "days",
+          "profile"
+        ],
+        "title": "ChipsData",
+        "type": "object"
+      },
       "CommandReceipt": {
         "properties": {
           "command_id": {
@@ -2005,6 +2110,29 @@
           "serving"
         ],
         "title": "Envelope[Union[BrinsonData, NoneType]]",
+        "type": "object"
+      },
+      "Envelope_Union_ChipsData__NoneType__": {
+        "properties": {
+          "data": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ChipsData"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[Union[ChipsData, NoneType]]",
         "type": "object"
       },
       "Envelope_Union_FundamentalsDoc__NoneType__": {
@@ -4822,6 +4950,47 @@
         ],
         "title": "Valuation",
         "type": "object"
+      },
+      "VolumeProfile": {
+        "properties": {
+          "days": {
+            "title": "Days",
+            "type": "integer"
+          },
+          "dist": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Dist",
+            "type": "array"
+          },
+          "poc": {
+            "title": "Poc",
+            "type": "number"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          },
+          "vah": {
+            "title": "Vah",
+            "type": "number"
+          },
+          "val": {
+            "title": "Val",
+            "type": "number"
+          }
+        },
+        "required": [
+          "source",
+          "days",
+          "dist",
+          "poc",
+          "val",
+          "vah"
+        ],
+        "title": "VolumeProfile",
+        "type": "object"
       }
     }
   },
@@ -5860,6 +6029,69 @@
           }
         },
         "summary": "个股档案"
+      }
+    },
+    "/api/v1/stocks/{code}/chips": {
+      "get": {
+        "operationId": "stock_chips_api_v1_stocks__code__chips_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "code",
+            "required": true,
+            "schema": {
+              "title": "Code",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "days",
+            "required": false,
+            "schema": {
+              "default": 250,
+              "maximum": 500,
+              "minimum": 20,
+              "title": "Days",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "profile_days",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 250,
+              "minimum": 1,
+              "title": "Profile Days",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_Union_ChipsData__NoneType__"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "筹码分布与成交量分布（近似）"
       }
     },
     "/api/v1/strategies": {

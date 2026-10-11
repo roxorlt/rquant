@@ -33,6 +33,7 @@ from rquant.web import tasks as task_view
 from rquant.web.ai_explain import Explanation, build_facts, deepseek_complete, explain
 from rquant.web.backtest_perf import backtest_perf, perf_from_returns
 from rquant.web.brinson import BrinsonData, brinson
+from rquant.web.chips import ChipsData, load_chips
 from rquant.web.health_layers import build_layers
 from rquant.web.models import (
     AckAlertRequest,
@@ -837,3 +838,19 @@ def stock_profile(code: str, request: Request, source: SourceDep) -> Envelope[St
         fundamentals_fields=doc.fields if doc else {},
         pools=in_pools, alerts=recent))
 
+
+
+@router.get("/stocks/{code}/chips", response_model=Envelope[ChipsData | None],
+            summary="筹码分布与成交量分布（近似）")
+def stock_chips(code: str, request: Request, source: SourceDep,
+                days: int = Query(250, ge=20, le=500),
+                profile_days: int = Query(20, ge=1, le=250)) -> Envelope[ChipsData | None]:
+    code = code.upper()
+    if not CODE_RE.match(code):
+        raise HTTPException(422, "代码格式应为 600519.SH")
+    with market(Path(_research_root(request) or research_root())) as con:
+        try:
+            data = load_chips(con, code, days, 250, profile_days) if con is not None else None
+        except duckdb.Error:
+            data = None
+    return _envelope(source, data)

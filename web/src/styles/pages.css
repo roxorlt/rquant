@@ -256,3 +256,60 @@ input:focus {
   gap: 10px;
   font-size: 12px;
 }
+.vp-bin {
+  fill: var(--faint);
+  opacity: 0.25;
+}
+.vp-bin.va {
+  fill: var(--accent);
+  opacity: 0.3;
+}
+.vp-poc {
+  stroke: var(--warn);
+  stroke-width: 1;
+}
+.vp-va {
+  stroke: var(--accent);
+  stroke-dasharray: 3 3;
+  opacity: 0.6;
+}
+.chip.win {
+  fill: #e0a93a;
+  opacity: 0.55;
+}
+.chip.lose {
+  fill: #4f8fe8;
+  opacity: 0.45;
+}
+.axis-tag {
+  fill: var(--surface-2);
+  stroke: var(--rule-strong);
+}
+.axis-tag.avg {
+  fill: var(--warn);
+  stroke: none;
+}
+.axis-tag-t {
+  fill: var(--ink);
+  font: 10px var(--font-mono);
+}
+.chip-avg {
+  stroke: var(--warn);
+  stroke-width: 1.5;
+}
+.chip-sep {
+  stroke: var(--rule);
+}
+.chip-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.chip-stats b {
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-weight: 500;
+}

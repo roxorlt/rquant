@@ -366,3 +366,17 @@ def test_text_to_condition_and_event_studies(tmp_path) -> None:
         '"horizons":{"5":{"n":3,"mean":0.01,"median":0.0,"win_rate":0.5}}}')
     studies = client.get("/api/v1/event-studies").json()["data"]["studies"]
     assert studies[0]["horizons"]["5"]["n"] == 3
+
+
+def test_stock_chips_endpoint(tmp_path) -> None:
+    from fastapi.testclient import TestClient
+
+    from rquant.web.app import create_app
+    from rquant.web.source import FixtureSource, write_demo_research
+
+    write_demo_research(tmp_path)
+    client = TestClient(create_app(FixtureSource(), dist=None, research_root=tmp_path))
+    body = client.get("/api/v1/stocks/600519.SH/chips").json()["data"]
+    assert len(body["days"]) == 250 and len(body["days"][-1]["dist"]) == body["bins"]
+    assert 0 <= body["days"][-1]["profit_ratio"] <= 1
+    assert body["profile"]["source"] == "daily"
