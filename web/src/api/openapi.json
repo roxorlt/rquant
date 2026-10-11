@@ -2430,6 +2430,17 @@
             "title": "Code",
             "type": "string"
           },
+          "industry": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Industry"
+          },
           "market_price": {
             "title": "Market Price",
             "type": "number"
@@ -2935,6 +2946,14 @@
           "nav": {
             "title": "Nav",
             "type": "number"
+          },
+          "nav_series": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/NavPoint"
+            },
+            "title": "Nav Series",
+            "type": "array"
           },
           "realized_pnl": {
             "title": "Realized Pnl",

@@ -312,6 +312,7 @@ class HoldingItem(BaseModel):
     market_price: float
     market_value: float
     unrealized_pnl: float
+    industry: str | None = None
 
 
 class PaperAccount(BaseModel):
@@ -322,6 +323,8 @@ class PaperAccount(BaseModel):
     unrealized_pnl: float
     realized_pnl: float
     holdings: list[HoldingItem]
+    #: simulated accounts only: daily NAV (fraction of start capital) for the curve
+    nav_series: list[NavPoint] = []
 
 
 class PaperData(BaseModel):

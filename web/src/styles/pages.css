@@ -61,3 +61,36 @@ input:focus {
   color: var(--accent-t);
   font-weight: 600;
 }
+.weight-bars {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: 12px;
+}
+.weight-bars li {
+  display: grid;
+  grid-template-columns: 72px 1fr 52px;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+}
+.wb-label {
+  overflow: hidden;
+  color: var(--muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.wb-bar {
+  height: 8px;
+  border-radius: 4px;
+  background: var(--sunken);
+  overflow: hidden;
+}
+.wb-bar > span {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+}
+.weight-bars .num {
+  text-align: right;
+}
