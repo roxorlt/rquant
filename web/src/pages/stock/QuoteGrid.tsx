@@ -12,6 +12,9 @@ const pct = (v: number | null | undefined) =>
 const yi = (wan: number | null | undefined) =>
   wan == null ? "—" : wan >= 1e4 ? `${(wan / 1e4).toFixed(2)}亿` : `${wan.toFixed(0)}万`;
 
+/** 手 → 万手; 外/内盘 come from the 5-minute bars (tick rule), absent without them */
+const lots = (v: number | null | undefined) => (v == null ? "—" : `${(v / 1e4).toFixed(2)}万手`);
+
 /** Dense THS/Eastmoney-style quote block: price, limits, volume, valuation, 52-week range. */
 export function QuoteGrid({ s }: { s: Profile }) {
   const bars = s.bars;
@@ -43,8 +46,8 @@ export function QuoteGrid({ s }: { s: Profile }) {
     { k: "量比", v: f2(volRatio), tone: volRatio == null ? "" : volRatio >= 1 ? "up" : "down" },
     { k: "换手率", v: v?.turnover_rate == null ? "—" : `${v.turnover_rate.toFixed(2)}%` },
     { k: "换手(自由)", v: v?.turnover_rate_f == null ? "—" : `${v.turnover_rate_f.toFixed(2)}%` },
-    { k: "外盘", v: yi(outer), tone: "up" },
-    { k: "内盘", v: yi(inner), tone: "down" },
+    { k: "外盘", v: lots(outer), tone: "up" },
+    { k: "内盘", v: lots(inner), tone: "down" },
     {
       k: "外/内",
       v: outer && inner ? f2(outer / inner) : "—",
