@@ -1,8 +1,14 @@
 import { useHealth } from "@/api/endpoints";
 import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
-import { PageHeader, Panel, StatusBadge } from "@/ui";
+import { KpiStrip, PageHeader, Panel, StatusBadge } from "@/ui";
 import { QueryView } from "../shared";
+
+/** Large counts get thousands separators; dates and text pass through. */
+function formatFresh(value: string | number): string {
+  const n = typeof value === "number" ? value : /^\d+$/.test(value) ? Number(value) : null;
+  return n === null ? String(value) : n.toLocaleString("zh-CN");
+}
 
 export default function HealthPage() {
   const query = useHealth();
@@ -77,15 +83,16 @@ export default function HealthPage() {
                 ]}
               />
             </Panel>
-            <Panel title="数据新鲜度">
-              <dl className="kv">
-                {data.freshness.map((item) => (
-                  <div key={item.key} style={{ display: "contents" }}>
-                    <dt>{item.label}</dt>
-                    <dd className="num">{item.value ?? "—"}</dd>
-                  </div>
-                ))}
-              </dl>
+            <Panel title="数据新鲜度" sub="各数据面最新日期与行数">
+              <KpiStrip
+                compact
+                label="数据新鲜度"
+                items={data.freshness.map((item) => ({
+                  key: item.key,
+                  label: item.label,
+                  value: item.value == null ? "—" : formatFresh(item.value),
+                }))}
+              />
             </Panel>
           </>
         )}
