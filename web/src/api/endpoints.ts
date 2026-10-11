@@ -404,3 +404,18 @@ export function useTextToCondition() {
     },
   });
 }
+
+export function useChips(
+  code: string | undefined,
+): ServingQueryResult<Schemas["ChipsData"] | null> {
+  return useServingQuery(
+    ["stock", code, "chips"],
+    async () => {
+      const { data, response } = await apiClient().GET("/api/v1/stocks/{code}/chips", {
+        params: { path: { code: code ?? "" } },
+      });
+      return unwrap(data, response);
+    },
+    { enabled: Boolean(code) },
+  );
+}

@@ -1,10 +1,10 @@
 import { Link, useParams } from "react-router";
 import { useStock } from "@/api/endpoints";
-import { Candles } from "@/charts/Candles";
 import { kpiTone } from "@/format/color";
 import { formatShanghaiDateTime } from "@/format/time";
 import { ChangeText, KpiStrip, PageHeader, Panel, Pill } from "@/ui";
 import { QueryView } from "../shared";
+import { KlinePanel } from "./Kline";
 
 const pct = (v: number | null | undefined) =>
   v == null ? "—" : `${v > 0 ? "+" : ""}${(v * 100).toFixed(2)}%`;
@@ -53,9 +53,7 @@ export default function StockPage() {
                 })),
               ]}
             />
-            <Panel title="日K线" sub={`近 ${s.bars.length} 个交易日，未复权`}>
-              <Candles bars={s.bars} />
-            </Panel>
+            <KlinePanel code={s.code} bars={s.bars} />
             <div className="risk-block">
               <Panel
                 title="财务指标"

@@ -97,9 +97,17 @@ def load_profile(con: duckdb.DuckDBPyConnection | None, code: str, days: int = 2
         out.update(basic[0])
     raw = _rows(con, "SELECT trade_date, open, high, low, close, pct_chg, amount FROM daily_bar "
                      "WHERE ts_code = ? ORDER BY trade_date DESC LIMIT ?", [code, days])
-    bars = [Bar(date=r["trade_date"], open=r["open"], high=r["high"], low=r["low"],
-                close=r["close"], pct_chg=r["pct_chg"], amount=r["amount"])
-            for r in reversed(raw) if r["close"] is not None]
+    adj = {r["trade_date"]: r["adj_factor"] for r in _rows(
+        con, "SELECT trade_date, adj_factor FROM adj_factor WHERE ts_code = ?", [code])}
+    last_adj = (adj.get(raw[0]["trade_date"]) if raw else None) or 1.0
+
+    def k(d: date) -> float:  # forward-adjust (前复权) so ex-rights gaps don't show
+        return (adj.get(d) or last_adj) / last_adj
+
+    bars = [Bar(date=r["trade_date"], open=r["open"] * k(r["trade_date"]),
+                high=r["high"] * k(r["trade_date"]), low=r["low"] * k(r["trade_date"]),
+                close=r["close"] * k(r["trade_date"]), pct_chg=r["pct_chg"], amount=r["amount"])
+            for r in reversed(raw) if None not in (r["close"], r["open"], r["high"], r["low"])]
     out["bars"] = bars
     val = _rows(con, "SELECT trade_date, pe_ttm, pb, total_mv, circ_mv, turnover_rate "
                      "FROM daily_basic WHERE ts_code = ? ORDER BY trade_date DESC LIMIT 1", [code])

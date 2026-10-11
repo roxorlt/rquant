@@ -553,6 +553,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/stocks/{code}/chips": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 筹码分布与成交量分布（近似） */
+        get: operations["stock_chips_api_v1_stocks__code__chips_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/strategies": {
         parameters: {
             query?: never;
@@ -1010,6 +1027,42 @@ export interface components {
             /** Unit */
             unit: string | null;
         };
+        /** ChipDay */
+        ChipDay: {
+            /** Avg Cost */
+            avg_cost: number;
+            /** Close */
+            close: number;
+            /** Conc70 */
+            conc70: number;
+            /** Conc90 */
+            conc90: number;
+            /** Cost70 */
+            cost70: number[];
+            /** Cost90 */
+            cost90: number[];
+            /**
+             * Date
+             * Format: date
+             */
+            date: string;
+            /** Dist */
+            dist: number[];
+            /** Profit Ratio */
+            profit_ratio: number;
+        };
+        /** ChipsData */
+        ChipsData: {
+            /** Bins */
+            bins: number;
+            /** Days */
+            days: components["schemas"]["ChipDay"][];
+            /** Hi */
+            hi: number;
+            /** Lo */
+            lo: number;
+            profile: components["schemas"]["VolumeProfile"] | null;
+        };
         /** CommandReceipt */
         CommandReceipt: {
             /** Command Id */
@@ -1218,6 +1271,11 @@ export interface components {
         /** Envelope[Union[BrinsonData, NoneType]] */
         Envelope_Union_BrinsonData__NoneType__: {
             data: components["schemas"]["BrinsonData"] | null;
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[Union[ChipsData, NoneType]] */
+        Envelope_Union_ChipsData__NoneType__: {
+            data: components["schemas"]["ChipsData"] | null;
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[Union[FundamentalsDoc, NoneType]] */
@@ -2118,6 +2176,21 @@ export interface components {
             /** Turnover Rate */
             turnover_rate: number | null;
         };
+        /** VolumeProfile */
+        VolumeProfile: {
+            /** Days */
+            days: number;
+            /** Dist */
+            dist: number[];
+            /** Poc */
+            poc: number;
+            /** Source */
+            source: string;
+            /** Vah */
+            vah: number;
+            /** Val */
+            val: number;
+        };
     };
     responses: never;
     parameters: never;
@@ -2992,6 +3065,40 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_StockProfile_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    stock_chips_api_v1_stocks__code__chips_get: {
+        parameters: {
+            query?: {
+                days?: number;
+                profile_days?: number;
+            };
+            header?: never;
+            path: {
+                code: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_Union_ChipsData__NoneType__"];
                 };
             };
             /** @description Validation Error */

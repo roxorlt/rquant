@@ -124,6 +124,7 @@ test("stock profile opens from a code link", async ({ page }) => {
   await expect(page.getByRole("heading", { name: /贵州茅台/ })).toBeVisible();
   await expect(page.getByRole("img", { name: "日K线" })).toBeVisible();
   await expect(page.getByLabel("个股财务")).toContainText("18.90");
+  await expect(page.getByText("获利比例")).toBeVisible();
 });
 
 test("one sentence becomes a validated condition", async ({ page }) => {
