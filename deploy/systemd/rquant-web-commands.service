@@ -1,0 +1,24 @@
+# rquant-web-commands: append-only write sink for the web app (ack / watchlist / alert rules /
+# pool saves). Plain unit, no credentials. Runs the web release's venv. See
+# docs/deploy/web-commands-service.md.
+[Unit]
+Description=rQuant web write commands (append-only sink)
+After=network-online.target
+
+[Service]
+Type=simple
+User=lighthouse
+Group=lighthouse
+WorkingDirectory=/home/lighthouse/rquant-web-rel/current
+Environment=RQUANT_DISABLE_DOTENV=1
+ExecStart=/home/lighthouse/rquant-web-rel/current/.venv/bin/python -m rquant.web.commands_service --dir /home/lighthouse/rquant-web-commands --host 127.0.0.1 --port 8769
+Restart=on-failure
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/lighthouse/rquant-web-commands
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
