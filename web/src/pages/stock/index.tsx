@@ -4,6 +4,7 @@ import { kpiTone } from "@/format/color";
 import { formatShanghaiDateTime } from "@/format/time";
 import { ChangeText, KpiStrip, PageHeader, Panel, Pill } from "@/ui";
 import { QueryView } from "../shared";
+import { FlowPanel } from "./Flow";
 import { KlinePanel } from "./Kline";
 
 const pct = (v: number | null | undefined) =>
@@ -54,6 +55,7 @@ export default function StockPage() {
               ]}
             />
             <KlinePanel code={s.code} bars={s.bars} />
+            <FlowPanel s={s} />
             <div className="risk-block">
               <Panel
                 title="财务指标"

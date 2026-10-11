@@ -5,8 +5,8 @@ A-share data here has no tick / order book, so both are approximations:
 * Chips (通达信 CYQ-style turnover decay): each day the existing chips shrink by the day's
   turnover t (fraction) and t of new chips are spread over [low, high] as a triangle peaked
   at the typical price (H+L+C)/3. Prices are forward-adjusted so ex-rights days don't tear
-  the distribution. Turnover is ``daily_basic.turnover_rate`` (total shares, not free float),
-  so decay is somewhat slower than vendors that use free-float turnover.
+  the distribution. Turnover is free-float ``turnover_rate_f`` (the vendor convention),
+  falling back to total-share ``turnover_rate`` where it was not ingested.
 * Volume profile: each bar's volume spread over its [low, high] the same way; 5-minute bars
   when the research DB has them for the stock, daily bars otherwise. POC = densest bin,
   value area = smallest band around POC holding 70% of volume.
@@ -137,10 +137,14 @@ def load_chips(con: duckdb.DuckDBPyConnection, code: str, show: int = 250, warmu
                                [code]).fetchall())
     except duckdb.Error:
         adj = {}
-    rows = con.execute(
-        "SELECT b.trade_date, b.high, b.low, b.close, b.vol, d.turnover_rate FROM daily_bar b "
-        "LEFT JOIN daily_basic d USING (ts_code, trade_date) WHERE b.ts_code = ? "
-        "ORDER BY b.trade_date DESC LIMIT ?", [code, show + warmup]).fetchall()[::-1]
+    sql = ("SELECT b.trade_date, b.high, b.low, b.close, b.vol, {t} FROM daily_bar b "
+           "LEFT JOIN daily_basic d USING (ts_code, trade_date) WHERE b.ts_code = ? "
+           "ORDER BY b.trade_date DESC LIMIT ?")
+    try:  # free-float turnover (vendor convention) when the column has been ingested
+        rows = con.execute(sql.format(t="COALESCE(d.turnover_rate_f, d.turnover_rate)"),
+                           [code, show + warmup]).fetchall()[::-1]
+    except duckdb.BinderException:
+        rows = con.execute(sql.format(t="d.turnover_rate"), [code, show + warmup]).fetchall()[::-1]
     if not rows:
         return None
     last_adj = adj.get(rows[-1][0]) or 1.0

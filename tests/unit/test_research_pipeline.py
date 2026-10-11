@@ -87,3 +87,27 @@ def test_tdx_cross_translates() -> None:
 
     expr = translate(HJK)
     assert "delay(ts_mean(close, 5), 1) <= delay(ts_mean(close, 10), 1)" in expr
+
+
+def test_moneyflow_ingest_and_float_turnover_backfill(tmp_path) -> None:
+    from datetime import date
+
+    con = ingest.connect(tmp_path)
+    d = date(2026, 1, 5)
+    ingest._upsert(con, "trade_calendar", pd.DataFrame({"cal_date": [d], "is_open": [True]}))
+    ingest._upsert(con, "daily_basic", pd.DataFrame({"ts_code": ["600000.SH"], "trade_date": [d],
+                                                     "turnover_rate": [1.0]}))
+
+    class FakePro:
+        def __call__(self, api, **kw):
+            if api == "moneyflow":
+                row = {c: 1.0 for c in ingest.MF_COLS}
+                return pd.DataFrame([{**row, "ts_code": "600000.SH", "trade_date": "20260105"}])
+            if api == "daily_basic":
+                return pd.DataFrame({"ts_code": ["600000.SH"], "turnover_rate_f": [2.5]})
+            raise AssertionError(api)
+
+    assert ingest.ingest_moneyflow(con, FakePro(), d, d) == 1
+    assert ingest.ingest_moneyflow(con, FakePro(), d, d) == 0  # nothing missing now
+    assert ingest.backfill_float_turnover(con, FakePro(), d, d) == 1
+    assert con.execute("SELECT turnover_rate_f FROM daily_basic").fetchone()[0] == 2.5
