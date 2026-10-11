@@ -1,6 +1,7 @@
 """Level-1 snapshot collector: ~3s 5-level quotes for a small universe, plus after-close ticks.
 
-Polls ``tushare.realtime_quote`` (sina primary, eastmoney ``dc`` fallback) during the
+Polls Tushare Pro ``rt_tick`` (5-level) / ``rt_k`` (level 1) for the FULL A-share market
+(one call each), falling back to ``realtime_quote`` sina/dc for the priority universe, during the
 A-share sessions (09:15-11:30, 13:00-15:00 Asia/Shanghai, trading days only) for a bounded
 universe (manual watchlist + pools + latest screen/condition hits, capped), and appends
 small parquet part files under ``$RQUANT_RESEARCH_ROOT/snapshots/YYYY-MM-DD/quotes/``.
@@ -41,14 +42,19 @@ TZ = ZoneInfo("Asia/Shanghai")
 SESSIONS = ((dtime(9, 15), dtime(11, 30, 30)), (dtime(13, 0), dtime(15, 0, 30)))
 TICK_AT = dtime(15, 10)
 CODE_RE = re.compile(r"^\d{6}\.(SH|SZ|BJ)$")
-DEFAULT_CAP = 80
-BATCH = 40
-INTERVAL = 3.0
-FLUSH_EVERY = 60.0
+DEFAULT_CAP = 300       # priority universe: fallback sources + after-close ticks
+TICK_CAP = 80           # realtime_tick (tx pages, ~25s/symbol) after the close
+SINA_CAP = 300          # sina fallback: 3 requests of 100 per ~3s cycle
+DC_CAP = 30             # eastmoney fallback: one request per symbol
+BATCH = 100
+INTERVAL = 3.25         # rt_tick every 2nd cycle (6.5s, <=10/min), rt_k in between
+TS_TICK_MIN_GAP = 6.4
+FLUSH_EVERY = 30.0
 MAX_FAILED_CYCLES = 30
 LEVEL_COLS = [f"{s}{i}_{k}" for s in ("b", "a") for i in range(1, 6) for k in ("p", "v")]
 QUOTE_COLS = ["ts_code", "name", "date", "time", "price", "open", "high", "low", "pre_close",
               "bid", "ask", "volume", "amount", *LEVEL_COLS]
+NUM_COLS = [*QUOTE_COLS[4:], "num"]
 
 
 def now() -> datetime:
@@ -182,19 +188,93 @@ def next_session_start(t: dtime) -> dtime | None:
 
 
 # --------------------------------------------------------------------------- fetch
+TUSHARE_URL = "http://api.tushare.pro"
+TS_TICK_FIELDS = ["ts_code", "name", "trade_time", "price", "pre_price", "high_price",
+                  "open_price", "low_price", "volume", "amount", "num",
+                  *[f"{s}_{k}{i}" for i in range(1, 6) for s in ("ask", "bid")
+                    for k in ("price", "volume")]]
+TS_K_FIELDS = ["ts_code", "name", "trade_time", "close", "pre_close", "high", "open", "low",
+               "vol", "amount", "num", "ask_price1", "ask_volume1", "bid_price1", "bid_volume1"]
+FULL_MARKET = "3*.SZ,6*.SH,0*.SZ,9*.BJ"
+
+
+def tushare_token() -> str | None:
+    """TUSHARE_TOKEN_MAIN from the environment or the rQuant .env (never logged)."""
+    tok = os.environ.get("TUSHARE_TOKEN_MAIN")
+    if tok:
+        return tok
+    path = Path(os.environ.get("RQUANT_TUSHARE_ENV_FILE") or Path.home() / "rquant" / ".env")
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            m = re.match(r"\s*(?:export\s+)?TUSHARE_TOKEN_MAIN\s*=\s*[\"']?([^\"'\s#]+)", line)
+            if m:
+                return m.group(1)
+    except OSError:
+        pass
+    return None
+
+
+class TushareError(RuntimeError):
+    pass
+
+
+def tushare_call(api: str, params: dict[str, Any], fields: list[str], token: str,
+                 timeout: float = 10.0) -> pd.DataFrame:
+    import urllib.request
+
+    body = json.dumps({"api_name": api, "token": token, "params": params,
+                       "fields": ",".join(fields)}).encode()
+    req = urllib.request.Request(TUSHARE_URL, body, {"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - fixed URL
+        r = json.loads(resp.read())
+    if r.get("code"):
+        raise TushareError(f"{api} code={r.get('code')} {str(r.get('msg'))[:120]}")
+    data = r.get("data") or {}
+    return pd.DataFrame(data.get("items") or [], columns=data.get("fields") or fields)
+
+
+def _split_time(df: pd.DataFrame, col: str) -> pd.DataFrame:
+    ts = df[col].astype(str)
+    df["date"] = ts.str.slice(0, 10).str.replace("-", "", regex=False)
+    df["time"] = ts.str.slice(11, 19)
+    return df
+
+
+def norm_rt_tick(df: pd.DataFrame) -> pd.DataFrame:
+    """Tushare rt_tick: full market, 5-level book. Volumes in shares."""
+    ren = {"price": "price", "pre_price": "pre_close", "high_price": "high",
+           "open_price": "open", "low_price": "low"}
+    for i in range(1, 6):
+        ren |= {f"bid_price{i}": f"b{i}_p", f"bid_volume{i}": f"b{i}_v",
+                f"ask_price{i}": f"a{i}_p", f"ask_volume{i}": f"a{i}_v"}
+    df = _split_time(df.rename(columns=ren), "trade_time")
+    df["bid"], df["ask"] = df.get("b1_p"), df.get("a1_p")
+    return _normalize(df, "ts_tick")
+
+
+def norm_rt_k(df: pd.DataFrame) -> pd.DataFrame:
+    """Tushare rt_k: full market, level 1 only (levels 2-5 null)."""
+    df = _split_time(df.rename(columns={"close": "price", "vol": "volume",
+                                        "bid_price1": "b1_p", "bid_volume1": "b1_v",
+                                        "ask_price1": "a1_p", "ask_volume1": "a1_v"}),
+                     "trade_time")
+    df["bid"], df["ask"] = df["b1_p"], df["a1_p"]
+    return _normalize(df, "ts_k")
+
+
 def _normalize(df: pd.DataFrame | None, src: str) -> pd.DataFrame:
     if df is None or len(df) == 0:
-        return pd.DataFrame(columns=[*QUOTE_COLS, "src"])
+        return pd.DataFrame(columns=[*QUOTE_COLS, "num", "src"])
     df = df.rename(columns=str.lower)
-    for c in QUOTE_COLS:
+    for c in [*QUOTE_COLS, "num"]:
         if c not in df.columns:
             df[c] = None
-    df = df[QUOTE_COLS].copy()
-    df["date"] = df["date"].astype(str).str.replace("-", "", regex=False)
-    df["time"] = df["time"].astype(str)
-    for c in ["price", "open", "high", "low", "pre_close", "bid", "ask", "volume", "amount",
-              *LEVEL_COLS]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df[[*QUOTE_COLS, "num"]].copy()
+    for c in ("ts_code", "name", "date", "time"):
+        df[c] = df[c].astype(str)
+    df["date"] = df["date"].str.replace("-", "", regex=False)
+    for c in NUM_COLS:
+        df[c] = pd.to_numeric(df[c], errors="coerce").astype("float64")
     df["src"] = src
     return df
 
@@ -202,7 +282,10 @@ def _normalize(df: pd.DataFrame | None, src: str) -> pd.DataFrame:
 def fetch_sina(codes: list[str]) -> pd.DataFrame:
     import tushare as ts
 
-    return _normalize(ts.realtime_quote(ts_code=",".join(codes), src="sina"), "sina")
+    df = _normalize(ts.realtime_quote(ts_code=",".join(codes), src="sina"), "sina")
+    vcols = [c for c in LEVEL_COLS if c.endswith("_v")]
+    df[vcols] = df[vcols] * 100  # sina book volumes come in lots; store shares
+    return df
 
 
 def fetch_dc(codes: list[str]) -> pd.DataFrame:
@@ -217,36 +300,77 @@ def fetch_dc(codes: list[str]) -> pd.DataFrame:
 
 
 class Poller:
-    def __init__(self, codes: list[str], sina: Callable[[list[str]], pd.DataFrame] = fetch_sina,
-                 dc: Callable[[list[str]], pd.DataFrame] = fetch_dc) -> None:
-        self.batches = [codes[i:i + BATCH] for i in range(0, len(codes), BATCH)]
+    """Tushare first: full market per call, alternating rt_tick (5 levels, our account is
+    limited to 10 calls/min) and rt_k (level 1, 50/min). On Tushare failure fall back to
+    sina for the priority universe (capped) and then eastmoney (per symbol, small cap)."""
+
+    def __init__(self, codes: list[str], *, token: str | None = None,
+                 sina: Callable[[list[str]], pd.DataFrame] = fetch_sina,
+                 dc: Callable[[list[str]], pd.DataFrame] = fetch_dc,
+                 ts_call: Callable[..., pd.DataFrame] | None = None,
+                 sina_cap: int = SINA_CAP, dc_cap: int = DC_CAP) -> None:
+        self.codes = codes
+        self.sina_batches = [codes[:sina_cap][i:i + BATCH]
+                             for i in range(0, min(len(codes), sina_cap), BATCH)]
+        self.dc_codes = codes[:dc_cap]
         self.sina, self.dc = sina, dc
+        self.token = token
+        self.ts_call = ts_call or tushare_call
         self.failed_cycles = 0
+        self.slot = 0
+        self.last_tick_call = 0.0
+        self.ts_cooldown_until = 0.0
         self.sina_cooldown_until = 0.0
 
-    def cycle(self) -> pd.DataFrame:
-        frames, ok = [], False
-        for batch in self.batches:
-            df = None
-            if time.monotonic() >= self.sina_cooldown_until:
-                try:
-                    df = self.sina(batch)
-                    if df is None or len(df) == 0:
-                        raise RuntimeError("empty sina response")
-                except Exception as exc:  # noqa: BLE001
-                    log.warning("sina failed (%s); dc fallback, sina cooldown 60s", str(exc)[:160])
-                    self.sina_cooldown_until = time.monotonic() + 60
-                    df = None
-            if df is None:
-                try:
-                    df = self.dc(batch)
-                except Exception as exc:  # noqa: BLE001
-                    log.warning("dc failed: %s", str(exc)[:160])
-                    df = None
-            if df is not None and len(df):
+    def _tushare(self) -> pd.DataFrame | None:
+        if not self.token or time.monotonic() < self.ts_cooldown_until:
+            return None
+        use_tick = time.monotonic() - self.last_tick_call >= TS_TICK_MIN_GAP
+        attempts = (["tick", "k"] if use_tick else ["k"])
+        for kind in attempts:
+            try:
+                if kind == "tick":
+                    self.last_tick_call = time.monotonic()
+                    df = norm_rt_tick(self.ts_call("rt_tick", {"ts_code": FULL_MARKET},
+                                                   TS_TICK_FIELDS, self.token))
+                else:
+                    df = norm_rt_k(self.ts_call("rt_k", {"ts_code": FULL_MARKET},
+                                                TS_K_FIELDS, self.token))
+                if len(df):
+                    return df
+                raise TushareError(f"empty {kind}")
+            except Exception as exc:  # noqa: BLE001
+                log.warning("tushare %s failed: %s", kind, str(exc)[:160])
+        self.ts_cooldown_until = time.monotonic() + 30
+        log.warning("tushare unavailable; fallback sources for 30s")
+        return None
+
+    def _fallback(self) -> list[pd.DataFrame]:
+        frames = []
+        for batch in self.sina_batches:
+            if time.monotonic() < self.sina_cooldown_until:
+                break
+            try:
+                df = self.sina(batch)
+                if df is None or len(df) == 0:
+                    raise RuntimeError("empty sina response")
                 frames.append(df)
-                ok = True
-        self.failed_cycles = 0 if ok else self.failed_cycles + 1
+            except Exception as exc:  # noqa: BLE001
+                log.warning("sina failed (%s); cooldown 60s", str(exc)[:160])
+                self.sina_cooldown_until = time.monotonic() + 60
+        if not frames and self.dc_codes:
+            try:
+                df = self.dc(self.dc_codes)
+                if df is not None and len(df):
+                    frames.append(df)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("dc failed: %s", str(exc)[:160])
+        return frames
+
+    def cycle(self) -> pd.DataFrame:
+        ts_df = self._tushare()
+        frames = [ts_df] if ts_df is not None else self._fallback()
+        self.failed_cycles = 0 if frames else self.failed_cycles + 1
         if not frames:
             return _normalize(None, "none")
         out = pd.concat(frames, ignore_index=True)
@@ -259,45 +383,85 @@ class Poller:
         return min(60.0, INTERVAL * 2 ** min(self.failed_cycles, 5))
 
 
+class Deduper:
+    """Drop a symbol's row when nothing changed since its last kept row from the same
+    source (same exchange time, volume, amount and book). Keeps memory O(symbols)."""
+
+    def __init__(self) -> None:
+        self.last: dict[tuple[str, str], tuple] = {}
+
+    def __call__(self, df: pd.DataFrame) -> pd.DataFrame:
+        if not len(df):
+            return df
+        cols = ["time", "price", "volume", "amount", *LEVEL_COLS]
+        keys = df[cols].astype(object).where(df[cols].notna(), None).itertuples(
+            index=False, name=None)
+        keep = []
+        for code, src, k in zip(df["ts_code"], df["src"], keys, strict=True):
+            prev = self.last.get((code, src))
+            keep.append(prev != k)
+            if prev != k:
+                self.last[(code, src)] = k
+        return df[keep]
+
+
 # --------------------------------------------------------------------------- storage
 def day_dir(out: Path, day: date) -> Path:
     return out / f"{day:%Y-%m-%d}"
 
 
+def _schema():
+    import pyarrow as pa
+
+    fields = [(c, pa.string()) for c in ("ts_code", "name", "date", "time")]
+    fields += [(c, pa.float64()) for c in NUM_COLS]
+    fields += [("src", pa.string()), ("local_ts", pa.timestamp("us"))]
+    return pa.schema(fields)
+
+
 def write_part(d: Path, frames: list[pd.DataFrame]) -> Path | None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
     frames = [f for f in frames if len(f)]
     if not frames:
         return None
     parts = d / "quotes"
     parts.mkdir(parents=True, exist_ok=True)
     df = pd.concat(frames, ignore_index=True)
+    schema = _schema()
+    df = df[[f.name for f in schema]]
     path = parts / f"part-{now():%H%M%S%f}-{os.getpid()}.parquet"
     tmp = path.with_suffix(".tmp")
-    df.to_parquet(tmp, index=False, compression="zstd")
+    pq.write_table(pa.Table.from_pandas(df, schema=schema, preserve_index=False), tmp,
+                   compression="zstd")
     tmp.rename(path)
     return path
 
 
 def compact(d: Path) -> dict[str, Any]:
+    """Stream parts into one quotes.parquet (row groups = parts; bounded memory)."""
+    import pyarrow.parquet as pq
+
     parts = sorted((d / "quotes").glob("part-*.parquet"))
     target = d / "quotes.parquet"
-    frames = [pd.read_parquet(p) for p in parts]
-    if target.is_file():
-        frames.insert(0, pd.read_parquet(target))
-    if not frames:
-        return {"rows": 0}
-    df = pd.concat(frames, ignore_index=True)
-    raw = len(df)
-    # Unchanged snapshots (same exchange time + book + volume) carry no information.
-    df = df.sort_values(["ts_code", "local_ts"]).drop_duplicates(
-        subset=["ts_code", "date", "time", "price", "volume", "amount", *LEVEL_COLS], keep="first")
+    if not parts:
+        return {"rows": pq.ParquetFile(target).metadata.num_rows if target.is_file() else 0}
+    schema = _schema()
     tmp = target.with_suffix(".tmp")
-    df.to_parquet(tmp, index=False, compression="zstd")
+    rows = 0
+    with pq.ParquetWriter(tmp, schema, compression="zstd") as w:
+        sources = ([target] if target.is_file() else []) + parts
+        for src in sources:
+            pf = pq.ParquetFile(src)
+            for i in range(pf.num_row_groups):
+                tbl = pf.read_row_group(i).cast(schema)
+                rows += tbl.num_rows
+                w.write_table(tbl)
     tmp.rename(target)
     for p in parts:
         p.unlink()
-    info = {"raw_rows": raw, "rows": len(df), "bytes": target.stat().st_size,
-            "symbols": int(df["ts_code"].nunique())}
+    info = {"rows": rows, "bytes": target.stat().st_size}
     log.info("compacted %s: %s", target, info)
     return info
 
@@ -377,11 +541,15 @@ def run(out: Path, *, force: bool = False, max_cycles: int | None = None, cap: i
     d.mkdir(parents=True, exist_ok=True)
     (d / "universe.json").write_text(json.dumps(uni, ensure_ascii=False, indent=1), "utf-8")
     log.info("universe %d symbols %s -> %s", len(codes), uni["counts"], d)
-    if not codes:
-        log.warning("empty universe; nothing to collect")
+    token = tushare_token()
+    log.info("primary source: %s", "tushare rt_tick/rt_k (full market)" if token
+             else "NO TUSHARE TOKEN -> sina/dc fallback only")
+    if not codes and not token:
+        log.warning("empty universe and no tushare token; nothing to collect")
         return 0
     socket.setdefaulttimeout(10)  # the SDK passes no timeout to requests
-    poller = Poller(codes)
+    poller = Poller(codes, token=token)
+    dedup = Deduper()
     buf: list[pd.DataFrame] = []
     last_flush, cycles, rc = time.monotonic(), 0, 0
     end_of_day = datetime.combine(today, SESSIONS[-1][1], TZ)
@@ -399,7 +567,7 @@ def run(out: Path, *, force: bool = False, max_cycles: int | None = None, cap: i
                         break
                     continue
             started = time.monotonic()
-            buf.append(poller.cycle())
+            buf.append(dedup(poller.cycle()))
             cycles += 1
             if poller.failed_cycles >= MAX_FAILED_CYCLES:
                 log.error("%d consecutive failed cycles; stopping collector", poller.failed_cycles)
@@ -417,7 +585,7 @@ def run(out: Path, *, force: bool = False, max_cycles: int | None = None, cap: i
     log.info("polling done: %d cycles", cycles)
     if ticks and not stop_requested() and (
             force or _sleep_until(datetime.combine(today, TICK_AT, TZ))):
-        fetch_ticks(d, codes[:tick_limit] if tick_limit else codes)
+        fetch_ticks(d, codes[:tick_limit or TICK_CAP])
     compact(d)
     return rc
 
