@@ -66,6 +66,7 @@ export function Conditions() {
               {run ? (
                 <DataTable
                   label="条件命中"
+                  tools="条件选股"
                   rows={run.hits}
                   rowKey={(row) => row.code}
                   height={320}

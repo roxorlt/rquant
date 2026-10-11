@@ -215,6 +215,7 @@ export default function ScreenerPage() {
           <Panel title={`结果 · 命中 ${filtered.rows.length} 只`} flush>
             <DataTable
               label="选股结果"
+              tools="选股结果"
               rows={filtered.rows}
               rowKey={(row) => `${row.preset}:${row.code}`}
               initialSort={{ id: "score", desc: true }}

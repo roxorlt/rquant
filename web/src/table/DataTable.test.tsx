@@ -1,7 +1,7 @@
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
-import { compareCells, type DataColumn, DataTable } from "./DataTable";
+import { compareCells, type DataColumn, DataTable, toCsv } from "./DataTable";
 
 interface Row {
   code: string;
@@ -128,5 +128,12 @@ describe("DataTable", () => {
   it("orders mixed values with nulls last", () => {
     expect([3, null, 1].sort(compareCells)).toEqual([1, 3, null]);
     expect(["乙", "甲"].sort(compareCells)).toEqual(["甲", "乙"]);
+  });
+});
+
+describe("toCsv", () => {
+  it("quotes commas and keeps nulls empty", () => {
+    const csv = toCsv(COLUMNS, [{ code: "a,b", name: "x", change: null }]);
+    expect(csv).toBe('\uFEFF代码,名称,涨幅\n"a,b",x,\n');
   });
 });
