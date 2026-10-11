@@ -1,5 +1,5 @@
 [Unit]
-Description=rQuant L1 snapshot collector (~3s 5-level quotes + after-close ticks, research only)
+Description=rQuant L1 snapshot collector (Tushare full-A rt_tick/rt_k ~3s, sina/dc fallback, after-close ticks)
 After=network-online.target
 Wants=network-online.target
 
@@ -17,7 +17,7 @@ EnvironmentFile=/etc/rquant-web.env
 Environment=RQUANT_DISABLE_DOTENV=1 TZ=Asia/Shanghai PYTHONWARNINGS=ignore
 ExecStart=/home/lighthouse/rquant-web-rel/current/.venv/bin/python -m rquant.research.snapshots run
 Restart=no
-# 09:10 start -> polling ends 15:00:30 -> ticks from 15:10 (~40 min for 80 symbols) -> compact
+# 09:10 start -> polling ends 15:00:30 -> ticks for top-80 from 15:10 (~35 min) -> compact
 RuntimeMaxSec=8h
 TimeoutStopSec=60
 Nice=10

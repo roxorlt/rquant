@@ -46,6 +46,7 @@ def test_poller_falls_back_and_counts_failures(monkeypatch):
         raise RuntimeError("boom")
 
     p = s.Poller(["600000.SH", "000001.SZ"], sina=bad, dc=lambda c: _frame(c, "dc"))
+    assert p.token is None
     df = p.cycle()
     assert set(df["src"]) == {"dc"} and len(df) == 2 and p.failed_cycles == 0
     p2 = s.Poller(["600000.SH"], sina=bad, dc=bad)
@@ -56,11 +57,12 @@ def test_poller_falls_back_and_counts_failures(monkeypatch):
 
 def test_parts_compact_dedup(tmp_path):
     d = tmp_path / "2026-10-09"
+    dedup = s.Deduper()
     p = s.Poller(["600000.SH"], sina=lambda c: _frame(c))
-    s.write_part(d, [p.cycle(), p.cycle()])  # identical snapshots
-    s.write_part(d, [s.Poller(["600000.SH"], sina=lambda c: _frame(c, vol=200.0)).cycle()])
+    s.write_part(d, [dedup(p.cycle()), dedup(p.cycle())])  # identical snapshots
+    s.write_part(d, [dedup(s.Poller(["600000.SH"], sina=lambda c: _frame(c, vol=200.0)).cycle())])
     info = s.compact(d)
-    assert info["raw_rows"] == 3 and info["rows"] == 2
+    assert info["rows"] == 2
     assert not list((d / "quotes").glob("part-*"))
     assert len(pd.read_parquet(d / "quotes.parquet")) == 2
 
@@ -71,3 +73,51 @@ def test_ticks(tmp_path):
     df = pd.DataFrame({"TIME": ["09:30:00"], "PRICE": [1.0], "VOLUME": [1], "TYPE": ["买盘"]})
     info = s.fetch_ticks(d, ["600000.SH"], fetch=lambda c: df, pause=0)
     assert info["rows"] == 1 and (d / "ticks.parquet").is_file()
+
+
+def _ts_items(api):
+    if api == "rt_tick":
+        row = ["600000.SH", "浦发", "2026-10-09 15:00:03", 9.54, 9.7, 9.74, 9.7, 9.54, 1e6, 9e6,
+               100.0] + [9.55, 100.0, 9.54, 200.0] * 5
+        return pd.DataFrame([row], columns=s.TS_TICK_FIELDS)
+    row = ["600000.SH", "浦发", "2026-10-09 15:00:03", 9.54, 9.7, 9.74, 9.7, 9.54, 1e6, 9e6,
+           100.0, 9.55, 100.0, 9.54, 200.0]
+    return pd.DataFrame([row], columns=s.TS_K_FIELDS)
+
+
+def test_tushare_first_alternates_tick_and_k(tmp_path, monkeypatch):
+    calls = []
+
+    def ts_call(api, params, fields, token):
+        calls.append(api)
+        assert params["ts_code"] == s.FULL_MARKET and token == "t"
+        return _ts_items(api)
+
+    def never(codes):
+        raise AssertionError("fallback must not run")
+
+    p = s.Poller(["600000.SH"], token="t", ts_call=ts_call, sina=never, dc=never)
+    a, b = p.cycle(), p.cycle()
+    assert calls == ["rt_tick", "rt_k"]
+    assert a.iloc[0]["src"] == "ts_tick" and a.iloc[0]["a5_p"] == 9.55
+    assert a.iloc[0]["date"] == "20261009" and a.iloc[0]["time"] == "15:00:03"
+    assert b.iloc[0]["src"] == "ts_k" and pd.isna(b.iloc[0]["a5_p"])
+    s.write_part(tmp_path, [a, b])
+    assert s.compact(tmp_path)["rows"] == 2
+
+
+def test_tushare_failure_falls_back_to_sina():
+    def ts_call(*a, **k):
+        raise s.TushareError("rate")
+
+    p = s.Poller(["600000.SH"], token="t", ts_call=ts_call, sina=lambda c: _frame(c))
+    df = p.cycle()
+    assert set(df["src"]) == {"sina"} and p.failed_cycles == 0
+
+
+def test_token_from_env_file(tmp_path, monkeypatch):
+    monkeypatch.delenv("TUSHARE_TOKEN_MAIN", raising=False)
+    f = tmp_path / ".env"
+    f.write_text("# c\nTUSHARE_TOKEN_MAIN=abc123\nOTHER=1\n")
+    monkeypatch.setenv("RQUANT_TUSHARE_ENV_FILE", str(f))
+    assert s.tushare_token() == "abc123"
