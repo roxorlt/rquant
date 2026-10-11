@@ -36,7 +36,7 @@ export default function PaperPage() {
                   label="持仓"
                   rows={account.holdings}
                   rowKey={(row) => row.code}
-                  emptyText="空仓"
+                  emptyText="空仓：模拟盘当前没有持仓，下一次调仓信号后会建仓。"
                   columns={[
                     { id: "code", header: "代码", value: (row) => row.code },
                     { id: "name", header: "名称", value: (row) => row.name ?? null },

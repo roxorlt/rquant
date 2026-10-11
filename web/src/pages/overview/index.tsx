@@ -119,7 +119,7 @@ function LatestAlerts() {
         label="最新告警"
         rows={rows}
         rowKey={(row) => row.alert_id}
-        emptyText="今天还没有告警"
+        emptyText="今天还没有告警：盯盘服务运行中且未触发规则。规则在「盯盘与告警」页调整。"
         columns={[
           {
             id: "at",
@@ -181,7 +181,7 @@ export default function OverviewPage() {
                 label="最新信号"
                 rows={data.signals}
                 rowKey={(row) => String(row.sequence)}
-                emptyText="今天还没有信号"
+                emptyText="今天还没有信号：策略信号在盘后生成，生成后会出现在这里。"
                 columns={[
                   {
                     id: "at",

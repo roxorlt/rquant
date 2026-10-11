@@ -1272,3 +1272,19 @@
   background: var(--surface);
   color: var(--ink);
 }
+
+/* Row hover on every table helps the eye track wide numeric rows. */
+.tbl tbody tr:not(.pad):hover td {
+  background: var(--surface-2);
+}
+.tbl td.tbl-empty {
+  padding: 20px 12px;
+  color: var(--muted);
+  white-space: normal;
+  text-align: center;
+  line-height: 1.6;
+}
+.tbl td.num,
+.tbl th.num {
+  font-variant-numeric: tabular-nums;
+}

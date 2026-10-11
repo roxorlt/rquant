@@ -109,6 +109,6 @@ describe("MVP pages render from the API", () => {
   ])("%s", async (path, text) => {
     stubApi();
     renderApp(path);
-    expect((await screen.findAllByText(text)).length).toBeGreaterThan(0);
+    expect((await screen.findAllByText(text, { exact: false })).length).toBeGreaterThan(0);
   });
 });

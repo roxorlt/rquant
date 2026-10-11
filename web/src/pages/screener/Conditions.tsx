@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useConditions, useTranslateTdx } from "@/api/endpoints";
+import { toneClass, toneOf } from "@/format/color";
 import { formatPrice } from "@/format/number";
 import { DataTable } from "@/table/DataTable";
 import { Button, Panel } from "@/ui";
@@ -69,7 +70,7 @@ export function Conditions() {
                   rowKey={(row) => row.code}
                   height={320}
                   columns={[
-                    { id: "code", header: "代码", value: (row) => row.code },
+                    { id: "code", header: "代码", sortable: true, value: (row) => row.code },
                     {
                       id: "close",
                       header: "收盘",
@@ -82,7 +83,15 @@ export function Conditions() {
                       header: "涨跌%",
                       numeric: true,
                       value: (row) => row.pct_chg ?? null,
-                      cell: (row) => (row.pct_chg == null ? "—" : row.pct_chg.toFixed(2)),
+                      cell: (row) =>
+                        row.pct_chg == null ? (
+                          "—"
+                        ) : (
+                          <span className={toneClass(toneOf(row.pct_chg))}>
+                            {row.pct_chg > 0 ? "+" : ""}
+                            {row.pct_chg.toFixed(2)}
+                          </span>
+                        ),
                     },
                   ]}
                 />

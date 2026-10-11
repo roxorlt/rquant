@@ -39,7 +39,7 @@ export default function PoolsPage() {
                   label="池子成员"
                   rows={pool.members}
                   rowKey={(row) => `${row.preset}:${row.code}`}
-                  emptyText="今天没有成员"
+                  emptyText="今天没有成员：去「选股器」筛选后点「保存为池子」。"
                   columns={[
                     { id: "code", header: "代码", value: (row) => row.code },
                     { id: "name", header: "名称", value: (row) => row.name ?? null },

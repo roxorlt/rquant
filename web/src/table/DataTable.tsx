@@ -99,7 +99,8 @@ export function DataTable<T>({
           column.cell
             ? column.cell(context.row.original)
             : (column.value(context.row.original) ?? "—"),
-        enableSorting: column.sortable ?? false,
+        // Numbers are what quant users rank by: numeric columns sort unless opted out.
+        enableSorting: column.sortable ?? column.numeric ?? false,
         sortDescFirst: false,
         sortUndefined: "last" as const,
         sortingFn: (left: Row<T>, right: Row<T>) =>
@@ -218,7 +219,7 @@ export function DataTable<T>({
         <tbody ref={bodyRef}>
           {sortedRows.length === 0 ? (
             <tr>
-              <td colSpan={columns.length} className="muted">
+              <td colSpan={columns.length} className="tbl-empty">
                 {emptyText}
               </td>
             </tr>

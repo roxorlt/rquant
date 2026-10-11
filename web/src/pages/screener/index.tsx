@@ -214,7 +214,7 @@ export default function ScreenerPage() {
               rowKey={(row) => `${row.preset}:${row.code}`}
               initialSort={{ id: "score", desc: true }}
               height={560}
-              emptyText="当天没有选股结果"
+              emptyText="当天没有选股结果：盘后选股尚未产出，或该方案今天无命中。可切换方案，或用下方条件选股自定义。"
               columns={[
                 { id: "code", header: "代码", value: (row) => row.code },
                 { id: "name", header: "名称", value: (row) => row.name ?? null },
