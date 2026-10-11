@@ -37,10 +37,10 @@ for attempt in $(seq 1 "${RQUANT_UPLOAD_TRIES:-60}"); do
   for ((i = 0; i < n; i++)); do
     grep -qx "p$i" <<<"$done_list" && continue
     missing=1
-    want=$(( i < n - 1 ? chunk : size - i * chunk ))
+    part_size=$(( i < n - 1 ? chunk : size - i * chunk ))
     tail -c +"$((i * chunk + 1))" "$local_tar" | head -c "$chunk" \
       | timeout "${RQUANT_CHUNK_TIMEOUT:-120}" "${SSH[@]}" \
-          "t=$parts/t$i.\$\$; cat > \$t; if [ \$(stat -c %s \$t) = $want ]; then mv \$t $parts/p$i; else rm -f \$t; exit 1; fi" \
+          "t=$parts/t$i.\$\$; cat > \$t; if [ \$(stat -c %s \$t) = $part_size ]; then mv \$t $parts/p$i; else rm -f \$t; exit 1; fi" \
       || sleep 5
     echo "[$(date "+%F %T")] part $((i + 1))/$n (pass $attempt)"
   done
