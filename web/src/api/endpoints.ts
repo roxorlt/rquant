@@ -386,3 +386,21 @@ export function useQuerySchema(): ServingQueryResult<Record<string, string[][]>>
     return unwrap(data, response);
   });
 }
+
+export function useEventStudies(): ServingQueryResult<Schemas["EventStudyListData"]> {
+  return useServingQuery(["event-studies"], async () => {
+    const { data, response } = await apiClient().GET("/api/v1/event-studies");
+    return unwrap(data, response);
+  });
+}
+
+export function useTextToCondition() {
+  return useMutation({
+    mutationFn: async (text: string) => {
+      const { data, response } = await apiClient().POST("/api/v1/formula/from-text", {
+        body: { text },
+      });
+      return unwrap(data, response);
+    },
+  });
+}

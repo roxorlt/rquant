@@ -12,6 +12,8 @@ import shutil
 from datetime import date, timedelta
 from pathlib import Path
 
+from rquant.research.tdx_strategy import HJK
+
 log = logging.getLogger("rquant.research")
 
 FACTORS = {
@@ -82,6 +84,19 @@ def run(years: int = 5, minutes: int = 300, ingest: bool = True, end: date | Non
                      title=f"{title} {bt_start}~{last}", strategy=f"{slug}@{version.version}",
                      bar_table="daily_bar_qfq")
         log.info("backtest %s done", slug)
+    from rquant.research import tdx_strategy
+
+    for slug, title, _cname, formula, n, hold in tdx_strategy.run(root, db, first, last):
+        spec = StrategySpec(slug=slug, title=title, preset=tdx_strategy.preset_name(slug),
+                            note=formula, config=BacktestConfig(
+                                hold_days=hold, weights=PortfolioWeightRule(max_positions=n)))
+        save_version(spec, root)
+        version = resolve(slug, root)
+        tdx_start = first + timedelta(days=60)
+        run_and_save(db, spec.preset, tdx_start, last, version.spec.config, root=root,
+                     title=f"{title} {tdx_start}~{last}", strategy=f"{slug}@{version.version}",
+                     bar_table="daily_bar_qfq")
+        log.info("backtest %s done", slug)
     prune_backtests(root)
 
     con = duckdb.connect(str(db), read_only=True)
@@ -110,6 +125,7 @@ CONDITIONS = {
     "5 日均线上穿 20 日均线": "MA(C,5)>MA(C,20) AND REF(MA(C,5),1)<=REF(MA(C,20),1)",
     "55 日新高": "C>=HHV(H,55)",
     "缩量回踩 10 日线": "C>MA(C,10) AND L<=MA(C,10)*1.01 AND V<MA(V,5)",
+    "黄金坑": HJK,
 }
 
 
@@ -139,7 +155,9 @@ def run_paper(root: Path, db: Path, last: date, days: int = 60) -> None:
     try:
         names = dict(con.execute("SELECT ts_code, name FROM stock_basic").fetchall())
         accounts = []
-        for slug, _title, _preset, _n, _every in STRATEGIES:
+        from rquant.research.tdx_strategy import TDX_STRATEGIES
+
+        for slug in [s[0] for s in STRATEGIES] + [s[0] for s in TDX_STRATEGIES]:
             spec = resolve(slug, root).spec
             accounts.append(paper.simulate(con, slug, spec.preset, spec.config, last, days, names))
     finally:

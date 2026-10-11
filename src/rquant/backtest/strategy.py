@@ -35,6 +35,8 @@ class StrategySpec(BaseModel):
 
     def content_hash(self) -> str:
         body = self.model_dump(mode="json", exclude={"note", "title"})
+        if body["config"].get("hold_days") is None:  # keep hashes of pre-event-mode specs
+            body["config"].pop("hold_days", None)
         return hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()[:12]
 
 

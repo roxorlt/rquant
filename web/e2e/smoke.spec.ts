@@ -125,3 +125,10 @@ test("stock profile opens from a code link", async ({ page }) => {
   await expect(page.getByRole("img", { name: "日K线" })).toBeVisible();
   await expect(page.getByLabel("个股财务")).toContainText("18.90");
 });
+
+test("one sentence becomes a validated condition", async ({ page }) => {
+  await page.goto("./#/screener");
+  await page.getByLabel("一句话条件").fill("站上20日线且放量一倍");
+  await page.getByRole("button", { name: "一句话生成" }).click();
+  await expect(page.getByLabel("生成结果")).toContainText("ts_mean(close,20)");
+});

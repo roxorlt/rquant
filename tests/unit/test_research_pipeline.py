@@ -7,6 +7,7 @@ from rquant.backtest.store import list_runs
 from rquant.backtest.strategy import list_strategies
 from rquant.factor.store import list_factors
 from rquant.research import daily, ingest, screens
+from rquant.research.tdx_strategy import TDX_STRATEGIES
 
 
 def _seed(root, days=420, n=40):
@@ -44,7 +45,7 @@ def test_screens_and_daily_job_populate_research_root(tmp_path, monkeypatch):
     assert ingest.missing_days(con, "daily_bar", idx[0].date(), idx[-1].date()) == []
     con.close()
     daily.run(ingest=False)
-    assert len(list_runs(tmp_path)) == len(daily.STRATEGIES)
+    assert len(list_runs(tmp_path)) == len(daily.STRATEGIES) + len(TDX_STRATEGIES)
     assert "mom20-top10" in {getattr(s, "slug", s) for s in list_strategies(tmp_path)}
     assert len(list_factors(tmp_path)) == len(daily.FACTORS)
     assert (tmp_path / "data_audit" / "latest.json").exists()
@@ -61,7 +62,7 @@ def test_screens_and_daily_job_populate_research_root(tmp_path, monkeypatch):
     assert {"daily_bar", "daily_basic", "index_daily"} <= ids
     for _ in range(6):
         daily.prune_backtests(tmp_path, keep=1)
-    assert len(list_runs(tmp_path)) == len(daily.STRATEGIES)
+    assert len(list_runs(tmp_path)) == len(daily.STRATEGIES) + len(TDX_STRATEGIES)
 
 
 def test_screen_api_falls_back_to_research_presets(tmp_path):
@@ -78,3 +79,11 @@ def test_screen_api_falls_back_to_research_presets(tmp_path):
     src.con.execute("DELETE FROM screen_result")
     body = TestClient(create_app(src, research_root=tmp_path)).get("/api/v1/screen").json()
     assert any(p.startswith("research_") for p in body["data"]["presets"])
+
+
+def test_tdx_cross_translates() -> None:
+    from rquant.factor.tdx import translate
+    from rquant.research.tdx_strategy import HJK
+
+    expr = translate(HJK)
+    assert "delay(ts_mean(close, 5), 1) <= delay(ts_mean(close, 10), 1)" in expr

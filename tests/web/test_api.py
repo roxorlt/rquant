@@ -239,8 +239,8 @@ def test_tdx_translate_and_condition_results(tmp_path) -> None:
     client = TestClient(create_app(FixtureSource(), dist=None, research_root=tmp_path))
     ok = client.post("/api/v1/formula/translate", json={"tdx": "C>MA(C,5)"}).json()
     assert ok == {"expression": "close>ts_mean(close,5)", "error": None}
-    bad = client.post("/api/v1/formula/translate", json={"tdx": "CROSS(C,1)"}).json()
-    assert bad["expression"] is None and "CROSS" in bad["error"]
+    bad = client.post("/api/v1/formula/translate", json={"tdx": "BARSLAST(C>1)"}).json()
+    assert bad["expression"] is None and "BARSLAST" in bad["error"]
     (run,) = client.get("/api/v1/conditions").json()["data"]["runs"]
     assert run["source_formula"].startswith("C>MA")
 
@@ -347,3 +347,22 @@ def test_factor_correlation_matrix(tmp_path) -> None:
 def test_query_schema_lists_columns(client) -> None:
     body = client.get("/api/v1/query/schema").json()["data"]
     assert ["ts_code", "VARCHAR"] in body["stock_basic"]
+
+
+def test_text_to_condition_and_event_studies(tmp_path) -> None:
+    from fastapi.testclient import TestClient
+
+    from rquant.web.app import create_app
+    from rquant.web.source import FixtureSource
+
+    app = create_app(FixtureSource(), dist=None, research_root=tmp_path)
+    app.state.llm = (lambda _m: "```\nC>MA(C,20) AND CROSS(MA(C,5),MA(C,10))\n```", "t")
+    client = TestClient(app)
+    got = client.post("/api/v1/formula/from-text", json={"text": "站上20日线"}).json()
+    assert got["error"] is None and got["expression"].startswith("close > ")
+    (tmp_path / "event_study").mkdir()
+    (tmp_path / "event_study" / "x.json").write_text(
+        '{"slug":"x","title":"t","formula":"C>1","window":["a","b"],"signals":3,'
+        '"horizons":{"5":{"n":3,"mean":0.01,"median":0.0,"win_rate":0.5}}}')
+    studies = client.get("/api/v1/event-studies").json()["data"]["studies"]
+    assert studies[0]["horizons"]["5"]["n"] == 3

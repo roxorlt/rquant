@@ -124,6 +124,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/event-studies": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 通达信策略事件研究 */
+        get: operations["event_studies_api_v1_event_studies_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/factors": {
         parameters: {
             query?: never;
@@ -169,6 +186,23 @@ export interface paths {
         get: operations["factor_detail_api_v1_factors__factor_id__get"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/formula/from-text": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 一句话生成条件（AI 写通达信公式，再本地翻译校验） */
+        post: operations["formula_from_text_api_v1_formula_from_text_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1086,6 +1120,11 @@ export interface components {
             data: components["schemas"]["DataCenterData"];
             serving: components["schemas"]["ServingMeta"];
         };
+        /** Envelope[EventStudyListData] */
+        Envelope_EventStudyListData_: {
+            data: components["schemas"]["EventStudyListData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
         /** Envelope[FactorCorrData] */
         Envelope_FactorCorrData_: {
             data: components["schemas"]["FactorCorrData"];
@@ -1205,6 +1244,68 @@ export interface components {
             /** Data */
             data: string[];
             serving: components["schemas"]["ServingMeta"];
+        };
+        /** EventHorizon */
+        EventHorizon: {
+            /**
+             * Excess Mean
+             * @default {}
+             */
+            excess_mean: {
+                [key: string]: number;
+            };
+            /**
+             * Excess Win Rate
+             * @default {}
+             */
+            excess_win_rate: {
+                [key: string]: number;
+            };
+            /** Mean */
+            mean: number;
+            /** Median */
+            median: number;
+            /** N */
+            n: number;
+            /** Win Rate */
+            win_rate: number;
+        };
+        /** EventStudy */
+        EventStudy: {
+            /**
+             * Caveats
+             * @default []
+             */
+            caveats: string[];
+            /** Formula */
+            formula: string;
+            /**
+             * Horizons
+             * @default {}
+             */
+            horizons: {
+                [key: string]: components["schemas"]["EventHorizon"];
+            };
+            /**
+             * Per Year
+             * @default {}
+             */
+            per_year: {
+                [key: string]: number;
+            };
+            /** Signals */
+            signals: number;
+            /** Slug */
+            slug: string;
+            /** Title */
+            title: string;
+            /** Window */
+            window: string[];
+        };
+        /** EventStudyListData */
+        EventStudyListData: {
+            /** Studies */
+            studies: components["schemas"]["EventStudy"][];
         };
         /** Explanation */
         Explanation: {
@@ -1946,6 +2047,22 @@ export interface components {
             /** Unit */
             unit: string;
         };
+        /** TextToConditionData */
+        TextToConditionData: {
+            /** Error */
+            error: string | null;
+            /** Expression */
+            expression: string | null;
+            /** Model */
+            model: string;
+            /** Tdx */
+            tdx: string | null;
+        };
+        /** TextToConditionRequest */
+        TextToConditionRequest: {
+            /** Text */
+            text: string;
+        };
         /** TrackingPoint */
         TrackingPoint: {
             /**
@@ -2221,6 +2338,26 @@ export interface operations {
             };
         };
     };
+    event_studies_api_v1_event_studies_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_EventStudyListData_"];
+                };
+            };
+        };
+    };
     factors_api_v1_factors_get: {
         parameters: {
             query?: never;
@@ -2279,6 +2416,39 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_FactorDetailData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    formula_from_text_api_v1_formula_from_text_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TextToConditionRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TextToConditionData"];
                 };
             };
             /** @description Validation Error */

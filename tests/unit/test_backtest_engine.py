@@ -87,3 +87,15 @@ def test_delisted_position_is_written_off_not_held_at_stale_price() -> None:
     gone = run_backtest([d0, d1, d2], bars, signals, cfg, {"A": d2})
     assert gone.days[-1].positions == {} and gone.days[-1].nav < 0.11
     assert gone.orders[-1].reason == "退市注销"
+
+
+def test_hold_mode_buys_next_open_and_exits_after_n_days() -> None:
+    ds = [date(2024, 1, d) for d in (2, 3, 4, 5, 8)]
+    bar = Bar(open=10, close=10, pre_close=10)
+    bars = {d: {"A": bar, "B": bar} for d in ds}
+    signals = {ds[0]: [PortfolioCandidate(ts_code="A")], ds[1]: [PortfolioCandidate(ts_code="B")]}
+    cfg = BacktestConfig(capital=20_000, hold_days=2,
+                         weights=PortfolioWeightRule(max_positions=2))
+    res = run_backtest(ds, bars, signals, cfg)
+    assert [d.positions for d in res.days] == [
+        {}, {"A": 1000}, {"A": 1000, "B": 900}, {"B": 900}, {}]

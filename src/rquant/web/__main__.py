@@ -49,6 +49,8 @@ def main(argv: list[str] | None = None) -> None:
         app.state.page_control_transport = transport
 
         def demo_llm(messages: list[dict]) -> str:  # no network in demo mode
+            if "通达信" in messages[0]["content"]:
+                return "C>MA(C,20) AND V>MA(V,5)*2"
             lines = messages[1]["content"].splitlines()[1:]
             facts = dict(line[2:].split("：", 1) for line in lines)
             total, drawdown = facts.get("总收益", "—"), facts.get("最大回撤", "—")

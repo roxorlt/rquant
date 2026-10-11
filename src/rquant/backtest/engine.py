@@ -58,6 +58,9 @@ class BacktestConfig(BaseModel):
     rebalance_every: int = Field(default=1, ge=1)
     weights: PortfolioWeightRule = PortfolioWeightRule(max_positions=10)
     costs: CostModel = CostModel()
+    #: event mode: buy each signal next open into a free slot (1/max_positions of equity),
+    #: sell at the open `hold_days` trading days later; None = rebalance mode
+    hold_days: int | None = Field(default=None, ge=1, le=250)
 
 
 class Order(BaseModel):
@@ -106,6 +109,8 @@ def run_backtest(
     """`delisted`: code -> delist date. A position still held past its delist date with no
     bar is written off at zero (otherwise it would sit at its stale last price forever)."""
     config = config or BacktestConfig()
+    if config.hold_days:
+        return _run_hold(trading_days, bars, signals, config, delisted or {})
     cash = float(config.capital)
     held: dict[str, int] = {}
     last_close: dict[str, float] = {}
@@ -219,4 +224,78 @@ def run_backtest(
             signal_count += 1
     if any(not math.isfinite(r.nav) for r in records):
         raise ValueError("non-finite NAV")
+    return BacktestResult(config=config, days=records, orders=orders)
+
+
+def _run_hold(trading_days: Sequence[date], bars: Mapping[date, Mapping[str, Bar]],
+              signals: Mapping[date, Sequence[PortfolioCandidate]], config: BacktestConfig,
+              delisted: Mapping[str, date]) -> BacktestResult:
+    """Event mode. Same A-share rules as rebalance mode (next-open fills, limit-up/down
+    opens blocked, suspensions block, T+1 holds since exits are >= 1 day later, costs)."""
+    hold = int(config.hold_days or 1)
+    slots = config.weights.max_positions
+    cash = float(config.capital)
+    held: dict[str, int] = {}
+    entered: dict[str, int] = {}
+    last_close: dict[str, float] = {}
+    orders: list[Order] = []
+    records: list[DayRecord] = []
+    pending: Sequence[PortfolioCandidate] = ()
+    for i, day in enumerate(trading_days):
+        today = bars.get(day, {})
+        for code in [c for c in held if c not in today and c in delisted
+                     and day >= delisted[c]]:
+            orders.append(Order(trade_date=day, ts_code=code, side="sell", quantity=held.pop(code),
+                                price=0.0, fee=0, status="filled", reason="退市注销"))
+            entered.pop(code, None)
+        for code in sorted(c for c in held if i - entered[c] >= hold):
+            bar = today.get(code)
+            if bar is None or bar.open <= _limit_price(bar.pre_close, bar.limit_pct, up=False):
+                orders.append(Order(trade_date=day, ts_code=code, side="sell",
+                                    quantity=held[code], price=bar.open if bar else None,
+                                    fee=0, status="rejected",
+                                    reason="停牌" if bar is None else "跌停开盘"))
+                continue  # retried next day
+            qty = held.pop(code)
+            entered.pop(code)
+            notional = qty * bar.open
+            fee = config.costs.fee("sell", notional)
+            cash += notional - fee
+            orders.append(Order(trade_date=day, ts_code=code, side="sell", quantity=qty,
+                                price=bar.open, fee=fee, status="filled"))
+        equity = cash + sum(q * last_close.get(c, 0.0) for c, q in held.items())
+        for cand in sorted(pending, key=lambda c: (-c.rank_score, c.ts_code)):
+            code = cand.ts_code
+            if len(held) >= slots:
+                break
+            if code in held:
+                continue
+            bar = today.get(code)
+            if bar is None or bar.open >= _limit_price(bar.pre_close, bar.limit_pct, up=True):
+                orders.append(Order(trade_date=day, ts_code=code, side="buy", quantity=0,
+                                    price=bar.open if bar else None, fee=0, status="rejected",
+                                    reason="停牌" if bar is None else "涨停开盘"))
+                continue
+            qty = _lots(min(equity / slots, cash), bar.open)
+            while qty > 0 and qty * bar.open + config.costs.fee("buy", qty * bar.open) > cash:
+                qty -= LOT
+            if qty <= 0:
+                orders.append(Order(trade_date=day, ts_code=code, side="buy", quantity=0,
+                                    price=bar.open, fee=0, status="rejected", reason="现金不足"))
+                continue
+            notional = qty * bar.open
+            fee = config.costs.fee("buy", notional)
+            cash -= notional + fee
+            held[code], entered[code] = qty, i
+            orders.append(Order(trade_date=day, ts_code=code, side="buy", quantity=qty,
+                                price=bar.open, fee=fee, status="filled"))
+        for code, bar in today.items():
+            last_close[code] = bar.close
+        value = sum(q * last_close.get(c, 0.0) for c, q in held.items())
+        records.append(DayRecord(trade_date=day, cash=round(cash, 2),
+                                 market_value=round(value, 2),
+                                 nav=(cash + value) / config.capital, positions=dict(held),
+                                 values={c: round(q * last_close.get(c, 0.0), 2)
+                                         for c, q in held.items()}))
+        pending = signals.get(day, ())
     return BacktestResult(config=config, days=records, orders=orders)
