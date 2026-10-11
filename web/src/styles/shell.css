@@ -531,3 +531,82 @@
   color: var(--ink-2);
   white-space: nowrap;
 }
+
+/* Keyboard hint inside the top-bar search, and the Ctrl+K / "/" palette. */
+.search-kbd {
+  position: absolute;
+  right: 8px;
+  top: 7px;
+  padding: 0 5px;
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  color: var(--faint);
+  font: 11px / 16px var(--font-mono, monospace);
+  pointer-events: none;
+}
+.search input:focus + .search-kbd {
+  display: none;
+}
+.cmdk-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding-top: 12vh;
+  background: rgb(0 0 0 / 0.45);
+}
+.cmdk {
+  width: min(560px, 92vw);
+  border: 1px solid var(--rule-strong);
+  border-radius: 10px;
+  background: var(--surface);
+  box-shadow: 0 16px 48px rgb(0 0 0 / 0.35);
+  overflow: hidden;
+}
+.cmdk-input {
+  width: 100%;
+  height: 46px;
+  padding: 0 16px;
+  border: 0;
+  border-bottom: 1px solid var(--rule);
+  background: transparent;
+  color: var(--ink);
+  font-size: 15px;
+  outline: none;
+}
+.cmdk-list {
+  max-height: 50vh;
+  margin: 0;
+  padding: 6px;
+  overflow-y: auto;
+  list-style: none;
+}
+.cmdk-item {
+  display: flex;
+  width: 100%;
+  justify-content: space-between;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink-2);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+.cmdk-item.active {
+  background: var(--accent-weak);
+  color: var(--accent-t);
+}
+.cmdk-hint {
+  color: var(--faint);
+  font-size: 12px;
+}
+.cmdk-foot {
+  padding: 8px 14px;
+  border-top: 1px solid var(--rule);
+  color: var(--faint);
+  font-size: 11px;
+}
