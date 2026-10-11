@@ -8,6 +8,7 @@ import {
   useStrategies,
 } from "@/api/endpoints";
 import type { components } from "@/api/schema";
+import { useUrlState } from "@/app/useUrlState";
 import { toneClass, toneOf } from "@/format/color";
 import { formatPrice } from "@/format/number";
 import { DataTable } from "@/table/DataTable";
@@ -197,7 +198,7 @@ function Detail({ runId, onCompare }: { runId: string; onCompare: () => void }) 
 
 export function PortfolioRuns() {
   const query = usePortfolioBacktests();
-  const [runId, setRunId] = useState<string | null>(null);
+  const [runId, setRunId] = useUrlState("prun");
   const [picked, setPicked] = useState<string[]>([]);
   const addCompare = (id: string) =>
     setPicked((list) => (list.includes(id) ? list : [...list, id].slice(-2)));

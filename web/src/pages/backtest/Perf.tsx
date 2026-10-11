@@ -2,6 +2,7 @@ import type { components } from "@/api/schema";
 import { TimeChart } from "@/charts/Chart";
 import { kpiTone } from "@/format/color";
 import { formatPercent } from "@/format/number";
+import { rollingSharpe, topDrawdowns, yearlyReturns } from "@/format/perf";
 import { KpiStrip, Panel } from "@/ui";
 
 type BacktestPerf = components["schemas"]["BacktestPerf"];
@@ -20,6 +21,13 @@ function NavChart({ nav }: { nav: BacktestPerf["nav"] }) {
       <TimeChart
         label="净值"
         dates={dates}
+        bands={topDrawdowns(
+          nav.map((p) => p.nav),
+          3,
+        ).map((d) => ({
+          from: d.start,
+          to: d.end ?? nav.length - 1,
+        }))}
         baseline={1}
         format={(v) => v.toFixed(3)}
         series={[
@@ -47,6 +55,74 @@ function NavChart({ nav }: { nav: BacktestPerf["nav"] }) {
         ]}
       />
     </>
+  );
+}
+
+/** Deepest drawdowns, rolling Sharpe and calendar-year returns (QuantConnect / 聚宽 style). */
+function RiskBlock({ nav }: { nav: BacktestPerf["nav"] }) {
+  if (nav.length < 3) return null;
+  const values = nav.map((p) => p.nav);
+  const dates = nav.map((p) => p.date);
+  const dds = topDrawdowns(values, 5);
+  const window = nav.length >= 180 ? 60 : 20;
+  const sharpe = rollingSharpe(values, window);
+  const years = yearlyReturns(nav);
+  return (
+    <div className="risk-block">
+      <div>
+        <h3 className="sub">前 {dds.length} 大回撤（净值图阴影为前 3）</h3>
+        <table className="tbl" aria-label="前五大回撤">
+          <thead>
+            <tr>
+              <th>开始</th>
+              <th>谷底</th>
+              <th>恢复</th>
+              <th className="num">深度</th>
+              <th className="num">持续(日)</th>
+            </tr>
+          </thead>
+          <tbody>
+            {dds.map((d) => (
+              <tr key={d.start}>
+                <td className="mono">{dates[d.start]}</td>
+                <td className="mono">{dates[d.trough]}</td>
+                <td className="mono">{d.end === null ? "未恢复" : dates[d.end]}</td>
+                <td className="num down">{pct(d.depth)}</td>
+                <td className="num">{(d.end ?? nav.length - 1) - d.start}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        <h3 className="sub">年度收益</h3>
+        <table className="tbl" aria-label="年度收益">
+          <tbody>
+            {years.map((y) => (
+              <tr key={y.year}>
+                <td>{y.year}</td>
+                <td className={`num ${y.ret > 0 ? "up" : y.ret < 0 ? "down" : ""}`}>
+                  {pct(y.ret)}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div>
+        <h3 className="sub">滚动夏普（{window} 日）</h3>
+        {sharpe.some((v) => v !== null) ? (
+          <TimeChart
+            label="滚动夏普"
+            dates={dates}
+            height={150}
+            baseline={0}
+            format={(v) => v.toFixed(1)}
+            series={[{ name: "夏普", values: sharpe, color: "var(--accent)" }]}
+          />
+        ) : (
+          <p className="hint">区间不足 {window + 1} 个交易日，暂不计算滚动夏普。</p>
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -135,6 +211,7 @@ export function PerfPanel({ perf }: { perf: BacktestPerf }) {
         ]}
       />
       <NavChart nav={perf.nav} />
+      <RiskBlock nav={perf.nav} />
       <Monthly monthly={perf.monthly} />
     </Panel>
   );

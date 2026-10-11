@@ -1,5 +1,5 @@
-import { useState } from "react";
 import { useFactor, useFactors } from "@/api/endpoints";
+import { useUrlState } from "@/app/useUrlState";
 import { TimeChart } from "@/charts/Chart";
 import { DataTable } from "@/table/DataTable";
 import { KpiStrip, PageHeader, Panel } from "@/ui";
@@ -123,7 +123,7 @@ function Detail({ id }: { id: string }) {
 
 export default function FactorPage() {
   const query = useFactors();
-  const [id, setId] = useState<string | null>(null);
+  const [id, setId] = useUrlState("factor");
   return (
     <>
       <PageHeader eyebrow="研究" title="因子研究" />

@@ -1339,13 +1339,13 @@
 }
 
 /* ---------- charts (charts/Chart.tsx) ---------- */
-.chart {
+.tchart {
   margin: 8px 0 12px;
 }
 .chart-body {
   position: relative;
 }
-.chart svg {
+.tchart svg {
   display: block;
   overflow: visible;
 }

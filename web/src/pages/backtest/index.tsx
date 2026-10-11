@@ -1,5 +1,5 @@
-import { useState } from "react";
 import { useBacktestDetail, useBacktests } from "@/api/endpoints";
+import { useUrlState } from "@/app/useUrlState";
 import { formatPercent, formatPrice } from "@/format/number";
 import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
@@ -59,7 +59,7 @@ function Trades({ runId }: { runId: string }) {
 
 export default function BacktestPage() {
   const query = useBacktests();
-  const [runId, setRunId] = useState<string | null>(null);
+  const [runId, setRunId] = useUrlState("run");
   return (
     <>
       <PageHeader eyebrow="策略与验证" title="回测" actions={<FlowSteps />} />
