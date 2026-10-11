@@ -1,14 +1,35 @@
+import type { ReactNode } from "react";
 import { Link, useParams } from "react-router";
 import { useStock } from "@/api/endpoints";
+import { useUrlState } from "@/app/useUrlState";
 import { formatShanghaiDateTime } from "@/format/time";
 import { ChangeText, PageHeader, Panel, Pill } from "@/ui";
 import { QueryView } from "../shared";
 import { FlowPanel } from "./Flow";
+import { IntradayPanel } from "./Intraday";
 import { KlinePanel } from "./Kline";
 import { QuoteGrid } from "./QuoteGrid";
 import { TpoPanel } from "./Tpo";
 
 const fix = (v: number | null | undefined, d = 2) => (v == null ? "—" : v.toFixed(d));
+
+function ChartTabs({ kline, intraday }: { kline: ReactNode; intraday: ReactNode }) {
+  const [tab, setTab] = useUrlState("chart");
+  const cur = tab === "intraday" ? "intraday" : "kline";
+  return (
+    <>
+      <div className="seg chart-tabs">
+        <button type="button" aria-pressed={cur === "kline"} onClick={() => setTab(null)}>
+          日K
+        </button>
+        <button type="button" aria-pressed={cur === "intraday"} onClick={() => setTab("intraday")}>
+          分时
+        </button>
+      </div>
+      {cur === "kline" ? kline : intraday}
+    </>
+  );
+}
 
 /** 个股档案 (F9-lite): quote, K-line, valuation, returns, fundamentals, pools, alerts. */
 export default function StockPage() {
@@ -35,7 +56,10 @@ export default function StockPage() {
               note={last ? `截至 ${last.date}` : "没有行情"}
             />
             <QuoteGrid s={s} />
-            <KlinePanel key={s.code} code={s.code} bars={s.bars} flow={s.flow} />
+            <ChartTabs
+              kline={<KlinePanel key={s.code} code={s.code} bars={s.bars} flow={s.flow} />}
+              intraday={<IntradayPanel key={s.code} code={s.code} />}
+            />
             <TpoPanel code={s.code} />
             <FlowPanel s={s} />
             <div className="risk-block">

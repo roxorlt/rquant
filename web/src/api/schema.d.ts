@@ -570,6 +570,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/stocks/{code}/intraday": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 分时（分钟线） */
+        get: operations["stock_intraday_api_v1_stocks__code__intraday_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/strategies": {
         parameters: {
             query?: never;
@@ -1290,6 +1307,11 @@ export interface components {
             data: components["schemas"]["FundamentalsDoc"] | null;
             serving: components["schemas"]["ServingMeta"];
         };
+        /** Envelope[Union[IntradayData, NoneType]] */
+        Envelope_Union_IntradayData__NoneType__: {
+            data: components["schemas"]["IntradayData"] | null;
+            serving: components["schemas"]["ServingMeta"];
+        };
         /** Envelope[dict[str, list[list[str]]]] */
         Envelope_dict_str__list_list_str____: {
             /** Data */
@@ -1628,6 +1650,43 @@ export interface components {
             pool_weight: number;
             /** Weight */
             weight: number;
+        };
+        /** IntradayBar */
+        IntradayBar: {
+            /** Amount */
+            amount: number | null;
+            /** Close */
+            close: number;
+            /** High */
+            high: number;
+            /** Low */
+            low: number;
+            /** Open */
+            open: number;
+            /** T */
+            t: string;
+            /** Vol */
+            vol: number;
+        };
+        /** IntradayData */
+        IntradayData: {
+            /** Bars */
+            bars: components["schemas"]["IntradayBar"][];
+            /** Code */
+            code: string;
+            /**
+             * Date
+             * Format: date
+             */
+            date: string;
+            /** Days */
+            days: string[];
+            /** Freq */
+            freq: string;
+            /** Pre Close */
+            pre_close: number | null;
+            /** Source */
+            source: string;
         };
         /** Kpi */
         Kpi: {
@@ -3204,6 +3263,39 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_Union_ChipsData__NoneType__"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    stock_intraday_api_v1_stocks__code__intraday_get: {
+        parameters: {
+            query?: {
+                day?: string | null;
+            };
+            header?: never;
+            path: {
+                code: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_Union_IntradayData__NoneType__"];
                 };
             };
             /** @description Validation Error */
