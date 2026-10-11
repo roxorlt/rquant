@@ -26,6 +26,7 @@ const PAGE_COMPONENTS: Record<PageId, LazyPage> = {
   experiments: lazy(() => import("@/pages/experiments")),
   tasks: lazy(() => import("@/pages/tasks")),
   query: lazy(() => import("@/pages/query")),
+  macro: lazy(() => import("@/pages/macro")),
 };
 
 export const appRoutes: RouteObject[] = [

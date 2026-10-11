@@ -15,12 +15,14 @@ export type PageId =
   | "strategies"
   | "experiments"
   | "tasks"
-  | "query";
+  | "query"
+  | "macro";
 
-export type NavGroup = "概览" | "数据" | "研究" | "策略与验证" | "跟踪与告警" | "运维";
+export type NavGroup = "概览" | "宏观" | "数据" | "研究" | "策略与验证" | "跟踪与告警" | "运维";
 
 export const NAV_GROUPS: readonly NavGroup[] = [
   "概览",
+  "宏观",
   "数据",
   "研究",
   "策略与验证",
@@ -40,6 +42,7 @@ export interface PageDef {
 
 export const PAGES: readonly PageDef[] = [
   { id: "overview", path: "/overview", title: "总览", group: "概览", phoneTab: "总览" },
+  { id: "macro", path: "/macro", title: "宏观", group: "宏观" },
   { id: "data", path: "/data", title: "数据中心", group: "数据" },
   { id: "query", path: "/query", title: "数据查询", group: "数据" },
   { id: "screener", path: "/screener", title: "选股器", group: "研究" },
