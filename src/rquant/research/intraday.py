@@ -48,11 +48,30 @@ def intraday_path(root: Path) -> Path:
     return root / "intraday.duckdb"
 
 
-def connect(root: Path, read_only: bool = False) -> duckdb.DuckDBPyConnection:
-    con = duckdb.connect(str(intraday_path(root)), read_only=read_only)
+def connect(root: Path, read_only: bool = False, tries: int = 60) -> duckdb.DuckDBPyConnection:
+    """Short-lived connections only: writers hold the file for one upsert, readers retry
+    while a write is in flight (DuckDB locks the whole file across processes)."""
+    import time
+
+    for attempt in range(tries):
+        try:
+            con = duckdb.connect(str(intraday_path(root)), read_only=read_only)
+            break
+        except duckdb.IOException:
+            if attempt == tries - 1:
+                raise
+            time.sleep(1)
     if not read_only:
         con.execute(DDL)
     return con
+
+
+def _write(root: Path, table: str, df: pd.DataFrame) -> int:
+    con = connect(root)
+    try:
+        return _upsert(con, table, df)
+    finally:
+        con.close()
 
 
 def aggregate_1450(df: pd.DataFrame) -> pd.DataFrame:
@@ -72,8 +91,12 @@ def aggregate_1450(df: pd.DataFrame) -> pd.DataFrame:
         ["ts_code", "trade_date", "p1450", "h1450", "l1450", "v1450", "a1450", "vday"]]
 
 
-def ingest_minutes(con, pro: Pro, codes: list[str], start: date, end: date) -> int:
-    done = {c: (s, e) for c, s, e in con.execute("SELECT * FROM minute_done").fetchall()}
+def ingest_minutes(root: Path, pro: Pro, codes: list[str], start: date, end: date) -> int:
+    con = connect(root)
+    try:
+        done = {c: (s, e) for c, s, e in con.execute("SELECT * FROM minute_done").fetchall()}
+    finally:
+        con.close()
     total = 0
     for i, code in enumerate(codes):
         if code in done and done[code][0] <= start and done[code][1] >= end:
@@ -90,17 +113,21 @@ def ingest_minutes(con, pro: Pro, codes: list[str], start: date, end: date) -> i
         if frames:
             agg = aggregate_1450(pd.concat(frames, ignore_index=True)
                                  .drop_duplicates(["trade_time"]))
-            total += _upsert(con, "bar_1450", agg)
-        _upsert(con, "minute_done", pd.DataFrame(
+            total += _write(root, "bar_1450", agg)
+        _write(root, "minute_done", pd.DataFrame(
             {"ts_code": [code], "start_date": [start], "end_date": [end]}))
         if i % 200 == 0:
             log.info("minutes %d/%d rows=%d", i, len(codes), total)
     return total
 
 
-def ingest_daily_api(con, pro: Pro, api: str, table: str, days: list[date],
+def ingest_daily_api(root: Path, pro: Pro, api: str, table: str, days: list[date],
                      cols: list[str]) -> int:
-    have = {r[0] for r in con.execute(f"SELECT DISTINCT trade_date FROM {table}").fetchall()}
+    con = connect(root)
+    try:
+        have = {r[0] for r in con.execute(f"SELECT DISTINCT trade_date FROM {table}").fetchall()}
+    finally:
+        con.close()
     total = 0
     for d in days:
         if d in have:
@@ -112,7 +139,7 @@ def ingest_daily_api(con, pro: Pro, api: str, table: str, days: list[date],
         for c in cols:
             if c not in df:
                 df[c] = None
-        total += _upsert(con, table, df[cols])
+        total += _write(root, table, df[cols])
     return total
 
 
@@ -131,21 +158,18 @@ def run(root: Path, years: float = 2, what: tuple[str, ...] = ("auction", "limit
     finally:
         mcon.close()
     pro = Pro(os.environ.get("TUSHARE_TOKEN_MAIN") or os.environ["TUSHARE_TOKEN"], pause=0.07)
-    con = connect(root)
+    connect(root).close()  # create schema
     out: dict[str, int] = {}
-    try:
-        if "auction" in what:
-            out["auction"] = ingest_daily_api(con, pro, "stk_auction", "auction", days, [
-                "ts_code", "trade_date", "vol", "price", "amount", "pre_close", "turnover_rate",
-                "volume_ratio", "float_share"])
-        if "limits" in what:
-            out["limits"] = ingest_daily_api(con, pro, "limit_list_d", "limit_list", days, [
-                "ts_code", "trade_date", "lim", "first_time", "last_time", "open_times",
-                "limit_times", "fd_amount", "float_mv", "turnover_ratio", "industry"])
-        if "minutes" in what:
-            out["minutes"] = ingest_minutes(con, pro, codes, start, end)
-    finally:
-        con.close()
+    if "auction" in what:
+        out["auction"] = ingest_daily_api(root, pro, "stk_auction", "auction", days, [
+            "ts_code", "trade_date", "vol", "price", "amount", "pre_close", "turnover_rate",
+            "volume_ratio", "float_share"])
+    if "limits" in what:
+        out["limits"] = ingest_daily_api(root, pro, "limit_list_d", "limit_list", days, [
+            "ts_code", "trade_date", "lim", "first_time", "last_time", "open_times",
+            "limit_times", "fd_amount", "float_mv", "turnover_ratio", "industry"])
+    if "minutes" in what:
+        out["minutes"] = ingest_minutes(root, pro, codes, start, end)
     return out
 
 

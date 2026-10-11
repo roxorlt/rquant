@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 
 from rquant.research.ingest import db_path
-from rquant.research.intraday import intraday_path
+from rquant.research.intraday import connect as intraday_connect
 from rquant.research.tdx_strategy import BENCH, study_path
 
 TOP_N = 5
@@ -53,7 +53,9 @@ def _save(root: Path, slug: str, body: dict) -> dict:
     body |= {"slug": slug, "generated_at": datetime.now(UTC).isoformat()}
     p = study_path(root, slug)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(body, ensure_ascii=False, indent=1))
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(body, ensure_ascii=False, indent=1))
+    tmp.replace(p)  # atomic: the web never reads a half-written study
     return body
 
 
@@ -71,7 +73,7 @@ def intraday_study(root: Path, slug: str, title: str, formula: str, eod_preset: 
     from rquant.factor.tdx import translate
 
     expr = translate(formula)
-    icon = duckdb.connect(str(intraday_path(root)), read_only=True)
+    icon = intraday_connect(root, read_only=True)
     b = icon.execute("SELECT * FROM bar_1450").df()
     icon.close()
     b["trade_date"] = pd.to_datetime(b["trade_date"])
@@ -198,7 +200,7 @@ FEATURES = {
 
 
 def auction_frame(root: Path) -> pd.DataFrame:
-    icon = duckdb.connect(str(intraday_path(root)), read_only=True)
+    icon = intraday_connect(root, read_only=True)
     auc = icon.execute("SELECT * FROM auction").df()
     ll = icon.execute("SELECT * FROM limit_list").df()
     icon.close()

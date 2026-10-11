@@ -144,7 +144,9 @@ def run(root: Path, db: Path, first: date, last: date) -> list[tuple]:
                             "进出场日停牌的样本被跳过"]}
             p = study_path(root, slug)
             p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(json.dumps(study, ensure_ascii=False, indent=1))
+            tmp = p.with_suffix(".tmp")
+            tmp.write_text(json.dumps(study, ensure_ascii=False, indent=1))
+            tmp.replace(p)
     finally:
         con.close()
     return TDX_STRATEGIES
