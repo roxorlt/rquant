@@ -407,12 +407,16 @@ export function useTextToCondition() {
 
 export function useChips(
   code: string | undefined,
+  tpoPeriod?: number,
 ): ServingQueryResult<Schemas["ChipsData"] | null> {
   return useServingQuery(
-    ["stock", code, "chips"],
+    ["stock", code, "chips", tpoPeriod ?? "default"],
     async () => {
       const { data, response } = await apiClient().GET("/api/v1/stocks/{code}/chips", {
-        params: { path: { code: code ?? "" } },
+        params: {
+          path: { code: code ?? "" },
+          ...(tpoPeriod ? { query: { tpo_period: tpoPeriod } } : {}),
+        },
       });
       return unwrap(data, response);
     },

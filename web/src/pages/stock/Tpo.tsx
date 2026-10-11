@@ -3,9 +3,16 @@ import type { Schemas } from "@/api/client";
 import { useChips } from "@/api/endpoints";
 import { Panel } from "@/ui";
 
+const LETTERS = "ABCDEFGHIJKLMNOP";
+/** server default, chosen by scripts/tpo_study.py */
+const TPO_DEFAULT = 30;
+
 /** Market profile (TPO): one letter per 30-minute period a price traded in, from 5-minute bars. */
 export function TpoPanel({ code }: { code: string }) {
-  const chips = useChips(code);
+  const [period, setPeriod] = useState<number | undefined>(undefined);
+  const chips = useChips(code, period);
+  const cur = period ?? TPO_DEFAULT;
+  const n = 240 / cur;
   const days: readonly Schemas["TpoDay"][] = chips.data?.tpo ?? [];
   const [pick, setPick] = useState<string | null>(null);
   if (days.length === 0) return null;
@@ -14,19 +21,28 @@ export function TpoPanel({ code }: { code: string }) {
   return (
     <Panel
       title="TPO 市场轮廓"
-      sub="5 分钟线聚合为 30 分钟时段 A–H（A 09:30、D 11:00、E 13:00、H 14:30）；高亮 = 70% 价值区，◆ = POC"
+      sub={`5 分钟线聚合为 ${cur} 分钟时段 A–${LETTERS[n - 1]}（A 09:30，${LETTERS[n / 2]} 13:00）；高亮 = 70% 价值区，◆ = POC`}
       actions={
-        <span className="seg">
-          {days.map((x) => (
-            <button
-              key={x.date}
-              type="button"
-              aria-pressed={x.date === d.date}
-              onClick={() => setPick(x.date)}
-            >
-              {x.date.slice(5)}
-            </button>
-          ))}
+        <span className="qc-ctl">
+          <span className="seg" title="TPO 时段长度（默认值由历史检验选定）">
+            {[15, 30, 60].map((p) => (
+              <button key={p} type="button" aria-pressed={p === cur} onClick={() => setPeriod(p)}>
+                {p}分
+              </button>
+            ))}
+          </span>
+          <span className="seg">
+            {days.map((x) => (
+              <button
+                key={x.date}
+                type="button"
+                aria-pressed={x.date === d.date}
+                onClick={() => setPick(x.date)}
+              >
+                {x.date.slice(5)}
+              </button>
+            ))}
+          </span>
         </span>
       }
     >

@@ -3155,6 +3155,8 @@ export interface operations {
             query?: {
                 days?: number;
                 profile_days?: number;
+                /** @description TPO 时段分钟数：15/30/60 */
+                tpo_period?: number;
             };
             header?: never;
             path: {

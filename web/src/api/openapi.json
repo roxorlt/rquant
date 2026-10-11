@@ -6243,6 +6243,18 @@
               "title": "Profile Days",
               "type": "integer"
             }
+          },
+          {
+            "description": "TPO 时段分钟数：15/30/60",
+            "in": "query",
+            "name": "tpo_period",
+            "required": false,
+            "schema": {
+              "default": 30,
+              "description": "TPO 时段分钟数：15/30/60",
+              "title": "Tpo Period",
+              "type": "integer"
+            }
           }
         ],
         "responses": {

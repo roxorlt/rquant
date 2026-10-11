@@ -383,5 +383,8 @@ def test_stock_chips_endpoint(tmp_path) -> None:
     assert body["profile"]["source"] == "5min"
     tpo = body["tpo"]
     assert len(tpo) == 5 and tpo[-1]["val"] <= tpo[-1]["poc"] <= tpo[-1]["vah"]
-    letters = "".join(r["letters"] for r in tpo[-1]["rows"])
-    assert set(letters) == set("ABCDEFGH")
+    for period, n in ((15, 16), (30, 8), (60, 4)):
+        url = f"/api/v1/stocks/600519.SH/chips?tpo_period={period}"
+        tpo = client.get(url).json()["data"]["tpo"]
+        assert len({ch for r in tpo[-1]["rows"] for ch in r["letters"]}) == n
+    assert client.get("/api/v1/stocks/600519.SH/chips?tpo_period=20").status_code == 422
