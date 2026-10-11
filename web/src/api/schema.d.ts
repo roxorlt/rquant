@@ -553,6 +553,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/report-factors": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 研报因子：目录与复现结果 */
+        get: operations["report_factors_api_v1_report_factors_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/screen": {
         parameters: {
             query?: never;
@@ -1355,6 +1372,11 @@ export interface components {
         /** Envelope[QueryResult] */
         Envelope_QueryResult_: {
             data: components["schemas"]["QueryResult"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[ReportFactorsData] */
+        Envelope_ReportFactorsData_: {
+            data: components["schemas"]["ReportFactorsData"];
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[ScreenData] */
@@ -2193,6 +2215,16 @@ export interface components {
             rows: unknown[][];
             /** Truncated */
             truncated: boolean;
+        };
+        /**
+         * ReportFactorsData
+         * @description 研报因子: catalog + per-factor replication results (opaque chart series).
+         */
+        ReportFactorsData: {
+            /** Results */
+            results: {
+                [key: string]: unknown;
+            } | null;
         };
         /** SavePoolRequest */
         SavePoolRequest: {
@@ -3467,6 +3499,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_list_str__"];
+                };
+            };
+        };
+    };
+    report_factors_api_v1_report_factors_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_ReportFactorsData_"];
                 };
             };
         };

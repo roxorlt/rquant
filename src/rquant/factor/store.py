@@ -267,4 +267,7 @@ def read_latest(root: Path | None = None) -> dict[str, dict[str, float]]:
                 out[run.name] = json.loads(p.read_text())["values"]
             except (ValueError, KeyError):
                 continue
+    from rquant.research.report_factors import read_latest as report_latest
+
+    out.update(report_latest(root))  # validated 研报因子 percentiles
     return out

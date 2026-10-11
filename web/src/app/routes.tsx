@@ -22,6 +22,7 @@ const PAGE_COMPONENTS: Record<PageId, LazyPage> = {
   data: lazy(() => import("@/pages/data")),
   ops: lazy(() => import("@/pages/ops")),
   factor: lazy(() => import("@/pages/factor")),
+  reportfactors: lazy(() => import("@/pages/reportfactors")),
   strategies: lazy(() => import("@/pages/strategies")),
   experiments: lazy(() => import("@/pages/experiments")),
   tasks: lazy(() => import("@/pages/tasks")),
