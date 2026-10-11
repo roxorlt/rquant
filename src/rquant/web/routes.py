@@ -88,6 +88,8 @@ from rquant.web.models import (
     SignalItem,
     StrategyListData,
     StrategyRow,
+    SurgeData,
+    SurgeEvent,
     TextToConditionData,
     TextToConditionRequest,
     TranslateData,
@@ -592,6 +594,23 @@ def data_center(request: Request, source: SourceDep) -> Envelope[DataCenterData]
     catalog = CatalogDocument.model_validate_json(_CATALOG.read_text(encoding="utf-8"))
     return _envelope(source, DataCenterData(datasets=catalog.datasets,
                                             audit=read_report(_research_root(request))))
+
+
+@router.get("/surge", response_model=Envelope[SurgeData], summary="量能异动（盘中扫描事件）")
+def surge_events(request: Request, source: SourceDep, day: date | None = None,
+                 limit: int = Query(300, ge=1, le=2000)) -> Envelope[SurgeData]:
+    from rquant.research.surge import read_events
+
+    d, rows = read_events(Path(_research_root(request) or research_root()),
+                          day.isoformat() if day else None, limit)
+    items = []
+    for r in rows:
+        try:
+            items.append(SurgeEvent(code=r["ts_code"], **{k: r.get(k) for k in (
+                "at", "time", "name", "kind", "ratio", "acc1", "acc5", "pct", "price", "amount")}))
+        except Exception:  # noqa: BLE001 - skip malformed lines
+            continue
+    return _envelope(source, SurgeData(date=d, items=items))
 
 
 @router.get("/alerts", response_model=Envelope[AlertsData], summary="告警时间线")

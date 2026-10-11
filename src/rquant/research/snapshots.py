@@ -550,6 +550,8 @@ def run(out: Path, *, force: bool = False, max_cycles: int | None = None, cap: i
     socket.setdefaulttimeout(10)  # the SDK passes no timeout to requests
     poller = Poller(codes, token=token)
     dedup = Deduper()
+    scanner = _start_scanner(out, today, d)
+    scan_errors = 0
     buf: list[pd.DataFrame] = []
     last_flush, cycles, rc = time.monotonic(), 0, 0
     end_of_day = datetime.combine(today, SESSIONS[-1][1], TZ)
@@ -567,7 +569,17 @@ def run(out: Path, *, force: bool = False, max_cycles: int | None = None, cap: i
                         break
                     continue
             started = time.monotonic()
-            buf.append(dedup(poller.cycle()))
+            raw = poller.cycle()
+            if scanner is not None:
+                try:
+                    scanner.update(raw)
+                except Exception as exc:  # noqa: BLE001 - never break collection
+                    scan_errors += 1
+                    log.warning("surge scanner error %d: %s", scan_errors, str(exc)[:200])
+                    if scan_errors >= 20:
+                        log.error("surge scanner disabled after 20 errors")
+                        scanner = None
+            buf.append(dedup(raw))
             cycles += 1
             if poller.failed_cycles >= MAX_FAILED_CYCLES:
                 log.error("%d consecutive failed cycles; stopping collector", poller.failed_cycles)
@@ -582,12 +594,43 @@ def run(out: Path, *, force: bool = False, max_cycles: int | None = None, cap: i
             time.sleep(wait + random.uniform(-0.3, 0.3))
     finally:
         write_part(d, buf)
+        if scanner is not None:
+            try:
+                scanner.close()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("surge close failed: %s", str(exc)[:200])
     log.info("polling done: %d cycles", cycles)
     if ticks and not stop_requested() and (
             force or _sleep_until(datetime.combine(today, TICK_AT, TZ))):
         fetch_ticks(d, codes[:tick_limit or TICK_CAP])
     compact(d)
+    try:
+        from rquant.research.auction import write_auction_factors
+
+        write_auction_factors(out, today)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("auction factors failed: %s", str(exc)[:200])
     return rc
+
+
+def _start_scanner(out: Path, today: date, d: Path):
+    """Surge scanner (rquant.research.surge); None when disabled or the prior curve is missing."""
+    if os.environ.get("SURGE_SCAN", "1") == "0":
+        return None
+    try:
+        from rquant.research.surge import Pusher, SurgeScanner, prior_in_subprocess
+
+        t0 = time.monotonic()
+        prior = prior_in_subprocess(out.parent, today, d / "surge" / "prior.npz")
+        if prior is None:
+            log.warning("surge: no prior-day curve; scanner off")
+            return None
+        log.info("surge: prior %s from %s (%d codes, %.1fs)", prior.day, prior.source,
+                 len(prior.codes), time.monotonic() - t0)
+        return SurgeScanner(prior, d / "surge", Pusher.from_env(out / "SURGE_NOPUSH"))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("surge scanner init failed: %s", str(exc)[:200])
+        return None
 
 
 def main(argv: list[str] | None = None) -> int:

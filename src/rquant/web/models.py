@@ -510,3 +510,22 @@ class OperationRow(BaseModel):
 
 class OperationsData(BaseModel):
     items: list[OperationRow]
+
+
+class SurgeEvent(BaseModel):
+    at: str | None = None  # local wall time (ISO)
+    time: str  # exchange time HH:MM:SS
+    code: str
+    name: str | None = None
+    kind: str  # "ratio" | "accel"
+    ratio: float | None = None  # cum vol / prior day cum vol at same time
+    acc1: float | None = None
+    acc5: float | None = None
+    pct: float | None = None
+    price: float | None = None
+    amount: float | None = None  # cumulative CNY
+
+
+class SurgeData(BaseModel):
+    date: str | None
+    items: list[SurgeEvent]

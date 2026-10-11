@@ -440,3 +440,19 @@ export function useIntraday(
     { enabled: Boolean(code) },
   );
 }
+
+export type SurgeEvent = Schemas["SurgeEvent"];
+
+/** Intraday volume-surge events (research snapshot scanner); refreshed every 15s. */
+export function useSurge(): ServingQueryResult<Schemas["SurgeData"]> {
+  return useServingQuery(
+    ["surge"],
+    async () => {
+      const { data, response } = await apiClient().GET("/api/v1/surge", {
+        params: { query: { limit: 300 } },
+      });
+      return unwrap(data, response);
+    },
+    { refetchInterval: 15_000 },
+  );
+}
