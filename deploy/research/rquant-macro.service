@@ -1,0 +1,15 @@
+[Unit]
+Description=rQuant 宏观页数据刷新（社保汇金持仓/巴菲特/两融/北向/股债利差/ETF期权）
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=lighthouse
+WorkingDirectory=/home/lighthouse/rquant-web-rel/current
+EnvironmentFile=/etc/rquant-web.env
+EnvironmentFile=/home/lighthouse/rquant-research/.tushare.env
+ExecStart=/home/lighthouse/rquant-web-rel/current/.venv/bin/python -m rquant.macro refresh
+Nice=10
+CPUQuota=100%
+MemoryMax=3G
+TimeoutStartSec=1h

@@ -456,3 +456,12 @@ export function useSurge(): ServingQueryResult<Schemas["SurgeData"]> {
     { refetchInterval: 15_000 },
   );
 }
+
+export type MacroData = Schemas["MacroData"];
+
+export function useMacro(): ServingQueryResult<MacroData> {
+  return useServingQuery(["macro"], async () => {
+    const { data, response } = await apiClient().GET("/api/v1/macro");
+    return unwrap(data, response);
+  });
+}

@@ -1,0 +1,9 @@
+[Unit]
+Description=rQuant 宏观页刷新，工作日盘后（研究日任务之后）
+
+[Timer]
+OnCalendar=Mon..Fri 20:30 Asia/Shanghai
+Persistent=true
+
+[Install]
+WantedBy=timers.target

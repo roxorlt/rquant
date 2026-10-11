@@ -868,6 +868,50 @@
         "title": "BandPoint",
         "type": "object"
       },
+      "Bands": {
+        "description": "Full-history percentiles / mean±σ (in-sample, descriptive only).",
+        "properties": {
+          "current": {
+            "title": "Current",
+            "type": "number"
+          },
+          "current_date": {
+            "title": "Current Date",
+            "type": "string"
+          },
+          "current_pct": {
+            "title": "Current Pct",
+            "type": "number"
+          },
+          "mean": {
+            "title": "Mean",
+            "type": "number"
+          },
+          "p20": {
+            "title": "P20",
+            "type": "number"
+          },
+          "p80": {
+            "title": "P80",
+            "type": "number"
+          },
+          "std": {
+            "title": "Std",
+            "type": "number"
+          }
+        },
+        "required": [
+          "p20",
+          "p80",
+          "mean",
+          "std",
+          "current",
+          "current_pct",
+          "current_date"
+        ],
+        "title": "Bands",
+        "type": "object"
+      },
       "Bar": {
         "properties": {
           "amount": {
@@ -1424,6 +1468,40 @@
         "title": "ChipsData",
         "type": "object"
       },
+      "Columns": {
+        "properties": {
+          "cols": {
+            "additionalProperties": {
+              "items": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "type": "array"
+            },
+            "title": "Cols",
+            "type": "object"
+          },
+          "dates": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Dates",
+            "type": "array"
+          }
+        },
+        "required": [
+          "dates",
+          "cols"
+        ],
+        "title": "Columns",
+        "type": "object"
+      },
       "CommandReceipt": {
         "properties": {
           "command_id": {
@@ -1882,6 +1960,22 @@
           "serving"
         ],
         "title": "Envelope[HealthData]",
+        "type": "object"
+      },
+      "Envelope_MacroData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/MacroData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[MacroData]",
         "type": "object"
       },
       "Envelope_MetaData_": {
@@ -3069,6 +3163,118 @@
         "title": "HealthLayer",
         "type": "object"
       },
+      "HolderQuarter": {
+        "properties": {
+          "basis": {
+            "title": "Basis",
+            "type": "string"
+          },
+          "entity": {
+            "title": "Entity",
+            "type": "string"
+          },
+          "flow": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Flow"
+          },
+          "mv": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mv"
+          },
+          "n_add": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "N Add"
+          },
+          "n_cut": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "N Cut"
+          },
+          "n_exit": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "N Exit"
+          },
+          "n_hold": {
+            "title": "N Hold",
+            "type": "integer"
+          },
+          "n_new": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "N New"
+          },
+          "quarter": {
+            "title": "Quarter",
+            "type": "string"
+          },
+          "share_chg": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Share Chg"
+          }
+        },
+        "required": [
+          "entity",
+          "basis",
+          "quarter",
+          "n_hold",
+          "n_new",
+          "n_exit",
+          "n_add",
+          "n_cut",
+          "share_chg",
+          "mv",
+          "flow"
+        ],
+        "title": "HolderQuarter",
+        "type": "object"
+      },
       "HoldingItem": {
         "properties": {
           "average_cost": {
@@ -3381,6 +3587,164 @@
         "title": "Kpi",
         "type": "object"
       },
+      "MacroData": {
+        "properties": {
+          "available": {
+            "title": "Available",
+            "type": "boolean"
+          },
+          "breadth": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Columns"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "buffett": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Columns"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "buffett_bands": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Bands"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "daily": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Columns"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "erp_bands": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Bands"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "etf_share": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Columns"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "futures": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/Columns"
+            },
+            "default": {},
+            "title": "Futures",
+            "type": "object"
+          },
+          "hk": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Columns"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "hk_rollcorr": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Columns"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "holders": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/HolderQuarter"
+            },
+            "title": "Holders",
+            "type": "array"
+          },
+          "index_m": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Columns"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "leadlag": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Columns"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "north_regime_change": {
+            "default": "2024-08-19",
+            "title": "North Regime Change",
+            "type": "string"
+          },
+          "options": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/Columns"
+            },
+            "default": {},
+            "title": "Options",
+            "type": "object"
+          },
+          "options_latest": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/OptionLatest"
+            },
+            "title": "Options Latest",
+            "type": "array"
+          },
+          "studies": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/StudyRow"
+            },
+            "title": "Studies",
+            "type": "array"
+          }
+        },
+        "required": [
+          "available"
+        ],
+        "title": "MacroData",
+        "type": "object"
+      },
       "MarketPulse": {
         "properties": {
           "down": {
@@ -3592,6 +3956,96 @@
           "items"
         ],
         "title": "OperationsData",
+        "type": "object"
+      },
+      "OptionLatest": {
+        "properties": {
+          "atm_iv": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Atm Iv"
+          },
+          "atm_iv_pct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Atm Iv Pct"
+          },
+          "oi_surge": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Oi Surge"
+          },
+          "pcr_oi": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pcr Oi"
+          },
+          "pcr_vol": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pcr Vol"
+          },
+          "trade_date": {
+            "title": "Trade Date",
+            "type": "string"
+          },
+          "und": {
+            "title": "Und",
+            "type": "string"
+          },
+          "vol_surge": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Vol Surge"
+          }
+        },
+        "required": [
+          "und",
+          "trade_date",
+          "pcr_vol",
+          "pcr_oi",
+          "vol_surge",
+          "oi_surge",
+          "atm_iv",
+          "atm_iv_pct"
+        ],
+        "title": "OptionLatest",
         "type": "object"
       },
       "OverfitStats": {
@@ -4995,6 +5449,89 @@
         "title": "StrategyRow",
         "type": "object"
       },
+      "StudyRow": {
+        "properties": {
+          "base_mean": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Base Mean"
+          },
+          "base_win": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Base Win"
+          },
+          "horizon": {
+            "title": "Horizon",
+            "type": "integer"
+          },
+          "mean": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mean"
+          },
+          "median": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Median"
+          },
+          "n": {
+            "title": "N",
+            "type": "integer"
+          },
+          "study": {
+            "title": "Study",
+            "type": "string"
+          },
+          "win": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Win"
+          }
+        },
+        "required": [
+          "study",
+          "horizon",
+          "n",
+          "mean",
+          "median",
+          "win",
+          "base_mean",
+          "base_win"
+        ],
+        "title": "StudyRow",
+        "type": "object"
+      },
       "StudyTable": {
         "properties": {
           "columns": {
@@ -6115,6 +6652,44 @@
           }
         },
         "summary": "系统健康"
+      }
+    },
+    "/api/v1/macro": {
+      "get": {
+        "operationId": "macro_api_v1_macro_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_MacroData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "宏观"
+      }
+    },
+    "/api/v1/macro/summary": {
+      "get": {
+        "operationId": "macro_summary_api_v1_macro_summary_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Macro Summary Api V1 Macro Summary Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "宏观日度摘要 JSON（schema rquant.macro.summary/1）"
       }
     },
     "/api/v1/meta": {

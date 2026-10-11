@@ -36,6 +36,7 @@ from rquant.web.brinson import BrinsonData, brinson
 from rquant.web.chips import TPO_DEFAULT, TPO_PERIODS, ChipsData, load_chips
 from rquant.web.health_layers import build_layers
 from rquant.web.intraday import IntradayData, load_intraday
+from rquant.web.macro import MacroData, load_macro, load_summary
 from rquant.web.models import (
     AckAlertRequest,
     AddWatchRequest,
@@ -893,3 +894,16 @@ def stock_chips(code: str, request: Request, source: SourceDep,
         except duckdb.Error:
             data = None
     return _envelope(source, data)
+
+
+@router.get("/macro", response_model=Envelope[MacroData], summary="宏观")
+def macro(request: Request, source: SourceDep) -> Envelope[MacroData]:
+    return _envelope(source, load_macro(Path(_research_root(request) or research_root())))
+
+
+@router.get("/macro/summary", summary="宏观日度摘要 JSON（schema rquant.macro.summary/1）")
+def macro_summary(request: Request) -> dict:
+    data = load_summary(Path(_research_root(request) or research_root()))
+    if data is None:
+        raise HTTPException(404, "宏观摘要尚未生成")
+    return data

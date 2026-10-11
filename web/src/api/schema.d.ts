@@ -260,6 +260,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/macro": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 宏观 */
+        get: operations["macro_api_v1_macro_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/macro/summary": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 宏观日度摘要 JSON（schema rquant.macro.summary/1） */
+        get: operations["macro_summary_api_v1_macro_summary_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/meta": {
         parameters: {
             query?: never;
@@ -926,6 +960,26 @@ export interface components {
             /** P95 */
             p95: number;
         };
+        /**
+         * Bands
+         * @description Full-history percentiles / mean±σ (in-sample, descriptive only).
+         */
+        Bands: {
+            /** Current */
+            current: number;
+            /** Current Date */
+            current_date: string;
+            /** Current Pct */
+            current_pct: number;
+            /** Mean */
+            mean: number;
+            /** P20 */
+            p20: number;
+            /** P80 */
+            p80: number;
+            /** Std */
+            std: number;
+        };
         /** Bar */
         Bar: {
             /** Amount */
@@ -1104,6 +1158,15 @@ export interface components {
              */
             tpo: components["schemas"]["TpoDay"][];
         };
+        /** Columns */
+        Columns: {
+            /** Cols */
+            cols: {
+                [key: string]: (number | null)[];
+            };
+            /** Dates */
+            dates: string[];
+        };
         /** CommandReceipt */
         CommandReceipt: {
             /** Command Id */
@@ -1237,6 +1300,11 @@ export interface components {
         /** Envelope[HealthData] */
         Envelope_HealthData_: {
             data: components["schemas"]["HealthData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[MacroData] */
+        Envelope_MacroData_: {
+            data: components["schemas"]["MacroData"];
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[MetaData] */
@@ -1631,6 +1699,31 @@ export interface components {
             /** Title */
             title: string;
         };
+        /** HolderQuarter */
+        HolderQuarter: {
+            /** Basis */
+            basis: string;
+            /** Entity */
+            entity: string;
+            /** Flow */
+            flow: number | null;
+            /** Mv */
+            mv: number | null;
+            /** N Add */
+            n_add: number | null;
+            /** N Cut */
+            n_cut: number | null;
+            /** N Exit */
+            n_exit: number | null;
+            /** N Hold */
+            n_hold: number;
+            /** N New */
+            n_new: number | null;
+            /** Quarter */
+            quarter: string;
+            /** Share Chg */
+            share_chg: number | null;
+        };
         /** HoldingItem */
         HoldingItem: {
             /** Average Cost */
@@ -1739,6 +1832,55 @@ export interface components {
             /** Value */
             value: string;
         };
+        /** MacroData */
+        MacroData: {
+            /** Available */
+            available: boolean;
+            breadth?: components["schemas"]["Columns"] | null;
+            buffett?: components["schemas"]["Columns"] | null;
+            buffett_bands?: components["schemas"]["Bands"] | null;
+            daily?: components["schemas"]["Columns"] | null;
+            erp_bands?: components["schemas"]["Bands"] | null;
+            etf_share?: components["schemas"]["Columns"] | null;
+            /**
+             * Futures
+             * @default {}
+             */
+            futures: {
+                [key: string]: components["schemas"]["Columns"];
+            };
+            hk?: components["schemas"]["Columns"] | null;
+            hk_rollcorr?: components["schemas"]["Columns"] | null;
+            /**
+             * Holders
+             * @default []
+             */
+            holders: components["schemas"]["HolderQuarter"][];
+            index_m?: components["schemas"]["Columns"] | null;
+            leadlag?: components["schemas"]["Columns"] | null;
+            /**
+             * North Regime Change
+             * @default 2024-08-19
+             */
+            north_regime_change: string;
+            /**
+             * Options
+             * @default {}
+             */
+            options: {
+                [key: string]: components["schemas"]["Columns"];
+            };
+            /**
+             * Options Latest
+             * @default []
+             */
+            options_latest: components["schemas"]["OptionLatest"][];
+            /**
+             * Studies
+             * @default []
+             */
+            studies: components["schemas"]["StudyRow"][];
+        };
         /** MarketPulse */
         MarketPulse: {
             /** Down */
@@ -1816,6 +1958,25 @@ export interface components {
         OperationsData: {
             /** Items */
             items: components["schemas"]["OperationRow"][];
+        };
+        /** OptionLatest */
+        OptionLatest: {
+            /** Atm Iv */
+            atm_iv: number | null;
+            /** Atm Iv Pct */
+            atm_iv_pct: number | null;
+            /** Oi Surge */
+            oi_surge: number | null;
+            /** Pcr Oi */
+            pcr_oi: number | null;
+            /** Pcr Vol */
+            pcr_vol: number | null;
+            /** Trade Date */
+            trade_date: string;
+            /** Und */
+            und: string;
+            /** Vol Surge */
+            vol_surge: number | null;
         };
         /** OverfitStats */
         OverfitStats: {
@@ -2236,6 +2397,25 @@ export interface components {
             version: number;
             /** Versions */
             versions: number;
+        };
+        /** StudyRow */
+        StudyRow: {
+            /** Base Mean */
+            base_mean: number | null;
+            /** Base Win */
+            base_win: number | null;
+            /** Horizon */
+            horizon: number;
+            /** Mean */
+            mean: number | null;
+            /** Median */
+            median: number | null;
+            /** N */
+            n: number;
+            /** Study */
+            study: string;
+            /** Win */
+            win: number | null;
         };
         /** StudyTable */
         StudyTable: {
@@ -2838,6 +3018,48 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_HealthData_"];
+                };
+            };
+        };
+    };
+    macro_api_v1_macro_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_MacroData_"];
+                };
+            };
+        };
+    };
+    macro_summary_api_v1_macro_summary_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
                 };
             };
         };

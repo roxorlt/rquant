@@ -3,6 +3,7 @@ import type { IconName } from "./pages";
 
 /** Navigation icons, 24×24 stroke paths drawn for the approved prototype. */
 const NAV_ICONS: Record<IconName, ReactNode> = {
+  macro: <path d="M3 20h18M5 16l4-5 4 3 6-8M15 6h4v4" />,
   tasks: (
     <>
       <circle cx="12" cy="12" r="8.5" />
