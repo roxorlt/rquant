@@ -3,6 +3,7 @@ import { useAlerts, useHealth, useOverview } from "@/api/endpoints";
 import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
 import { Button, KpiStrip, PageHeader, Panel, Pill } from "@/ui";
+import { StockLink } from "@/ui/StockLink";
 import { QueryView } from "../shared";
 
 const STATE_PILL = {
@@ -191,7 +192,12 @@ export default function OverviewPage() {
                     value: (row) => row.at ?? null,
                     cell: (row) => (row.at ? formatShanghaiDateTime(row.at) : "—"),
                   },
-                  { id: "code", header: "代码", value: (row) => row.code },
+                  {
+                    id: "code",
+                    header: "代码",
+                    value: (row) => row.code,
+                    cell: (row) => <StockLink code={row.code} />,
+                  },
                   { id: "name", header: "名称", value: (row) => row.name ?? null },
                   { id: "strategy", header: "策略", value: (row) => row.strategy_id },
                   {

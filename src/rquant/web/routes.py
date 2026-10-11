@@ -86,6 +86,7 @@ from rquant.web.models import (
 )
 from rquant.web.overfit_stats import overfit_stats, sharpe_per_period
 from rquant.web.source import Source, SourceUnavailableError, table_missing
+from rquant.web.stocks import CODE_RE, StockProfile, load_profile, market
 
 router = APIRouter(prefix="/api/v1")
 T = TypeVar("T")
@@ -699,3 +700,30 @@ def query_tables(source: SourceDep) -> Envelope[list[str]]:
 def fundamentals(request: Request, source: SourceDep) -> Envelope[FundamentalsDoc | None]:
     root = _research_root(request) or research_root()
     return _envelope(source, read_fundamentals(Path(root)))
+
+
+@router.get("/stocks/{code}", response_model=Envelope[StockProfile], summary="个股档案")
+def stock_profile(code: str, request: Request, source: SourceDep) -> Envelope[StockProfile]:
+    code = code.upper()
+    if not CODE_RE.match(code):
+        raise HTTPException(422, "代码格式应为 600519.SH")
+    root = Path(_research_root(request) or research_root())
+    with market(root) as con:
+        base = load_profile(con, code)
+    doc = read_fundamentals(root)
+    fund = next((r for r in doc.rows if r.code == code), None) if doc else None
+    in_pools = sorted({p.name for p in pools(source).data.pools
+                       if any(m.code == code for m in p.members)})
+    recent = [a.model_dump(mode="json", include={"at", "level", "trigger_type", "trigger_price"})
+              for a in alerts(source, 1000).data.items if a.code == code][:20]
+    if base["name"] is None:
+        base["name"] = _names(source).get(code)
+    if not base["bars"] and base["name"] is None and fund is None:
+        raise HTTPException(404, f"没有 {code} 的数据")
+    return _envelope(source, StockProfile(
+        code=code, **base,
+        fundamentals=fund.values if fund else {},
+        fundamentals_period=fund.end_date if fund else None,
+        fundamentals_fields=doc.fields if doc else {},
+        pools=in_pools, alerts=recent))
+

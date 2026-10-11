@@ -23,6 +23,7 @@ export { Segmented, type SegmentedOption } from "./Segmented";
 export { ServingBanner, type ServingState, servingBannerMessage } from "./ServingBanner";
 export { PageSkeleton, SkeletonKpis, SkeletonLine, SkeletonRows } from "./Skeleton";
 export { StatusBadge, type StatusBadgeProps, type UserState } from "./StatusBadge";
+export { StockLink } from "./StockLink";
 export { Switch } from "./Switch";
 export { type TabItem, Tabs } from "./Tabs";
 export { Tip, type TipProps, useTouchOnly } from "./Tip";

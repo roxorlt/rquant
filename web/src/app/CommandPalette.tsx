@@ -1,5 +1,6 @@
 import { type KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router";
+import { fullCode } from "@/format/code";
 import { PAGES } from "./pages";
 
 interface Command {
@@ -68,6 +69,19 @@ export function CommandPalette() {
         navigate(`/screener?q=${encodeURIComponent(q.trim())}`);
       },
     };
+    const full = fullCode(q);
+    if (full) {
+      const profile: Command = {
+        key: "profile",
+        label: `打开个股档案 ${full}`,
+        hint: "个股",
+        run: () => {
+          close();
+          navigate(`/stock/${full}`);
+        },
+      };
+      return [profile, stock, ...pages];
+    }
     // A code-like query (digits / .SH) puts the stock search first.
     return /^[0-9.a-z]+$/.test(term) && /\d/.test(term) ? [stock, ...pages] : [...pages, stock];
   }, [q, navigate]);

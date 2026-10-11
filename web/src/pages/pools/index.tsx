@@ -4,6 +4,7 @@ import { useUrlState } from "@/app/useUrlState";
 import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
 import { EmptyState, FlowSteps, PageHeader, Panel, Segmented } from "@/ui";
+import { StockLink } from "@/ui/StockLink";
 import { QueryView } from "../shared";
 
 export default function PoolsPage() {
@@ -69,7 +70,12 @@ export default function PoolsPage() {
                   rowKey={(row) => `${row.preset}:${row.code}`}
                   emptyText="今天没有成员：去「选股器」筛选后点「保存为池子」。"
                   columns={[
-                    { id: "code", header: "代码", value: (row) => row.code },
+                    {
+                      id: "code",
+                      header: "代码",
+                      value: (row) => row.code,
+                      cell: (row) => <StockLink code={row.code} />,
+                    },
                     { id: "name", header: "名称", value: (row) => row.name ?? null },
                     { id: "preset", header: "来源", value: (row) => row.preset },
                   ]}

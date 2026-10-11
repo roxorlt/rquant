@@ -117,3 +117,10 @@ test("data center shows fundamentals", async ({ page }) => {
   await page.goto("./#/data");
   await expect(page.getByText("财务指标 · 2")).toBeVisible();
 });
+
+test("stock profile opens from a code link", async ({ page }) => {
+  await page.goto("./#/stock/600519.SH");
+  await expect(page.getByRole("heading", { name: /贵州茅台/ })).toBeVisible();
+  await expect(page.getByRole("img", { name: "日K线" })).toBeVisible();
+  await expect(page.getByLabel("个股财务")).toContainText("18.90");
+});

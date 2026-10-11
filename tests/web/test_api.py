@@ -283,3 +283,20 @@ def test_viewer_cannot_write_and_operations_list_web_writes(monkeypatch) -> None
     assert sorted(kinds) == ["ack_alert", "save_alert_rule"]
     monkeypatch.delenv("RQUANT_WEB_ADMINS")
     assert client.get("/api/v1/meta").json()["data"]["role"] == "admin"
+
+
+def test_stock_profile_reads_the_research_market(tmp_path) -> None:
+    from fastapi.testclient import TestClient
+
+    from rquant.web.app import create_app
+    from rquant.web.source import FixtureSource, write_demo_research
+
+    write_demo_research(tmp_path)
+    client = TestClient(create_app(FixtureSource(), dist=None, research_root=tmp_path))
+    body = client.get("/api/v1/stocks/600519.sh").json()["data"]
+    assert body["name"] == "贵州茅台" and body["industry"] == "白酒"
+    assert len(body["bars"]) > 200 and body["valuation"]["pe_ttm"] is not None
+    assert body["fundamentals"]["roe"] == 18.9
+    assert set(body["returns"]) >= {"5日", "20日", "年初至今"}
+    assert client.get("/api/v1/stocks/bad").status_code == 422
+    assert client.get("/api/v1/stocks/999999.SH").status_code == 404

@@ -5,6 +5,7 @@ import { formatPrice } from "@/format/number";
 import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
 import { Button, PageHeader, Panel, Pill, Segmented, useToast } from "@/ui";
+import { StockLink } from "@/ui/StockLink";
 import { QueryView } from "../shared";
 import { AlertRules } from "./Rules";
 
@@ -66,7 +67,13 @@ export default function MonitorPage() {
                     value: (row) => row.at ?? null,
                     cell: (row) => (row.at ? formatShanghaiDateTime(row.at) : row.trade_date),
                   },
-                  { id: "code", header: "代码", sortable: true, value: (row) => row.code },
+                  {
+                    id: "code",
+                    header: "代码",
+                    sortable: true,
+                    value: (row) => row.code,
+                    cell: (row) => <StockLink code={row.code} />,
+                  },
                   { id: "name", header: "名称", value: (row) => row.name ?? null },
                   {
                     id: "level",

@@ -19,12 +19,12 @@ describe("CommandPalette", () => {
     expect(router.state.location.pathname).toBe("/backtest");
   });
 
-  it("puts a code search first for a stock code", () => {
+  it("opens the stock profile first for a stock code", () => {
     const router = setup();
     fireEvent.keyDown(window, { key: "/" });
     const input = screen.getByLabelText("跳转到页面或搜索股票");
     fireEvent.change(input, { target: { value: "600519" } });
     fireEvent.keyDown(input, { key: "Enter" });
-    expect(router.state.location.search).toBe("?q=600519");
+    expect(router.state.location.pathname).toBe("/stock/600519.SH");
   });
 });
