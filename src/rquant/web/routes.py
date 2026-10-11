@@ -208,22 +208,50 @@ def panorama(source: SourceDep) -> Envelope[PanoramaData]:
     return _envelope(source, PanoramaData(as_of=as_of, pulse=pulse, boards=boards))
 
 
+def _research_screen(request: Request, trade_date: date | None) -> list[dict[str, Any]]:
+    """Research presets from $RQUANT_RESEARCH_ROOT/market.duckdb (historical pipeline)."""
+    import duckdb
+
+    db = Path(_research_root(request) or research_root()) / "market.duckdb"
+    if not db.exists():
+        return []
+    try:
+        con = duckdb.connect(str(db), read_only=True)
+    except duckdb.Error:  # the daily job holds the write lock for a few minutes
+        return []
+    try:
+        day = trade_date or con.execute("SELECT max(trade_date) FROM screen_result").fetchone()[0]
+        cur = con.execute(
+            "SELECT trade_date, ts_code, preset_name, name, close, pct_chg FROM screen_result "
+            "WHERE trade_date = ? LIMIT 5000", [day])
+        cols = [c[0] for c in cur.description]
+        return [dict(zip(cols, r, strict=True)) for r in cur.fetchall()]
+    except duckdb.Error:
+        return []
+    finally:
+        con.close()
+
+
 @router.get("/screen", response_model=Envelope[ScreenData], summary="选股结果与排序")
-def screen(source: SourceDep, trade_date: date | None = None,
+def screen(request: Request, source: SourceDep, trade_date: date | None = None,
            preset: str | None = None) -> Envelope[ScreenData]:
-    if trade_date is None:
+    day = trade_date
+    if day is None:
         latest = source.query("SELECT max(trade_date) AS d FROM screen_result")
-        trade_date = latest[0]["d"] if latest else None
-    if trade_date is None:
-        return _envelope(source, ScreenData(trade_date=None, presets=[], rows=[]))
+        day = latest[0]["d"] if latest else None
     rows = source.query(
         "SELECT trade_date, ts_code, preset_name, name, close, pct_chg FROM screen_result "
-        "WHERE trade_date = ? ORDER BY pct_chg DESC NULLS LAST LIMIT 5000", [trade_date])
+        "WHERE trade_date = ? ORDER BY pct_chg DESC NULLS LAST LIMIT 5000", [day]) if day else []
+    if not rows:  # no live screen (e.g. replay / non-trading day): historical research presets
+        rows = _research_screen(request, trade_date)
+        day = rows[0]["trade_date"] if rows else day
+    if day is None:
+        return _envelope(source, ScreenData(trade_date=None, presets=[], rows=[]))
     presets = sorted({r["preset_name"] for r in rows})
     items = [ScreenRow(trade_date=r["trade_date"], code=r["ts_code"], name=r["name"],
                        preset=r["preset_name"], close=_f(r["close"]), pct_chg=_f(r["pct_chg"]))
              for r in rows if preset is None or r["preset_name"] == preset]
-    return _envelope(source, ScreenData(trade_date=trade_date, presets=presets, rows=items))
+    return _envelope(source, ScreenData(trade_date=day, presets=presets, rows=items))
 
 
 @router.get("/pools", response_model=Envelope[PoolsData], summary="池子")

@@ -44,7 +44,8 @@ def research_root() -> Path:
 
 
 def load_inputs(
-    con: duckdb.DuckDBPyConnection, preset: str, start: date, end: date
+    con: duckdb.DuckDBPyConnection, preset: str, start: date, end: date,
+    bar_table: str = "daily_bar",
 ) -> tuple[list[date], dict[date, dict[str, Bar]], dict[date, list[PortfolioCandidate]]]:
     signal_rows = con.execute(
         "SELECT trade_date, ts_code, extra FROM screen_result "
@@ -60,14 +61,14 @@ def load_inputs(
         signals[day].append(PortfolioCandidate(ts_code=code, rank_score=max(score, 0)))
     codes = sorted({c.ts_code for items in signals.values() for c in items})
     days = [r[0] for r in con.execute(
-        "SELECT DISTINCT trade_date FROM daily_bar WHERE trade_date BETWEEN ? AND ? "
+        f"SELECT DISTINCT trade_date FROM {bar_table} WHERE trade_date BETWEEN ? AND ? "
         "ORDER BY trade_date", [start, end]).fetchall()]
     bars: dict[date, dict[str, Bar]] = defaultdict(dict)
     if codes:
         marks = ",".join("?" * len(codes))
         for day, code, o, c, pre, pct in con.execute(
             f"SELECT b.trade_date, b.ts_code, b.open, b.close, b.pre_close, "
-            f"COALESCE(s.limit_pct, 0.10) FROM daily_bar b LEFT JOIN daily_state s "
+            f"COALESCE(s.limit_pct, 0.10) FROM {bar_table} b LEFT JOIN daily_state s "
             f"ON s.ts_code = b.ts_code AND s.trade_date = b.trade_date "
             f"WHERE b.ts_code IN ({marks}) AND b.trade_date BETWEEN ? AND ? "
             f"AND b.open IS NOT NULL AND b.close IS NOT NULL AND b.pre_close IS NOT NULL",
@@ -92,10 +93,11 @@ def load_industries(con: duckdb.DuckDBPyConnection, codes: list[str]) -> dict[st
 def run_and_save(
     database: Path, preset: str, start: date, end: date, config: BacktestConfig,
     *, root: Path | None = None, title: str | None = None, strategy: str | None = None,
+    bar_table: str = "daily_bar",
 ) -> StoredRun:
     con = duckdb.connect(str(database), read_only=True)
     try:
-        days, bars, signals = load_inputs(con, preset, start, end)
+        days, bars, signals = load_inputs(con, preset, start, end, bar_table)
         industries = load_industries(
             con, sorted({c.ts_code for items in signals.values() for c in items}))
     finally:
