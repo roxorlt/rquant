@@ -15,6 +15,8 @@ import numpy as np
 import pandas as pd
 
 FIELDS = ("open", "high", "low", "close", "pre_close", "pct_chg", "vol", "amount")
+#: derived fields resolved on demand (turnover %, chip distribution; see rquant.factor.chips)
+EXTRA_FIELDS = ("turnover", "chip_profit", "chip_cost_dev", "chip_conc90")
 MAX_WINDOW = 250
 
 
@@ -75,7 +77,7 @@ def validate(expression: str) -> ast.Expression:
                                    and isinstance(node.args[1].value, int)):
                 raise FactorExpressionError(f"{node.func.id} 的窗口须为整数常量")
         elif isinstance(node, ast.Name):
-            if node.id not in FIELDS and node.id not in FUNCS:
+            if node.id not in FIELDS and node.id not in EXTRA_FIELDS and node.id not in FUNCS:
                 raise FactorExpressionError(f"未知字段：{node.id}")
         elif not isinstance(node, (ast.Expression, ast.BinOp, ast.UnaryOp, ast.Constant,
                                    ast.Load, ast.USub, ast.Not, ast.Compare, ast.BoolOp,
