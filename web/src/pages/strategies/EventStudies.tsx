@@ -25,7 +25,7 @@ export function EventStudies() {
               <table aria-label={`事件研究 ${s.slug}`} className="tbl">
                 <thead>
                   <tr>
-                    <th>持有</th>
+                    <th>出场</th>
                     <th>样本</th>
                     <th>平均</th>
                     <th>中位</th>
@@ -37,7 +37,7 @@ export function EventStudies() {
                 <tbody>
                   {Object.entries(s.horizons ?? {}).map(([n, h]) => (
                     <tr key={n}>
-                      <td>{n} 日</td>
+                      <td>{/^\d+$/.test(n) ? `${n} 日` : n}</td>
                       <td>{h.n}</td>
                       <td>{pct(h.mean)}</td>
                       <td>{pct(h.median)}</td>
@@ -48,6 +48,31 @@ export function EventStudies() {
                   ))}
                 </tbody>
               </table>
+              {(s.tables ?? []).map((t) => (
+                <div key={t.title}>
+                  <h4>{t.title}</h4>
+                  <table aria-label={t.title} className="tbl">
+                    <thead>
+                      <tr>
+                        {t.columns.map((c) => (
+                          <th key={c}>{c}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {t.rows.map((r) => (
+                        <tr key={r.join("|")}>
+                          {r.map((c, i) => (
+                            // biome-ignore lint/suspicious/noArrayIndexKey: fixed columns
+                            <td key={i}>{c}</td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ))}
+              {(s.notes ?? []).length ? <p className="sub">说明：{s.notes?.join("；")}</p> : null}
               <p className="sub">注意：{(s.caveats ?? []).join("；")}</p>
             </Panel>
           ))}

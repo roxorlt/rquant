@@ -458,6 +458,12 @@ class EventHorizon(BaseModel):
     excess_win_rate: dict[str, float] = {}
 
 
+class StudyTable(BaseModel):
+    title: str
+    columns: list[str]
+    rows: list[list[str]]
+
+
 class EventStudy(BaseModel):
     slug: str
     title: str
@@ -467,6 +473,8 @@ class EventStudy(BaseModel):
     per_year: dict[str, int] = {}
     horizons: dict[str, EventHorizon] = {}
     caveats: list[str] = []
+    notes: list[str] = []
+    tables: list[StudyTable] = []
 
 
 class EventStudyListData(BaseModel):
