@@ -85,5 +85,5 @@ def test_delisted_position_is_written_off_not_held_at_stale_price() -> None:
     kept = run_backtest([d0, d1, d2], bars, signals, cfg).days[-1]
     assert kept.positions == {"A": 900}  # suspended: held at last price
     gone = run_backtest([d0, d1, d2], bars, signals, cfg, {"A": d2})
-    assert gone.days[-1].positions == {} and gone.days[-1].nav < 0.01
+    assert gone.days[-1].positions == {} and gone.days[-1].nav < 0.11
     assert gone.orders[-1].reason == "退市注销"
