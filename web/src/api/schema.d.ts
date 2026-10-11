@@ -1138,10 +1138,17 @@ export interface components {
             mean_ic: number | null;
             /** Positive Ratio */
             positive_ratio: number | null;
+            /**
+             * Quantile Series
+             * @default []
+             */
+            quantile_series: components["schemas"]["QuantileDay"][];
             /** Quantiles */
             quantiles: components["schemas"]["QuantileReturn"][];
             /** T Stat */
             t_stat: number | null;
+            /** Top Turnover */
+            top_turnover?: number | null;
         };
         /** FactorTracking */
         FactorTracking: {
@@ -1543,6 +1550,19 @@ export interface components {
             strategy?: string | null;
             /** Title */
             title: string;
+        };
+        /**
+         * QuantileDay
+         * @description Mean forward return per quantile on one day, scaled to one day (fwd / horizon).
+         */
+        QuantileDay: {
+            /**
+             * Date
+             * Format: date
+             */
+            date: string;
+            /** Returns */
+            returns: (number | null)[];
         };
         /** QuantileReturn */
         QuantileReturn: {

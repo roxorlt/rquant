@@ -49,6 +49,9 @@ def test_perfect_foresight_factor_has_ic_one_and_noise_near_zero() -> None:
     assert perfect.mean_ic == pytest.approx(1.0)
     assert [q.quantile for q in perfect.quantiles] == [1, 2, 3, 4, 5]
     assert perfect.long_short is not None and perfect.long_short > 0
+    day = perfect.quantile_series[0]
+    assert len(day.returns) == 5 and day.returns[-1] > day.returns[0]
+    assert perfect.top_turnover is not None and 0 <= perfect.top_turnover <= 1
     noise = factor_test(pd.DataFrame(np.random.default_rng(9).normal(size=close.shape),
                                      index=close.index, columns=close.columns), close)
     assert noise.mean_ic is not None and abs(noise.mean_ic) < 0.1

@@ -2104,6 +2104,14 @@
             ],
             "title": "Positive Ratio"
           },
+          "quantile_series": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/QuantileDay"
+            },
+            "title": "Quantile Series",
+            "type": "array"
+          },
           "quantiles": {
             "items": {
               "$ref": "#/components/schemas/QuantileReturn"
@@ -2121,6 +2129,17 @@
               }
             ],
             "title": "T Stat"
+          },
+          "top_turnover": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Top Turnover"
           }
         },
         "required": [
@@ -3322,6 +3341,36 @@
           "rejected"
         ],
         "title": "PortfolioRunSummary",
+        "type": "object"
+      },
+      "QuantileDay": {
+        "description": "Mean forward return per quantile on one day, scaled to one day (fwd / horizon).",
+        "properties": {
+          "date": {
+            "format": "date",
+            "title": "Date",
+            "type": "string"
+          },
+          "returns": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "title": "Returns",
+            "type": "array"
+          }
+        },
+        "required": [
+          "date",
+          "returns"
+        ],
+        "title": "QuantileDay",
         "type": "object"
       },
       "QuantileReturn": {
