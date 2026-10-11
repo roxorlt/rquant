@@ -64,7 +64,7 @@ class StockProfile(BaseModel):
     alerts: list[dict[str, object]]
     flow: list[FlowPoint] = []
     # latest-day extras: pre_close, limit_up/limit_down (that day's prices, 前复权 not applied),
-    # outer/inner = active buy/sell amount (万元, moneyflow; 外盘/内盘 approximation)
+    # outer/inner = 外盘/内盘 in 手 (tick rule on the 5-minute bars)
     quote: dict[str, float | None] = {}
 
 
@@ -167,15 +167,27 @@ def _quote(con: duckdb.DuckDBPyConnection, code: str, last: dict | None) -> dict
         pct = float(lim[0]["limit_pct"])
         q["limit_up"] = round(pc * (1 + pct), 2)
         q["limit_down"] = round(pc * (1 - pct), 2)
+    # 外盘/内盘 (tick-rule on 5-minute bars, 手): Tushare moneyflow buy and sell totals are
+    # the two sides of the same trades and always match, so they cannot be used here
     try:
-        mf = _rows(con, """
-            SELECT buy_sm_amount + buy_md_amount + buy_lg_amount + buy_elg_amount AS outer_amt,
-                   sell_sm_amount + sell_md_amount + sell_lg_amount + sell_elg_amount AS inner_amt
-            FROM moneyflow WHERE ts_code = ? AND trade_date = ?""", [code, last["trade_date"]])
+        mins = _rows(con, "SELECT close, vol FROM minute_bar WHERE ts_code = ? AND freq = '5min' "
+                          "AND trade_date = ? ORDER BY trade_time", [code, last["trade_date"]])
     except duckdb.Error:
-        mf = []
-    if mf:
-        q["outer"], q["inner"] = mf[0]["outer_amt"], mf[0]["inner_amt"]
+        mins = []
+    if mins:
+        outer = inner = 0.0
+        prev = pc or mins[0]["close"]
+        for m in mins:
+            v = m["vol"] or 0.0
+            if m["close"] > prev:
+                outer += v
+            elif m["close"] < prev:
+                inner += v
+            else:
+                outer += v / 2
+                inner += v / 2
+            prev = m["close"]
+        q["outer"], q["inner"] = round(outer), round(inner)
     return q
 
 
