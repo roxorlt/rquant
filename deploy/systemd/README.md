@@ -1,5 +1,7 @@
 # systemd 部署（Linux 服务器）
 
+> 全局运维总览见 `docs/ops/README.md`。
+
 腾讯云 / VPS / 任何 systemd Linux 主机用。macOS 用 `../com.roxor.rquant*.plist` launchd 那套。
 
 ## 核心调度 unit
