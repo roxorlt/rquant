@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 
 export interface Candle {
   date: string;
+  vol?: number | null;
   open: number;
   high: number;
   low: number;
@@ -9,7 +10,17 @@ export interface Candle {
   amount?: number | null;
 }
 
-const PAD = { left: 8, right: 58, top: 8, bottom: 20 };
+export const PAD = { left: 8, right: 58, top: 8, bottom: 20 };
+
+/** Clamp a [start, end) window of ``n`` bars to at least ``min`` bars. */
+export function clampView(s: number, e: number, n: number, min = 10): [number, number] {
+  let len = Math.min(n, Math.max(min, Math.round(e - s)));
+  let a = Math.round(s);
+  if (a < 0) a = 0;
+  if (a + len > n) a = n - len;
+  len = Math.min(len, n - a);
+  return [a, a + len];
+}
 
 function ma(values: number[], n: number): (number | null)[] {
   let sum = 0;
@@ -21,14 +32,18 @@ function ma(values: number[], n: number): (number | null)[] {
 }
 
 export interface SideDist {
-  /** Bins from low to high price over ``range``. */
+  /** Bins from ``lo`` to ``hi``. */
   dist: readonly number[];
+  lo: number;
+  hi: number;
   close: number;
   avg: number;
 }
 
 export interface ProfileOverlay {
   dist: readonly number[];
+  lo: number;
+  hi: number;
   poc: number;
   val: number;
   vah: number;
@@ -40,9 +55,10 @@ export interface ProfileOverlay {
  * distribution column on the right (``side``), a volume-profile overlay, and ``onHover``.
  */
 export function Candles({
-  bars,
+  bars: all,
   height = 300,
-  range,
+  view,
+  onView,
   side,
   profile,
   onHover,
@@ -52,7 +68,9 @@ export function Candles({
 }: {
   bars: readonly Candle[];
   height?: number;
-  range?: [number, number];
+  /** visible window [start, end) over ``bars``; hover/anchor indices are into ``bars`` */
+  view?: [number, number];
+  onView?: (v: [number, number]) => void;
   side?: SideDist | null;
   profile?: ProfileOverlay | null;
   onHover?: (i: number | null) => void;
@@ -75,11 +93,47 @@ export function Candles({
     ro.observe(el);
     return () => ro.disconnect();
   }, []);
+  const [s0, e0] = view ?? [0, all.length];
+  const bars = all.slice(s0, e0);
+  const svgRef = useRef<SVGSVGElement>(null);
+  const drag = useRef<{ x: number; view: [number, number]; moved: boolean } | null>(null);
+  const live = useRef({ s0, e0, n: all.length, w, onView });
+  live.current = { s0, e0, n: all.length, w, onView };
+  useEffect(() => {
+    const el = svgRef.current;
+    if (!el) return;
+    // wheel / trackpad pinch (ctrlKey) zooms around the cursor; horizontal swipe pans
+    const onWheel = (e: WheelEvent) => {
+      const { s0: a, e0: b, n, w: width, onView: cb } = live.current;
+      if (!cb) return;
+      e.preventDefault();
+      const r = el.getBoundingClientRect();
+      const span = b - a;
+      if (Math.abs(e.deltaX) > Math.abs(e.deltaY) && !e.ctrlKey) {
+        const shift = (e.deltaX / (width - PAD.left - PAD.right)) * span;
+        cb(clampView(a + shift, b + shift, n));
+        return;
+      }
+      const frac = Math.min(
+        1,
+        Math.max(0, (e.clientX - r.left - PAD.left) / (width - PAD.left - PAD.right)),
+      );
+      const k = Math.exp(e.deltaY * (e.ctrlKey ? 0.01 : 0.0025));
+      const len = span * k;
+      const at = a + span * frac;
+      cb(clampView(at - len * frac, at - len * frac + len, n));
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, []);
   if (bars.length === 0) return <p className="hint">没有日线数据。</p>;
   const volH = 50;
   const priceH = height - volH - PAD.top - PAD.bottom - 8;
-  const lo = range ? range[0] : Math.min(...bars.map((b) => b.low));
-  const hi = range ? range[1] : Math.max(...bars.map((b) => b.high));
+  const rawLo = Math.min(...bars.map((b) => b.low));
+  const rawHi = Math.max(...bars.map((b) => b.high));
+  const padY = (rawHi - rawLo) * 0.04 || rawHi * 0.01 || 1;
+  const lo = rawLo - padY;
+  const hi = rawHi + padY;
   const plotR = w - PAD.right;
   const chipW = (plotR - PAD.left) * 0.28;
   const step = (plotR - PAD.left) / bars.length;
@@ -87,11 +141,11 @@ export function Candles({
   const y = (v: number) => PAD.top + ((hi - v) / (hi - lo || 1)) * priceH;
   const maxAmt = Math.max(...bars.map((b) => b.amount ?? 0), 1);
   const volTop = PAD.top + priceH + 8;
-  const closes = bars.map((b) => b.close);
+  const closes = all.map((b) => b.close);
   const lines: [string, (number | null)[]][] = [
-    ["var(--warn)", ma(closes, 5)],
-    ["var(--accent)", ma(closes, 20)],
-    ["var(--muted)", ma(closes, 60)],
+    ["var(--warn)", ma(closes, 5).slice(s0, e0)],
+    ["var(--accent)", ma(closes, 20).slice(s0, e0)],
+    ["var(--muted)", ma(closes, 60).slice(s0, e0)],
   ];
   const path = (vals: (number | null)[]) =>
     vals
@@ -101,6 +155,7 @@ export function Candles({
       .join("");
   const ticks = [0, 0.25, 0.5, 0.75, 1].map((t) => lo + (hi - lo) * t);
   const h = hover == null ? bars[bars.length - 1] : bars[hover];
+  const anchorAt = anchor == null ? null : anchor - s0;
   const bw = Math.max(1, step * 0.7);
   return (
     <div className="candles" ref={ref}>
@@ -116,6 +171,8 @@ export function Candles({
       ) : null}
       {/* biome-ignore lint/a11y/useKeyWithClickEvents: picking an anchor is a pointer shortcut; a default anchor is always set */}
       <svg
+        ref={svgRef}
+        className={onView ? "pannable" : undefined}
         width={w}
         height={height}
         viewBox={`0 0 ${w} ${height}`}
@@ -127,16 +184,33 @@ export function Candles({
           onHover?.(null);
         }}
         onClick={() => {
-          if (hover != null) onPick?.(hover);
+          if (drag.current?.moved) return;
+          if (hover != null) onPick?.(hover + s0);
+        }}
+        onPointerDown={(e) => {
+          drag.current = { x: e.clientX, view: [s0, e0], moved: false };
+        }}
+        onPointerUp={() => {
+          setTimeout(() => {
+            drag.current = null;
+          }, 0);
         }}
         onMouseMove={(e) => {
+          const d = drag.current;
+          if (d && e.buttons === 1 && onView) {
+            const dx = e.clientX - d.x;
+            if (Math.abs(dx) > 3) d.moved = true;
+            const shift = -dx / step;
+            onView(clampView(d.view[0] + shift, d.view[1] + shift, all.length));
+            return;
+          }
           const r = e.currentTarget.getBoundingClientRect();
           const i = Math.floor((e.clientX - r.left - PAD.left) / step);
           const next = i >= 0 && i < bars.length ? i : null;
           const yy = e.clientY - r.top;
           setHy(yy >= PAD.top && yy <= PAD.top + priceH ? yy : null);
           setHover(next);
-          onHover?.(next);
+          onHover?.(next == null ? null : next + s0);
         }}
       >
         {ticks.map((t) => (
@@ -172,9 +246,11 @@ export function Candles({
         {profile ? (
           <g className="vp" aria-label="成交量分布">
             {profile.dist.map((v, k) => {
-              const bh = (hi - lo) / profile.dist.length;
-              const top = y(lo + bh * (k + 1));
-              const inVa = lo + bh * (k + 0.5) >= profile.val && lo + bh * (k + 0.5) <= profile.vah;
+              const bh = (profile.hi - profile.lo) / profile.dist.length;
+              const b0 = profile.lo + bh * k;
+              if (b0 + bh < lo || b0 > hi) return null;
+              const top = y(b0 + bh);
+              const inVa = b0 + bh / 2 >= profile.val && b0 + bh / 2 <= profile.vah;
               return (
                 <rect
                   // biome-ignore lint/suspicious/noArrayIndexKey: bins are positional.
@@ -182,7 +258,7 @@ export function Candles({
                   x={PAD.left}
                   y={top}
                   width={(v / 1000) * (plotR - PAD.left) * 0.3}
-                  height={Math.max(0.5, y(lo + bh * k) - top - 0.5)}
+                  height={Math.max(0.5, y(b0) - top - 0.5)}
                   className={inVa ? "vp-bin va" : "vp-bin"}
                 />
               );
@@ -213,9 +289,11 @@ export function Candles({
         {side ? (
           <g aria-label="筹码分布">
             {side.dist.map((v, k) => {
-              const bh = (hi - lo) / side.dist.length;
-              const top = y(lo + bh * (k + 1));
-              const mid = lo + bh * (k + 0.5);
+              const bh = (side.hi - side.lo) / side.dist.length;
+              const b0 = side.lo + bh * k;
+              if (b0 + bh < lo || b0 > hi) return null;
+              const top = y(b0 + bh);
+              const mid = b0 + bh / 2;
               const len = (v / 1000) * chipW;
               return (
                 <rect
@@ -224,7 +302,7 @@ export function Candles({
                   x={plotR - len}
                   y={top}
                   width={len}
-                  height={Math.max(0.5, y(lo + bh * k) - top - 0.3)}
+                  height={Math.max(0.5, y(b0) - top - 0.3)}
                   className={mid <= side.close ? "chip win" : "chip lose"}
                 />
               );
@@ -248,28 +326,35 @@ export function Candles({
             </text>
           </g>
         ) : null}
-        {(overlays ?? []).map((o) => (
-          <path
-            key={o.key}
-            d={path(o.values)}
-            fill="none"
-            stroke={o.color}
-            strokeWidth={o.dash ? 1 : 1.6}
-            strokeDasharray={o.dash ? "4 3" : undefined}
-          />
-        ))}
-        {anchor != null && anchor >= 0 && anchor < bars.length ? (
-          <line
-            className="avwap-anchor"
-            x1={x(anchor)}
-            x2={x(anchor)}
-            y1={PAD.top}
-            y2={volTop + volH}
-          />
-        ) : null}
-        {lines.map(([color, vals]) => (
-          <path key={color} d={path(vals)} fill="none" stroke={color} strokeWidth={1.2} />
-        ))}
+        <defs>
+          <clipPath id="candles-plot">
+            <rect x={PAD.left} y={PAD.top} width={plotR - PAD.left} height={priceH} />
+          </clipPath>
+        </defs>
+        <g clipPath="url(#candles-plot)">
+          {(overlays ?? []).map((o) => (
+            <path
+              key={o.key}
+              d={path(o.values.slice(s0, e0))}
+              fill="none"
+              stroke={o.color}
+              strokeWidth={o.dash ? 1 : 1.6}
+              strokeDasharray={o.dash ? "4 3" : undefined}
+            />
+          ))}
+          {anchorAt != null && anchorAt >= 0 && anchorAt < bars.length ? (
+            <line
+              className="avwap-anchor"
+              x1={x(anchorAt)}
+              x2={x(anchorAt)}
+              y1={PAD.top}
+              y2={volTop + volH}
+            />
+          ) : null}
+          {lines.map(([color, vals]) => (
+            <path key={color} d={path(vals)} fill="none" stroke={color} strokeWidth={1.2} />
+          ))}
+        </g>
         {hover != null ? (
           <line
             className="chart-cross"

@@ -37,6 +37,9 @@ class Valuation(BaseModel):
     total_mv: float | None  # 万元 (Tushare)
     circ_mv: float | None
     turnover_rate: float | None
+    turnover_rate_f: float | None = None
+    ps_ttm: float | None = None
+    dv_ttm: float | None = None  # 股息率(TTM) %
 
 
 class FlowPoint(BaseModel):
@@ -60,6 +63,9 @@ class StockProfile(BaseModel):
     pools: list[str]
     alerts: list[dict[str, object]]
     flow: list[FlowPoint] = []
+    # latest-day extras: pre_close, limit_up/limit_down (that day's prices, 前复权 not applied),
+    # outer/inner = active buy/sell amount (万元, moneyflow; 外盘/内盘 approximation)
+    quote: dict[str, float | None] = {}
 
 
 @contextmanager
@@ -93,10 +99,10 @@ def _ret(bars: list[Bar], n: int) -> float | None:
     return bars[-1].close / bars[-1 - n].close - 1
 
 
-def load_profile(con: duckdb.DuckDBPyConnection | None, code: str, days: int = 250) -> dict:
+def load_profile(con: duckdb.DuckDBPyConnection | None, code: str, days: int = 750) -> dict:
     """Market part of the profile; the caller adds fundamentals, pools and alerts."""
     out: dict = {"name": None, "industry": None, "market": None, "list_date": None,
-                 "bars": [], "valuation": None, "returns": {}, "flow": []}
+                 "bars": [], "valuation": None, "returns": {}, "flow": [], "quote": {}}
     if con is None:
         return out
     basic = _rows(con, "SELECT name, industry, market, list_date FROM stock_basic "
@@ -119,9 +125,16 @@ def load_profile(con: duckdb.DuckDBPyConnection | None, code: str, days: int = 2
                 amount=r["amount"])
             for r in reversed(raw) if None not in (r["close"], r["open"], r["high"], r["low"])]
     out["bars"] = bars
-    val = _rows(con, "SELECT trade_date, pe_ttm, pb, total_mv, circ_mv, turnover_rate "
-                     "FROM daily_basic WHERE ts_code = ? ORDER BY trade_date DESC LIMIT 1", [code])
+    cols = "trade_date, pe_ttm, pb, total_mv, circ_mv, turnover_rate"
+    for extra in (", turnover_rate_f, ps_ttm, dv_ttm", ", turnover_rate_f", ""):
+        try:
+            val = _rows(con, f"SELECT {cols}{extra} FROM daily_basic WHERE ts_code = ? "
+                             "ORDER BY trade_date DESC LIMIT 1", [code])
+            break
+        except duckdb.Error:
+            val = []
     out["valuation"] = Valuation(**val[0]) if val else None
+    out["quote"] = _quote(con, code, raw[0] if raw else None)
     out["flow"] = [FlowPoint(date=r["trade_date"], main_net=r["main"], net=r["net_mf_amount"])
                    for r in reversed(_rows(con, """
         SELECT trade_date, buy_lg_amount + buy_elg_amount - sell_lg_amount - sell_elg_amount
@@ -135,6 +148,35 @@ def load_profile(con: duckdb.DuckDBPyConnection | None, code: str, days: int = 2
     out["returns"] = {"5日": _ret(bars, 5), "20日": _ret(bars, 20), "60日": _ret(bars, 60),
                       "250日": _ret(bars, 249), "年初至今": ytd}
     return out
+
+
+def _quote(con: duckdb.DuckDBPyConnection, code: str, last: dict | None) -> dict:
+    if last is None:
+        return {}
+    q: dict[str, float | None] = {}
+    pre = _rows(con, "SELECT pre_close FROM daily_bar WHERE ts_code = ? AND trade_date = ?",
+                [code, last["trade_date"]])
+    pc = pre[0]["pre_close"] if pre else None
+    q["pre_close"] = pc
+    try:
+        lim = _rows(con, "SELECT limit_pct FROM daily_state WHERE ts_code = ? AND trade_date = ?",
+                    [code, last["trade_date"]])
+    except duckdb.Error:
+        lim = []
+    if pc and lim and lim[0]["limit_pct"]:
+        pct = float(lim[0]["limit_pct"])
+        q["limit_up"] = round(pc * (1 + pct), 2)
+        q["limit_down"] = round(pc * (1 - pct), 2)
+    try:
+        mf = _rows(con, """
+            SELECT buy_sm_amount + buy_md_amount + buy_lg_amount + buy_elg_amount AS outer_amt,
+                   sell_sm_amount + sell_md_amount + sell_lg_amount + sell_elg_amount AS inner_amt
+            FROM moneyflow WHERE ts_code = ? AND trade_date = ?""", [code, last["trade_date"]])
+    except duckdb.Error:
+        mf = []
+    if mf:
+        q["outer"], q["inner"] = mf[0]["outer_amt"], mf[0]["inner_amt"]
+    return q
 
 
 def enrich(con: duckdb.DuckDBPyConnection | None, codes: list[str], day: date) -> dict[str, dict]:
@@ -237,7 +279,8 @@ def write_demo_market(root: Path, today: date) -> None:
                                  min(prev_p, p), p, vol / 48, p * vol / 480))
                     prev_p = p
             basic.append((code, d.date(), 0.5 + k * 0.2, 10 + 5 * k + c / p0, 1 + k * 0.5,
-                          c * 1e6 * (k + 1), c * 8e5 * (k + 1), 1.5 + k * 0.5))
+                          c * 1e6 * (k + 1), c * 8e5 * (k + 1), 1.5 + k * 0.5, 3 + k,
+                          1.2 + k * 0.3))
             main = (c / pc - 1) * 5e4 + rng.normal(0, 800)
             flows.append((code, d.date(), 100.0, 100.0, 200.0, 200.0, 300 + max(main, 0),
                            300 + max(-main, 0), 100.0, 100.0, main * 1.2))
@@ -254,7 +297,7 @@ def write_demo_market(root: Path, today: date) -> None:
         con.execute("INSERT INTO daily_bar SELECT * FROM bar_df")
         con.execute("CREATE TABLE daily_basic(ts_code VARCHAR, trade_date DATE, "
                     "turnover_rate DOUBLE, pe_ttm DOUBLE, pb DOUBLE, total_mv DOUBLE, "
-                    "circ_mv DOUBLE, turnover_rate_f DOUBLE)")
+                    "circ_mv DOUBLE, turnover_rate_f DOUBLE, ps_ttm DOUBLE, dv_ttm DOUBLE)")
         basic_df = pd.DataFrame(basic)  # noqa: F841
         con.execute("INSERT INTO daily_basic SELECT * FROM basic_df")
         con.execute("CREATE TABLE moneyflow(ts_code VARCHAR, trade_date DATE, "
@@ -263,6 +306,9 @@ def write_demo_market(root: Path, today: date) -> None:
                     "buy_elg_amount DOUBLE, sell_elg_amount DOUBLE, net_mf_amount DOUBLE)")
         flow_df = pd.DataFrame(flows)  # noqa: F841
         con.execute("INSERT INTO moneyflow SELECT * FROM flow_df")
+        con.execute("CREATE TABLE daily_state AS SELECT ts_code, trade_date, "
+                    "0.1::DOUBLE AS limit_pct "
+                    "FROM daily_bar")
         con.execute("CREATE TABLE minute_bar(ts_code VARCHAR, trade_time TIMESTAMP, freq VARCHAR, "
                     "trade_date DATE, open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE, "
                     "vol DOUBLE, amount DOUBLE)")

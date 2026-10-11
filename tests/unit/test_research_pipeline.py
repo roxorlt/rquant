@@ -104,7 +104,8 @@ def test_moneyflow_ingest_and_float_turnover_backfill(tmp_path) -> None:
                 row = {c: 1.0 for c in ingest.MF_COLS}
                 return pd.DataFrame([{**row, "ts_code": "600000.SH", "trade_date": "20260105"}])
             if api == "daily_basic":
-                return pd.DataFrame({"ts_code": ["600000.SH"], "turnover_rate_f": [2.5]})
+                return pd.DataFrame({"ts_code": ["600000.SH"], "turnover_rate_f": [2.5],
+                                     "ps_ttm": [3.0], "dv_ttm": [1.1]})
             raise AssertionError(api)
 
     assert ingest.ingest_moneyflow(con, FakePro(), d, d) == 1

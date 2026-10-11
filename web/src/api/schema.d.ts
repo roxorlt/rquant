@@ -2094,6 +2094,13 @@ export interface components {
             name: string | null;
             /** Pools */
             pools: string[];
+            /**
+             * Quote
+             * @default {}
+             */
+            quote: {
+                [key: string]: number | null;
+            };
             /** Returns */
             returns: {
                 [key: string]: number | null;
@@ -2252,10 +2259,14 @@ export interface components {
         Valuation: {
             /** Circ Mv */
             circ_mv: number | null;
+            /** Dv Ttm */
+            dv_ttm?: number | null;
             /** Pb */
             pb: number | null;
             /** Pe Ttm */
             pe_ttm: number | null;
+            /** Ps Ttm */
+            ps_ttm?: number | null;
             /** Total Mv */
             total_mv: number | null;
             /**
@@ -2265,6 +2276,8 @@ export interface components {
             trade_date: string;
             /** Turnover Rate */
             turnover_rate: number | null;
+            /** Turnover Rate F */
+            turnover_rate_f?: number | null;
         };
         /** VolumeProfile */
         VolumeProfile: {

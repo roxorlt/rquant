@@ -347,3 +347,73 @@ input:focus {
   letter-spacing: 3px;
   color: var(--ink);
 }
+
+.quote-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  background: var(--surface);
+  margin-bottom: 12px;
+}
+.qg-cell {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--rule);
+  border-right: 1px solid var(--rule);
+  font-size: 12px;
+}
+.qg-k {
+  color: var(--muted);
+  white-space: nowrap;
+}
+.qg-v {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.qg-v.up {
+  color: var(--up);
+}
+.qg-v.down {
+  color: var(--down);
+}
+
+.candles svg.pannable {
+  cursor: crosshair;
+  touch-action: none;
+}
+.candles svg.pannable:active {
+  cursor: grabbing;
+}
+.kline-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin: 6px 0;
+}
+.sub-wrap {
+  position: relative;
+  border-top: 1px solid var(--rule);
+}
+.sub-pick {
+  position: absolute;
+  right: 64px;
+  top: 2px;
+  font-size: 11px;
+  z-index: 1;
+}
+.sub-x {
+  position: absolute;
+  right: 40px;
+  top: 2px;
+  background: none;
+  border: 0;
+  color: var(--muted);
+  cursor: pointer;
+  z-index: 1;
+}

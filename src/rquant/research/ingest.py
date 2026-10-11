@@ -36,6 +36,8 @@ CREATE TABLE IF NOT EXISTS daily_basic(ts_code VARCHAR, trade_date DATE,
   turnover_rate DOUBLE, pe_ttm DOUBLE, pb DOUBLE, total_mv DOUBLE, circ_mv DOUBLE,
   PRIMARY KEY (ts_code, trade_date));
 ALTER TABLE daily_basic ADD COLUMN IF NOT EXISTS turnover_rate_f DOUBLE;
+ALTER TABLE daily_basic ADD COLUMN IF NOT EXISTS ps_ttm DOUBLE;
+ALTER TABLE daily_basic ADD COLUMN IF NOT EXISTS dv_ttm DOUBLE;
 CREATE TABLE IF NOT EXISTS moneyflow(ts_code VARCHAR, trade_date DATE,
   buy_sm_amount DOUBLE, sell_sm_amount DOUBLE, buy_md_amount DOUBLE, sell_md_amount DOUBLE,
   buy_lg_amount DOUBLE, sell_lg_amount DOUBLE, buy_elg_amount DOUBLE, sell_elg_amount DOUBLE,
@@ -158,7 +160,8 @@ def ingest_day(con: duckdb.DuckDBPyConnection, pro: Pro, day: date,
         _upsert(con, "adj_factor", adj.assign(trade_date=_d(adj["trade_date"]))[
             ["ts_code", "trade_date", "adj_factor"]])
     basic = pro("daily_basic", trade_date=ds,
-                fields="ts_code,trade_date,turnover_rate,turnover_rate_f,pe_ttm,pb,total_mv,circ_mv")
+                fields="ts_code,trade_date,turnover_rate,turnover_rate_f,pe_ttm,pb,ps_ttm,dv_ttm,"
+                       "total_mv,circ_mv")
     if basic is not None and not basic.empty:
         _upsert(con, "daily_basic", basic.assign(trade_date=_d(basic["trade_date"])))
     lim = pro("stk_limit", trade_date=ds)
@@ -190,19 +193,28 @@ def ingest_moneyflow(con: duckdb.DuckDBPyConnection, pro: Pro, start: date, end:
     return total
 
 
+BACKFILL_COLS = ("turnover_rate_f", "ps_ttm", "dv_ttm")
+
+
 def backfill_float_turnover(con: duckdb.DuckDBPyConnection, pro: Pro, start: date,
                             end: date) -> int:
-    """Fill ``turnover_rate_f`` on days ingested before the column existed."""
+    """Fill ``BACKFILL_COLS`` on days ingested before those columns existed."""
+    missing = " OR ".join(f"count({c}) = 0" for c in BACKFILL_COLS)
     days = [r[0] for r in con.execute(
         "SELECT trade_date FROM daily_basic WHERE trade_date BETWEEN ? AND ? GROUP BY 1 "
-        "HAVING count(turnover_rate_f) = 0 ORDER BY 1", [start, end]).fetchall()]
+        f"HAVING {missing} ORDER BY 1", [start, end]).fetchall()]
     n = 0
+    sets = ", ".join(f"{c} = _trf.{c}" for c in BACKFILL_COLS)
     for day in days:
-        df = pro("daily_basic", trade_date=f"{day:%Y%m%d}", fields="ts_code,turnover_rate_f")
+        df = pro("daily_basic", trade_date=f"{day:%Y%m%d}",
+                 fields="ts_code," + ",".join(BACKFILL_COLS))
         if df is None or df.empty:
             continue
+        for c in BACKFILL_COLS:
+            if c not in df:
+                df[c] = None
         con.register("_trf", df)
-        con.execute("UPDATE daily_basic SET turnover_rate_f = _trf.turnover_rate_f FROM _trf "
+        con.execute(f"UPDATE daily_basic SET {sets} FROM _trf "
                     "WHERE daily_basic.ts_code = _trf.ts_code AND daily_basic.trade_date = ?",
                     [day])
         con.unregister("_trf")
