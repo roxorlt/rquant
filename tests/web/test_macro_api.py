@@ -79,7 +79,7 @@ def _raw() -> dict[str, pd.DataFrame]:
         "holders": pd.DataFrame(
             {
                 "entity": "中央汇金",
-                "ts_code": ["A", "A"],
+                "ts_code": ["600001.SH", "600001.SH"],
                 "ann_date": ["20231030", "20240330"],
                 "end_date": ["20230930", "20231231"],
                 "holder_name": "中央汇金",
@@ -87,7 +87,7 @@ def _raw() -> dict[str, pd.DataFrame]:
             }
         ),
         "qprice": pd.DataFrame(
-            {"end_date": ["20230930", "20231231"], "ts_code": "A", "close": [1.0, 1.0]}
+            {"end_date": ["20230930", "20231231"], "ts_code": "600001.SH", "close": [1.0, 1.0]}
         ),
         "mv": pd.DataFrame(
             {
