@@ -4,6 +4,7 @@ import { toneClass, toneOf } from "@/format/color";
 import { formatPrice } from "@/format/number";
 import { DataTable } from "@/table/DataTable";
 import { Button, Panel } from "@/ui";
+import { StockLink } from "@/ui/StockLink";
 import { QueryView } from "../shared";
 
 function TdxImport() {
@@ -71,7 +72,13 @@ export function Conditions() {
                   rowKey={(row) => row.code}
                   height={320}
                   columns={[
-                    { id: "code", header: "代码", sortable: true, value: (row) => row.code },
+                    {
+                      id: "code",
+                      header: "代码",
+                      sortable: true,
+                      value: (row) => row.code,
+                      cell: (row) => <StockLink code={row.code} />,
+                    },
                     {
                       id: "close",
                       header: "收盘",

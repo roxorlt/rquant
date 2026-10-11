@@ -1,6 +1,7 @@
 import { type FormEvent, useState } from "react";
 import { Link, useNavigate } from "react-router";
 import type { MetaEnvelope } from "@/api/client";
+import { fullCode } from "@/format/code";
 import { formatShanghaiDateTime, shanghaiDate } from "@/format/time";
 import { THEME_LABELS, useTheme } from "@/theme/ThemeProvider";
 import { BrandMark, ThemeIcon } from "./icons";
@@ -14,7 +15,9 @@ export function Topbar({ meta, failed }: { meta: MetaEnvelope | undefined; faile
   const search = (e: FormEvent) => {
     e.preventDefault();
     const code = q.trim();
-    if (code) navigate(`/screener?q=${encodeURIComponent(code)}`);
+    const full = fullCode(code);
+    if (full) navigate(`/stock/${full}`);
+    else if (code) navigate(`/screener?q=${encodeURIComponent(code)}`);
   };
   const generation = meta?.data.generation;
   const text = failed

@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 
 export interface PageHeaderProps {
   eyebrow: string;
-  title: string;
+  title: ReactNode;
   note?: ReactNode;
   actions?: ReactNode;
 }

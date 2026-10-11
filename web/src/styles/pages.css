@@ -94,3 +94,32 @@ input:focus {
 .weight-bars .num {
   text-align: right;
 }
+.stock-link {
+  color: inherit;
+  text-decoration: none;
+  border-bottom: 1px dotted var(--faint);
+}
+.stock-link:hover {
+  color: var(--accent-t);
+  border-bottom-color: var(--accent);
+}
+.candles svg {
+  display: block;
+}
+.candle.up {
+  stroke: var(--up);
+  fill: var(--up);
+}
+.candle.down {
+  stroke: var(--down);
+  fill: var(--down);
+}
+.stock-head {
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+.stock-head .px {
+  font: 600 26px var(--font-mono);
+}

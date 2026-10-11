@@ -4,6 +4,7 @@ import { formatPercent, formatPrice } from "@/format/number";
 import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
 import { ChangeText, FlowSteps, PageHeader, Panel } from "@/ui";
+import { StockLink } from "@/ui/StockLink";
 import { QueryView } from "../shared";
 import { PerfPanel } from "./Perf";
 import { PortfolioRuns } from "./Portfolio";
@@ -24,7 +25,12 @@ function Trades({ runId }: { runId: string }) {
               height={420}
               columns={[
                 { id: "date", header: "信号日", value: (row) => row.signal_date ?? null },
-                { id: "code", header: "代码", value: (row) => row.code },
+                {
+                  id: "code",
+                  header: "代码",
+                  value: (row) => row.code,
+                  cell: (row) => <StockLink code={row.code} />,
+                },
                 { id: "name", header: "名称", value: (row) => row.name ?? null },
                 {
                   id: "entry",

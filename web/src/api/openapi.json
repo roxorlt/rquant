@@ -868,6 +868,64 @@
         "title": "BandPoint",
         "type": "object"
       },
+      "Bar": {
+        "properties": {
+          "amount": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Amount"
+          },
+          "close": {
+            "title": "Close",
+            "type": "number"
+          },
+          "date": {
+            "format": "date",
+            "title": "Date",
+            "type": "string"
+          },
+          "high": {
+            "title": "High",
+            "type": "number"
+          },
+          "low": {
+            "title": "Low",
+            "type": "number"
+          },
+          "open": {
+            "title": "Open",
+            "type": "number"
+          },
+          "pct_chg": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pct Chg"
+          }
+        },
+        "required": [
+          "date",
+          "open",
+          "high",
+          "low",
+          "close",
+          "pct_chg",
+          "amount"
+        ],
+        "title": "Bar",
+        "type": "object"
+      },
       "BenchmarkStats": {
         "properties": {
           "alpha": {
@@ -1755,6 +1813,22 @@
           "serving"
         ],
         "title": "Envelope[ScreenData]",
+        "type": "object"
+      },
+      "Envelope_StockProfile_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/StockProfile"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[StockProfile]",
         "type": "object"
       },
       "Envelope_StrategyListData_": {
@@ -3746,6 +3820,154 @@
         "title": "SignalItem",
         "type": "object"
       },
+      "StockProfile": {
+        "properties": {
+          "alerts": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Alerts",
+            "type": "array"
+          },
+          "bars": {
+            "items": {
+              "$ref": "#/components/schemas/Bar"
+            },
+            "title": "Bars",
+            "type": "array"
+          },
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "fundamentals": {
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "title": "Fundamentals",
+            "type": "object"
+          },
+          "fundamentals_fields": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Fundamentals Fields",
+            "type": "object"
+          },
+          "fundamentals_period": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fundamentals Period"
+          },
+          "industry": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Industry"
+          },
+          "list_date": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "List Date"
+          },
+          "market": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Market"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "pools": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Pools",
+            "type": "array"
+          },
+          "returns": {
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "title": "Returns",
+            "type": "object"
+          },
+          "valuation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Valuation"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "code",
+          "name",
+          "industry",
+          "market",
+          "list_date",
+          "bars",
+          "valuation",
+          "returns",
+          "fundamentals",
+          "fundamentals_period",
+          "fundamentals_fields",
+          "pools",
+          "alerts"
+        ],
+        "title": "StockProfile",
+        "type": "object"
+      },
       "StrategyListData": {
         "properties": {
           "strategies": {
@@ -4024,6 +4246,80 @@
           "type"
         ],
         "title": "ValidationError",
+        "type": "object"
+      },
+      "Valuation": {
+        "properties": {
+          "circ_mv": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Circ Mv"
+          },
+          "pb": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pb"
+          },
+          "pe_ttm": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pe Ttm"
+          },
+          "total_mv": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total Mv"
+          },
+          "trade_date": {
+            "format": "date",
+            "title": "Trade Date",
+            "type": "string"
+          },
+          "turnover_rate": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Turnover Rate"
+          }
+        },
+        "required": [
+          "trade_date",
+          "pe_ttm",
+          "pb",
+          "total_mv",
+          "circ_mv",
+          "turnover_rate"
+        ],
+        "title": "Valuation",
         "type": "object"
       }
     }
@@ -4893,6 +5189,45 @@
           }
         },
         "summary": "选股结果与排序"
+      }
+    },
+    "/api/v1/stocks/{code}": {
+      "get": {
+        "operationId": "stock_profile_api_v1_stocks__code__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "code",
+            "required": true,
+            "schema": {
+              "title": "Code",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_StockProfile_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "个股档案"
       }
     },
     "/api/v1/strategies": {

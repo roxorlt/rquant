@@ -257,6 +257,9 @@ def write_demo_research(root: Path) -> None:
                               industry={"600519.SH": "白酒", "000001.SZ": "银行"}.get(c))
                   for c, q in sim.days[-1].positions.items()],
         nav_series=_nav_series(sim.days))])
+    from rquant.web.stocks import write_demo_market
+
+    write_demo_market(root, today)
     from rquant.data_catalog.audit import AuditReport, DatasetCoverage, write_report
 
     write_report(AuditReport(

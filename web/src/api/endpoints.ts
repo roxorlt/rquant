@@ -343,3 +343,16 @@ export function useFundamentals(): ServingQueryResult<Schemas["FundamentalsDoc"]
     return unwrap(data, response);
   });
 }
+
+export function useStock(code: string | undefined): ServingQueryResult<Schemas["StockProfile"]> {
+  return useServingQuery(
+    ["stock", code],
+    async () => {
+      const { data, response } = await apiClient().GET("/api/v1/stocks/{code}", {
+        params: { path: { code: code ?? "" } },
+      });
+      return unwrap(data, response);
+    },
+    { enabled: Boolean(code) },
+  );
+}

@@ -1,4 +1,7 @@
 import { type ComponentType, type LazyExoticComponent, lazy } from "react";
+
+const StockPage = lazy(() => import("@/pages/stock"));
+
 import { Navigate, type RouteObject } from "react-router";
 import { NotFound } from "./NotFound";
 import { HOME_PATH, PAGES, type PageId } from "./pages";
@@ -36,6 +39,7 @@ export const appRoutes: RouteObject[] = [
         const Page = PAGE_COMPONENTS[page.id];
         return { path: page.id, element: <Page />, handle: { title: page.title } };
       }),
+      { path: "stock/:code", element: <StockPage />, handle: { title: "个股档案" } },
       { path: "*", element: <NotFound />, handle: { title: "页面不存在" } },
     ],
   },

@@ -4,6 +4,7 @@ import { toneClass, toneOf } from "@/format/color";
 import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
 import { PageHeader, Panel, Pill } from "@/ui";
+import { StockLink } from "@/ui/StockLink";
 import { QueryView } from "../shared";
 
 function Fundamentals() {
@@ -29,7 +30,12 @@ function Fundamentals() {
         rows={doc.rows}
         rowKey={(r) => r.code}
         columns={[
-          { id: "code", header: "代码", value: (r) => r.code },
+          {
+            id: "code",
+            header: "代码",
+            value: (r) => r.code,
+            cell: (r) => <StockLink code={r.code} />,
+          },
           { id: "end", header: "报告期", value: (r) => r.end_date },
           ...keys.map((k) => ({
             id: k,

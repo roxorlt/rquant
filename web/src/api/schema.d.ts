@@ -451,6 +451,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/stocks/{code}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 个股档案 */
+        get: operations["stock_profile_api_v1_stocks__code__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/strategies": {
         parameters: {
             query?: never;
@@ -773,6 +790,26 @@ export interface components {
             /** P95 */
             p95: number;
         };
+        /** Bar */
+        Bar: {
+            /** Amount */
+            amount: number | null;
+            /** Close */
+            close: number;
+            /**
+             * Date
+             * Format: date
+             */
+            date: string;
+            /** High */
+            high: number;
+            /** Low */
+            low: number;
+            /** Open */
+            open: number;
+            /** Pct Chg */
+            pct_chg: number | null;
+        };
         /** BenchmarkStats */
         BenchmarkStats: {
             /** Alpha */
@@ -1032,6 +1069,11 @@ export interface components {
         /** Envelope[ScreenData] */
         Envelope_ScreenData_: {
             data: components["schemas"]["ScreenData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[StockProfile] */
+        Envelope_StockProfile_: {
+            data: components["schemas"]["StockProfile"];
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[StrategyListData] */
@@ -1679,6 +1721,42 @@ export interface components {
             /** Strategy Id */
             strategy_id: string;
         };
+        /** StockProfile */
+        StockProfile: {
+            /** Alerts */
+            alerts: {
+                [key: string]: unknown;
+            }[];
+            /** Bars */
+            bars: components["schemas"]["Bar"][];
+            /** Code */
+            code: string;
+            /** Fundamentals */
+            fundamentals: {
+                [key: string]: number | null;
+            };
+            /** Fundamentals Fields */
+            fundamentals_fields: {
+                [key: string]: string;
+            };
+            /** Fundamentals Period */
+            fundamentals_period: string | null;
+            /** Industry */
+            industry: string | null;
+            /** List Date */
+            list_date: string | null;
+            /** Market */
+            market: string | null;
+            /** Name */
+            name: string | null;
+            /** Pools */
+            pools: string[];
+            /** Returns */
+            returns: {
+                [key: string]: number | null;
+            };
+            valuation: components["schemas"]["Valuation"] | null;
+        };
         /** StrategyListData */
         StrategyListData: {
             /** Strategies */
@@ -1772,6 +1850,24 @@ export interface components {
             msg: string;
             /** Error Type */
             type: string;
+        };
+        /** Valuation */
+        Valuation: {
+            /** Circ Mv */
+            circ_mv: number | null;
+            /** Pb */
+            pb: number | null;
+            /** Pe Ttm */
+            pe_ttm: number | null;
+            /** Total Mv */
+            total_mv: number | null;
+            /**
+             * Trade Date
+             * Format: date
+             */
+            trade_date: string;
+            /** Turnover Rate */
+            turnover_rate: number | null;
         };
     };
     responses: never;
@@ -2492,6 +2588,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_ScreenData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    stock_profile_api_v1_stocks__code__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                code: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_StockProfile_"];
                 };
             };
             /** @description Validation Error */

@@ -5,6 +5,7 @@ import { formatAmount, formatCount, formatPrice } from "@/format/number";
 import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
 import { EmptyState, KpiStrip, PageHeader, Panel } from "@/ui";
+import { StockLink } from "@/ui/StockLink";
 import { QueryView } from "../shared";
 import { PaperBand } from "./Band";
 
@@ -108,7 +109,12 @@ export default function PaperPage() {
                   rowKey={(row) => row.code}
                   emptyText="空仓：模拟盘当前没有持仓，下一次调仓信号后会建仓。"
                   columns={[
-                    { id: "code", header: "代码", value: (row) => row.code },
+                    {
+                      id: "code",
+                      header: "代码",
+                      value: (row) => row.code,
+                      cell: (row) => <StockLink code={row.code} />,
+                    },
                     { id: "name", header: "名称", value: (row) => row.name ?? null },
                     {
                       id: "industry",

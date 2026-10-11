@@ -14,6 +14,7 @@ import { toneClass, toneOf } from "@/format/color";
 import { formatPrice } from "@/format/number";
 import { DataTable } from "@/table/DataTable";
 import { Button, ChangeText, KpiStrip, Panel, Pill } from "@/ui";
+import { StockLink } from "@/ui/StockLink";
 import { QueryView } from "../shared";
 import { PerfPanel } from "./Perf";
 
@@ -212,7 +213,12 @@ function Detail({ runId, onCompare }: { runId: string; onCompare: () => void }) 
               height={360}
               columns={[
                 { id: "date", header: "日期", value: (row) => row.trade_date },
-                { id: "code", header: "代码", value: (row) => row.code },
+                {
+                  id: "code",
+                  header: "代码",
+                  value: (row) => row.code,
+                  cell: (row) => <StockLink code={row.code} />,
+                },
                 {
                   id: "side",
                   header: "方向",
