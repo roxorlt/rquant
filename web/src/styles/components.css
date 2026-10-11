@@ -1287,4 +1287,51 @@
 .tbl td.num,
 .tbl th.num {
   font-variant-numeric: tabular-nums;
+/* ---------- research flow stepper ---------- */
+.flow-steps {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+}
+.flow-step {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.flow-steps a {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px 3px 4px;
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  color: var(--muted);
+}
+.flow-steps a:hover {
+  text-decoration: none;
+  border-color: var(--rule-strong);
+  color: var(--ink);
+}
+.flow-steps a.active {
+  border-color: var(--accent);
+  background: var(--accent-weak);
+  color: var(--accent-t);
+}
+.flow-n {
+  display: inline-grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--sunken);
+  font: 10px / 1 var(--font-mono);
+}
+.flow-steps a.active .flow-n {
+  background: var(--accent);
+  color: var(--accent-ink);
+}
+.flow-arrow {
+  color: var(--faint);
 }
