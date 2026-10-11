@@ -147,7 +147,7 @@ export default function FactorPage() {
               rowKey={(row) => row.factor_id}
               onSelect={(row) => setId(row.factor_id)}
               selectedKey={id}
-              emptyText="还没有因子检验结果"
+              emptyText="还没有因子检验结果：运行 python -m rquant.factor 产出 IC / 分组检验后显示。"
               columns={[
                 { id: "name", header: "名称", value: (row) => row.name },
                 { id: "expr", header: "表达式", value: (row) => row.expression },

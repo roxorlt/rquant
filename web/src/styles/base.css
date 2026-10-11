@@ -116,3 +116,24 @@ code {
     scroll-behavior: auto !important;
   }
 }
+
+/* Bare form controls follow the theme instead of the UA's light defaults. */
+textarea,
+select {
+  background: var(--surface-2);
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  color: var(--ink);
+}
+textarea {
+  padding: 8px 10px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.5;
+  resize: vertical;
+}
+textarea:focus,
+select:focus {
+  border-color: var(--accent);
+  outline: none;
+}
