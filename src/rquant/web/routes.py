@@ -81,6 +81,7 @@ from rquant.web.models import (
     PortfolioRunDetailData,
     PortfolioRunListData,
     PortfolioRunSummary,
+    ReportFactorsData,
     SavePoolRequest,
     ScreenData,
     ScreenRow,
@@ -622,6 +623,15 @@ def data_center(request: Request, source: SourceDep) -> Envelope[DataCenterData]
     catalog = CatalogDocument.model_validate_json(_CATALOG.read_text(encoding="utf-8"))
     return _envelope(source, DataCenterData(datasets=catalog.datasets,
                                             audit=read_report(_research_root(request))))
+
+
+@router.get("/report-factors", response_model=Envelope[ReportFactorsData],
+            summary="研报因子：目录与复现结果")
+def report_factors(request: Request, source: SourceDep) -> Envelope[ReportFactorsData]:
+    from rquant.research.report_factors import read_results
+
+    return _envelope(source, ReportFactorsData(
+        results=read_results(Path(_research_root(request) or research_root()))))
 
 
 @router.get("/surge", response_model=Envelope[SurgeData], summary="量能异动（盘中扫描事件）")

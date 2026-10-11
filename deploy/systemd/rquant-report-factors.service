@@ -1,0 +1,20 @@
+[Unit]
+Description=rQuant 研报因子: recompute replicated sell-side factors + validated percentiles (off-hours)
+After=network-online.target
+
+[Service]
+# Reads market.duckdb read-only (~1-2 min, connection closed before the pandas stage);
+# writes ~/rquant-research/report_factors/{results,latest}.json. Runs well before 09:10.
+Type=oneshot
+Slice=rquant-research.slice
+User=lighthouse
+Group=lighthouse
+WorkingDirectory=/home/lighthouse/rquant-web-rel/current
+EnvironmentFile=/etc/rquant-web.env
+Environment=RQUANT_DISABLE_DOTENV=1 TZ=Asia/Shanghai PYTHONWARNINGS=ignore
+ExecStart=/home/lighthouse/rquant-web-rel/current/.venv/bin/python -m rquant.research.report_factors run
+TimeoutStartSec=1800
+Nice=15
+MemoryMax=6G
+StandardOutput=journal
+StandardError=journal

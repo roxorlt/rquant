@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Generic, Literal, TypeVar
+from typing import Any, Generic, Literal, TypeVar
 
 from pydantic import BaseModel, Field
 
@@ -524,6 +524,11 @@ class SurgeEvent(BaseModel):
     pct: float | None = None
     price: float | None = None
     amount: float | None = None  # cumulative CNY
+
+
+class ReportFactorsData(BaseModel):
+    """研报因子: catalog + per-factor replication results (opaque chart series)."""
+    results: dict[str, Any] | None
 
 
 class SurgeData(BaseModel):

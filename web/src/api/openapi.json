@@ -2138,6 +2138,22 @@
         "title": "Envelope[QueryResult]",
         "type": "object"
       },
+      "Envelope_ReportFactorsData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/ReportFactorsData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[ReportFactorsData]",
+        "type": "object"
+      },
       "Envelope_ScreenData_": {
         "properties": {
           "data": {
@@ -4716,6 +4732,28 @@
         "title": "QueryResult",
         "type": "object"
       },
+      "ReportFactorsData": {
+        "description": "研报因子: catalog + per-factor replication results (opaque chart series).",
+        "properties": {
+          "results": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Results"
+          }
+        },
+        "required": [
+          "results"
+        ],
+        "title": "ReportFactorsData",
+        "type": "object"
+      },
       "SavePoolRequest": {
         "properties": {
           "description": {
@@ -7163,6 +7201,24 @@
           }
         },
         "summary": "可查询的表"
+      }
+    },
+    "/api/v1/report-factors": {
+      "get": {
+        "operationId": "report_factors_api_v1_report_factors_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_ReportFactorsData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "研报因子：目录与复现结果"
       }
     },
     "/api/v1/screen": {

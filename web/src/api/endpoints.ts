@@ -465,3 +465,11 @@ export function useMacro(): ServingQueryResult<MacroData> {
     return unwrap(data, response);
   });
 }
+
+/** 研报因子: sell-side factor catalog + replication results (daily batch). */
+export function useReportFactors(): ServingQueryResult<Schemas["ReportFactorsData"]> {
+  return useServingQuery(["report-factors"], async () => {
+    const { data, response } = await apiClient().GET("/api/v1/report-factors");
+    return unwrap(data, response);
+  });
+}
