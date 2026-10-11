@@ -123,3 +123,34 @@ input:focus {
 .stock-head .px {
   font: 600 26px var(--font-mono);
 }
+.heatmap {
+  position: relative;
+  margin: 0 12px 12px;
+}
+.hm-cell {
+  position: absolute;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  border: 1px solid var(--bg);
+  color: var(--ink);
+  font-size: 12px;
+  line-height: 1.3;
+  cursor: default;
+}
+.hm-cell:hover {
+  outline: 1px solid var(--ink-2);
+  z-index: 1;
+}
+.hm-name {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.hm-pct {
+  font-weight: 600;
+}
