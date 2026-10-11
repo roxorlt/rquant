@@ -394,3 +394,19 @@ def test_stock_chips_endpoint(tmp_path) -> None:
         tpo = client.get(url).json()["data"]["tpo"]
         assert len({ch for r in tpo[-1]["rows"] for ch in r["letters"]}) == n
     assert client.get("/api/v1/stocks/600519.SH/chips?tpo_period=20").status_code == 422
+
+
+def test_stock_intraday_endpoint(tmp_path) -> None:
+    from fastapi.testclient import TestClient
+
+    from rquant.web.app import create_app
+    from rquant.web.source import FixtureSource, write_demo_research
+
+    write_demo_research(tmp_path)
+    client = TestClient(create_app(FixtureSource(), dist=None, research_root=tmp_path))
+    body = client.get("/api/v1/stocks/600519.SH/intraday").json()["data"]
+    assert body["freq"] == "5min" and len(body["days"]) == 5 and len(body["bars"]) == 48
+    assert body["pre_close"] and body["bars"][0]["t"] == "09:35"
+    first = body["days"][0]
+    again = client.get(f"/api/v1/stocks/600519.SH/intraday?day={first}").json()["data"]
+    assert again["date"] == first

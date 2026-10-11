@@ -417,3 +417,25 @@ input:focus {
   cursor: pointer;
   z-index: 1;
 }
+
+.chart-tabs {
+  margin: 4px 0 8px;
+}
+.intraday .chart-axis.up {
+  fill: var(--up);
+}
+.intraday .chart-axis.down {
+  fill: var(--down);
+}
+.mk.up {
+  fill: var(--up);
+  stroke: var(--surface);
+}
+.mk.down {
+  fill: var(--down);
+  stroke: var(--surface);
+}
+.mk.spike {
+  fill: var(--warn);
+}
+.chart-tabs { display: inline-flex; }

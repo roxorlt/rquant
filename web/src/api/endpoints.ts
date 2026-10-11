@@ -423,3 +423,19 @@ export function useChips(
     { enabled: Boolean(code) },
   );
 }
+
+export function useIntraday(
+  code: string | undefined,
+  day?: string,
+): ServingQueryResult<Schemas["IntradayData"] | null> {
+  return useServingQuery(
+    ["stock", code, "intraday", day ?? "latest"],
+    async () => {
+      const { data, response } = await apiClient().GET("/api/v1/stocks/{code}/intraday", {
+        params: { path: { code: code ?? "" }, ...(day ? { query: { day } } : {}) },
+      });
+      return unwrap(data, response);
+    },
+    { enabled: Boolean(code) },
+  );
+}

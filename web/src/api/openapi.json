@@ -2177,6 +2177,29 @@
         "title": "Envelope[Union[FundamentalsDoc, NoneType]]",
         "type": "object"
       },
+      "Envelope_Union_IntradayData__NoneType__": {
+        "properties": {
+          "data": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/IntradayData"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[Union[IntradayData, NoneType]]",
+        "type": "object"
+      },
       "Envelope_dict_str__list_list_str____": {
         "properties": {
           "data": {
@@ -3141,6 +3164,114 @@
           "deviation"
         ],
         "title": "IndustryExposure",
+        "type": "object"
+      },
+      "IntradayBar": {
+        "properties": {
+          "amount": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Amount"
+          },
+          "close": {
+            "title": "Close",
+            "type": "number"
+          },
+          "high": {
+            "title": "High",
+            "type": "number"
+          },
+          "low": {
+            "title": "Low",
+            "type": "number"
+          },
+          "open": {
+            "title": "Open",
+            "type": "number"
+          },
+          "t": {
+            "title": "T",
+            "type": "string"
+          },
+          "vol": {
+            "title": "Vol",
+            "type": "number"
+          }
+        },
+        "required": [
+          "t",
+          "open",
+          "high",
+          "low",
+          "close",
+          "vol",
+          "amount"
+        ],
+        "title": "IntradayBar",
+        "type": "object"
+      },
+      "IntradayData": {
+        "properties": {
+          "bars": {
+            "items": {
+              "$ref": "#/components/schemas/IntradayBar"
+            },
+            "title": "Bars",
+            "type": "array"
+          },
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "date": {
+            "format": "date",
+            "title": "Date",
+            "type": "string"
+          },
+          "days": {
+            "items": {
+              "format": "date",
+              "type": "string"
+            },
+            "title": "Days",
+            "type": "array"
+          },
+          "freq": {
+            "title": "Freq",
+            "type": "string"
+          },
+          "pre_close": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pre Close"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "date",
+          "days",
+          "freq",
+          "source",
+          "pre_close",
+          "bars"
+        ],
+        "title": "IntradayData",
         "type": "object"
       },
       "Kpi": {
@@ -6427,6 +6558,62 @@
           }
         },
         "summary": "筹码分布与成交量分布（近似）"
+      }
+    },
+    "/api/v1/stocks/{code}/intraday": {
+      "get": {
+        "operationId": "stock_intraday_api_v1_stocks__code__intraday_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "code",
+            "required": true,
+            "schema": {
+              "title": "Code",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "day",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Day"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_Union_IntradayData__NoneType__"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "分时（分钟线）"
       }
     },
     "/api/v1/strategies": {

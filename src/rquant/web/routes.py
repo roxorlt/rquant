@@ -35,6 +35,7 @@ from rquant.web.backtest_perf import backtest_perf, perf_from_returns
 from rquant.web.brinson import BrinsonData, brinson
 from rquant.web.chips import TPO_DEFAULT, TPO_PERIODS, ChipsData, load_chips
 from rquant.web.health_layers import build_layers
+from rquant.web.intraday import IntradayData, load_intraday
 from rquant.web.models import (
     AckAlertRequest,
     AddWatchRequest,
@@ -838,6 +839,19 @@ def stock_profile(code: str, request: Request, source: SourceDep) -> Envelope[St
         fundamentals_fields=doc.fields if doc else {},
         pools=in_pools, alerts=recent))
 
+
+
+@router.get("/stocks/{code}/intraday", response_model=Envelope[IntradayData | None],
+            summary="分时（分钟线）")
+def stock_intraday(code: str, request: Request, source: SourceDep,
+                   day: date | None = None) -> Envelope[IntradayData | None]:
+    code = code.upper()
+    if not CODE_RE.match(code):
+        raise HTTPException(422, "代码格式应为 600519.SH")
+    root = Path(_research_root(request) or research_root())
+    with market(root) as con:
+        data = load_intraday(con, root, code, day)
+    return _envelope(source, data)
 
 
 @router.get("/stocks/{code}/chips", response_model=Envelope[ChipsData | None],
