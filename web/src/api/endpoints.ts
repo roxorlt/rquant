@@ -1,5 +1,5 @@
 /** Every API call the pages make. Types come only from the generated schema. */
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQueries, useQueryClient } from "@tanstack/react-query";
 import { ApiError, apiClient, type Schemas } from "./client";
 import { type ServingQueryResult, useServingQuery } from "./useServingQuery";
 
@@ -87,6 +87,21 @@ export function usePortfolioBacktest(
     },
     { enabled: runId !== null },
   );
+}
+
+/** Several portfolio runs at once (multi-run compare); same cache keys as usePortfolioBacktest. */
+export function usePortfolioBacktestMany(runIds: readonly string[]) {
+  return useQueries({
+    queries: runIds.map((runId) => ({
+      queryKey: ["portfolio-backtests", runId],
+      queryFn: async () => {
+        const { data, response } = await apiClient().GET("/api/v1/portfolio-backtests/{run_id}", {
+          params: { path: { run_id: runId } },
+        });
+        return unwrap(data, response);
+      },
+    })),
+  });
 }
 
 export function usePortfolioCompare(

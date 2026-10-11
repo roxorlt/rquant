@@ -57,3 +57,7 @@ input:focus {
     grid-template-columns: 1fr;
   }
 }
+.tbl td.best {
+  color: var(--accent-t);
+  font-weight: 600;
+}
