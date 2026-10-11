@@ -911,6 +911,8 @@ export interface components {
             open: number;
             /** Pct Chg */
             pct_chg: number | null;
+            /** Vol */
+            vol?: number | null;
         };
         /** BenchmarkStats */
         BenchmarkStats: {
@@ -1062,6 +1064,11 @@ export interface components {
             /** Lo */
             lo: number;
             profile: components["schemas"]["VolumeProfile"] | null;
+            /**
+             * Tpo
+             * @default []
+             */
+            tpo: components["schemas"]["TpoDay"][];
         };
         /** CommandReceipt */
         CommandReceipt: {
@@ -2156,6 +2163,35 @@ export interface components {
         TextToConditionRequest: {
             /** Text */
             text: string;
+        };
+        /** TpoDay */
+        TpoDay: {
+            /** Close */
+            close: number;
+            /**
+             * Date
+             * Format: date
+             */
+            date: string;
+            /** Open */
+            open: number;
+            /** Poc */
+            poc: number;
+            /** Rows */
+            rows: components["schemas"]["TpoRow"][];
+            /** Step */
+            step: number;
+            /** Vah */
+            vah: number;
+            /** Val */
+            val: number;
+        };
+        /** TpoRow */
+        TpoRow: {
+            /** Letters */
+            letters: string;
+            /** Price */
+            price: number;
         };
         /** TrackingPoint */
         TrackingPoint: {

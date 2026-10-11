@@ -14,7 +14,7 @@ A-share data here has no tick / order book, so both are approximations:
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 
 import duckdb
 import numpy as np
@@ -44,12 +44,29 @@ class VolumeProfile(BaseModel):
     vah: float
 
 
+class TpoRow(BaseModel):
+    price: float
+    letters: str  # one letter per 30-minute period the price traded in (A = 09:30–10:00)
+
+
+class TpoDay(BaseModel):
+    date: date
+    step: float
+    rows: list[TpoRow]  # high → low
+    poc: float
+    val: float
+    vah: float
+    open: float
+    close: float
+
+
 class ChipsData(BaseModel):
     lo: float
     hi: float
     bins: int
     days: list[ChipDay]
     profile: VolumeProfile | None
+    tpo: list[TpoDay] = []
 
 
 def _tri(lo: float, hi: float, peak: float, edges: np.ndarray) -> np.ndarray:
@@ -128,6 +145,55 @@ def volume_profile(bars: list[tuple[float, float, float, float]], edges: np.ndar
                          vah=round(float(edges[b + 1]), 3))
 
 
+LETTERS = "ABCDEFGH"
+
+
+def _period(t: datetime) -> int:
+    """30-minute TPO period of a 5-minute bar *end* time (A..D morning, E..H afternoon)."""
+    m = t.hour * 60 + t.minute - 1
+    return (m - 570) // 30 if m < 720 else 4 + (m - 780) // 30
+
+
+def tpo_days(mins: list[tuple], k: dict, days: int = 5, rows: int = 28) -> list[TpoDay]:
+    """Market profile (TPO letters) per day from 5-minute bars ``(time, date, h, l, o, c)``."""
+    by: dict[date, list[tuple]] = {}
+    for m in mins:
+        by.setdefault(m[1], []).append(m)
+    out = []
+    for d in sorted(by)[-days:]:
+        bars = sorted(by[d])
+        f = k.get(d, 1.0)
+        hi, lo = max(b[2] for b in bars) * f, min(b[3] for b in bars) * f
+        step = max((hi - lo) / rows, hi * 0.0005, 0.01)
+        n = int((hi - lo) / step) + 1
+        sets: list[set[int]] = [set() for _ in range(n)]
+        for t, _, h, low, _o, _c in bars:
+            p = min(max(_period(t), 0), 7)
+            for j in range(int((low * f - lo) / step), min(int((h * f - lo) / step), n - 1) + 1):
+                sets[j].add(p)
+        counts = np.array([len(x) for x in sets], dtype=float)
+        poc = int(np.argmax(counts))
+        a, b, tot, target = poc, poc, counts[poc], counts.sum() * 0.7
+        while tot < target and (a > 0 or b < n - 1):
+            up = counts[b + 1] if b < n - 1 else -1
+            dn = counts[a - 1] if a > 0 else -1
+            if up >= dn:
+                b += 1
+                tot += up
+            else:
+                a -= 1
+                tot += dn
+        def px(j: int, lo: float = lo, step: float = step) -> float:
+            return round(lo + (j + 0.5) * step, 2)
+
+        out.append(TpoDay(
+            date=d, step=round(step, 4), poc=px(poc), val=px(a), vah=px(b),
+            open=round(bars[0][4] * f, 2), close=round(bars[-1][5] * f, 2),
+            rows=[TpoRow(price=px(j), letters="".join(LETTERS[p] for p in sorted(sets[j])))
+                  for j in range(n - 1, -1, -1)]))
+    return out
+
+
 def load_chips(con: duckdb.DuckDBPyConnection, code: str, show: int = 250, warmup: int = 250,
                profile_days: int = 20) -> ChipsData | None:
     """Forward-adjusted daily bars (+turnover) → chips for the last ``show`` days and a volume
@@ -167,6 +233,15 @@ def load_chips(con: duckdb.DuckDBPyConnection, code: str, show: int = 250, warmu
             "AND freq = '5min' AND trade_date >= ?", [code, min(recent)]).fetchall()
     except duckdb.Error:
         mins = []
+    tpo: list[TpoDay] = []
+    try:
+        five = con.execute(
+            "SELECT trade_time, trade_date, high, low, open, close FROM minute_bar "
+            "WHERE ts_code = ? AND freq = '5min' AND trade_date >= ? ORDER BY trade_time",
+            [code, min(recent)]).fetchall()
+        tpo = tpo_days(five, k)
+    except duckdb.Error:
+        pass
     if mins:
         profile = volume_profile([(h * k.get(d, 1), lo_ * k.get(d, 1), c * k.get(d, 1), v)
                                   for d, h, lo_, c, v in mins], edges, "5min",
@@ -176,4 +251,4 @@ def load_chips(con: duckdb.DuckDBPyConnection, code: str, show: int = 250, warmu
                                   for b in clipped if b["date"] in recent], edges, "daily",
                                  len(recent))
     return ChipsData(lo=float(edges[0]), hi=float(edges[-1]), bins=BINS, days=days,
-                     profile=profile)
+                     profile=profile, tpo=tpo)

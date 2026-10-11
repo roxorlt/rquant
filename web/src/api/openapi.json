@@ -912,6 +912,17 @@
               }
             ],
             "title": "Pct Chg"
+          },
+          "vol": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Vol"
           }
         },
         "required": [
@@ -1393,6 +1404,14 @@
                 "type": "null"
               }
             ]
+          },
+          "tpo": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/TpoDay"
+            },
+            "title": "Tpo",
+            "type": "array"
           }
         },
         "required": [
@@ -4844,6 +4863,76 @@
           "text"
         ],
         "title": "TextToConditionRequest",
+        "type": "object"
+      },
+      "TpoDay": {
+        "properties": {
+          "close": {
+            "title": "Close",
+            "type": "number"
+          },
+          "date": {
+            "format": "date",
+            "title": "Date",
+            "type": "string"
+          },
+          "open": {
+            "title": "Open",
+            "type": "number"
+          },
+          "poc": {
+            "title": "Poc",
+            "type": "number"
+          },
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/TpoRow"
+            },
+            "title": "Rows",
+            "type": "array"
+          },
+          "step": {
+            "title": "Step",
+            "type": "number"
+          },
+          "vah": {
+            "title": "Vah",
+            "type": "number"
+          },
+          "val": {
+            "title": "Val",
+            "type": "number"
+          }
+        },
+        "required": [
+          "date",
+          "step",
+          "rows",
+          "poc",
+          "val",
+          "vah",
+          "open",
+          "close"
+        ],
+        "title": "TpoDay",
+        "type": "object"
+      },
+      "TpoRow": {
+        "properties": {
+          "letters": {
+            "title": "Letters",
+            "type": "string"
+          },
+          "price": {
+            "title": "Price",
+            "type": "number"
+          }
+        },
+        "required": [
+          "price",
+          "letters"
+        ],
+        "title": "TpoRow",
         "type": "object"
       },
       "TrackingPoint": {

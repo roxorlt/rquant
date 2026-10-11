@@ -313,3 +313,37 @@ input:focus {
   font-family: var(--font-mono);
   font-weight: 500;
 }
+
+.avwap-anchor {
+  stroke: #c792ea;
+  stroke-dasharray: 2 3;
+  stroke-width: 1;
+}
+.tpo {
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 15px;
+  max-height: 460px;
+  overflow: auto;
+}
+.tpo-row {
+  display: flex;
+  gap: 12px;
+  padding: 0 6px;
+}
+.tpo-row.va {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+.tpo-row.poc {
+  background: color-mix(in srgb, var(--warn) 22%, transparent);
+}
+.tpo-px {
+  width: 64px;
+  text-align: right;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.tpo-l {
+  letter-spacing: 3px;
+  color: var(--text);
+}

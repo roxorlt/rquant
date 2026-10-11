@@ -46,6 +46,9 @@ export function Candles({
   side,
   profile,
   onHover,
+  overlays,
+  anchor,
+  onPick,
 }: {
   bars: readonly Candle[];
   height?: number;
@@ -53,6 +56,11 @@ export function Candles({
   side?: SideDist | null;
   profile?: ProfileOverlay | null;
   onHover?: (i: number | null) => void;
+  /** extra price lines (e.g. anchored VWAP and its bands) */
+  overlays?: { key: string; values: (number | null)[]; color: string; dash?: boolean }[];
+  /** bar index marked as an anchor; ``onPick`` makes bars clickable */
+  anchor?: number | null;
+  onPick?: (i: number) => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const [w, setW] = useState(800);
@@ -106,6 +114,7 @@ export function Candles({
           <span className="hint">MA5 / MA20 / MA60</span>
         </div>
       ) : null}
+      {/* biome-ignore lint/a11y/useKeyWithClickEvents: picking an anchor is a pointer shortcut; a default anchor is always set */}
       <svg
         width={w}
         height={height}
@@ -116,6 +125,9 @@ export function Candles({
           setHover(null);
           setHy(null);
           onHover?.(null);
+        }}
+        onClick={() => {
+          if (hover != null) onPick?.(hover);
         }}
         onMouseMove={(e) => {
           const r = e.currentTarget.getBoundingClientRect();
@@ -235,6 +247,25 @@ export function Candles({
               {side.avg.toFixed(2)}
             </text>
           </g>
+        ) : null}
+        {(overlays ?? []).map((o) => (
+          <path
+            key={o.key}
+            d={path(o.values)}
+            fill="none"
+            stroke={o.color}
+            strokeWidth={o.dash ? 1 : 1.6}
+            strokeDasharray={o.dash ? "4 3" : undefined}
+          />
+        ))}
+        {anchor != null && anchor >= 0 && anchor < bars.length ? (
+          <line
+            className="avwap-anchor"
+            x1={x(anchor)}
+            x2={x(anchor)}
+            y1={PAD.top}
+            y2={volTop + volH}
+          />
         ) : null}
         {lines.map(([color, vals]) => (
           <path key={color} d={path(vals)} fill="none" stroke={color} strokeWidth={1.2} />

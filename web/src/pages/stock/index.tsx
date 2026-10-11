@@ -6,6 +6,7 @@ import { ChangeText, KpiStrip, PageHeader, Panel, Pill } from "@/ui";
 import { QueryView } from "../shared";
 import { FlowPanel } from "./Flow";
 import { KlinePanel } from "./Kline";
+import { TpoPanel } from "./Tpo";
 
 const pct = (v: number | null | undefined) =>
   v == null ? "—" : `${v > 0 ? "+" : ""}${(v * 100).toFixed(2)}%`;
@@ -55,6 +56,7 @@ export default function StockPage() {
               ]}
             />
             <KlinePanel code={s.code} bars={s.bars} />
+            <TpoPanel code={s.code} />
             <FlowPanel s={s} />
             <div className="risk-block">
               <Panel

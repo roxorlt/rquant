@@ -380,4 +380,8 @@ def test_stock_chips_endpoint(tmp_path) -> None:
     body = client.get("/api/v1/stocks/600519.SH/chips").json()["data"]
     assert len(body["days"]) == 250 and len(body["days"][-1]["dist"]) == body["bins"]
     assert 0 <= body["days"][-1]["profit_ratio"] <= 1
-    assert body["profile"]["source"] == "daily"
+    assert body["profile"]["source"] == "5min"
+    tpo = body["tpo"]
+    assert len(tpo) == 5 and tpo[-1]["val"] <= tpo[-1]["poc"] <= tpo[-1]["vah"]
+    letters = "".join(r["letters"] for r in tpo[-1]["rows"])
+    assert set(letters) == set("ABCDEFGH")
