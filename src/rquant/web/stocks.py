@@ -38,6 +38,12 @@ class Valuation(BaseModel):
     turnover_rate: float | None
 
 
+class FlowPoint(BaseModel):
+    date: date
+    main_net: float  # 大单+特大单 主动买 - 主动卖, 万元
+    net: float | None  # Tushare net_mf_amount, 万元
+
+
 class StockProfile(BaseModel):
     code: str
     name: str | None
@@ -52,6 +58,7 @@ class StockProfile(BaseModel):
     fundamentals_fields: dict[str, str]
     pools: list[str]
     alerts: list[dict[str, object]]
+    flow: list[FlowPoint] = []
 
 
 @contextmanager
@@ -88,7 +95,7 @@ def _ret(bars: list[Bar], n: int) -> float | None:
 def load_profile(con: duckdb.DuckDBPyConnection | None, code: str, days: int = 250) -> dict:
     """Market part of the profile; the caller adds fundamentals, pools and alerts."""
     out: dict = {"name": None, "industry": None, "market": None, "list_date": None,
-                 "bars": [], "valuation": None, "returns": {}}
+                 "bars": [], "valuation": None, "returns": {}, "flow": []}
     if con is None:
         return out
     basic = _rows(con, "SELECT name, industry, market, list_date FROM stock_basic "
@@ -112,6 +119,12 @@ def load_profile(con: duckdb.DuckDBPyConnection | None, code: str, days: int = 2
     val = _rows(con, "SELECT trade_date, pe_ttm, pb, total_mv, circ_mv, turnover_rate "
                      "FROM daily_basic WHERE ts_code = ? ORDER BY trade_date DESC LIMIT 1", [code])
     out["valuation"] = Valuation(**val[0]) if val else None
+    out["flow"] = [FlowPoint(date=r["trade_date"], main_net=r["main"], net=r["net_mf_amount"])
+                   for r in reversed(_rows(con, """
+        SELECT trade_date, buy_lg_amount + buy_elg_amount - sell_lg_amount - sell_elg_amount
+               AS main, net_mf_amount
+        FROM moneyflow WHERE ts_code = ? ORDER BY trade_date DESC LIMIT ?""", [code, days]))
+                   if r["main"] is not None]
     ytd = None
     if bars:
         prior = [b for b in bars if b.date.year < bars[-1].date.year]
@@ -150,7 +163,7 @@ def write_demo_market(root: Path, today: date) -> None:
               ("600036.SH", "招商银行", "银行", 35.0), ("000858.SZ", "五粮液", "白酒", 140.0)]
     days = pd.bdate_range(end=pd.Timestamp(today), periods=300)
     rng = np.random.default_rng(11)
-    bars, basic = [], []
+    bars, basic, flows = [], [], []
     for k, (code, _, _, p0) in enumerate(stocks):
         rets = rng.normal(0.0004, 0.018, len(days))
         close = p0 * np.exp(np.cumsum(rets))
@@ -161,7 +174,10 @@ def write_demo_market(root: Path, today: date) -> None:
             lo = min(o, c) * (1 - abs(rng.normal(0, 0.006)))
             bars.append((code, d.date(), o, hi, lo, c, pc, (c / pc - 1) * 100, 1e5, c * 1e5))
             basic.append((code, d.date(), 0.5 + k * 0.2, 10 + 5 * k + c / p0, 1 + k * 0.5,
-                          c * 1e6 * (k + 1), c * 8e5 * (k + 1)))
+                          c * 1e6 * (k + 1), c * 8e5 * (k + 1), 1.5 + k * 0.5))
+            main = (c / pc - 1) * 5e4 + rng.normal(0, 800)
+            flows.append((code, d.date(), 100.0, 100.0, 200.0, 200.0, 300 + max(main, 0),
+                           300 + max(-main, 0), 100.0, 100.0, main * 1.2))
     con = duckdb.connect(str(root / "market.duckdb"))
     try:
         con.execute("CREATE TABLE stock_basic(ts_code VARCHAR, name VARCHAR, industry VARCHAR, "
@@ -175,8 +191,14 @@ def write_demo_market(root: Path, today: date) -> None:
         con.execute("INSERT INTO daily_bar SELECT * FROM bar_df")
         con.execute("CREATE TABLE daily_basic(ts_code VARCHAR, trade_date DATE, "
                     "turnover_rate DOUBLE, pe_ttm DOUBLE, pb DOUBLE, total_mv DOUBLE, "
-                    "circ_mv DOUBLE)")
+                    "circ_mv DOUBLE, turnover_rate_f DOUBLE)")
         basic_df = pd.DataFrame(basic)  # noqa: F841
         con.execute("INSERT INTO daily_basic SELECT * FROM basic_df")
+        con.execute("CREATE TABLE moneyflow(ts_code VARCHAR, trade_date DATE, "
+                    "buy_sm_amount DOUBLE, sell_sm_amount DOUBLE, buy_md_amount DOUBLE, "
+                    "sell_md_amount DOUBLE, buy_lg_amount DOUBLE, sell_lg_amount DOUBLE, "
+                    "buy_elg_amount DOUBLE, sell_elg_amount DOUBLE, net_mf_amount DOUBLE)")
+        flow_df = pd.DataFrame(flows)  # noqa: F841
+        con.execute("INSERT INTO moneyflow SELECT * FROM flow_df")
     finally:
         con.close()

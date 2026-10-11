@@ -1501,6 +1501,18 @@ export interface components {
              */
             window_start: string;
         };
+        /** FlowPoint */
+        FlowPoint: {
+            /**
+             * Date
+             * Format: date
+             */
+            date: string;
+            /** Main Net */
+            main_net: number;
+            /** Net */
+            net: number | null;
+        };
         /** FreshnessItem */
         FreshnessItem: {
             /** Key */
@@ -2032,6 +2044,11 @@ export interface components {
             bars: components["schemas"]["Bar"][];
             /** Code */
             code: string;
+            /**
+             * Flow
+             * @default []
+             */
+            flow: components["schemas"]["FlowPoint"][];
             /** Fundamentals */
             fundamentals: {
                 [key: string]: number | null;

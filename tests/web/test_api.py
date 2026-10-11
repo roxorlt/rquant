@@ -298,6 +298,7 @@ def test_stock_profile_reads_the_research_market(tmp_path) -> None:
     assert len(body["bars"]) > 200 and body["valuation"]["pe_ttm"] is not None
     assert body["fundamentals"]["roe"] == 18.9
     assert set(body["returns"]) >= {"5日", "20日", "年初至今"}
+    assert len(body["flow"]) > 200 and "main_net" in body["flow"][0]
     assert client.get("/api/v1/stocks/bad").status_code == 422
     assert client.get("/api/v1/stocks/999999.SH").status_code == 404
 

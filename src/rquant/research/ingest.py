@@ -35,6 +35,11 @@ CREATE TABLE IF NOT EXISTS adj_factor(ts_code VARCHAR, trade_date DATE, adj_fact
 CREATE TABLE IF NOT EXISTS daily_basic(ts_code VARCHAR, trade_date DATE,
   turnover_rate DOUBLE, pe_ttm DOUBLE, pb DOUBLE, total_mv DOUBLE, circ_mv DOUBLE,
   PRIMARY KEY (ts_code, trade_date));
+ALTER TABLE daily_basic ADD COLUMN IF NOT EXISTS turnover_rate_f DOUBLE;
+CREATE TABLE IF NOT EXISTS moneyflow(ts_code VARCHAR, trade_date DATE,
+  buy_sm_amount DOUBLE, sell_sm_amount DOUBLE, buy_md_amount DOUBLE, sell_md_amount DOUBLE,
+  buy_lg_amount DOUBLE, sell_lg_amount DOUBLE, buy_elg_amount DOUBLE, sell_elg_amount DOUBLE,
+  net_mf_amount DOUBLE, PRIMARY KEY (ts_code, trade_date));
 CREATE TABLE IF NOT EXISTS daily_state(ts_code VARCHAR, trade_date DATE, limit_pct DOUBLE,
   PRIMARY KEY (ts_code, trade_date));
 CREATE TABLE IF NOT EXISTS index_daily(ts_code VARCHAR, trade_date DATE, close DOUBLE,
@@ -153,7 +158,7 @@ def ingest_day(con: duckdb.DuckDBPyConnection, pro: Pro, day: date,
         _upsert(con, "adj_factor", adj.assign(trade_date=_d(adj["trade_date"]))[
             ["ts_code", "trade_date", "adj_factor"]])
     basic = pro("daily_basic", trade_date=ds,
-                fields="ts_code,trade_date,turnover_rate,pe_ttm,pb,total_mv,circ_mv")
+                fields="ts_code,trade_date,turnover_rate,turnover_rate_f,pe_ttm,pb,total_mv,circ_mv")
     if basic is not None and not basic.empty:
         _upsert(con, "daily_basic", basic.assign(trade_date=_d(basic["trade_date"])))
     lim = pro("stk_limit", trade_date=ds)
@@ -167,6 +172,41 @@ def ingest_day(con: duckdb.DuckDBPyConnection, pro: Pro, day: date,
         state = pd.DataFrame({"ts_code": bar["ts_code"], "trade_date": day,
                               "limit_pct": [_limit_pct(c, names.get(c, "")) for c in bar["ts_code"]]})
     _upsert(con, "daily_state", state)
+    return n
+
+
+MF_COLS = ["ts_code", "trade_date", "buy_sm_amount", "sell_sm_amount", "buy_md_amount",
+           "sell_md_amount", "buy_lg_amount", "sell_lg_amount", "buy_elg_amount",
+           "sell_elg_amount", "net_mf_amount"]
+
+
+def ingest_moneyflow(con: duckdb.DuckDBPyConnection, pro: Pro, start: date, end: date) -> int:
+    """Daily active buy/sell by order size (万元; Tushare, computed from L2) for missing days."""
+    total = 0
+    for day in missing_days(con, "moneyflow", start, end):
+        df = pro("moneyflow", trade_date=f"{day:%Y%m%d}")
+        if df is not None and not df.empty:
+            total += _upsert(con, "moneyflow", df.assign(trade_date=_d(df["trade_date"]))[MF_COLS])
+    return total
+
+
+def backfill_float_turnover(con: duckdb.DuckDBPyConnection, pro: Pro, start: date,
+                            end: date) -> int:
+    """Fill ``turnover_rate_f`` on days ingested before the column existed."""
+    days = [r[0] for r in con.execute(
+        "SELECT trade_date FROM daily_basic WHERE trade_date BETWEEN ? AND ? GROUP BY 1 "
+        "HAVING count(turnover_rate_f) = 0 ORDER BY 1", [start, end]).fetchall()]
+    n = 0
+    for day in days:
+        df = pro("daily_basic", trade_date=f"{day:%Y%m%d}", fields="ts_code,turnover_rate_f")
+        if df is None or df.empty:
+            continue
+        con.register("_trf", df)
+        con.execute("UPDATE daily_basic SET turnover_rate_f = _trf.turnover_rate_f FROM _trf "
+                    "WHERE daily_basic.ts_code = _trf.ts_code AND daily_basic.trade_date = ?",
+                    [day])
+        con.unregister("_trf")
+        n += 1
     return n
 
 
@@ -222,6 +262,10 @@ def run(root: Path, years: int = 5, end: date | None = None, minutes: int = 300,
             if i % 50 == 0:
                 log.info("daily %s (%d/%d)", day, i + 1, len(days))
         ingest_indexes(con, pro, start, end)
+        recent = end - timedelta(days=900)  # ~600 trading days: chips warm-up + factor window
+        flow = ingest_moneyflow(con, pro, recent, end)
+        trf = backfill_float_turnover(con, pro, recent, end)
+        log.info("moneyflow rows %d, float-turnover days backfilled %d", flow, trf)
         mins = ingest_minutes(con, pro, minute_universe(con, minutes),
                               end - timedelta(days=minute_days), end) if minutes else 0
         con.execute("CHECKPOINT")
@@ -234,4 +278,5 @@ def run(root: Path, years: int = 5, end: date | None = None, minutes: int = 300,
 RESEARCH_TABLES = {"daily_bar": "trade_date", "adj_factor": "trade_date",
                    "daily_basic": "trade_date", "daily_state": "trade_date",
                    "index_daily": "trade_date", "minute_bar": "trade_date",
+                   "moneyflow": "trade_date",
                    "screen_result": "trade_date"}

@@ -2794,6 +2794,37 @@
         "title": "FactorTracking",
         "type": "object"
       },
+      "FlowPoint": {
+        "properties": {
+          "date": {
+            "format": "date",
+            "title": "Date",
+            "type": "string"
+          },
+          "main_net": {
+            "title": "Main Net",
+            "type": "number"
+          },
+          "net": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Net"
+          }
+        },
+        "required": [
+          "date",
+          "main_net",
+          "net"
+        ],
+        "title": "FlowPoint",
+        "type": "object"
+      },
       "FreshnessItem": {
         "properties": {
           "key": {
@@ -4421,6 +4452,14 @@
           "code": {
             "title": "Code",
             "type": "string"
+          },
+          "flow": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/FlowPoint"
+            },
+            "title": "Flow",
+            "type": "array"
           },
           "fundamentals": {
             "additionalProperties": {
