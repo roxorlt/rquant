@@ -18,6 +18,8 @@
 | `rquant-research-ingest.timer` | 工作日 18:10 触发研究日增量 | Mon-Fri 18:10 |
 | `rquant-snapshot-collector.service` | 研究用 L1 快照：盘中每约3.25秒一次 Tushare 全A（rt_tick 五档 ≤10次/分 与 rt_k 一档交替），失败时 sina/dc 备援优先池（≤300/≤30 只），收盘后拉当日分笔，写 `$RQUANT_RESEARCH_ROOT/snapshots/YYYY-MM-DD`；`touch snapshots/STOP` 当日停 | 由 timer 触发，15:45 前后自然退出 |
 | `rquant-snapshot-collector.timer` | 工作日 09:10 触发快照采集（非交易日服务自行退出） | Mon-Fri 09:10 |
+| `rquant-snapshot-archive.service` | 快照日目录 tar.gz 上传 R2 `rquant-snapshots/snapshots/YYYY-MM-DD/`，HEAD 校验 size+sha256 后写 `.r2_archived.json`；>14 天且 R2 复核通过才删本地；凭据 `/etc/rquant-r2.env`；取回：`python -m rquant.research.snapshot_archive fetch YYYY-MM-DD --dest DIR` | 由 timer 触发 |
+| `rquant-snapshot-archive.timer` | 工作日 16:20 归档（采集器仍在跑则当天顺延） | Mon-Fri 16:20 |
 | `rquant-artifact-retention.service` | 发布终态 artifact 回收 outbox、迁移热/温/冷分层并执行经恢复门禁批准的 GC | 由 timer 触发 |
 | `rquant-artifact-retention.timer` | 触发 artifact retention 单步处理 | 每 5 分钟 |
 | `rquant-daily-receipt-signer.socket` | root Daily receipt 签名入口，socket 为 `root:lighthouse 0660` | `active/waiting` |
