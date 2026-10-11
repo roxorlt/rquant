@@ -70,3 +70,36 @@
 .funnel-inline li:last-child .fv {
   color: var(--accent-t);
 }
+.schemes {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+}
+.schemes input {
+  width: 150px;
+  height: 26px;
+}
+.scheme-chip {
+  display: inline-flex;
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  overflow: hidden;
+  font-size: 12px;
+}
+.scheme-chip button {
+  padding: 2px 8px;
+  border: 0;
+  background: var(--surface-2);
+  color: var(--ink-2);
+  cursor: pointer;
+}
+.scheme-chip button + button {
+  padding: 2px 6px;
+  border-left: 1px solid var(--rule);
+  color: var(--faint);
+}
+.scheme-chip button:hover {
+  color: var(--accent-t);
+}
