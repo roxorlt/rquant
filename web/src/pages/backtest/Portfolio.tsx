@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Link } from "react-router";
 import {
   useExplainBacktest,
   usePortfolioBacktest,
@@ -7,9 +8,10 @@ import {
   useStrategies,
 } from "@/api/endpoints";
 import type { components } from "@/api/schema";
+import { toneClass, toneOf } from "@/format/color";
 import { formatPrice } from "@/format/number";
 import { DataTable } from "@/table/DataTable";
-import { Button, KpiStrip, Panel, Pill } from "@/ui";
+import { Button, ChangeText, KpiStrip, Panel, Pill } from "@/ui";
 import { QueryView } from "../shared";
 import { PerfPanel } from "./Perf";
 
@@ -210,7 +212,7 @@ export function PortfolioRuns() {
               rowKey={(row) => row.run_id}
               onSelect={(row) => setRunId(row.run_id)}
               selectedKey={runId}
-              emptyText="还没有组合回测结果"
+              emptyText="还没有组合回测结果：用 python -m rquant.backtest 跑一次组合回测，结果会作为一条实验出现在这里。"
               columns={[
                 { id: "title", header: "名称", value: (row) => row.title },
                 { id: "strategy", header: "策略版本", value: (row) => row.strategy ?? "—" },
@@ -232,7 +234,23 @@ export function PortfolioRuns() {
                   header: "期末净值",
                   numeric: true,
                   value: (row) => row.final_nav ?? null,
-                  cell: (row) => (row.final_nav == null ? "—" : row.final_nav.toFixed(4)),
+                  cell: (row) =>
+                    row.final_nav == null ? (
+                      "—"
+                    ) : (
+                      <span className={toneClass(toneOf(row.final_nav - 1))}>
+                        {row.final_nav.toFixed(4)}
+                      </span>
+                    ),
+                },
+                {
+                  id: "ret",
+                  header: "收益",
+                  numeric: true,
+                  value: (row) => (row.final_nav == null ? null : row.final_nav - 1),
+                  cell: (row) => (
+                    <ChangeText value={row.final_nav == null ? null : (row.final_nav - 1) * 100} />
+                  ),
                 },
                 { id: "filled", header: "成交", numeric: true, value: (row) => row.filled },
                 { id: "rejected", header: "拒单", numeric: true, value: (row) => row.rejected },
@@ -244,6 +262,8 @@ export function PortfolioRuns() {
             <Compare a={picked[0]} b={picked[1]} />
           ) : picked.length === 1 ? (
             <Panel title="对比">再选一条回测，点「加入对比」</Panel>
+          ) : !runId && data.runs.length > 1 ? (
+            <p className="hint">点一行看净值与委托；再点「加入对比」，选满两条即显示对比。</p>
           ) : null}
         </>
       )}
@@ -265,7 +285,7 @@ export function StrategyList() {
             label="策略版本"
             rows={data.strategies}
             rowKey={(row) => row.slug}
-            emptyText="还没有保存的策略"
+            emptyText="还没有保存的策略：用 python -m rquant.backtest strategy save 把一套入场池 + 持仓规则存成版本。"
             columns={[
               { id: "title", header: "策略", value: (row) => row.title },
               {
@@ -287,6 +307,13 @@ export function StrategyList() {
                 header: "调仓间隔",
                 numeric: true,
                 value: (row) => row.rebalance_every,
+              },
+              {
+                id: "go",
+                header: "",
+                sortable: false,
+                value: () => null,
+                cell: () => <Link to="/backtest">看回测 →</Link>,
               },
             ]}
           />

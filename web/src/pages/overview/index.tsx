@@ -176,23 +176,46 @@ export default function OverviewPage() {
               <LatestAlerts />
               <Attention />
             </div>
-            <Panel title="最新信号" flush>
+            <Panel title={`最新信号 · ${data.signals.length}`} sub="盘后策略产出，最新在上" flush>
               <DataTable
                 label="最新信号"
                 rows={data.signals}
                 rowKey={(row) => String(row.sequence)}
+                initialSort={{ id: "at", desc: true }}
                 emptyText="今天还没有信号：策略信号在盘后生成，生成后会出现在这里。"
                 columns={[
                   {
                     id: "at",
                     header: "时间",
+                    sortable: true,
                     value: (row) => row.at ?? null,
                     cell: (row) => (row.at ? formatShanghaiDateTime(row.at) : "—"),
                   },
                   { id: "code", header: "代码", value: (row) => row.code },
                   { id: "name", header: "名称", value: (row) => row.name ?? null },
                   { id: "strategy", header: "策略", value: (row) => row.strategy_id },
-                  { id: "action", header: "动作", value: (row) => row.action },
+                  {
+                    id: "action",
+                    header: "动作",
+                    value: (row) => row.action,
+                    cell: (row) => (
+                      <span
+                        className={
+                          /buy|买/i.test(row.action)
+                            ? "up"
+                            : /sell|卖/i.test(row.action)
+                              ? "down"
+                              : ""
+                        }
+                      >
+                        {/buy/i.test(row.action)
+                          ? "买入"
+                          : /sell/i.test(row.action)
+                            ? "卖出"
+                            : row.action}
+                      </span>
+                    ),
+                  },
                 ]}
               />
             </Panel>
