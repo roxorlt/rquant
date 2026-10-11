@@ -86,6 +86,9 @@ def test_guard_table_allowlist_rejects(sql):
 
 def test_guard_allowlist_accepts_cte_and_env_override(monkeypatch):
     assert q.guard("with x as (select * from stock_basic) select * from x, main.signals")
+    assert q.guard("select * from stock_basic s join signals AS g on s.ts_code = g.ts_code")
+    with pytest.raises(q.QueryError):
+        q.guard("select * from stock_basic s join other.signals g on true")
     monkeypatch.setenv("RQUANT_WEB_QUERY_TABLES", "signals")
     with pytest.raises(q.QueryError):
         q.guard("select * from stock_basic")
