@@ -117,6 +117,7 @@ def run(years: int = 5, minutes: int = 300, ingest: bool = True, end: date | Non
     for run in existing.values():
         save_tracking(track(run, panel, last, lookback_days=60), root)
     run_conditions(root, panel)
+    run_intraday_studies(root, db)
     run_paper(root, db, last)
 
 
@@ -163,6 +164,63 @@ def run_paper(root: Path, db: Path, last: date, days: int = 60) -> None:
     finally:
         con.close()
     paper.save(root, accounts)
+
+
+AUCTION_SLUG, AUCTION_PRESET = "auction-top5", "auction_ths"
+
+
+def run_intraday_studies(root: Path, db: Path) -> None:
+    """Auction/limit-list refresh + the two intraday studies; skipped without intraday DB."""
+    import duckdb
+
+    from rquant.backtest import BacktestConfig
+    from rquant.backtest.store import run_and_save
+    from rquant.backtest.strategy import StrategySpec, resolve, save_version
+    from rquant.factor.condition import KIND, list_conditions
+    from rquant.factor.condition import save as save_condition
+    from rquant.portfolio import PortfolioWeightRule
+    from rquant.research import intraday, studies
+
+    if not intraday.intraday_path(root).exists():
+        return
+    try:
+        intraday.run(root, years=2, what=("auction", "limits"))
+    except Exception as exc:  # noqa: BLE001 - data refresh is best effort
+        log.warning("intraday refresh failed: %s", exc)
+    for name, fn in (("hjk-1450", studies.hjk_1450), ("auction-ths", studies.auction_study)):
+        try:
+            fn(root)
+            log.info("study %s done", name)
+        except Exception as exc:  # noqa: BLE001 - one study must not stop the job
+            log.warning("study %s failed: %s", name, exc)
+    try:
+        cname = "竞价选股（同花顺复刻）"
+        for old in list_conditions(root):
+            if old.name == cname:
+                shutil.rmtree(root / KIND / old.run_id, ignore_errors=True)
+        save_condition(cname, "昨日涨停非一字 & 竞价涨幅>4% & 非ST/退市，竞价量降序前5",
+                       None, studies.latest_picks(root), root=root)
+        sig = studies.signals_for_backtest(root)
+        con = duckdb.connect(str(db))
+        try:
+            con.execute("DELETE FROM screen_result WHERE preset_name = ?", [AUCTION_PRESET])
+            con.register("_s", sig.assign(preset_name=AUCTION_PRESET))
+            con.execute("""INSERT INTO screen_result SELECT s.trade_date, s.ts_code,
+              s.preset_name, b.name, NULL, NULL, json_object('score', s.score)::VARCHAR
+              FROM _s s LEFT JOIN stock_basic b USING (ts_code)""")
+            first, last = con.execute("SELECT MIN(trade_date), MAX(trade_date) FROM _s").fetchone()
+        finally:
+            con.close()
+        spec = StrategySpec(slug=AUCTION_SLUG, title="竞价选股 前5 开盘买次日开盘卖",
+                            preset=AUCTION_PRESET, config=BacktestConfig(
+                                hold_days=1, weights=PortfolioWeightRule(max_positions=5)))
+        save_version(spec, root)
+        version = resolve(AUCTION_SLUG, root)
+        run_and_save(db, AUCTION_PRESET, first, last, version.spec.config, root=root,
+                     title=f"{spec.title} {first}~{last}",
+                     strategy=f"{AUCTION_SLUG}@{version.version}", bar_table="daily_bar_qfq")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("auction strategy failed: %s", exc)
 
 
 def prune_backtests(root: Path, keep: int = 5) -> None:

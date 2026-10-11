@@ -42,7 +42,7 @@ jobs:
         run: |
           uv run ruff check src/rquant/web src/rquant/backtest src/rquant/factor \
             src/rquant/data_catalog src/rquant/alert_rules.py src/rquant/fundamentals.py src/rquant/research tests/web tests/unit/test_research_pipeline.py
-          uv run pytest -q tests/web tests/unit/test_research_pipeline.py
+          uv run pytest -q tests/web tests/unit/test_research_pipeline.py tests/unit/test_intraday_studies.py
       - name: Roadmap module unit tests
         run: |
           uv run pytest -q tests/unit/test_perf_metrics.py tests/unit/test_portfolio_*.py \
