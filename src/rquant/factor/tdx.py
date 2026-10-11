@@ -15,7 +15,9 @@ from rquant.factor.expr import validate
 
 FIELD = {"C": "close", "CLOSE": "close", "O": "open", "OPEN": "open", "H": "high",
          "HIGH": "high", "L": "low", "LOW": "low", "V": "vol", "VOL": "vol",
-         "AMOUNT": "amount", "AMO": "amount"}
+         "AMOUNT": "amount", "AMO": "amount",
+         # moneyflow: 内盘/外盘 (active sell / active buy amount), 大单净额 / 成交额
+         "NWP": "mf_io", "DDJE": "mf_lg"}
 FUNC = {"MA": "ts_mean", "REF": "delay", "HHV": "ts_max", "LLV": "ts_min",
         "SUM": "ts_sum", "STD": "ts_std", "ABS": "abs", "CROSS": "cross", "EMA": "ts_ema"}
 WORD = {"AND": " and ", "OR": " or ", "NOT": " not "}

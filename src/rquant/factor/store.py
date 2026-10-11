@@ -51,7 +51,30 @@ def load_panel(con: duckdb.DuckDBPyConnection, start: date, end: date,
     turnover = _turnover(con, start, end)
     if turnover is not None:
         panel["turnover"] = turnover.reindex_like(panel["close"])
+    panel.update(_moneyflow(con, start, end, panel["close"], panel["amount"]))
     return panel
+
+
+def _moneyflow(con: duckdb.DuckDBPyConnection, start: date, end: date, like: pd.DataFrame,
+               amount: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    """mf_io = active-sell / active-buy amount (>1: 内盘>外盘); mf_lg = (large + extra-large)
+    net buy / turnover amount. Empty dict when the moneyflow table is absent."""
+    try:
+        frame = con.execute(
+            "SELECT trade_date, ts_code,"
+            " sell_sm_amount+sell_md_amount+sell_lg_amount+sell_elg_amount AS s,"
+            " buy_sm_amount+buy_md_amount+buy_lg_amount+buy_elg_amount AS b,"
+            " buy_lg_amount+buy_elg_amount-sell_lg_amount-sell_elg_amount AS lg"
+            " FROM moneyflow WHERE trade_date BETWEEN ? AND ?",
+            [start - timedelta(days=WARMUP_DAYS), end + timedelta(days=45)]).df()
+    except duckdb.Error:
+        return {}
+    frame["trade_date"] = pd.to_datetime(frame["trade_date"])
+    piv = {c: frame.pivot(index="trade_date", columns="ts_code", values=c).reindex_like(like)
+           for c in ("s", "b", "lg")}
+    # moneyflow amounts are 万元, daily bar amount is 千元
+    return {"mf_io": piv["s"] / piv["b"].where(piv["b"] > 0),
+            "mf_lg": piv["lg"] / (amount / 10).where(amount > 0)}
 
 
 def _turnover(con: duckdb.DuckDBPyConnection, start: date, end: date) -> pd.DataFrame | None:

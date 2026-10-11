@@ -16,7 +16,7 @@ import pandas as pd
 
 FIELDS = ("open", "high", "low", "close", "pre_close", "pct_chg", "vol", "amount")
 #: derived fields resolved on demand (turnover %, chip distribution; see rquant.factor.chips)
-EXTRA_FIELDS = ("turnover", "chip_profit", "chip_cost_dev", "chip_conc90")
+EXTRA_FIELDS = ("turnover", "mf_io", "mf_lg", "chip_profit", "chip_cost_dev", "chip_conc90")
 MAX_WINDOW = 250
 
 
