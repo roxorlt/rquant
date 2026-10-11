@@ -106,6 +106,9 @@ def run(years: int = 5, minutes: int = 300, ingest: bool = True, end: date | Non
     try:
         f_start = last - timedelta(days=365 * 2)
         panel = load_panel(con, f_start, last, table="daily_bar_hfq")
+        from rquant.research.pit import adjust_volume
+
+        adjust_volume(con, panel)  # 送转-neutral volume for V-based conditions
     finally:
         con.close()
     existing = {f.name: f for f in list_factors(root)}
