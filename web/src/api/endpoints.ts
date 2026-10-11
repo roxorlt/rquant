@@ -379,3 +379,10 @@ export function useFactorCorrelation(): ServingQueryResult<Schemas["FactorCorrDa
     return unwrap(data, response);
   });
 }
+
+export function useQuerySchema(): ServingQueryResult<Record<string, string[][]>> {
+  return useServingQuery(["query", "schema"], async () => {
+    const { data, response } = await apiClient().GET("/api/v1/query/schema");
+    return unwrap(data, response);
+  });
+}

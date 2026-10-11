@@ -451,6 +451,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/query/schema": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 可查询表的字段 */
+        get: operations["query_schema_api_v1_query_schema_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/query/tables": {
         parameters: {
             query?: never;
@@ -1167,6 +1184,14 @@ export interface components {
         /** Envelope[Union[FundamentalsDoc, NoneType]] */
         Envelope_Union_FundamentalsDoc__NoneType__: {
             data: components["schemas"]["FundamentalsDoc"] | null;
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[dict[str, list[list[str]]]] */
+        Envelope_dict_str__list_list_str____: {
+            /** Data */
+            data: {
+                [key: string]: string[][];
+            };
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[list[TaskRow]] */
@@ -2703,6 +2728,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    query_schema_api_v1_query_schema_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_dict_str__list_list_str____"];
                 };
             };
         };

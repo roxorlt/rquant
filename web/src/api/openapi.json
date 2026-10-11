@@ -2014,6 +2014,32 @@
         "title": "Envelope[Union[FundamentalsDoc, NoneType]]",
         "type": "object"
       },
+      "Envelope_dict_str__list_list_str____": {
+        "properties": {
+          "data": {
+            "additionalProperties": {
+              "items": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "type": "array"
+            },
+            "title": "Data",
+            "type": "object"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[dict[str, list[list[str]]]]",
+        "type": "object"
+      },
       "Envelope_list_TaskRow__": {
         "properties": {
           "data": {
@@ -5440,6 +5466,24 @@
           }
         },
         "summary": "只读查询"
+      }
+    },
+    "/api/v1/query/schema": {
+      "get": {
+        "operationId": "query_schema_api_v1_query_schema_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_dict_str__list_list_str____"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "可查询表的字段"
       }
     },
     "/api/v1/query/tables": {

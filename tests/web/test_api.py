@@ -344,3 +344,6 @@ def test_factor_correlation_matrix(tmp_path) -> None:
     body = client.get("/api/v1/factors/correlation").json()["data"]
     assert body["names"] == ["演示动量因子"]
     assert body["ic_corr"] == [[1.0]]
+def test_query_schema_lists_columns(client) -> None:
+    body = client.get("/api/v1/query/schema").json()["data"]
+    assert ["ts_code", "VARCHAR"] in body["stock_basic"]
