@@ -549,14 +549,14 @@ def paper(source: SourceDep) -> Envelope[PaperData]:
 
 
 def _user(request: Request) -> str | None:
-    return request.headers.get("X-Forwarded-User") or None
+    return request.headers.get("X-Remote-User") or None
 
 
 def _role(request: Request) -> str:
     """``RQUANT_WEB_ADMINS`` (comma list) unset = everyone is admin (single-user default).
 
     Set, only those basic-auth users may write; everyone else is a viewer. nginx must
-    pass ``proxy_set_header X-Forwarded-User $remote_user;`` for this to mean anything.
+    pass ``proxy_set_header X-Remote-User $remote_user;`` for this to mean anything.
     """
     admins = {a.strip() for a in os.environ.get("RQUANT_WEB_ADMINS", "").split(",") if a.strip()}
     return "admin" if not admins or _user(request) in admins else "viewer"
@@ -586,7 +586,7 @@ def ack_alert(body: AckAlertRequest, request: Request, source: SourceDep) -> Com
     generation_id, _ = source.generation()
     gen = generation_id if generation_id and len(generation_id) == 64 else hashlib.sha256(
         str(generation_id).encode()).hexdigest()
-    actor = request.headers.get("X-Forwarded-User", "owner")
+    actor = _user(request) or "owner"
     return _send(request, "ack_alert",
                  {"alert_id": body.alert_id, "generation_id": gen, "actor_id": actor})
 
@@ -674,7 +674,8 @@ def run_query(request: Request, source: SourceDep,
         raise HTTPException(403, "只读账号不能执行查询")
     try:
         sql = sql_query.guard(body.sql)
-        rows = source.query(sql)
+        runner = getattr(source, "query_sandboxed", source.query)
+        rows = runner(sql)
     except sql_query.QueryError as exc:
         raise HTTPException(400, str(exc)) from exc
     except SourceUnavailableError:
@@ -687,7 +688,8 @@ def run_query(request: Request, source: SourceDep,
 @router.get("/query/tables", response_model=Envelope[list[str]], summary="可查询的表")
 def query_tables(source: SourceDep) -> Envelope[list[str]]:
     rows = source.query("SELECT table_name FROM information_schema.tables ORDER BY 1")
-    return _envelope(source, [r["table_name"] for r in rows])
+    allowed = sql_query.allowed_tables()
+    return _envelope(source, [r["table_name"] for r in rows if r["table_name"] in allowed])
 
 
 @router.get("/fundamentals", response_model=Envelope[FundamentalsDoc | None], summary="财务指标")

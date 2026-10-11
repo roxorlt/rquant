@@ -51,6 +51,23 @@ class ServingSource:
             raise SourceUnavailableError(result.detail)
         return [dict(zip(result.columns, row, strict=True)) for row in result.rows]
 
+    def query_sandboxed(self, sql: str) -> list[dict[str, Any]]:
+        """Ad-hoc query page: verify the lease connection is read-only, then disable file
+        access and lock configuration for its (per-lease) lifetime before running."""
+        from rquant.dashboard.serving_only_page_data import ServingFrameState
+
+        with self._open() as ctx:
+            con = ctx._lease.connection  # noqa: SLF001 - one fresh connection per lease
+            mode = con.execute("SELECT current_setting('access_mode')").fetchone()
+            if not mode or str(mode[0]).lower() != "read_only":
+                raise SourceUnavailableError("serving connection is not read-only")
+            con.execute("SET enable_external_access = false")
+            con.execute("SET lock_configuration = true")
+            result = ctx.query(sql, max_rows=1001)
+        if result.state is ServingFrameState.UNAVAILABLE:
+            raise SourceUnavailableError(result.detail)
+        return [dict(zip(result.columns, row, strict=True)) for row in result.rows]
+
 
 _FIXTURE_DDL = """
 CREATE TABLE stock_basic(ts_code VARCHAR, name VARCHAR, industry VARCHAR);

@@ -50,6 +50,11 @@ def test_screen_route_over_published_generation(tmp_path: Path) -> None:
     assert [r["code"] for r in body["data"]["rows"]] == ["600519.SH"]
     # No alert_ack / monitor_event published: alerts must fail closed, not crash on acks.
     assert client.get("/api/v1/alerts").status_code == 503
+    # Query page: read-only, sandboxed connection; file access is denied at the engine.
+    q = client.post("/api/v1/query", json={"sql": "select ts_code from stock_basic"})
+    assert q.status_code == 200 and q.json()["data"]["rows"] == [["600519.SH"]]
+    rows = ServingSource(root).query_sandboxed("select current_setting('access_mode') AS m")
+    assert rows == [{"m": "read_only"}]
 
 
 def test_missing_generation_is_503(tmp_path: Path) -> None:
