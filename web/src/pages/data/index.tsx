@@ -1,5 +1,5 @@
-import { useState } from "react";
 import { useDataCenter, useFundamentals } from "@/api/endpoints";
+import { useUrlState } from "@/app/useUrlState";
 import { toneClass, toneOf } from "@/format/color";
 import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
@@ -55,7 +55,7 @@ function Fundamentals() {
 
 export default function DataCenterPage() {
   const query = useDataCenter();
-  const [picked, setPicked] = useState<string | null>(null);
+  const [picked, setPicked] = useUrlState("dataset");
   return (
     <>
       <PageHeader eyebrow="数据" title="数据中心" />

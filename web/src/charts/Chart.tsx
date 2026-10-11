@@ -75,6 +75,8 @@ export interface TimeChartProps {
   baseline?: number;
   /** Bars instead of lines (first series only), coloured red-up / green-down around baseline. */
   bars?: boolean;
+  /** Shaded index ranges (e.g. the deepest drawdowns). */
+  bands?: readonly { from: number; to: number }[];
 }
 
 export function TimeChart({
@@ -85,6 +87,7 @@ export function TimeChart({
   height = 200,
   baseline,
   bars = false,
+  bands = [],
 }: TimeChartProps) {
   const { ref, w } = useWidth(FRAME.w);
   const f = { ...FRAME, w, h: height };
@@ -149,7 +152,7 @@ export function TimeChart({
     );
 
   return (
-    <figure className="chart">
+    <figure className="tchart">
       {series.length > 1 ? (
         <figcaption className="chart-legend">
           {series.map((s) => (
@@ -188,6 +191,16 @@ export function TimeChart({
             >
               {dates[i]}
             </text>
+          ))}
+          {bands.map((b) => (
+            <rect
+              key={`${b.from}-${b.to}`}
+              x={x(b.from)}
+              width={Math.max(1, x(b.to) - x(b.from))}
+              y={f.top}
+              height={f.h - f.top - f.bottom}
+              className="chart-band"
+            />
           ))}
           {baseline !== undefined ? (
             <line

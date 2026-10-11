@@ -1,5 +1,5 @@
-import { useState } from "react";
 import { useTaskLog, useTasks } from "@/api/endpoints";
+import { useUrlState } from "@/app/useUrlState";
 import { DataTable } from "@/table/DataTable";
 import { PageHeader, Panel, Pill } from "@/ui";
 import { QueryView } from "../shared";
@@ -39,7 +39,7 @@ function shortRun(value: string | null | undefined): string {
 
 export default function TasksPage() {
   const query = useTasks();
-  const [unit, setUnit] = useState<string | null>(null);
+  const [unit, setUnit] = useUrlState("unit");
   return (
     <>
       <PageHeader

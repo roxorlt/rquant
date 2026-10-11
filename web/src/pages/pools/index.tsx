@@ -1,6 +1,6 @@
-import { useState } from "react";
 import { Link } from "react-router";
 import { usePools } from "@/api/endpoints";
+import { useUrlState } from "@/app/useUrlState";
 import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
 import { EmptyState, FlowSteps, PageHeader, Panel, Segmented } from "@/ui";
@@ -8,7 +8,7 @@ import { QueryView } from "../shared";
 
 export default function PoolsPage() {
   const query = usePools();
-  const [selected, setSelected] = useState<string | null>(null);
+  const [selected, setSelected] = useUrlState("pool");
   return (
     <>
       <PageHeader

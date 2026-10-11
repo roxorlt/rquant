@@ -42,3 +42,18 @@ input:focus {
   border-color: var(--accent);
   color: var(--accent-t);
 }
+.chart-band {
+  fill: var(--down);
+  opacity: 0.08;
+}
+.risk-block {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 20px;
+  margin: 12px 0;
+}
+@media (max-width: 900px) {
+  .risk-block {
+    grid-template-columns: 1fr;
+  }
+}
