@@ -1,0 +1,11 @@
+[Unit]
+Description=竞价选股 pool candidates Mon-Fri 08:40:00
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 08:40:00
+AccuracySec=1s
+Persistent=false
+Unit=rquant-auction-pool-candidates.service
+
+[Install]
+WantedBy=timers.target

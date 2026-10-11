@@ -42,6 +42,7 @@ Times are Asia/Shanghai (server TZ = CST).
 | `rquant-snapshot-collector.timer` | Mon-Fri **09:10** | L1 ~3s snapshots → `snapshots/YYYY-MM-DD/`, ticks after close, compacts ~15:45 | `deploy/systemd/` |
 | `rquant-surge-prior.timer` | Mon-Fri **09:02** | builds today's prior-day cumulative-volume curve → `snapshots/YYYY-MM-DD/surge/prior.npz` (oneshot, ~6s) | `deploy/systemd/` |
 | ↳ `rquant-snapshot-collector.service.d/surge-push.conf` | — | sets `SURGE_PUSH_ENV_FILE` (PushDeer key names read from `~/rquant/.env`) for the in-collector surge scanner | `deploy/systemd/rquant-snapshot-collector.service.d/` |
+| `rquant-auction-pool-candidates.timer` / `rquant-auction-pool-pick.timer` | Mon-Fri **08:40** / **09:25:30** | 竞价选股 pool: T-1 candidates (limit-up non-一字, 封单/流通市值 ≤0.94%, non-ST/BJ), then rt_k auction picks (gap ≥5.37%, top 3 by auction vol) → `pools/auction/YYYY-MM-DD.json`; web 池子 page, collector universe (top priority, reloaded 09:25:45), surge push ★ first | `deploy/systemd/`, `rquant.research.auction_pool` |
 | `rquant-snapshot-archive.timer` | Mon-Fri **16:20** | tar.gz finished day dirs → R2, verify, prune >14d (verified only) | `deploy/systemd/` |
 | `rquant-artifact-retention.timer` | every 5 min | artifact tiering/GC | `deploy/systemd/` |
 

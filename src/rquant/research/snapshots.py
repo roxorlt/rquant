@@ -135,13 +135,28 @@ def _condition_hits(root: Path) -> list[str]:
     return codes
 
 
+def _safe_pool(fn: Callable[[Path, date], list[str]], day: date) -> list[str]:
+    try:
+        return _codes(fn(research_root(), day))
+    except Exception as exc:  # noqa: BLE001 - the pool is optional
+        log.info("auction pool skipped: %s", str(exc)[:160])
+        return []
+
+
+POOL_RELOAD_AT = dtime(9, 25, 45)  # after the 09:25:30 auction pick
+
+
 def build_universe(cap: int = DEFAULT_CAP) -> dict[str, Any]:
-    """Priority: extra env > watchlist (commands log, Serving) > pools > screen > condition."""
+    """Priority: extra env > 竞价选股 pool > watchlist (commands log, Serving) > pools > screen
+    > condition."""
+    from rquant.research.auction_pool import priority_codes
+
     commands_dir = Path(os.environ.get("RQUANT_WEB_COMMANDS_DIR")
                        or Path.home() / "rquant-web-commands")
     serving = _serving(os.environ.get("RQUANT_SERVING_ROOT"))
     sources = {
         "extra": _codes(os.environ.get("RQUANT_SNAPSHOT_EXTRA", "").split(",")),
+        "auction_pool": _safe_pool(priority_codes, now().date()),
         "watchlist": _watchlist_log(commands_dir),
         "serving_watchlist": serving.get("serving_watchlist", []),
         "pools": serving.get("pools", []),
@@ -309,10 +324,8 @@ class Poller:
                  dc: Callable[[list[str]], pd.DataFrame] = fetch_dc,
                  ts_call: Callable[..., pd.DataFrame] | None = None,
                  sina_cap: int = SINA_CAP, dc_cap: int = DC_CAP) -> None:
-        self.codes = codes
-        self.sina_batches = [codes[:sina_cap][i:i + BATCH]
-                             for i in range(0, min(len(codes), sina_cap), BATCH)]
-        self.dc_codes = codes[:dc_cap]
+        self.sina_cap, self.dc_cap = sina_cap, dc_cap
+        self.set_codes(codes)
         self.sina, self.dc = sina, dc
         self.token = token
         self.ts_call = ts_call or tushare_call
@@ -321,6 +334,12 @@ class Poller:
         self.last_tick_call = 0.0
         self.ts_cooldown_until = 0.0
         self.sina_cooldown_until = 0.0
+
+    def set_codes(self, codes: list[str]) -> None:
+        self.codes = codes
+        self.sina_batches = [codes[:self.sina_cap][i:i + BATCH]
+                             for i in range(0, min(len(codes), self.sina_cap), BATCH)]
+        self.dc_codes = codes[:self.dc_cap]
 
     def _tushare(self) -> pd.DataFrame | None:
         if not self.token or time.monotonic() < self.ts_cooldown_until:
@@ -554,6 +573,7 @@ def run(out: Path, *, force: bool = False, max_cycles: int | None = None, cap: i
     scan_errors = 0
     buf: list[pd.DataFrame] = []
     last_flush, cycles, rc = time.monotonic(), 0, 0
+    reloaded = False
     end_of_day = datetime.combine(today, SESSIONS[-1][1], TZ)
     try:
         while not stop_requested():
@@ -568,6 +588,15 @@ def run(out: Path, *, force: bool = False, max_cycles: int | None = None, cap: i
                     if nxt is None or not _sleep_until(datetime.combine(today, nxt, TZ)):
                         break
                     continue
+            if not reloaded and t.time() >= POOL_RELOAD_AT:
+                reloaded = True
+                uni = build_universe(cap)
+                if uni["codes"] != codes:
+                    codes = uni["codes"]
+                    poller.set_codes(codes)
+                    (d / "universe.json").write_text(
+                        json.dumps(uni, ensure_ascii=False, indent=1), "utf-8")
+                    log.info("universe reloaded %d symbols %s", len(codes), uni["counts"])
             started = time.monotonic()
             raw = poller.cycle()
             if scanner is not None:

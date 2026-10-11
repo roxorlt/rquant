@@ -201,6 +201,19 @@ class Pusher:
         self.nopush_file = nopush_file
         self.lock = threading.Lock()
 
+    @staticmethod
+    def priority() -> set[str]:
+        """竞价选股 pool codes for today: pushed first, marked ★ (never raises)."""
+        try:
+            from datetime import datetime as _dt
+            from zoneinfo import ZoneInfo
+
+            from rquant.research.auction_pool import priority_codes, research_root
+
+            return set(priority_codes(research_root(), _dt.now(ZoneInfo("Asia/Shanghai")).date()))
+        except Exception:  # noqa: BLE001
+            return set()
+
     @classmethod
     def from_env(cls, nopush_file: Path | None = None) -> Pusher:
         if os.environ.get("SURGE_PUSH", "1") == "0":
@@ -231,7 +244,7 @@ class Pusher:
             return None
         evs, self.pending = self.pending, []
         self.last = now_s
-        title, body = format_push(evs)
+        title, body = format_push(evs, self.priority())
         threading.Thread(target=self._send, args=(title, body), daemon=True).start()
         return {"title": title, "body": body}
 
@@ -242,17 +255,19 @@ class Pusher:
             log.warning("surge push failed: %s", str(exc)[:200])
 
 
-def format_push(evs: list[dict]) -> tuple[str, str]:
+def format_push(evs: list[dict], priority: set[str] | None = None) -> tuple[str, str]:
+    priority = priority or set()
     best: dict[str, dict] = {}
     for e in evs:
         if e["ts_code"] not in best or e["ratio"] > best[e["ts_code"]]["ratio"]:
             best[e["ts_code"]] = e
-    top = sorted(best.values(), key=lambda e: -e["ratio"])[:PUSH_TOP]
+    top = sorted(best.values(), key=lambda e: (e["ts_code"] not in priority, -e["ratio"]))[:PUSH_TOP]
     t = max(e["time"] for e in evs)[:5]
     title = f"异动 {len(best)}只 {t}"
     lines = ["| 时间 | 股票 | 量比 | 5分加速 | 涨跌 | 成交额 |", "|---|---|---|---|---|---|"]
     for e in top:
-        lines.append(f"| {e['time'][:5]} | {e['name']} {e['ts_code'][:6]} | {e['ratio']:.1f} | "
+        star = "★" if e["ts_code"] in priority else ""
+        lines.append(f"| {e['time'][:5]} | {star}{e['name']} {e['ts_code'][:6]} | {e['ratio']:.1f} | "
                      f"{e['acc5']:.1f} | {e['pct'] * 100:+.1f}% | {e['amount'] / 1e8:.2f}亿 |")
     if len(best) > len(top):
         lines.append(f"\n另 {len(best) - len(top)} 只见网页「盯盘与告警 · 量能异动」")
