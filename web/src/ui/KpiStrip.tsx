@@ -10,7 +10,7 @@ export interface Kpi {
   /** What the number means, on hover / tap of the label. */
   tip?: ReactNode;
   /** Colours the value (e.g. 异常 count in red). */
-  tone?: "warn" | "crit" | "ok";
+  tone?: "warn" | "crit" | "ok" | "up" | "down";
 }
 
 /** A row of key numbers drawn as one joined strip; `compact` for dense rows. */

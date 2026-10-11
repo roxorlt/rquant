@@ -1,0 +1,44 @@
+/* Page-level polish shared by paper, query and forms. */
+.kpi .val[data-tone="up"] {
+  color: var(--up-t);
+}
+.kpi .val[data-tone="down"] {
+  color: var(--down-t);
+}
+.panel .kpis + .tbl-wrap {
+  margin-top: 12px;
+}
+input[type="text"],
+input[type="number"],
+input[type="date"],
+input:not([type]) {
+  height: 30px;
+  padding-inline: 8px;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  background: var(--surface-2);
+  color: var(--ink);
+}
+input:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+.sql-tables {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 8px;
+}
+.sql-table {
+  padding: 2px 8px;
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  background: var(--surface-2);
+  color: var(--muted);
+  font: 11px / 18px var(--font-mono);
+  cursor: pointer;
+}
+.sql-table:hover {
+  border-color: var(--accent);
+  color: var(--accent-t);
+}

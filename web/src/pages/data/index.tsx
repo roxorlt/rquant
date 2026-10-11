@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useDataCenter, useFundamentals } from "@/api/endpoints";
+import { toneClass, toneOf } from "@/format/color";
 import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
 import { PageHeader, Panel, Pill } from "@/ui";
@@ -36,7 +37,13 @@ function Fundamentals() {
             value: (r: (typeof doc.rows)[number]) => r.values[k] ?? null,
             cell: (r: (typeof doc.rows)[number]) => {
               const v = r.values[k];
-              return v === null || v === undefined ? "—" : v.toFixed(2);
+              if (v === null || v === undefined) return "—";
+              // Growth rates (同比) carry direction: red up / green down.
+              return /同比|增长/.test(doc.fields[k] ?? "") ? (
+                <span className={toneClass(toneOf(v))}>{v.toFixed(2)}</span>
+              ) : (
+                v.toFixed(2)
+              );
             },
           })),
         ]}
