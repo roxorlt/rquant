@@ -62,3 +62,15 @@ def test_rebalance_every_n_signals() -> None:
     result = run_backtest([D1, D2, D3], bars, {D1: [_c("A")], D2: [_c("B")]},
                           _cfg().model_copy(update={"rebalance_every": 2}))
     assert {o.ts_code for o in result.orders} == {"A"}
+
+
+def test_pricey_pick_still_bought_and_leftover_cash_redistributed() -> None:
+    d0, d1 = date(2024, 1, 2), date(2024, 1, 3)
+    bars = {d0: {}, d1: {"A": Bar(open=300, close=300, pre_close=300),
+                         "B": Bar(open=10, close=10, pre_close=10),
+                         "C": Bar(open=10, close=10, pre_close=10.0 / 1.1)}}  # C limit-up
+    signals = {d0: [PortfolioCandidate(ts_code=c) for c in "ABC"]}
+    cfg = BacktestConfig(capital=60_000, weights=PortfolioWeightRule(max_positions=3))
+    rec = run_backtest([d0, d1], bars, signals, cfg).days[-1]
+    assert rec.positions["A"] == 100  # 20k target / 300 -> floor would be 0 lots
+    assert rec.cash < 2_000  # C is blocked, its cash flows to B (capped at 1.5x)
