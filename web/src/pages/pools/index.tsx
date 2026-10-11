@@ -50,6 +50,16 @@ export default function PoolsPage() {
                 ]
                   .filter(Boolean)
                   .join(" · ")}
+                actions={
+                  pool.pool_refs.length ? (
+                    <Link
+                      className="btn sm"
+                      to={`/experiments?preset=${encodeURIComponent(pool.pool_refs[0] ?? "")}`}
+                    >
+                      看此池的回测 →
+                    </Link>
+                  ) : undefined
+                }
                 flush
               >
                 <DataTable

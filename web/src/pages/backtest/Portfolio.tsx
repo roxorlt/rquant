@@ -254,77 +254,100 @@ export function PortfolioRuns() {
   const [picked, setPicked] = useState<string[]>([]);
   const addCompare = (id: string) =>
     setPicked((list) => (list.includes(id) ? list : [...list, id].slice(-5)));
+  const [preset, setPreset] = useUrlState("preset");
   return (
     <QueryView query={query}>
-      {(data) => (
-        <>
-          <Panel
-            title={`组合回测 · ${data.runs.length}`}
-            sub="python -m rquant.backtest 产出，点一行看净值与委托"
-            flush
-          >
-            <DataTable
-              label="组合回测列表"
-              tools="组合回测"
-              rows={data.runs}
-              rowKey={(row) => row.run_id}
-              onSelect={(row) => setRunId(row.run_id)}
-              selectedKey={runId}
-              emptyText="还没有组合回测结果：用 python -m rquant.backtest 跑一次组合回测，结果会作为一条实验出现在这里。"
-              columns={[
-                { id: "title", header: "名称", value: (row) => row.title },
-                { id: "strategy", header: "策略版本", value: (row) => row.strategy ?? "—" },
-                {
-                  id: "range",
-                  header: "区间",
-                  value: (row) => row.start,
-                  cell: (row) => `${row.start} ~ ${row.end}`,
-                },
-                { id: "n", header: "持股数", numeric: true, value: (row) => row.max_positions },
-                {
-                  id: "every",
-                  header: "调仓间隔",
-                  numeric: true,
-                  value: (row) => row.rebalance_every,
-                },
-                {
-                  id: "nav",
-                  header: "期末净值",
-                  numeric: true,
-                  value: (row) => row.final_nav ?? null,
-                  cell: (row) =>
-                    row.final_nav == null ? (
-                      "—"
-                    ) : (
-                      <span className={toneClass(toneOf(row.final_nav - 1))}>
-                        {row.final_nav.toFixed(4)}
-                      </span>
+      {(all) => {
+        const data = {
+          ...all,
+          runs: preset ? all.runs.filter((r) => r.preset === preset) : all.runs,
+        };
+        return (
+          <>
+            <Panel
+              title={`组合回测 · ${data.runs.length}`}
+              sub={
+                preset
+                  ? `只看入场池 ${preset}；新回测：python -m rquant.backtest --preset ${preset}`
+                  : "python -m rquant.backtest 产出，点一行看净值与委托"
+              }
+              actions={
+                preset ? (
+                  <Button size="sm" variant="ghost" onClick={() => setPreset(null)}>
+                    显示全部
+                  </Button>
+                ) : undefined
+              }
+              flush
+            >
+              <DataTable
+                label="组合回测列表"
+                tools="组合回测"
+                rows={data.runs}
+                rowKey={(row) => row.run_id}
+                onSelect={(row) => setRunId(row.run_id)}
+                selectedKey={runId}
+                emptyText="还没有组合回测结果：用 python -m rquant.backtest 跑一次组合回测，结果会作为一条实验出现在这里。"
+                columns={[
+                  { id: "title", header: "名称", value: (row) => row.title },
+                  { id: "strategy", header: "策略版本", value: (row) => row.strategy ?? "—" },
+                  {
+                    id: "range",
+                    header: "区间",
+                    value: (row) => row.start,
+                    cell: (row) => `${row.start} ~ ${row.end}`,
+                  },
+                  { id: "n", header: "持股数", numeric: true, value: (row) => row.max_positions },
+                  {
+                    id: "every",
+                    header: "调仓间隔",
+                    numeric: true,
+                    value: (row) => row.rebalance_every,
+                  },
+                  {
+                    id: "nav",
+                    header: "期末净值",
+                    numeric: true,
+                    value: (row) => row.final_nav ?? null,
+                    cell: (row) =>
+                      row.final_nav == null ? (
+                        "—"
+                      ) : (
+                        <span className={toneClass(toneOf(row.final_nav - 1))}>
+                          {row.final_nav.toFixed(4)}
+                        </span>
+                      ),
+                  },
+                  {
+                    id: "ret",
+                    header: "收益",
+                    numeric: true,
+                    value: (row) => (row.final_nav == null ? null : row.final_nav - 1),
+                    cell: (row) => (
+                      <ChangeText
+                        value={row.final_nav == null ? null : (row.final_nav - 1) * 100}
+                      />
                     ),
-                },
-                {
-                  id: "ret",
-                  header: "收益",
-                  numeric: true,
-                  value: (row) => (row.final_nav == null ? null : row.final_nav - 1),
-                  cell: (row) => (
-                    <ChangeText value={row.final_nav == null ? null : (row.final_nav - 1) * 100} />
-                  ),
-                },
-                { id: "filled", header: "成交", numeric: true, value: (row) => row.filled },
-                { id: "rejected", header: "拒单", numeric: true, value: (row) => row.rejected },
-              ]}
-            />
-          </Panel>
-          {runId ? <Detail runId={runId} onCompare={() => addCompare(runId)} /> : null}
-          {picked.length >= 2 ? (
-            <Compare ids={picked} onRemove={(id) => setPicked((l) => l.filter((x) => x !== id))} />
-          ) : picked.length === 1 ? (
-            <Panel title="对比">已选 1 条；再选一条回测点「加入对比」（最多 5 条）</Panel>
-          ) : !runId && data.runs.length > 1 ? (
-            <p className="hint">点一行看净值与委托；再点「加入对比」，选 2–5 条即显示对比。</p>
-          ) : null}
-        </>
-      )}
+                  },
+                  { id: "filled", header: "成交", numeric: true, value: (row) => row.filled },
+                  { id: "rejected", header: "拒单", numeric: true, value: (row) => row.rejected },
+                ]}
+              />
+            </Panel>
+            {runId ? <Detail runId={runId} onCompare={() => addCompare(runId)} /> : null}
+            {picked.length >= 2 ? (
+              <Compare
+                ids={picked}
+                onRemove={(id) => setPicked((l) => l.filter((x) => x !== id))}
+              />
+            ) : picked.length === 1 ? (
+              <Panel title="对比">已选 1 条；再选一条回测点「加入对比」（最多 5 条）</Panel>
+            ) : !runId && data.runs.length > 1 ? (
+              <p className="hint">点一行看净值与委托；再点「加入对比」，选 2–5 条即显示对比。</p>
+            ) : null}
+          </>
+        );
+      }}
     </QueryView>
   );
 }

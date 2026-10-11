@@ -8,6 +8,7 @@ import { Button, ChangeText, FlowSteps, PageHeader, Panel, Segmented, useToast }
 import { QueryView } from "../shared";
 import { applyFilters, FIELDS, type Field, type Filter, type Rank, score } from "./Builder";
 import { Conditions } from "./Conditions";
+import { Schemes } from "./Schemes";
 
 function stepLabel(filters: Filter[], i: number): string {
   const f = filters[i - 1];
@@ -200,6 +201,14 @@ export default function ScreenerPage() {
             <RankRows ranks={ranks} onChange={setRanks} />
           </div>
         </div>
+        <Schemes
+          filters={filters}
+          ranks={ranks}
+          onLoad={(sc) => {
+            setFilters(sc.filters);
+            setRanks(sc.ranks);
+          }}
+        />
         <ol className="funnel-inline" aria-label="逐条命中">
           {filtered.steps.map((n, i) => (
             // biome-ignore lint/suspicious/noArrayIndexKey: steps are positional.
