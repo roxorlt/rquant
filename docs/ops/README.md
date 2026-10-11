@@ -40,6 +40,8 @@ Times are Asia/Shanghai (server TZ = CST).
 | `rquant-research.timer` → `rquant-research.service` | Mon-Fri 18:10 | `python -m rquant.research daily` | `deploy/research/` |
 | ↳ drop-in `rquant-research.service.d/minutes-all.conf` | after research | **minute backfill**: `MB_DAILY=1 python ~/rquant-research/minute_backfill.py` (all-A 5-min bars, staged parquet + merge) | `deploy/research/rquant-research.service.d/minutes-all.conf`, `deploy/research/minute_backfill.py` |
 | `rquant-snapshot-collector.timer` | Mon-Fri **09:10** | L1 ~3s snapshots → `snapshots/YYYY-MM-DD/`, ticks after close, compacts ~15:45 | `deploy/systemd/` |
+| `rquant-surge-prior.timer` | Mon-Fri **09:02** | builds today's prior-day cumulative-volume curve → `snapshots/YYYY-MM-DD/surge/prior.npz` (oneshot, ~6s) | `deploy/systemd/` |
+| ↳ `rquant-snapshot-collector.service.d/surge-push.conf` | — | sets `SURGE_PUSH_ENV_FILE` (PushDeer key names read from `~/rquant/.env`) for the in-collector surge scanner | `deploy/systemd/rquant-snapshot-collector.service.d/` |
 | `rquant-snapshot-archive.timer` | Mon-Fri **16:20** | tar.gz finished day dirs → R2, verify, prune >14d (verified only) | `deploy/systemd/` |
 | `rquant-artifact-retention.timer` | every 5 min | artifact tiering/GC | `deploy/systemd/` |
 
@@ -51,6 +53,29 @@ Also on the server (user crontab, not systemd): `~/itick_probe` collect 09:10 / 
 Status: `systemctl list-timers --all | grep rquant`; logs: `journalctl -u <unit> -n 100`.
 Start/stop: `sudo systemctl start|stop <unit>`; disable: `sudo systemctl disable --now <timer>`.
 Snapshot collector kill switch for today: `touch ~/rquant-research/snapshots/STOP`.
+
+## Surge scanner (量能异动) + auction factors
+
+Runs **inside the snapshot collector** (`rquant.research.surge`), fed every ~3s cycle with the raw
+full-A rt_k/rt_tick frame; any error is logged and after 20 errors the scanner disables itself —
+it never stops collection.
+
+- Factors: `ratio` = today cum vol / prior trading day cum vol at the same trading minute;
+  `acc1`/`acc5` = last ~1/~5-min volume / prior day same interval. Prior curve: prior day's
+  snapshot dir if it covers ≥3000 codes, else 5-min `minute_bar` (market.duckdb) interpolated.
+- Events (from 09:35): `ratio` ≥ 3 and cum amount ≥ 3000万; `accel`: acc5 ≥ 5, 5-min amount ≥
+  1000万, ratio ≥ 1.5. Skips ST names and limit-locked (at limit, empty opposite side). Cooldown
+  15 min per stock per kind. Env overrides: `SURGE_RATIO_MIN`, `SURGE_AMOUNT_MIN`, `SURGE_ACC5_MIN`,
+  `SURGE_WIN_AMOUNT_MIN`, `SURGE_COOLDOWN_S`.
+- Output `snapshots/YYYY-MM-DD/surge/`: `events.jsonl` (live), `factors-HHMM.parquet` → merged
+  `factors.parquet` + `events.parquet` at 15:00; `prior.npz`.
+- Web: 盯盘与告警 page → 「量能异动」 panel (`GET /api/v1/surge[?day=]`).
+- Push: PushDeer (admin keys `PUSHDEER_KEYS`), ≤1 message/min, top 10 by ratio.
+  Mute today: `touch ~/rquant-research/snapshots/SURGE_NOPUSH`; disable push: `SURGE_PUSH=0`;
+  disable scanner: `SURGE_SCAN=0` (drop-in env).
+- Auction factors: after the collector compacts (~15:45) it writes `snapshots/YYYY-MM-DD/auction.parquet`
+  (`rquant.research.auction`; columns documented in the module). Manual:
+  `.venv/bin/python -m rquant.research.auction ~/rquant-research/snapshots/2026-10-12`.
 
 ## Data dirs (server)
 

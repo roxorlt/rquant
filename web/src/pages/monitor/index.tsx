@@ -8,6 +8,7 @@ import { Button, PageHeader, Panel, Pill, Segmented, useToast } from "@/ui";
 import { StockLink } from "@/ui/StockLink";
 import { QueryView } from "../shared";
 import { AlertRules } from "./Rules";
+import { SurgePanel } from "./Surge";
 
 export default function MonitorPage() {
   const query = useAlerts();
@@ -26,6 +27,7 @@ export default function MonitorPage() {
   return (
     <>
       <PageHeader eyebrow="跟踪与告警" title="盯盘与告警" />
+      <SurgePanel />
       <QueryView query={query}>
         {(data) => {
           const open = data.items.filter((r) => !r.acked_at).length;

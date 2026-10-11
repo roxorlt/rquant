@@ -1,0 +1,10 @@
+[Unit]
+Description=Build surge prior curve Mon-Fri 09:02 (collector starts 09:10)
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 09:02:00
+Persistent=false
+Unit=rquant-surge-prior.service
+
+[Install]
+WantedBy=timers.target

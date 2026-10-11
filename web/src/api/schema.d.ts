@@ -604,6 +604,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/surge": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 量能异动（盘中扫描事件） */
+        get: operations["surge_events_api_v1_surge_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/tasks": {
         parameters: {
             query?: never;
@@ -1285,6 +1302,11 @@ export interface components {
         /** Envelope[StrategyListData] */
         Envelope_StrategyListData_: {
             data: components["schemas"]["StrategyListData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[SurgeData] */
+        Envelope_SurgeData_: {
+            data: components["schemas"]["SurgeData"];
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[TaskLog] */
@@ -2223,6 +2245,38 @@ export interface components {
             rows: string[][];
             /** Title */
             title: string;
+        };
+        /** SurgeData */
+        SurgeData: {
+            /** Date */
+            date: string | null;
+            /** Items */
+            items: components["schemas"]["SurgeEvent"][];
+        };
+        /** SurgeEvent */
+        SurgeEvent: {
+            /** Acc1 */
+            acc1?: number | null;
+            /** Acc5 */
+            acc5?: number | null;
+            /** Amount */
+            amount?: number | null;
+            /** At */
+            at?: string | null;
+            /** Code */
+            code: string;
+            /** Kind */
+            kind: string;
+            /** Name */
+            name?: string | null;
+            /** Pct */
+            pct?: number | null;
+            /** Price */
+            price?: number | null;
+            /** Ratio */
+            ratio?: number | null;
+            /** Time */
+            time: string;
         };
         /** TaskLog */
         TaskLog: {
@@ -3344,6 +3398,38 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_StrategyListData_"];
+                };
+            };
+        };
+    };
+    surge_events_api_v1_surge_get: {
+        parameters: {
+            query?: {
+                day?: string | null;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_SurgeData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };

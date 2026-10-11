@@ -1,0 +1,20 @@
+[Unit]
+Description=rQuant surge scanner: build prior-day cumulative volume curve (before the collector)
+After=network-online.target
+
+[Service]
+# Writes snapshots/YYYY-MM-DD/surge/prior.npz; the collector's in-process scanner loads it
+# (and builds it itself in a child process only if this did not run).
+Type=oneshot
+Slice=rquant-research.slice
+User=lighthouse
+Group=lighthouse
+WorkingDirectory=/home/lighthouse/rquant-web-rel/current
+EnvironmentFile=/etc/rquant-web.env
+Environment=RQUANT_DISABLE_DOTENV=1 TZ=Asia/Shanghai PYTHONWARNINGS=ignore
+ExecStart=/home/lighthouse/rquant-web-rel/current/.venv/bin/python -m rquant.research.surge prior-today
+TimeoutStartSec=600
+Nice=10
+MemoryMax=600M
+StandardOutput=journal
+StandardError=journal
