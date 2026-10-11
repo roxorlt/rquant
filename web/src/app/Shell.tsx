@@ -3,6 +3,7 @@ import { Outlet, ScrollRestoration, useLocation, useMatches } from "react-router
 import { useMeta } from "@/api/useMeta";
 import { readPreference, writePreference } from "@/theme/storage";
 import { PageSkeleton, ServingBanner } from "@/ui";
+import { CommandPalette } from "./CommandPalette";
 import { PhoneNav } from "./PhoneNav";
 import { APP_TITLE } from "./pages";
 import { RAIL_STORAGE_KEY, Rail } from "./Rail";
@@ -69,6 +70,7 @@ export function Shell() {
         </main>
       </div>
       <PhoneNav open={navOpen} onOpen={() => setNavOpen(true)} onClose={() => setNavOpen(false)} />
+      <CommandPalette />
       <ScrollRestoration />
     </div>
   );
