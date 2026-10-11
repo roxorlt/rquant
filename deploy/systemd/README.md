@@ -16,6 +16,8 @@
 | `rquant-midday-report.timer` | 工作日午间触发战报 | Mon-Fri 12:00 |
 | `rquant-research-ingest.service` | daily/副本就绪后补齐并封存云端分钟/竞价研究分区 | 由 timer 触发，失败有限重试 |
 | `rquant-research-ingest.timer` | 工作日 18:10 触发研究日增量 | Mon-Fri 18:10 |
+| `rquant-snapshot-collector.service` | 研究用 L1 快照：盘中约3秒轮询 ≤80 只的五档行情（sina 主 / dc 备），收盘后拉当日分笔，写 `$RQUANT_RESEARCH_ROOT/snapshots/YYYY-MM-DD`；`touch snapshots/STOP` 当日停 | 由 timer 触发，15:45 前后自然退出 |
+| `rquant-snapshot-collector.timer` | 工作日 09:10 触发快照采集（非交易日服务自行退出） | Mon-Fri 09:10 |
 | `rquant-artifact-retention.service` | 发布终态 artifact 回收 outbox、迁移热/温/冷分层并执行经恢复门禁批准的 GC | 由 timer 触发 |
 | `rquant-artifact-retention.timer` | 触发 artifact retention 单步处理 | 每 5 分钟 |
 | `rquant-daily-receipt-signer.socket` | root Daily receipt 签名入口，socket 为 `root:lighthouse 0660` | `active/waiting` |

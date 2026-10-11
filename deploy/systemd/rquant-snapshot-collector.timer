@@ -1,0 +1,12 @@
+[Unit]
+Description=Start the rQuant L1 snapshot collector before the 09:15 call auction (Mon-Fri)
+
+[Timer]
+# The service itself checks the trade calendar (market.duckdb trade_calendar) and exits
+# immediately on holidays.
+OnCalendar=Mon..Fri *-*-* 09:10:00
+Persistent=false
+Unit=rquant-snapshot-collector.service
+
+[Install]
+WantedBy=timers.target

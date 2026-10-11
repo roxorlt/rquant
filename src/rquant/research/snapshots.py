@@ -271,7 +271,7 @@ def write_part(d: Path, frames: list[pd.DataFrame]) -> Path | None:
     parts = d / "quotes"
     parts.mkdir(parents=True, exist_ok=True)
     df = pd.concat(frames, ignore_index=True)
-    path = parts / f"part-{now():%H%M%S}-{os.getpid()}.parquet"
+    path = parts / f"part-{now():%H%M%S%f}-{os.getpid()}.parquet"
     tmp = path.with_suffix(".tmp")
     df.to_parquet(tmp, index=False, compression="zstd")
     tmp.rename(path)
@@ -333,7 +333,7 @@ def fetch_ticks(d: Path, codes: list[str], fetch: Callable[[str], pd.DataFrame] 
     info: dict[str, Any] = {"symbols": len(frames), "failed": failed}
     if frames:
         df = pd.concat(frames, ignore_index=True)
-        df["trade_date"] = d.name
+        df["fetched_on"] = d.name
         path = d / "ticks.parquet"
         tmp = path.with_suffix(".tmp")
         df.to_parquet(tmp, index=False, compression="zstd")

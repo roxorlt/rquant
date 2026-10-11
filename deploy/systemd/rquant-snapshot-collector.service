@@ -1,0 +1,32 @@
+[Unit]
+Description=rQuant L1 snapshot collector (~3s 5-level quotes + after-close ticks, research only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Research-only side job: reads Serving/watchlist/condition results, writes only
+# $RQUANT_RESEARCH_ROOT/snapshots/YYYY-MM-DD. Not part of runtime/page-control/monitor.
+# Stop for today:   touch /home/lighthouse/rquant-research/snapshots/STOP  (or systemctl stop)
+# Disable:          sudo systemctl disable --now rquant-snapshot-collector.timer
+Type=exec
+Slice=rquant-research.slice
+User=lighthouse
+Group=lighthouse
+WorkingDirectory=/home/lighthouse/rquant-web-rel/current
+EnvironmentFile=/etc/rquant-web.env
+Environment=RQUANT_DISABLE_DOTENV=1 TZ=Asia/Shanghai PYTHONWARNINGS=ignore
+ExecStart=/home/lighthouse/rquant-web-rel/current/.venv/bin/python -m rquant.research.snapshots run
+Restart=no
+# 09:10 start -> polling ends 15:00:30 -> ticks from 15:10 (~40 min for 80 symbols) -> compact
+RuntimeMaxSec=8h
+TimeoutStopSec=60
+Nice=10
+CPUQuota=30%
+MemoryHigh=300M
+MemoryMax=400M
+TasksMax=32
+IOWeight=50
+NoNewPrivileges=yes
+PrivateTmp=yes
+StandardOutput=journal
+StandardError=journal
