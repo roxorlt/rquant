@@ -31,9 +31,15 @@ LYT = ("AA:=MA(C,5); BB:=MA(C,10); CC:=MA(C,20); DD:=MA(C,60); "
        "NN:=AA>REF(AA,1) AND BB>REF(BB,1) AND CC>REF(CC,1) AND DD>REF(DD,1); "
        "XG:GG AND HH AND II AND KK AND LL AND MM AND NN;")
 
+#: 量比>=3 + 内盘>外盘 + 大单净额>10% 成交额（大单吸收散户卖盘的背离）+ 站上 20 日线 + 5 日涨幅<=10%.
+#: Best of a threshold scan (train 2024-05~2025-09); out-of-sample 2025-10~2026-10 is ~flat after costs.
+VRDIV = ("VR:=V/REF(MA(V,5),1); XG:VR>=3 AND NWP>1 AND DDJE>0.1 AND C>=MA(C,20) "
+         "AND C<=REF(C,5)*1.1;")
+
 #: slug, title, condition name, formula, max positions, hold days
 TDX_STRATEGIES = [("hjk-hold10", "黄金坑 持有 10 日", "黄金坑", HJK, 10, 10),
-                  ("lyt-hold10", "老鸭头 持有 10 日", "老鸭头", LYT, 10, 10)]
+                  ("lyt-hold10", "老鸭头 持有 10 日", "老鸭头", LYT, 10, 10),
+                  ("vrdiv-hold5", "量比+内外盘背离 持有 5 日", "量比+内外盘背离", VRDIV, 10, 5)]
 HORIZONS = (5, 10, 20)
 BENCH = {"沪深300": "000300.SH", "中证1000": "000852.SH"}
 

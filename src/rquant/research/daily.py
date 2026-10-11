@@ -12,7 +12,7 @@ import shutil
 from datetime import date, timedelta
 from pathlib import Path
 
-from rquant.research.tdx_strategy import HJK, LYT
+from rquant.research.tdx_strategy import HJK, LYT, VRDIV
 
 log = logging.getLogger("rquant.research")
 
@@ -131,6 +131,7 @@ CONDITIONS = {
     "缩量回踩 10 日线": "C>MA(C,10) AND L<=MA(C,10)*1.01 AND V<MA(V,5)",
     "黄金坑": HJK,
     "老鸭头": LYT,
+    "量比+内外盘背离": VRDIV,
 }
 
 
