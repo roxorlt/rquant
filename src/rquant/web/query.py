@@ -39,7 +39,9 @@ def referenced_tables(body: str) -> set[str]:
     """Parse only (no execution) on a private in-memory connection with no file access."""
     con = duckdb.connect(":memory:", config={"enable_external_access": False})
     try:
-        return {t.lower() for t in con.get_table_names(body, qualified=True)}
+        # qualified names come back as "schema.table AS alias"; drop the alias part
+        return {re.split(r"\s+as\s+", t, maxsplit=1, flags=re.I)[0].strip().lower()
+                for t in con.get_table_names(body, qualified=True)}
     except duckdb.Error as exc:
         raise QueryError(f"无法解析查询: {str(exc)[:200]}") from exc
     finally:
