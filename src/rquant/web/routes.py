@@ -282,7 +282,7 @@ def screen(request: Request, source: SourceDep, trade_date: date | None = None,
 
 
 @router.get("/pools", response_model=Envelope[PoolsData], summary="池子")
-def pools(source: SourceDep) -> Envelope[PoolsData]:
+def pools(source: SourceDep, request: Request = None) -> Envelope[PoolsData]:  # type: ignore[assignment]
     names = _names(source)
     latest = source.query("SELECT max(trade_date) AS d FROM canvas_hit")
     trade_date = latest[0]["d"] if latest else None
@@ -306,7 +306,34 @@ def pools(source: SourceDep) -> Envelope[PoolsData]:
         members = [m for ref in refs for m in by_preset.get(ref, [])]
         out.append(PoolItem(name=c["name"], description=c["description"] or "", pool_refs=refs,
                             updated_at=c["updated_at"], members=members))
+    auction = _auction_pool_item(request) if request is not None else None
+    if auction is not None:
+        out.insert(0, auction)
     return _envelope(source, PoolsData(trade_date=trade_date, pools=out))
+
+
+def _auction_pool_item(request: Request) -> PoolItem | None:  # noqa: D401
+    """Research-side auto pool 「竞价选股」 (rquant.research.auction_pool), newest day."""
+    from rquant.research.auction_pool import POOL_NAME, PRESET, read_pool
+
+    try:
+        pool = read_pool(Path(_research_root(request) or research_root()))
+    except Exception:  # noqa: BLE001 - optional
+        return None
+    if not pool:
+        return None
+    picks = {p["ts_code"]: p for p in pool.get("picks") or []}
+    members = [PoolMember(code=p["ts_code"], name=p.get("name"), preset=PRESET,
+                          detail={**p, "date": pool["date"], "stage": "pick"})
+               for p in sorted(picks.values(), key=lambda x: x["rank"])]
+    members += [PoolMember(code=c["ts_code"], name=c.get("name"), preset=PRESET,
+                           detail={**c, "date": pool["date"], "stage": "candidate"})
+                for c in pool.get("candidates") or [] if c["ts_code"] not in picks]
+    stage = "终选" if pool.get("stage") == "final" else "候选"
+    desc = (f"{pool['date']} {stage}（T-1={pool.get('prior_date')}，候选 "
+            f"{len(pool.get('candidates') or [])}，终选 {len(picks)}）· {pool.get('rule', '')}")
+    return PoolItem(name=POOL_NAME, description=desc, pool_refs=[PRESET],
+                    updated_at=pool.get("updated_at"), members=members)
 
 
 _RUN_SQL = ("SELECT run_id, computed_at, start_date, end_date, entry_mode, profile_variant, "
@@ -844,7 +871,7 @@ def stock_profile(code: str, request: Request, source: SourceDep) -> Envelope[St
         base = load_profile(con, code)
     doc = read_fundamentals(root)
     fund = next((r for r in doc.rows if r.code == code), None) if doc else None
-    in_pools = sorted({p.name for p in pools(source).data.pools
+    in_pools = sorted({p.name for p in pools(source, request).data.pools
                        if any(m.code == code for m in p.members)})
     recent = [a.model_dump(mode="json", include={"at", "level", "trigger_type", "trigger_price"})
               for a in alerts(source, 1000).data.items if a.code == code][:20]

@@ -1,0 +1,18 @@
+[Unit]
+Description=rQuant 竞价选股 pool: pick
+After=network-online.target
+
+[Service]
+Type=oneshot
+Slice=rquant-research.slice
+User=lighthouse
+Group=lighthouse
+WorkingDirectory=/home/lighthouse/rquant-web-rel/current
+EnvironmentFile=/etc/rquant-web.env
+Environment=RQUANT_DISABLE_DOTENV=1 TZ=Asia/Shanghai PYTHONWARNINGS=ignore
+ExecStart=/home/lighthouse/rquant-web-rel/current/.venv/bin/python -m rquant.research.auction_pool pick
+TimeoutStartSec=180
+Nice=5
+MemoryMax=600M
+StandardOutput=journal
+StandardError=journal
