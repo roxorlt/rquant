@@ -4,7 +4,8 @@
 `.github/workflows/web-release.yml`：main 上 **Web MVP 检查通过后**（`workflow_run`），构建前端并打包
 `rquant-web-<sha8>.tar.gz`（`git archive` 的代码 + `uv.lock` + 构建好的 `web/dist` + `RELEASE.json`），
 连同 `.sha256` 发布为 GitHub prerelease，tag `web-<sha8>`。也可手动 `workflow_dispatch` 指定 commit。
-仓库是 public，服务器直接 `curl` 下载，**服务器上不放任何 GitHub 凭据**。
+仓库是 public，服务器上不放任何 GitHub 凭据。**实测服务器连不上 GitHub release 下载（超时）**，
+所以默认从 box 中转：`deploy/web/deploy-from-box.sh`（box 上 `gh` 下载 + sha256 校验 → scp → 服务器脚本 `--tarball`）。
 
 ## 服务器布局（82.156.0.68，用户 lighthouse）
 | 路径 | 说明 |
@@ -19,6 +20,9 @@
 
 ## 部署
 ```bash
+# 推荐（box 上，仓库目录）：
+deploy/web/deploy-from-box.sh latest        # 或 <sha8>，或 --rollback
+# 服务器能直连 GitHub 时也可以直接：
 ssh -i ~/.ssh/rquant_deploy lighthouse@82.156.0.68 '~/bin/rquant-web-deploy latest'      # 最新
 ssh ... '~/bin/rquant-web-deploy 1a2b3c4d'                                              # 指定
 ssh ... '~/bin/rquant-web-deploy --rollback'                                            # 回上一个
