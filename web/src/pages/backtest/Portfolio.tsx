@@ -212,6 +212,7 @@ export function PortfolioRuns() {
           >
             <DataTable
               label="组合回测列表"
+              tools="组合回测"
               rows={data.runs}
               rowKey={(row) => row.run_id}
               onSelect={(row) => setRunId(row.run_id)}

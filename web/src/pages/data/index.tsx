@@ -25,6 +25,7 @@ function Fundamentals() {
     >
       <DataTable
         label="财务指标"
+        tools="财务指标"
         rows={doc.rows}
         rowKey={(r) => r.code}
         columns={[

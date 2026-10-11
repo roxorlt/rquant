@@ -18,6 +18,7 @@ function Trades({ runId }: { runId: string }) {
           <Panel title={`逐笔交易 · ${data.trades.length}`} flush>
             <DataTable
               label="逐笔交易"
+              tools="逐笔交易"
               rows={data.trades}
               rowKey={(row) => row.trade_id}
               height={420}

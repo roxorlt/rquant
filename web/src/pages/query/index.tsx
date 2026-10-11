@@ -70,6 +70,7 @@ export default function QueryPage() {
         >
           <DataTable
             label="查询结果"
+            tools="查询结果"
             emptyText="查询成功但 0 行：表为空，或 WHERE 条件没有匹配。"
             rows={result.rows.map((r, i) => ({ i, r }))}
             rowKey={(x) => String(x.i)}

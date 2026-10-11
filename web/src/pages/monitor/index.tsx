@@ -48,6 +48,7 @@ export default function MonitorPage() {
             >
               <DataTable
                 label="告警时间线"
+                tools="告警"
                 rows={rows}
                 initialSort={{ id: "at", desc: true }}
                 rowKey={(row) => row.alert_id}

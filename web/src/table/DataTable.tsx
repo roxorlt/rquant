@@ -9,6 +9,8 @@ import {
 } from "@tanstack/react-table";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { type KeyboardEvent, type ReactNode, useMemo, useRef, useState } from "react";
+import { readPreference, writePreference } from "@/theme/storage";
+import { DropdownMenu } from "@/ui/DropdownMenu";
 
 export type CellValue = string | number | null;
 
@@ -45,6 +47,32 @@ export interface DataTableProps<T> {
   height?: number;
   virtualizeFrom?: number;
   estimatedRowHeight?: number;
+  /**
+   * A small toolbar: show/hide columns (remembered per table label) and CSV
+   * export of the visible columns in the current sort order. A string names the file.
+   */
+  tools?: boolean | string;
+}
+
+/** CSV text (with BOM so Excel reads UTF-8) of the given columns and rows. */
+export function toCsv<T>(columns: readonly DataColumn<T>[], rows: readonly T[]): string {
+  const esc = (v: CellValue) => {
+    if (v === null) return "";
+    const s = String(v);
+    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const lines = [columns.map((c) => esc(c.header)).join(",")];
+  for (const row of rows) lines.push(columns.map((c) => esc(c.value(row))).join(","));
+  return `\uFEFF${lines.join("\n")}\n`;
+}
+
+function download(name: string, text: string) {
+  const url = URL.createObjectURL(new Blob([text], { type: "text/csv;charset=utf-8" }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name.endsWith(".csv") ? name : `${name}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
 /** Nulls always sort after real values, whatever the direction. */
@@ -73,7 +101,7 @@ const ARIA_SORT = { asc: "ascending", desc: "descending" } as const;
  */
 export function DataTable<T>({
   rows,
-  columns,
+  columns: allColumns,
   rowKey,
   label,
   initialSort,
@@ -83,7 +111,21 @@ export function DataTable<T>({
   height,
   virtualizeFrom = 200,
   estimatedRowHeight = 37,
+  tools,
 }: DataTableProps<T>) {
+  const prefKey = `cols.${label}`;
+  const [hidden, setHidden] = useState<Set<string>>(
+    () => new Set((tools ? (readPreference(prefKey) ?? "") : "").split(",").filter(Boolean)),
+  );
+  const toggleColumn = (id: string) =>
+    setHidden((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      writePreference(prefKey, next.size ? [...next].join(",") : null);
+      return next;
+    });
+  const columns = useMemo(() => allColumns.filter((c) => !hidden.has(c.id)), [allColumns, hidden]);
   const [sorting, setSorting] = useState<SortingState>(initialSort ? [initialSort] : []);
   const scrollRef = useRef<HTMLDivElement>(null);
   const bodyRef = useRef<HTMLTableSectionElement>(null);
@@ -177,85 +219,123 @@ export function DataTable<T>({
 
   const selectable = onSelect !== undefined;
 
-  return (
-    <div
-      ref={scrollRef}
-      className={height === undefined ? "tbl-wrap" : "tbl-wrap scroll"}
-      style={height === undefined ? undefined : { maxHeight: height }}
-    >
-      <table className="tbl" aria-label={label} aria-rowcount={sortedRows.length + 1}>
-        <thead>
-          {table.getHeaderGroups().map((group) => (
-            <tr key={group.id}>
-              {group.headers.map((header) => {
-                const sorted = header.column.getIsSorted();
-                return (
-                  <th
-                    key={header.id}
-                    scope="col"
-                    className={cellClass(header.column.id)}
-                    aria-sort={sorted ? ARIA_SORT[sorted] : undefined}
-                  >
-                    {header.column.getCanSort() ? (
-                      <button
-                        type="button"
-                        className="sort"
-                        onClick={header.column.getToggleSortingHandler()}
-                      >
-                        {flexRender(header.column.columnDef.header, header.getContext())}
-                        <span aria-hidden="true">
-                          {sorted === "asc" ? "↑" : sorted === "desc" ? "↓" : "↕"}
-                        </span>
-                      </button>
-                    ) : (
-                      flexRender(header.column.columnDef.header, header.getContext())
-                    )}
-                  </th>
-                );
-              })}
-            </tr>
-          ))}
-        </thead>
-        <tbody ref={bodyRef}>
-          {sortedRows.length === 0 ? (
-            <tr>
-              <td colSpan={columns.length} className="tbl-empty">
-                {emptyText}
-              </td>
-            </tr>
-          ) : null}
-          {padTop > 0 ? (
-            <tr className="pad">
-              <td colSpan={columns.length} style={{ height: padTop }} />
-            </tr>
-          ) : null}
-          {visible.map(({ row, index }) => (
-            <tr
-              key={row.id}
-              data-index={index}
-              aria-rowindex={index + 2}
-              className={selectable ? "click" : undefined}
-              aria-selected={selectable ? row.id === selectedKey : undefined}
-              tabIndex={selectable ? 0 : undefined}
-              onClick={selectable ? () => onSelect(row.original) : undefined}
-              onKeyDown={
-                selectable ? (event) => onRowKeyDown(event, index, row.original) : undefined
-              }
-            >
-              {row.getVisibleCells().map((cell) => (
-                <td key={cell.id} className={cellClass(cell.column.id)}>
-                  {flexRender(cell.column.columnDef.cell, cell.getContext())}
-                </td>
-              ))}
-            </tr>
-          ))}
-          {padBottom > 0 ? (
-            <tr className="pad">
-              <td colSpan={columns.length} style={{ height: padBottom }} />
-            </tr>
-          ) : null}
-        </tbody>
-      </table>
+  const toolbar = tools ? (
+    <div className="tbl-tools">
+      <span className="tbl-count">{sortedRows.length} 行</span>
+      <DropdownMenu
+        items={allColumns
+          .filter((c) => c.header)
+          .map((c) => ({
+            key: c.id,
+            label: c.header,
+            checked: !hidden.has(c.id),
+            onSelect: () => toggleColumn(c.id),
+          }))}
+      >
+        <button type="button" className="tbl-tool">
+          列{hidden.size ? `（隐藏 ${hidden.size}）` : ""} ▾
+        </button>
+      </DropdownMenu>
+      <button
+        type="button"
+        className="tbl-tool"
+        onClick={() =>
+          download(
+            typeof tools === "string" ? tools : label,
+            toCsv(
+              columns.filter((c) => c.header),
+              sortedRows.map((r) => r.original),
+            ),
+          )
+        }
+      >
+        导出 CSV
+      </button>
     </div>
+  ) : null;
+
+  return (
+    <>
+      {toolbar}
+      <div
+        ref={scrollRef}
+        className={height === undefined ? "tbl-wrap" : "tbl-wrap scroll"}
+        style={height === undefined ? undefined : { maxHeight: height }}
+      >
+        <table className="tbl" aria-label={label} aria-rowcount={sortedRows.length + 1}>
+          <thead>
+            {table.getHeaderGroups().map((group) => (
+              <tr key={group.id}>
+                {group.headers.map((header) => {
+                  const sorted = header.column.getIsSorted();
+                  return (
+                    <th
+                      key={header.id}
+                      scope="col"
+                      className={cellClass(header.column.id)}
+                      aria-sort={sorted ? ARIA_SORT[sorted] : undefined}
+                    >
+                      {header.column.getCanSort() ? (
+                        <button
+                          type="button"
+                          className="sort"
+                          onClick={header.column.getToggleSortingHandler()}
+                        >
+                          {flexRender(header.column.columnDef.header, header.getContext())}
+                          <span aria-hidden="true">
+                            {sorted === "asc" ? "↑" : sorted === "desc" ? "↓" : "↕"}
+                          </span>
+                        </button>
+                      ) : (
+                        flexRender(header.column.columnDef.header, header.getContext())
+                      )}
+                    </th>
+                  );
+                })}
+              </tr>
+            ))}
+          </thead>
+          <tbody ref={bodyRef}>
+            {sortedRows.length === 0 ? (
+              <tr>
+                <td colSpan={columns.length} className="tbl-empty">
+                  {emptyText}
+                </td>
+              </tr>
+            ) : null}
+            {padTop > 0 ? (
+              <tr className="pad">
+                <td colSpan={columns.length} style={{ height: padTop }} />
+              </tr>
+            ) : null}
+            {visible.map(({ row, index }) => (
+              <tr
+                key={row.id}
+                data-index={index}
+                aria-rowindex={index + 2}
+                className={selectable ? "click" : undefined}
+                aria-selected={selectable ? row.id === selectedKey : undefined}
+                tabIndex={selectable ? 0 : undefined}
+                onClick={selectable ? () => onSelect(row.original) : undefined}
+                onKeyDown={
+                  selectable ? (event) => onRowKeyDown(event, index, row.original) : undefined
+                }
+              >
+                {row.getVisibleCells().map((cell) => (
+                  <td key={cell.id} className={cellClass(cell.column.id)}>
+                    {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                  </td>
+                ))}
+              </tr>
+            ))}
+            {padBottom > 0 ? (
+              <tr className="pad">
+                <td colSpan={columns.length} style={{ height: padBottom }} />
+              </tr>
+            ) : null}
+          </tbody>
+        </table>
+      </div>
+    </>
   );
 }

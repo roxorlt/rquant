@@ -136,6 +136,7 @@ export default function FactorPage() {
           >
             <DataTable
               label="因子列表"
+              tools="因子"
               rows={data.factors}
               rowKey={(row) => row.factor_id}
               onSelect={(row) => setId(row.factor_id)}

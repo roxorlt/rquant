@@ -54,6 +54,7 @@ export default function PoolsPage() {
               >
                 <DataTable
                   label="池子成员"
+                  tools="池子成员"
                   rows={pool.members}
                   rowKey={(row) => `${row.preset}:${row.code}`}
                   emptyText="今天没有成员：去「选股器」筛选后点「保存为池子」。"
