@@ -441,3 +441,7 @@ input:focus {
 .chart-tabs {
   display: inline-flex;
 }
+.intraday .day-sep {
+  stroke: var(--border-strong, #555);
+  stroke-dasharray: none;
+}

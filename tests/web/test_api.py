@@ -410,3 +410,23 @@ def test_stock_intraday_endpoint(tmp_path) -> None:
     first = body["days"][0]
     again = client.get(f"/api/v1/stocks/600519.SH/intraday?day={first}").json()["data"]
     assert again["date"] == first
+
+
+def test_stock_intraday_history_and_5day(tmp_path) -> None:
+    from fastapi.testclient import TestClient
+
+    from rquant.web.app import create_app
+    from rquant.web.source import FixtureSource, write_demo_research
+
+    write_demo_research(tmp_path)
+    client = TestClient(create_app(FixtureSource(), dist=None, research_root=tmp_path))
+    url = "/api/v1/stocks/600519.SH/intraday"
+    days = client.get(url).json()["data"]["days"]
+    five = client.get(f"{url}?span=5").json()["data"]
+    assert [s["date"] for s in five["sessions"]] == days[-5:]
+    assert all(len(s["bars"]) == 48 and s["pre_close"] for s in five["sessions"])
+    two = client.get(f"{url}?span=5&day={days[1]}").json()["data"]
+    assert [s["date"] for s in two["sessions"]] == days[:2] and two["date"] == days[1]
+    early = client.get(f"{url}?day=2000-01-01").json()["data"]
+    assert early["date"] == days[0]
+    assert client.get(f"{url}?span=6").status_code == 422

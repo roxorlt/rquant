@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { deltas, phi, profile, sessionMinute, sessionVwap } from "./orderflow";
+import { barMinute, deltas, phi, profile, sessionMinute, sessionVwap, stitch } from "./orderflow";
 
 const b = (c: number, v = 100) => ({ open: c, high: c + 0.1, low: c - 0.1, close: c, vol: v });
 
@@ -21,5 +21,21 @@ describe("orderflow", () => {
     const p = profile(bars, 9.8, 11.2, 14);
     expect(p.poc).toBeGreaterThan(10.8);
     expect(p.val).toBeLessThanOrEqual(p.poc);
+  });
+  it("auction bar sits on the left axis; 5日 stitching resets VWAP per day", () => {
+    expect(barMinute("09:30", 1)).toBe(0);
+    expect(barMinute("09:31", 1)).toBe(0.5);
+    expect(barMinute("09:35", 5)).toBe(2.5);
+    const day = (c: number) => [
+      { ...b(c), t: "09:35" },
+      { ...b(c + 1), t: "15:00" },
+    ];
+    const s = stitch([
+      { date: "2026-10-08", freq: "5min", bars: day(10) },
+      { date: "2026-10-09", freq: "5min", bars: day(20) },
+    ]);
+    expect(s.map((x) => x.x)).toEqual([2.5, 237.5, 242.5, 477.5]);
+    expect(s[2]?.vwap).toBeCloseTo(20, 6);
+    expect(s[3]?.date).toBe("2026-10-09");
   });
 });

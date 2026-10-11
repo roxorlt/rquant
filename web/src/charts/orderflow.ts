@@ -78,3 +78,37 @@ export function sessionMinute(t: string): number {
   const x = (h ?? 0) * 60 + (m ?? 0);
   return x <= 690 ? x - 570 : 120 + (x - 780);
 }
+
+/** Bar x on the session axis (minutes): centred in its interval, the 09:30 auction bar at 0. */
+export function barMinute(t: string, step: number): number {
+  return Math.max(0, sessionMinute(t) - step / 2);
+}
+
+export interface SBar extends OBar {
+  t: string;
+}
+
+/**
+ * Stitch consecutive sessions onto one axis (240 min per day) for the 5日 view: each bar gets
+ * its day index, x in minutes, and a VWAP/σ that resets every day (like 同花顺 5日分时).
+ */
+export function stitch<B extends SBar>(
+  sessions: readonly { date: string; freq: string; bars: readonly B[] }[],
+) {
+  const out: (B & { day: number; date: string; x: number; vwap: number; sd: number })[] = [];
+  sessions.forEach((s, k) => {
+    const step = s.freq === "1min" ? 1 : 5;
+    const vw = sessionVwap(s.bars);
+    s.bars.forEach((b, i) => {
+      out.push({
+        ...b,
+        day: k,
+        date: s.date,
+        x: k * 240 + barMinute(b.t, step),
+        vwap: vw[i]?.vwap ?? b.close,
+        sd: vw[i]?.sd ?? 0,
+      });
+    });
+  });
+  return out;
+}

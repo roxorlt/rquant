@@ -13,9 +13,15 @@ import { TpoPanel } from "./Tpo";
 
 const fix = (v: number | null | undefined, d = 2) => (v == null ? "—" : v.toFixed(d));
 
-function ChartTabs({ kline, intraday }: { kline: ReactNode; intraday: ReactNode }) {
+function ChartTabs({
+  kline,
+  intraday,
+}: {
+  kline: ReactNode;
+  intraday: (span: 1 | 5) => ReactNode;
+}) {
   const [tab, setTab] = useUrlState("chart");
-  const cur = tab === "intraday" ? "intraday" : "kline";
+  const cur = tab === "intraday" || tab === "5d" ? tab : "kline";
   return (
     <>
       <div className="seg chart-tabs">
@@ -25,8 +31,11 @@ function ChartTabs({ kline, intraday }: { kline: ReactNode; intraday: ReactNode 
         <button type="button" aria-pressed={cur === "intraday"} onClick={() => setTab("intraday")}>
           分时
         </button>
+        <button type="button" aria-pressed={cur === "5d"} onClick={() => setTab("5d")}>
+          5日
+        </button>
       </div>
-      {cur === "kline" ? kline : intraday}
+      {cur === "kline" ? kline : intraday(cur === "5d" ? 5 : 1)}
     </>
   );
 }
@@ -58,7 +67,7 @@ export default function StockPage() {
             <QuoteGrid s={s} />
             <ChartTabs
               kline={<KlinePanel key={s.code} code={s.code} bars={s.bars} flow={s.flow} />}
-              intraday={<IntradayPanel key={s.code} code={s.code} />}
+              intraday={(span) => <IntradayPanel key={s.code} code={s.code} span={span} />}
             />
             <TpoPanel code={s.code} />
             <FlowPanel s={s} />

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useIntraday } from "@/api/endpoints";
-import { deltas, profile, sessionMinute, sessionVwap } from "@/charts/orderflow";
-import { Panel } from "@/ui";
+import { deltas, profile, stitch } from "@/charts/orderflow";
+import { DatePicker, Panel } from "@/ui";
 
 const P = { left: 56, right: 56, top: 8 };
 const PRICE_H = 260;
@@ -10,9 +10,9 @@ const DELTA_H = 80;
 const GAP = 10;
 
 /** 分时: price & VWAP vs prior close, volume, estimated order flow (all estimates from bars). */
-export function IntradayPanel({ code }: { code: string }) {
+export function IntradayPanel({ code, span = 1 }: { code: string; span?: 1 | 5 }) {
   const [day, setDay] = useState<string | undefined>(undefined);
-  const q = useIntraday(code, day);
+  const q = useIntraday(code, day, span);
   const [bands, setBands] = useState(true);
   const [showVp, setShowVp] = useState(true);
   const [marks, setMarks] = useState(true);
@@ -30,19 +30,23 @@ export function IntradayPanel({ code }: { code: string }) {
     return () => ro.disconnect();
   }, []);
   const d = q.data;
-  const bars = d?.bars ?? [];
-  const pc = d?.pre_close ?? bars[0]?.open ?? 1;
-  const vw = useMemo(() => sessionVwap(bars), [bars]);
+  const sessions = d?.sessions ?? [];
+  const bars = useMemo(() => stitch(sessions), [sessions]);
+  const vw = bars;
+  const pc = sessions[0]?.pre_close ?? bars[0]?.open ?? 1;
   const delta = useMemo(() => {
     let acc = 0;
-    return deltas(bars, pc, mode).map((v) => {
-      acc += v;
-      return acc;
-    });
-  }, [bars, pc, mode]);
+    return sessions
+      .flatMap((x) => deltas(x.bars, x.pre_close ?? x.bars[0]?.open ?? 1, mode))
+      .map((v) => {
+        acc += v;
+        return acc;
+      });
+  }, [sessions, mode]);
+  const multi = sessions.length > 1;
   if (!d || bars.length === 0) {
     return (
-      <Panel title="分时">
+      <Panel title={span === 5 ? "5日分时" : "分时"}>
         <div ref={ref} />
         <p className="hint">
           {q.isLoading
@@ -53,12 +57,14 @@ export function IntradayPanel({ code }: { code: string }) {
     );
   }
   const step = d.freq === "1min" ? 1 : 5;
-  const n = 240;
+  const n = 240 * Math.max(1, sessions.length);
   const plotR = w - P.right;
-  const X = (i: number) => {
-    const b = bars[i];
-    const m = b ? sessionMinute(b.t) - step / 2 : 0;
-    return P.left + (m / n) * (plotR - P.left);
+  const X = (i: number) => P.left + ((bars[i]?.x ?? 0) / n) * (plotR - P.left);
+  const XM = (m: number) => P.left + (m / n) * (plotR - P.left);
+  const di = d.days.indexOf(d.date);
+  const go = (k: number) => {
+    const x = d.days[di + k];
+    if (x) setDay(x);
   };
   const lastVw = vw[vw.length - 1];
   const extra = bands && lastVw ? Math.max(...vw.map((v) => Math.abs(v.vwap - pc) + 2 * v.sd)) : 0;
@@ -78,8 +84,14 @@ export function IntradayPanel({ code }: { code: string }) {
   const dMax = Math.max(0, ...delta);
   const DY = (v: number) => dTop + ((dMax - v) / (dMax - dMin || 1)) * DELTA_H;
   const H = dTop + DELTA_H + 18;
-  const line = (vals: number[]) =>
-    vals.map((v, i) => `${i ? "L" : "M"}${X(i).toFixed(1)},${Y(v).toFixed(1)}`).join("");
+  // brk: start a new subpath at each day (VWAP/bands reset daily in the 5日 view)
+  const line = (vals: number[], brk = false) =>
+    vals
+      .map((v, i) => {
+        const cont = i > 0 && !(brk && bars[i]?.day !== bars[i - 1]?.day);
+        return `${cont ? "L" : "M"}${X(i).toFixed(1)},${Y(v).toFixed(1)}`;
+      })
+      .join("");
   const dline = delta
     .map((v, i) => `${i ? "L" : "M"}${X(i).toFixed(1)},${DY(v).toFixed(1)}`)
     .join("");
@@ -97,26 +109,45 @@ export function IntradayPanel({ code }: { code: string }) {
   const pct = (v: number) => `${v >= pc ? "+" : ""}${(((v - pc) / pc) * 100).toFixed(2)}%`;
   const tone = (v: number) => (v > pc ? "up" : v < pc ? "down" : "");
   const ticks = [-1, -0.5, 0, 0.5, 1].map((k) => pc + dev * k * 0.9);
-  const times: [string, number][] = [
-    ["09:30", 0],
-    ["10:30", 60],
-    ["11:30/13:00", 120],
-    ["14:00", 180],
-    ["15:00", 240],
-  ];
+  const times: [string, number][] = multi
+    ? []
+    : [
+        ["09:30", 0],
+        ["10:30", 60],
+        ["11:30/13:00", 120],
+        ["14:00", 180],
+        ["15:00", 240],
+      ];
   const totalVol = bars.reduce((s, b) => s + b.vol, 0);
   return (
     <Panel
-      title="分时"
-      sub={`${d.date} · ${d.freq === "1min" ? "1 分钟线" : "5 分钟线"} · ${d.source === "intraday" ? "盘中库" : "研究库"}；黄线 = 均价(VWAP)，资金/订单流均为由 K 线估算`}
+      title={span === 5 ? "5日分时" : "分时"}
+      sub={`${multi ? `${sessions[0]?.date} ~ ` : ""}${d.date} · ${d.freq === "1min" ? "1 分钟线" : "5 分钟线"} · ${d.source === "intraday" ? "盘中库" : "研究库"}；黄线 = 均价(VWAP)，资金/订单流均为由 K 线估算`}
       actions={
         <span className="qc-ctl">
-          <span className="seg">
-            {d.days.map((x) => (
-              <button key={x} type="button" aria-pressed={x === d.date} onClick={() => setDay(x)}>
-                {x.slice(5)}
+          <span className="seg" title={`共 ${d.days.length} 个交易日有分钟线`}>
+            <button type="button" disabled={di <= 0} onClick={() => go(-1)} aria-label="前一交易日">
+              ‹
+            </button>
+            <DatePicker
+              label="分时日期"
+              value={d.date}
+              allowed={d.days}
+              onChange={(x) => setDay(x)}
+            />
+            <button
+              type="button"
+              disabled={di < 0 || di >= d.days.length - 1}
+              onClick={() => go(1)}
+              aria-label="后一交易日"
+            >
+              ›
+            </button>
+            {di < d.days.length - 1 ? (
+              <button type="button" onClick={() => setDay(undefined)}>
+                最新
               </button>
-            ))}
+            ) : null}
           </span>
           <label>
             <input type="checkbox" checked={bands} onChange={(e) => setBands(e.target.checked)} />{" "}
@@ -136,7 +167,7 @@ export function IntradayPanel({ code }: { code: string }) {
       <div ref={ref} className="intraday">
         {hb && hv ? (
           <div className="chart-readout">
-            <span className="when">{hb.t}</span>
+            <span className="when">{multi ? `${hb.date.slice(5)} ${hb.t}` : hb.t}</span>
             <span className={tone(hb.close)}>
               价 {hb.close.toFixed(2)} {pct(hb.close)}
             </span>
@@ -215,6 +246,37 @@ export function IntradayPanel({ code }: { code: string }) {
               </text>
             </g>
           ))}
+          {multi
+            ? sessions.map((x, k) => (
+                <g key={x.date}>
+                  {k ? (
+                    <line
+                      className="chart-grid day-sep"
+                      x1={XM(k * 240)}
+                      x2={XM(k * 240)}
+                      y1={P.top}
+                      y2={dTop + DELTA_H}
+                    />
+                  ) : null}
+                  <line
+                    className="chart-grid"
+                    strokeDasharray="2 4"
+                    x1={XM(k * 240 + 120)}
+                    x2={XM(k * 240 + 120)}
+                    y1={P.top}
+                    y2={volTop + VOL_H}
+                  />
+                  <text
+                    className="chart-axis"
+                    x={XM(k * 240 + 120)}
+                    y={volTop + VOL_H + 12}
+                    textAnchor="middle"
+                  >
+                    {x.date.slice(5)}
+                  </text>
+                </g>
+              ))
+            : null}
           {showVp ? (
             <g aria-label="分时成交量分布（估算）">
               {prof.dist.map((v, k) => {
@@ -247,12 +309,10 @@ export function IntradayPanel({ code }: { code: string }) {
               {[1, -1, 2, -2].map((k) => (
                 <path
                   key={k}
-                  d={vw
-                    .map(
-                      (v, i) =>
-                        `${i ? "L" : "M"}${X(i).toFixed(1)},${Y(v.vwap + k * v.sd).toFixed(1)}`,
-                    )
-                    .join("")}
+                  d={line(
+                    vw.map((v) => v.vwap + k * v.sd),
+                    true,
+                  )}
                   stroke={Math.abs(k) === 1 ? "#c792ea" : "#7f6a99"}
                   strokeWidth={1}
                 />
@@ -273,7 +333,15 @@ export function IntradayPanel({ code }: { code: string }) {
             strokeWidth={1.5}
             clipPath="url(#id-below)"
           />
-          <path d={line(vw.map((v) => v.vwap))} fill="none" stroke="#e0a93a" strokeWidth={1.3} />
+          <path
+            d={line(
+              vw.map((v) => v.vwap),
+              true,
+            )}
+            fill="none"
+            stroke="#e0a93a"
+            strokeWidth={1.3}
+          />
           {marks
             ? bars.map((b, i) => {
                 const spike = medVol > 0 && b.vol > 3 * medVol;
@@ -281,7 +349,7 @@ export function IntradayPanel({ code }: { code: string }) {
                 if (!spike && !big) return null;
                 const upBar = (rets[i] ?? 0) >= 0;
                 return (
-                  <g key={b.t}>
+                  <g key={`${b.date}${b.t}`}>
                     {big ? (
                       <circle
                         cx={X(i)}
@@ -289,12 +357,12 @@ export function IntradayPanel({ code }: { code: string }) {
                         r={3.5}
                         className={upBar ? "mk up" : "mk down"}
                       >
-                        <title>{`${b.t} 大幅波动 ${((rets[i] ?? 0) * 100).toFixed(2)}%`}</title>
+                        <title>{`${b.date.slice(5)} ${b.t} 大幅波动 ${((rets[i] ?? 0) * 100).toFixed(2)}%`}</title>
                       </circle>
                     ) : null}
                     {spike ? (
                       <path d={`M${X(i)},${volTop - 2}l-4,-7h8z`} className="mk spike">
-                        <title>{`${b.t} 放量 ${(b.vol / medVol).toFixed(1)}× 中位数`}</title>
+                        <title>{`${b.date.slice(5)} ${b.t} 放量 ${(b.vol / medVol).toFixed(1)}× 中位数`}</title>
                       </path>
                     ) : null}
                   </g>
@@ -307,7 +375,7 @@ export function IntradayPanel({ code }: { code: string }) {
             const bw = Math.max(1, ((plotR - P.left) / n) * step * 0.7);
             return (
               <rect
-                key={`v${b.t}`}
+                key={`v${b.date}${b.t}`}
                 x={X(i) - bw / 2}
                 y={volTop + VOL_H - h}
                 width={bw}
