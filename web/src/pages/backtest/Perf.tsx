@@ -1,4 +1,5 @@
 import type { components } from "@/api/schema";
+import { TimeChart } from "@/charts/Chart";
 import { formatPercent } from "@/format/number";
 import { KpiStrip, Panel } from "@/ui";
 
@@ -8,47 +9,43 @@ const pct = (v: number | null | undefined, d = 2) =>
   v === null || v === undefined ? "—" : formatPercent(v * 100, d);
 const num = (v: number | null | undefined) => (v === null || v === undefined ? "—" : v.toFixed(2));
 
-/** NAV line with the drawdown band under it; plain SVG, no chart library. */
+/** NAV vs benchmark, then drawdown underneath, sharing the date axis. */
 function NavChart({ nav }: { nav: BacktestPerf["nav"] }) {
-  const w = 720;
-  const h = 200;
-  const dd = 60;
   if (nav.length < 2) return null;
-  const values = nav.flatMap((p) => (p.benchmark_nav == null ? [p.nav] : [p.nav, p.benchmark_nav]));
-  const lo = Math.min(1, ...values);
-  const hi = Math.max(1, ...values);
-  const minDd = Math.min(-0.0001, ...nav.map((p) => p.drawdown));
-  const x = (i: number) => (i / (nav.length - 1)) * w;
-  const y = (v: number) => h - ((v - lo) / (hi - lo || 1)) * (h - 8) - 4;
-  const line = nav.map((p, i) => `${x(i).toFixed(1)},${y(p.nav).toFixed(1)}`).join(" ");
-  const benchLine = nav
-    .filter((p) => p.benchmark_nav != null)
-    .map((p) => `${x(nav.indexOf(p)).toFixed(1)},${y(p.benchmark_nav ?? 1).toFixed(1)}`)
-    .join(" ");
-  const band = nav
-    .map((p, i) => `${x(i).toFixed(1)},${(h + (p.drawdown / minDd) * dd).toFixed(1)}`)
-    .join(" ");
+  const dates = nav.map((p) => p.date);
+  const hasBench = nav.some((p) => p.benchmark_nav != null);
   return (
-    <svg
-      viewBox={`0 0 ${w} ${h + dd}`}
-      width="100%"
-      role="img"
-      aria-label="净值与回撤"
-      style={{ display: "block" }}
-    >
-      <line x1={0} x2={w} y1={y(1)} y2={y(1)} stroke="var(--line, #ccc)" strokeDasharray="3 3" />
-      {benchLine ? (
-        <polyline
-          points={benchLine}
-          fill="none"
-          stroke="var(--text-3, #999)"
-          strokeWidth={1}
-          strokeDasharray="4 2"
-        />
-      ) : null}
-      <polyline points={line} fill="none" stroke="var(--accent)" strokeWidth={1.5} />
-      <polygon points={`0,${h} ${band} ${w},${h}`} fill="var(--down, #2a9d5c)" opacity={0.25} />
-    </svg>
+    <>
+      <TimeChart
+        label="净值"
+        dates={dates}
+        baseline={1}
+        format={(v) => v.toFixed(3)}
+        series={[
+          { name: "策略净值", values: nav.map((p) => p.nav), color: "var(--accent)" },
+          ...(hasBench
+            ? [
+                {
+                  name: "基准",
+                  values: nav.map((p) => p.benchmark_nav ?? null),
+                  color: "var(--faint)",
+                  dashed: true,
+                },
+              ]
+            : []),
+        ]}
+      />
+      <TimeChart
+        label="回撤"
+        dates={dates}
+        height={110}
+        baseline={0}
+        format={(v) => `${(v * 100).toFixed(1)}%`}
+        series={[
+          { name: "回撤", values: nav.map((p) => p.drawdown), color: "var(--down)", area: true },
+        ]}
+      />
+    </>
   );
 }
 
