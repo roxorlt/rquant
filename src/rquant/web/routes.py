@@ -844,13 +844,14 @@ def stock_profile(code: str, request: Request, source: SourceDep) -> Envelope[St
 @router.get("/stocks/{code}/intraday", response_model=Envelope[IntradayData | None],
             summary="分时（分钟线）")
 def stock_intraday(code: str, request: Request, source: SourceDep,
-                   day: date | None = None) -> Envelope[IntradayData | None]:
+                   day: date | None = None,
+                   span: int = Query(1, ge=1, le=5)) -> Envelope[IntradayData | None]:
     code = code.upper()
     if not CODE_RE.match(code):
         raise HTTPException(422, "代码格式应为 600519.SH")
     root = Path(_research_root(request) or research_root())
     with market(root) as con:
-        data = load_intraday(con, root, code, day)
+        data = load_intraday(con, root, code, day, span)
     return _envelope(source, data)
 
 

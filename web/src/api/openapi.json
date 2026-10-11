@@ -3257,6 +3257,13 @@
             ],
             "title": "Pre Close"
           },
+          "sessions": {
+            "items": {
+              "$ref": "#/components/schemas/IntradaySession"
+            },
+            "title": "Sessions",
+            "type": "array"
+          },
           "source": {
             "title": "Source",
             "type": "string"
@@ -3269,9 +3276,54 @@
           "freq",
           "source",
           "pre_close",
-          "bars"
+          "bars",
+          "sessions"
         ],
         "title": "IntradayData",
+        "type": "object"
+      },
+      "IntradaySession": {
+        "properties": {
+          "bars": {
+            "items": {
+              "$ref": "#/components/schemas/IntradayBar"
+            },
+            "title": "Bars",
+            "type": "array"
+          },
+          "date": {
+            "format": "date",
+            "title": "Date",
+            "type": "string"
+          },
+          "freq": {
+            "title": "Freq",
+            "type": "string"
+          },
+          "pre_close": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pre Close"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "required": [
+          "date",
+          "freq",
+          "source",
+          "pre_close",
+          "bars"
+        ],
+        "title": "IntradaySession",
         "type": "object"
       },
       "Kpi": {
@@ -6588,6 +6640,18 @@
                 }
               ],
               "title": "Day"
+            }
+          },
+          {
+            "in": "query",
+            "name": "span",
+            "required": false,
+            "schema": {
+              "default": 1,
+              "maximum": 5,
+              "minimum": 1,
+              "title": "Span",
+              "type": "integer"
             }
           }
         ],

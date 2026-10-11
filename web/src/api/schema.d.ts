@@ -1685,6 +1685,24 @@ export interface components {
             freq: string;
             /** Pre Close */
             pre_close: number | null;
+            /** Sessions */
+            sessions: components["schemas"]["IntradaySession"][];
+            /** Source */
+            source: string;
+        };
+        /** IntradaySession */
+        IntradaySession: {
+            /** Bars */
+            bars: components["schemas"]["IntradayBar"][];
+            /**
+             * Date
+             * Format: date
+             */
+            date: string;
+            /** Freq */
+            freq: string;
+            /** Pre Close */
+            pre_close: number | null;
             /** Source */
             source: string;
         };
@@ -3280,6 +3298,7 @@ export interface operations {
         parameters: {
             query?: {
                 day?: string | null;
+                span?: number;
             };
             header?: never;
             path: {
