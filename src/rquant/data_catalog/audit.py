@@ -39,25 +39,30 @@ class AuditReport(BaseModel):
     datasets: list[DatasetCoverage]
 
 
-def audit(con: duckdb.DuckDBPyConnection, end: date, days: int = 30) -> AuditReport:
+def audit(con: duckdb.DuckDBPyConnection, end: date, days: int = 30,
+          extra: dict[str, str] | None = None) -> AuditReport:
     start = end - timedelta(days=days)
     open_days = [r[0] for r in con.execute(
         "SELECT DISTINCT cal_date FROM trade_calendar WHERE is_open AND cal_date BETWEEN ? AND ? "
         "ORDER BY cal_date", [start, end]).fetchall()]
     out: list[DatasetCoverage] = []
-    for contract in CATALOG_CONTRACTS:
-        column = contract.event_date_column
-        if column is None:
-            continue
-        required = contract.freshness.required_on_open_day
+    specs = [(c.dataset_id, c.table_name, c.event_date_column, c.freshness.required_on_open_day)
+             for c in CATALOG_CONTRACTS if c.event_date_column is not None]
+    if extra is not None:  # research DB: only tables that exist, plus its own tables
+        existing = {r[0] for r in con.execute(
+            "SELECT table_name FROM information_schema.tables").fetchall()}
+        specs = [s for s in specs if s[1] in existing]
+        covered = {s[1] for s in specs}
+        specs += [(t, t, col, t != "minute_bar") for t, col in extra.items() if t not in covered]
+    for dataset_id, table_name, column, required in specs:
         try:
-            latest = con.execute(f'SELECT MAX("{column}") FROM "{contract.table_name}"').fetchone()
+            latest = con.execute(f'SELECT MAX("{column}") FROM "{table_name}"').fetchone()
             per_day = dict(con.execute(
-                f'SELECT CAST("{column}" AS DATE), COUNT(*) FROM "{contract.table_name}" '
+                f'SELECT CAST("{column}" AS DATE), COUNT(*) FROM "{table_name}" '
                 f'WHERE "{column}" BETWEEN ? AND ? GROUP BY 1', [start, end]).fetchall())
         except duckdb.Error as exc:
-            out.append(DatasetCoverage(dataset_id=contract.dataset_id,
-                                       table_name=contract.table_name, latest_date=None,
+            out.append(DatasetCoverage(dataset_id=dataset_id,
+                                       table_name=table_name, latest_date=None,
                                        rows_in_window=0, missing_open_days=[],
                                        required_on_open_day=required,
                                        error=str(exc).splitlines()[0][:200]))
@@ -66,7 +71,7 @@ def audit(con: duckdb.DuckDBPyConnection, end: date, days: int = 30) -> AuditRep
         if isinstance(latest_date, datetime):
             latest_date = latest_date.date()
         out.append(DatasetCoverage(
-            dataset_id=contract.dataset_id, table_name=contract.table_name,
+            dataset_id=dataset_id, table_name=table_name,
             latest_date=latest_date, rows_in_window=int(sum(per_day.values())),
             missing_open_days=[d for d in open_days if d not in per_day] if required else [],
             required_on_open_day=required,

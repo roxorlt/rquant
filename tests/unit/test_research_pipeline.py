@@ -50,6 +50,18 @@ def test_screens_and_daily_job_populate_research_root(tmp_path, monkeypatch):
     assert (tmp_path / "data_audit" / "latest.json").exists()
     daily.run(ingest=False)  # idempotent
     assert len(list_factors(tmp_path)) == len(daily.FACTORS)
+    from rquant.factor.condition import list_conditions
+    from rquant.research import paper
+
+    assert len(list_conditions(tmp_path)) == len(daily.CONDITIONS)
+    assert {a.account_id for a in paper.read(tmp_path)} >= {"sim-mom20-top10"}
+    from rquant.data_catalog.audit import read_report
+
+    ids = {d.dataset_id for d in read_report(tmp_path).datasets}
+    assert {"daily_bar", "daily_basic", "index_daily"} <= ids
+    for _ in range(6):
+        daily.prune_backtests(tmp_path, keep=1)
+    assert len(list_runs(tmp_path)) == len(daily.STRATEGIES)
 
 
 def test_screen_api_falls_back_to_research_presets(tmp_path):

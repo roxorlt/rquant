@@ -46,6 +46,14 @@ CREATE OR REPLACE VIEW daily_bar_hfq AS
          b.low * a.adj_factor AS low, b.close * a.adj_factor AS close,
          b.pre_close * a.adj_factor AS pre_close, b.pct_chg, b.vol, b.amount
   FROM daily_bar b JOIN adj_factor a USING (ts_code, trade_date);
+CREATE OR REPLACE VIEW daily_bar_qfq AS
+  SELECT b.ts_code, b.trade_date, b.open * a.adj_factor / l.adj AS open,
+         b.high * a.adj_factor / l.adj AS high, b.low * a.adj_factor / l.adj AS low,
+         b.close * a.adj_factor / l.adj AS close, b.pre_close * a.adj_factor / l.adj AS pre_close,
+         b.pct_chg, b.vol, b.amount
+  FROM daily_bar b JOIN adj_factor a USING (ts_code, trade_date)
+  JOIN (SELECT ts_code, arg_max(adj_factor, trade_date) AS adj FROM adj_factor GROUP BY ts_code) l
+  USING (ts_code);
 """
 
 
@@ -215,3 +223,10 @@ def run(root: Path, years: int = 5, end: date | None = None, minutes: int = 300,
         return {"days": len(days), "daily_rows": rows, "minute_rows": mins}
     finally:
         con.close()
+
+
+#: research tables and their date column, for the coverage audit
+RESEARCH_TABLES = {"daily_bar": "trade_date", "adj_factor": "trade_date",
+                   "daily_basic": "trade_date", "daily_state": "trade_date",
+                   "index_daily": "trade_date", "minute_bar": "trade_date",
+                   "screen_result": "trade_date"}

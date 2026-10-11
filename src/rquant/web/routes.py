@@ -525,7 +525,7 @@ def _acks(source: Source) -> dict[str, dict[str, Any]]:
 
 
 @router.get("/paper", response_model=Envelope[PaperData], summary="模拟盘")
-def paper(source: SourceDep) -> Envelope[PaperData]:
+def paper(request: Request, source: SourceDep) -> Envelope[PaperData]:
     names = _names(source)
     holdings: dict[str, list[HoldingItem]] = {}
     for h in source.query(
@@ -542,6 +542,9 @@ def paper(source: SourceDep) -> Envelope[PaperData]:
         for a in source.query(
             "SELECT account_id, as_of_time, nav, cash, unrealized_pnl, realized_pnl "
             "FROM paper_accounts ORDER BY account_id LIMIT 50")]
+    from rquant.research.paper import read as read_sim
+
+    accounts += read_sim(Path(_research_root(request) or research_root()))
     return _envelope(source, PaperData(accounts=accounts))
 
 

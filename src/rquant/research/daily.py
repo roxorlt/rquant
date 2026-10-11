@@ -61,7 +61,7 @@ def run(years: int = 5, minutes: int = 300, ingest: bool = True, end: date | Non
         first = con.execute("SELECT MIN(trade_date) FROM daily_bar").fetchone()[0]
         bt_start = max(first + timedelta(days=200), last - timedelta(days=365 * 3))
         log.info("screens: %d rows", screens.build(con, bt_start - timedelta(days=10), last))
-        write_report(audit(con, last, 30), root)
+        write_report(audit(con, last, 30, extra=ing.RESEARCH_TABLES), root)
     finally:
         con.close()
 
@@ -72,8 +72,9 @@ def run(years: int = 5, minutes: int = 300, ingest: bool = True, end: date | Non
         version = resolve(slug, root)
         run_and_save(db, preset, bt_start, last, version.spec.config, root=root,
                      title=f"{title} {bt_start}~{last}", strategy=f"{slug}@{version.version}",
-                     bar_table="daily_bar_hfq")
+                     bar_table="daily_bar_qfq")
         log.info("backtest %s done", slug)
+    prune_backtests(root)
 
     con = duckdb.connect(str(db), read_only=True)
     try:
@@ -91,6 +92,62 @@ def run(years: int = 5, minutes: int = 300, ingest: bool = True, end: date | Non
         log.info("factor %s done", name)
     for run in existing.values():
         save_tracking(track(run, panel, last, lookback_days=60), root)
+    run_conditions(root, panel)
+    run_paper(root, db, last)
+
+
+CONDITIONS = {
+    "站上 20 日线且放量": "C>MA(C,20) AND V>MA(V,5)*1.5",
+    "5 日均线上穿 20 日均线": "MA(C,5)>MA(C,20) AND REF(MA(C,5),1)<=REF(MA(C,20),1)",
+    "55 日新高": "C>=HHV(H,55)",
+    "缩量回踩 10 日线": "C>MA(C,10) AND L<=MA(C,10)*1.01 AND V<MA(V,5)",
+}
+
+
+def run_conditions(root: Path, panel) -> None:
+    from rquant.factor.condition import KIND, list_conditions, screen
+    from rquant.factor.condition import save as save_condition
+    from rquant.factor.tdx import translate
+
+    for old in list_conditions(root):  # keep only the latest run per condition
+        if old.name in CONDITIONS:
+            shutil.rmtree(root / KIND / old.run_id, ignore_errors=True)
+    for name, tdx in CONDITIONS.items():
+        try:
+            expr = translate(tdx)
+            save_condition(name, expr, tdx, screen(panel, expr), root=root)
+        except Exception as exc:  # noqa: BLE001 - one bad formula must not stop the job
+            log.warning("condition %s failed: %s", name, exc)
+
+
+def run_paper(root: Path, db: Path, last: date, days: int = 60) -> None:
+    import duckdb
+
+    from rquant.backtest.strategy import resolve
+    from rquant.research import paper
+
+    con = duckdb.connect(str(db), read_only=True)
+    try:
+        names = dict(con.execute("SELECT ts_code, name FROM stock_basic").fetchall())
+        accounts = []
+        for slug, _title, _preset, _n, _every in STRATEGIES:
+            spec = resolve(slug, root).spec
+            accounts.append(paper.simulate(con, slug, spec.preset, spec.config, last, days, names))
+    finally:
+        con.close()
+    paper.save(root, accounts)
+
+
+def prune_backtests(root: Path, keep: int = 5) -> None:
+    """Keep the newest `keep` runs per strategy (and per preset for ad-hoc runs)."""
+    from rquant.backtest.store import KIND, list_runs
+
+    seen: dict[str, int] = {}
+    for run in list_runs(root):  # newest first
+        key = (run.strategy or run.preset).split("@")[0]
+        seen[key] = seen.get(key, 0) + 1
+        if seen[key] > keep:
+            shutil.rmtree(root / KIND / run.run_id, ignore_errors=True)
 
 
 def main(argv: list[str] | None = None) -> int:
