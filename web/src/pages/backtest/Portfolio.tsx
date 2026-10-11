@@ -3,12 +3,13 @@ import { Link } from "react-router";
 import {
   useExplainBacktest,
   usePortfolioBacktest,
+  usePortfolioBacktestMany,
   usePortfolioBacktests,
-  usePortfolioCompare,
   useStrategies,
 } from "@/api/endpoints";
 import type { components } from "@/api/schema";
 import { useUrlState } from "@/app/useUrlState";
+import { TimeChart } from "@/charts/Chart";
 import { toneClass, toneOf } from "@/format/color";
 import { formatPrice } from "@/format/number";
 import { DataTable } from "@/table/DataTable";
@@ -20,45 +21,96 @@ type Perf = components["schemas"]["BacktestPerf"];
 const pct = (v: number | null | undefined) => (v == null ? "—" : `${(v * 100).toFixed(2)}%`);
 const num = (v: number | null | undefined, d = 2) => (v == null ? "—" : v.toFixed(d));
 
-function Compare({ a, b }: { a: string; b: string }) {
-  const query = usePortfolioCompare(a, b);
-  const rows: [string, (p: Perf | null | undefined) => string][] = [
-    ["总收益", (p) => pct(p?.total_return)],
-    ["年化", (p) => pct(p?.annualized_return)],
-    ["夏普", (p) => num(p?.sharpe)],
-    ["最大回撤", (p) => pct(p?.max_drawdown)],
-    ["超额", (p) => pct(p?.benchmark?.excess_return)],
+const COLORS = ["var(--accent)", "var(--warn)", "var(--up)", "var(--down)", "var(--faint)"];
+
+/** Up to five runs side by side: NAV overlay plus a metric table, best value highlighted. */
+function Compare({ ids, onRemove }: { ids: string[]; onRemove: (id: string) => void }) {
+  const results = usePortfolioBacktestMany(ids);
+  if (results.some((r) => r.isLoading)) return <Panel title="对比">读取中…</Panel>;
+  const runs = results.flatMap((r) => (r.data ? [r.data.data] : []));
+  if (runs.length < 2) return null;
+  const rows: [
+    string,
+    (p: Perf | null | undefined) => number | null | undefined,
+    (v: number | null | undefined) => string,
+    boolean,
+  ][] = [
+    ["总收益", (p) => p?.total_return, pct, true],
+    ["年化", (p) => p?.annualized_return, pct, true],
+    ["年化波动", (p) => p?.annualized_volatility, pct, false],
+    ["夏普", (p) => p?.sharpe, num, true],
+    ["卡玛", (p) => p?.calmar, num, true],
+    ["最大回撤", (p) => p?.max_drawdown, pct, true],
+    ["日胜率", (p) => p?.win_rate, pct, true],
+    ["超额", (p) => p?.benchmark?.excess_return, pct, true],
   ];
+  // Union of dates so runs over different windows still line up.
+  const dates = [...new Set(runs.flatMap((r) => r.perf?.nav.map((p) => p.date) ?? []))].sort();
   return (
-    <QueryView query={query}>
-      {(data) => (
-        <Panel title="对比" sub={`${data.a.run.title} vs ${data.b.run.title}`}>
-          <table className="tbl" aria-label="回测对比">
-            <thead>
-              <tr>
-                <th>指标</th>
-                <th>{data.a.run.title}</th>
-                <th>{data.b.run.title}</th>
+    <Panel title={`对比 · ${runs.length} 条`} sub="净值叠加；每行最优值高亮（回撤取最浅）">
+      <TimeChart
+        label="对比净值"
+        dates={dates}
+        baseline={1}
+        format={(v) => v.toFixed(3)}
+        series={runs.map((r, k) => {
+          const byDate = new Map(r.perf?.nav.map((p) => [p.date, p.nav]) ?? []);
+          return {
+            name: r.run.title,
+            values: dates.map((d) => byDate.get(d) ?? null),
+            color: COLORS[k % COLORS.length] ?? "var(--accent)",
+          };
+        })}
+      />
+      <table className="tbl" aria-label="回测对比">
+        <thead>
+          <tr>
+            <th>指标</th>
+            {runs.map((r) => (
+              <th key={r.run.run_id} className="num">
+                {r.run.title}{" "}
+                <button
+                  type="button"
+                  className="tbl-tool"
+                  aria-label={`移出对比 ${r.run.title}`}
+                  onClick={() => onRemove(r.run.run_id)}
+                >
+                  ×
+                </button>
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>参数</td>
+            {runs.map((r) => (
+              <td key={r.run.run_id} className="num">
+                {`${r.run.max_positions} 只 / 每 ${r.run.rebalance_every} 次调仓`}
+              </td>
+            ))}
+          </tr>
+          {rows.map(([label, get, fmt, higher]) => {
+            const vals = runs.map((r) => get(r.perf));
+            const real = vals.filter((v): v is number => v != null);
+            const best = real.length ? (higher ? Math.max(...real) : Math.min(...real)) : null;
+            return (
+              <tr key={label}>
+                <td>{label}</td>
+                {vals.map((v, k) => (
+                  <td
+                    key={runs[k]?.run.run_id}
+                    className={v != null && v === best && real.length > 1 ? "num best" : "num"}
+                  >
+                    {fmt(v)}
+                  </td>
+                ))}
               </tr>
-            </thead>
-            <tbody>
-              <tr>
-                <td>参数</td>
-                <td>{`${data.a.run.max_positions} 只 / 每 ${data.a.run.rebalance_every} 次调仓`}</td>
-                <td>{`${data.b.run.max_positions} 只 / 每 ${data.b.run.rebalance_every} 次调仓`}</td>
-              </tr>
-              {rows.map(([label, f]) => (
-                <tr key={label}>
-                  <td>{label}</td>
-                  <td className="num">{f(data.a.perf)}</td>
-                  <td className="num">{f(data.b.perf)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </Panel>
-      )}
-    </QueryView>
+            );
+          })}
+        </tbody>
+      </table>
+    </Panel>
   );
 }
 
@@ -201,7 +253,7 @@ export function PortfolioRuns() {
   const [runId, setRunId] = useUrlState("prun");
   const [picked, setPicked] = useState<string[]>([]);
   const addCompare = (id: string) =>
-    setPicked((list) => (list.includes(id) ? list : [...list, id].slice(-2)));
+    setPicked((list) => (list.includes(id) ? list : [...list, id].slice(-5)));
   return (
     <QueryView query={query}>
       {(data) => (
@@ -264,12 +316,12 @@ export function PortfolioRuns() {
             />
           </Panel>
           {runId ? <Detail runId={runId} onCompare={() => addCompare(runId)} /> : null}
-          {picked.length === 2 && picked[0] && picked[1] ? (
-            <Compare a={picked[0]} b={picked[1]} />
+          {picked.length >= 2 ? (
+            <Compare ids={picked} onRemove={(id) => setPicked((l) => l.filter((x) => x !== id))} />
           ) : picked.length === 1 ? (
-            <Panel title="对比">再选一条回测，点「加入对比」</Panel>
+            <Panel title="对比">已选 1 条；再选一条回测点「加入对比」（最多 5 条）</Panel>
           ) : !runId && data.runs.length > 1 ? (
-            <p className="hint">点一行看净值与委托；再点「加入对比」，选满两条即显示对比。</p>
+            <p className="hint">点一行看净值与委托；再点「加入对比」，选 2–5 条即显示对比。</p>
           ) : null}
         </>
       )}
