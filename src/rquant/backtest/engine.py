@@ -101,7 +101,10 @@ def run_backtest(
     bars: Mapping[date, Mapping[str, Bar]],
     signals: Mapping[date, Sequence[PortfolioCandidate]],
     config: BacktestConfig | None = None,
+    delisted: Mapping[str, date] | None = None,
 ) -> BacktestResult:
+    """`delisted`: code -> delist date. A position still held past its delist date with no
+    bar is written off at zero (otherwise it would sit at its stale last price forever)."""
     config = config or BacktestConfig()
     cash = float(config.capital)
     held: dict[str, int] = {}
@@ -113,6 +116,10 @@ def run_backtest(
 
     for day in trading_days:
         today = bars.get(day, {})
+        for code in [c for c in held if c not in today and delisted and c in delisted
+                     and day >= delisted[c]]:
+            orders.append(Order(trade_date=day, ts_code=code, side="sell", quantity=held.pop(code),
+                                price=0.0, fee=0, status="filled", reason="退市注销"))
         if pending is not None:
             equity = cash + sum(q * last_close.get(c, 0.0) for c, q in held.items())
             target = allocate_target_weights(

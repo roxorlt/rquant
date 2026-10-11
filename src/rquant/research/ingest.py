@@ -25,7 +25,8 @@ BENCHMARKS = ("000300.SH", "000905.SH", "000852.SH", "000001.SH", "399006.SZ", "
 DDL = """
 CREATE TABLE IF NOT EXISTS trade_calendar(cal_date DATE PRIMARY KEY, is_open BOOLEAN);
 CREATE TABLE IF NOT EXISTS stock_basic(ts_code VARCHAR PRIMARY KEY, name VARCHAR,
-  industry VARCHAR, market VARCHAR, list_date DATE);
+  industry VARCHAR, market VARCHAR, list_date DATE, delist_date DATE);
+ALTER TABLE stock_basic ADD COLUMN IF NOT EXISTS delist_date DATE;
 CREATE TABLE IF NOT EXISTS daily_bar(ts_code VARCHAR, trade_date DATE, open DOUBLE,
   high DOUBLE, low DOUBLE, close DOUBLE, pre_close DOUBLE, pct_chg DOUBLE, vol DOUBLE,
   amount DOUBLE, PRIMARY KEY (ts_code, trade_date));
@@ -121,10 +122,14 @@ def refresh_reference(con: duckdb.DuckDBPyConnection, pro: Pro, start: date, end
     _upsert(con, "trade_calendar", pd.DataFrame(
         {"cal_date": _d(cal["cal_date"]), "is_open": cal["is_open"].astype(int) == 1}))
     frames = [pro("stock_basic", list_status=s,
-                  fields="ts_code,name,industry,market,list_date") for s in ("L", "D", "P")]
+                  fields="ts_code,name,industry,market,list_date,delist_date") for s in ("L", "D", "P")]
     sb = pd.concat([f for f in frames if f is not None], ignore_index=True)
     sb["list_date"] = pd.to_datetime(sb["list_date"], format="%Y%m%d", errors="coerce").dt.date
-    _upsert(con, "stock_basic", sb[["ts_code", "name", "industry", "market", "list_date"]])
+    if "delist_date" not in sb:
+        sb["delist_date"] = None
+    sb["delist_date"] = pd.to_datetime(sb["delist_date"], format="%Y%m%d", errors="coerce").dt.date
+    _upsert(con, "stock_basic",
+            sb[["ts_code", "name", "industry", "market", "list_date", "delist_date"]])
 
 
 def missing_days(con: duckdb.DuckDBPyConnection, table: str, start: date, end: date) -> list[date]:

@@ -78,6 +78,14 @@ def load_inputs(
     return days, dict(bars), dict(signals)
 
 
+def load_delisted(con: duckdb.DuckDBPyConnection) -> dict[str, date]:
+    try:
+        return dict(con.execute("SELECT ts_code, delist_date FROM stock_basic "
+                                "WHERE delist_date IS NOT NULL").fetchall())
+    except duckdb.Error:  # older replicas have no delist_date
+        return {}
+
+
 def load_industries(con: duckdb.DuckDBPyConnection, codes: list[str]) -> dict[str, str]:
     if not codes:
         return {}
@@ -100,9 +108,10 @@ def run_and_save(
         days, bars, signals = load_inputs(con, preset, start, end, bar_table)
         industries = load_industries(
             con, sorted({c.ts_code for items in signals.values() for c in items}))
+        delisted = load_delisted(con)
     finally:
         con.close()
-    result = run_backtest(days, bars, signals, config)
+    result = run_backtest(days, bars, signals, config, delisted)
     pool = [c.ts_code for c in signals[max(signals)]] if signals else []
     return save(result, preset=preset, start=start, end=end, root=root, title=title,
                 industries=industries, pool_last=pool, strategy=strategy)

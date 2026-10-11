@@ -74,3 +74,16 @@ def test_pricey_pick_still_bought_and_leftover_cash_redistributed() -> None:
     rec = run_backtest([d0, d1], bars, signals, cfg).days[-1]
     assert rec.positions["A"] == 100  # 20k target / 300 -> floor would be 0 lots
     assert rec.cash < 2_000  # C is blocked, its cash flows to B (capped at 1.5x)
+
+
+def test_delisted_position_is_written_off_not_held_at_stale_price() -> None:
+    d0, d1, d2 = date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 4)
+    bar = Bar(open=10, close=10, pre_close=10)
+    bars = {d0: {}, d1: {"A": bar}, d2: {}}
+    signals = {d0: [PortfolioCandidate(ts_code="A")]}
+    cfg = BacktestConfig(capital=10_000, weights=PortfolioWeightRule(max_positions=1))
+    kept = run_backtest([d0, d1, d2], bars, signals, cfg).days[-1]
+    assert kept.positions == {"A": 900}  # suspended: held at last price
+    gone = run_backtest([d0, d1, d2], bars, signals, cfg, {"A": d2})
+    assert gone.days[-1].positions == {} and gone.days[-1].nav < 0.01
+    assert gone.orders[-1].reason == "退市注销"

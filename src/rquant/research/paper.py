@@ -8,7 +8,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 from rquant.backtest import run_backtest
-from rquant.backtest.store import load_inputs
+from rquant.backtest.store import load_delisted, load_inputs
 from rquant.web.models import HoldingItem, PaperAccount
 
 
@@ -17,7 +17,7 @@ def simulate(con, slug: str, preset: str, config, last: date, days: int = 60,
     start = last - timedelta(days=int(days * 1.6))
     tdays, bars, signals = load_inputs(con, preset, start, last, "daily_bar_qfq")
     tdays = tdays[-days:]
-    result = run_backtest(tdays, bars, signals, config)
+    result = run_backtest(tdays, bars, signals, config, load_delisted(con))
     rec = result.days[-1]
     cost: dict[str, tuple[float, int]] = {}
     for o in result.orders:
