@@ -21,19 +21,32 @@ short="${tag#web-}"
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 gh release download "$tag" -R "$REPO" -D "$tmp" -p "rquant-web-$short.tar.gz*"
 (cd "$tmp" && sha256sum -c --quiet "rquant-web-$short.tar.gz.sha256")
-# resumable upload: append 512 KiB chunks from the remote file's current size (the uplink can
-# stall mid-transfer), then check the sha256 on the server before installing
+# resumable upload (the uplink can stall mid-transfer): 512 KiB parts, each written to a temp
+# name and renamed only when complete, so a killed transfer never leaves a bad part behind;
+# parts already on the server are skipped; then concatenate and check the sha256 there
 local_tar="$tmp/rquant-web-$short.tar.gz"
 remote_tar="/tmp/rquant-web-$short.tar.gz"
+parts="/tmp/rquant-web-$short.parts"
+chunk=524288
 size=$(stat -c %s "$local_tar")
-for attempt in $(seq 1 "${RQUANT_UPLOAD_TRIES:-400}"); do
-  have=$("${SSH[@]}" "stat -c %s $remote_tar 2>/dev/null || echo 0" </dev/null) || { sleep 5; continue; }
-  if (( have > size )); then "${SSH[@]}" "rm -f $remote_tar" </dev/null; continue; fi
-  (( have == size )) && break
-  tail -c +"$((have + 1))" "$local_tar" | head -c 524288 \
-    | timeout "${RQUANT_CHUNK_TIMEOUT:-120}" "${SSH[@]}" "cat >> $remote_tar" || sleep 5
-  echo "[$(date "+%F %T")] upload $have/$size (try $attempt)"
+n=$(( (size + chunk - 1) / chunk ))
+"${SSH[@]}" "mkdir -p $parts" </dev/null
+for attempt in $(seq 1 "${RQUANT_UPLOAD_TRIES:-60}"); do
+  done_list=$("${SSH[@]}" "ls $parts" </dev/null) || { sleep 10; continue; }
+  missing=0
+  for ((i = 0; i < n; i++)); do
+    grep -qx "p$i" <<<"$done_list" && continue
+    missing=1
+    want=$(( i < n - 1 ? chunk : size - i * chunk ))
+    tail -c +"$((i * chunk + 1))" "$local_tar" | head -c "$chunk" \
+      | timeout "${RQUANT_CHUNK_TIMEOUT:-120}" "${SSH[@]}" \
+          "t=$parts/t$i.\$\$; cat > \$t; if [ \$(stat -c %s \$t) = $want ]; then mv \$t $parts/p$i; else rm -f \$t; exit 1; fi" \
+      || sleep 5
+    echo "[$(date "+%F %T")] part $((i + 1))/$n (pass $attempt)"
+  done
+  (( missing == 0 )) && break
 done
+"${SSH[@]}" "cd $parts && cat \$(for ((i = 0; i < $n; i++)); do echo p\$i; done) > $remote_tar && rm -rf $parts" </dev/null
 want_sum=$(cut -d' ' -f1 "$local_tar.sha256" 2>/dev/null || sha256sum "$local_tar" | cut -d' ' -f1)
 got_sum=$("${SSH[@]}" "sha256sum $remote_tar | cut -d' ' -f1" </dev/null)
 [[ "$got_sum" == "$want_sum" ]] || { "${SSH[@]}" "rm -f $remote_tar" </dev/null; echo "upload checksum mismatch" >&2; exit 1; }
