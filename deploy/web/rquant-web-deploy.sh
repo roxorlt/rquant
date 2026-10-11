@@ -44,6 +44,10 @@ switch_to() {  # atomic symlink swap of `current`
   ln -sfn "$1" "$REL_ROOT/.current.tmp"
   mv -T "$REL_ROOT/.current.tmp" "$REL_ROOT/current"
   sudo -n systemctl restart "$SERVICE"
+  # rquant-web-commands runs from the same release venv
+  if systemctl is-enabled --quiet rquant-web-commands 2>/dev/null; then
+    sudo -n systemctl restart rquant-web-commands
+  fi
 }
 
 ensure_static_link() {
