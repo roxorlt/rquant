@@ -376,6 +376,10 @@ export function useBrinson(
 export function useFactorCorrelation(): ServingQueryResult<Schemas["FactorCorrData"]> {
   return useServingQuery(["factors", "correlation"], async () => {
     const { data, response } = await apiClient().GET("/api/v1/factors/correlation");
+    return unwrap(data, response);
+  });
+}
+
 export function useQuerySchema(): ServingQueryResult<Record<string, string[][]>> {
   return useServingQuery(["query", "schema"], async () => {
     const { data, response } = await apiClient().GET("/api/v1/query/schema");
