@@ -1087,6 +1087,95 @@
         "title": "BoardItem",
         "type": "object"
       },
+      "BrinsonData": {
+        "properties": {
+          "allocation": {
+            "title": "Allocation",
+            "type": "number"
+          },
+          "benchmark": {
+            "title": "Benchmark",
+            "type": "string"
+          },
+          "benchmark_return": {
+            "title": "Benchmark Return",
+            "type": "number"
+          },
+          "days": {
+            "title": "Days",
+            "type": "integer"
+          },
+          "interaction": {
+            "title": "Interaction",
+            "type": "number"
+          },
+          "portfolio_return": {
+            "title": "Portfolio Return",
+            "type": "number"
+          },
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/BrinsonRow"
+            },
+            "title": "Rows",
+            "type": "array"
+          },
+          "selection": {
+            "title": "Selection",
+            "type": "number"
+          }
+        },
+        "required": [
+          "benchmark",
+          "days",
+          "portfolio_return",
+          "benchmark_return",
+          "allocation",
+          "selection",
+          "interaction",
+          "rows"
+        ],
+        "title": "BrinsonData",
+        "type": "object"
+      },
+      "BrinsonRow": {
+        "properties": {
+          "allocation": {
+            "title": "Allocation",
+            "type": "number"
+          },
+          "industry": {
+            "title": "Industry",
+            "type": "string"
+          },
+          "interaction": {
+            "title": "Interaction",
+            "type": "number"
+          },
+          "selection": {
+            "title": "Selection",
+            "type": "number"
+          },
+          "weight_benchmark": {
+            "title": "Weight Benchmark",
+            "type": "number"
+          },
+          "weight_portfolio": {
+            "title": "Weight Portfolio",
+            "type": "number"
+          }
+        },
+        "required": [
+          "industry",
+          "weight_portfolio",
+          "weight_benchmark",
+          "allocation",
+          "selection",
+          "interaction"
+        ],
+        "title": "BrinsonRow",
+        "type": "object"
+      },
       "CatalogDataset": {
         "additionalProperties": false,
         "properties": {
@@ -1861,6 +1950,29 @@
           "serving"
         ],
         "title": "Envelope[TaskLog]",
+        "type": "object"
+      },
+      "Envelope_Union_BrinsonData__NoneType__": {
+        "properties": {
+          "data": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BrinsonData"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[Union[BrinsonData, NoneType]]",
         "type": "object"
       },
       "Envelope_Union_FundamentalsDoc__NoneType__": {
@@ -5031,6 +5143,45 @@
           }
         },
         "summary": "回测自助抽样区间"
+      }
+    },
+    "/api/v1/portfolio-backtests/{run_id}/brinson": {
+      "get": {
+        "operationId": "portfolio_brinson_api_v1_portfolio_backtests__run_id__brinson_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_Union_BrinsonData__NoneType__"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "行业 Brinson 归因"
       }
     },
     "/api/v1/portfolio-backtests/{run_id}/explain": {
