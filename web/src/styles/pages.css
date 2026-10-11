@@ -320,7 +320,7 @@ input:focus {
   stroke-width: 1;
 }
 .tpo {
-  font-family: var(--mono);
+  font-family: var(--font-mono);
   font-size: 12px;
   line-height: 15px;
   max-height: 460px;
@@ -345,5 +345,5 @@ input:focus {
 }
 .tpo-l {
   letter-spacing: 3px;
-  color: var(--text);
+  color: var(--ink);
 }

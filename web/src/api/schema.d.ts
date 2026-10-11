@@ -1957,6 +1957,12 @@ export interface components {
         };
         /** ScreenRow */
         ScreenRow: {
+            /** Amount */
+            amount?: number | null;
+            /** Amplitude */
+            amplitude?: number | null;
+            /** Circ Mv */
+            circ_mv?: number | null;
             /** Close */
             close: number | null;
             /** Code */
@@ -1967,6 +1973,10 @@ export interface components {
             };
             /** Industry */
             industry?: string | null;
+            /** Main Net */
+            main_net?: number | null;
+            /** Main Net 5D */
+            main_net_5d?: number | null;
             /** Name */
             name: string | null;
             /** Netprofit Yoy */
@@ -1981,6 +1991,10 @@ export interface components {
             pe_ttm?: number | null;
             /** Preset */
             preset: string;
+            /** Ret20 */
+            ret20?: number | null;
+            /** Ret5 */
+            ret5?: number | null;
             /** Roe */
             roe?: number | null;
             /** Total Mv */
@@ -1992,6 +2006,10 @@ export interface components {
             trade_date: string;
             /** Turnover Rate */
             turnover_rate?: number | null;
+            /** Turnover Rate F */
+            turnover_rate_f?: number | null;
+            /** Vol Ratio */
+            vol_ratio?: number | null;
         };
         /** ServiceItem */
         ServiceItem: {
