@@ -131,6 +131,29 @@ export default function DataCenterPage() {
                   ) : null}
                 </Panel>
               ) : null}
+              <Panel title="研究库覆盖" sub="research market.duckdb 各表最近 30 天" flush>
+                <DataTable
+                  label="研究库覆盖"
+                  rows={(data.audit?.datasets ?? []).filter((c) => !c.error)}
+                  rowKey={(c) => c.dataset_id}
+                  columns={[
+                    { id: "table", header: "表", value: (c) => c.table_name },
+                    { id: "latest", header: "最新日期", value: (c) => c.latest_date ?? null },
+                    {
+                      id: "rows",
+                      header: "窗口行数",
+                      numeric: true,
+                      value: (c) => c.rows_in_window,
+                    },
+                    {
+                      id: "missing",
+                      header: "缺失交易日",
+                      numeric: true,
+                      value: (c) => c.missing_open_days.length,
+                    },
+                  ]}
+                />
+              </Panel>
             </>
           );
         }}
