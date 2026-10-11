@@ -1,0 +1,15 @@
+[Unit]
+Description=rQuant research data refresh + recompute (factors, screens, backtests)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=lighthouse
+WorkingDirectory=/home/lighthouse/rquant-web-rel/current
+EnvironmentFile=/etc/rquant-web.env
+EnvironmentFile=/home/lighthouse/rquant-research/.tushare.env
+ExecStart=/home/lighthouse/rquant-web-rel/current/.venv/bin/python -m rquant.research daily
+Nice=10
+CPUQuota=200%
+MemoryMax=6G
+TimeoutStartSec=4h

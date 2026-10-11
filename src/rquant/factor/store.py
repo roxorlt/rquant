@@ -36,9 +36,10 @@ class FactorRun(BaseModel):
     result: FactorTestResult
 
 
-def load_panel(con: duckdb.DuckDBPyConnection, start: date, end: date) -> dict[str, pd.DataFrame]:
+def load_panel(con: duckdb.DuckDBPyConnection, start: date, end: date,
+               table: str = "daily_bar") -> dict[str, pd.DataFrame]:
     frame = con.execute(
-        f"SELECT trade_date, ts_code, {', '.join(FIELDS)} FROM daily_bar "
+        f"SELECT trade_date, ts_code, {', '.join(FIELDS)} FROM {table} "
         "WHERE trade_date BETWEEN ? AND ?",
         [start - timedelta(days=WARMUP_DAYS), end + timedelta(days=45)],
     ).df()
