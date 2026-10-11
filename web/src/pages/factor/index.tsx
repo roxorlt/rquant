@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useFactor, useFactors } from "@/api/endpoints";
+import { TimeChart } from "@/charts/Chart";
 import { DataTable } from "@/table/DataTable";
 import { KpiStrip, PageHeader, Panel } from "@/ui";
 import { QueryView } from "../shared";
@@ -14,28 +15,16 @@ function IcBars({
   points: { date: string; ic: number }[];
   label?: string;
 }) {
-  if (points.length < 2) return null;
-  const w = 640;
-  const h = 120;
-  const max = Math.max(0.05, ...points.map((p) => Math.abs(p.ic)));
-  const bw = w / points.length;
   return (
-    <svg viewBox={`0 0 ${w} ${h}`} width="100%" height={h} role="img" aria-label={label}>
-      <line x1={0} x2={w} y1={h / 2} y2={h / 2} stroke="var(--line, #ddd)" />
-      {points.map((p, i) => {
-        const bar = (Math.abs(p.ic) / max) * (h / 2 - 4);
-        return (
-          <rect
-            key={p.date}
-            x={i * bw}
-            width={Math.max(1, bw - 1)}
-            y={p.ic >= 0 ? h / 2 - bar : h / 2}
-            height={bar}
-            fill={p.ic >= 0 ? "var(--up, #d33)" : "var(--down, #2a2)"}
-          />
-        );
-      })}
-    </svg>
+    <TimeChart
+      label={label}
+      dates={points.map((p) => p.date)}
+      bars
+      baseline={0}
+      height={140}
+      format={(v) => v.toFixed(3)}
+      series={[{ name: "IC", values: points.map((p) => p.ic), color: "var(--accent)" }]}
+    />
   );
 }
 
