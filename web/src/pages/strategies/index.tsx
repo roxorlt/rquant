@@ -1,5 +1,6 @@
 import { PageHeader } from "@/ui";
 import { StrategyList } from "../backtest/Portfolio";
+import { EventStudies } from "./EventStudies";
 
 export default function StrategiesPage() {
   return (
@@ -10,6 +11,7 @@ export default function StrategiesPage() {
         note="版本化策略配置；回测用 --strategy 名称@版本 复现"
       />
       <StrategyList />
+      <EventStudies />
     </>
   );
 }

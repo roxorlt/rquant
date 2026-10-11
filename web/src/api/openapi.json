@@ -1680,6 +1680,22 @@
         "title": "Envelope[DataCenterData]",
         "type": "object"
       },
+      "Envelope_EventStudyListData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/EventStudyListData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[EventStudyListData]",
+        "type": "object"
+      },
       "Envelope_FactorCorrData_": {
         "properties": {
           "data": {
@@ -2078,6 +2094,126 @@
           "serving"
         ],
         "title": "Envelope[list[str]]",
+        "type": "object"
+      },
+      "EventHorizon": {
+        "properties": {
+          "excess_mean": {
+            "additionalProperties": {
+              "type": "number"
+            },
+            "default": {},
+            "title": "Excess Mean",
+            "type": "object"
+          },
+          "excess_win_rate": {
+            "additionalProperties": {
+              "type": "number"
+            },
+            "default": {},
+            "title": "Excess Win Rate",
+            "type": "object"
+          },
+          "mean": {
+            "title": "Mean",
+            "type": "number"
+          },
+          "median": {
+            "title": "Median",
+            "type": "number"
+          },
+          "n": {
+            "title": "N",
+            "type": "integer"
+          },
+          "win_rate": {
+            "title": "Win Rate",
+            "type": "number"
+          }
+        },
+        "required": [
+          "n",
+          "mean",
+          "median",
+          "win_rate"
+        ],
+        "title": "EventHorizon",
+        "type": "object"
+      },
+      "EventStudy": {
+        "properties": {
+          "caveats": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Caveats",
+            "type": "array"
+          },
+          "formula": {
+            "title": "Formula",
+            "type": "string"
+          },
+          "horizons": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/EventHorizon"
+            },
+            "default": {},
+            "title": "Horizons",
+            "type": "object"
+          },
+          "per_year": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "default": {},
+            "title": "Per Year",
+            "type": "object"
+          },
+          "signals": {
+            "title": "Signals",
+            "type": "integer"
+          },
+          "slug": {
+            "title": "Slug",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "window": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Window",
+            "type": "array"
+          }
+        },
+        "required": [
+          "slug",
+          "title",
+          "formula",
+          "window",
+          "signals"
+        ],
+        "title": "EventStudy",
+        "type": "object"
+      },
+      "EventStudyListData": {
+        "properties": {
+          "studies": {
+            "items": {
+              "$ref": "#/components/schemas/EventStudy"
+            },
+            "title": "Studies",
+            "type": "array"
+          }
+        },
+        "required": [
+          "studies"
+        ],
+        "title": "EventStudyListData",
         "type": "object"
       },
       "Explanation": {
@@ -4431,6 +4567,70 @@
         "title": "TaskRow",
         "type": "object"
       },
+      "TextToConditionData": {
+        "properties": {
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "expression": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expression"
+          },
+          "model": {
+            "title": "Model",
+            "type": "string"
+          },
+          "tdx": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tdx"
+          }
+        },
+        "required": [
+          "tdx",
+          "expression",
+          "error",
+          "model"
+        ],
+        "title": "TextToConditionData",
+        "type": "object"
+      },
+      "TextToConditionRequest": {
+        "properties": {
+          "text": {
+            "maxLength": 300,
+            "minLength": 2,
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "title": "TextToConditionRequest",
+        "type": "object"
+      },
       "TrackingPoint": {
         "properties": {
           "date": {
@@ -4882,6 +5082,24 @@
         "summary": "数据中心"
       }
     },
+    "/api/v1/event-studies": {
+      "get": {
+        "operationId": "event_studies_api_v1_event_studies_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_EventStudyListData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "通达信策略事件研究"
+      }
+    },
     "/api/v1/factors": {
       "get": {
         "operationId": "factors_api_v1_factors_get",
@@ -4955,6 +5173,44 @@
           }
         },
         "summary": "因子检验详情"
+      }
+    },
+    "/api/v1/formula/from-text": {
+      "post": {
+        "operationId": "formula_from_text_api_v1_formula_from_text_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TextToConditionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TextToConditionData"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "一句话生成条件（AI 写通达信公式，再本地翻译校验）"
       }
     },
     "/api/v1/formula/translate": {

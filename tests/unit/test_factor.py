@@ -102,7 +102,7 @@ def test_tdx_translation(tdx: str, expr: str) -> None:
     evaluate(expr, _panel(30, 5))
 
 
-@pytest.mark.parametrize("bad", ["CROSS(C,MA(C,5))", "C>MA(C,N)", "DRAWTEXT(1,2,'x')", ""])
+@pytest.mark.parametrize("bad", ["BARSLAST(C>MA(C,5))", "C>MA(C,N)", "DRAWTEXT(1,2,'x')", ""])
 def test_tdx_unsupported_is_explicit(bad: str) -> None:
     from rquant.factor.tdx import TdxFormulaError, translate
 

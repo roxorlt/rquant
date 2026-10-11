@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useConditions, useTranslateTdx } from "@/api/endpoints";
+import { useConditions, useTextToCondition, useTranslateTdx } from "@/api/endpoints";
 import { toneClass, toneOf } from "@/format/color";
 import { formatPrice } from "@/format/number";
 import { DataTable } from "@/table/DataTable";
@@ -11,8 +11,42 @@ function TdxImport() {
   const [tdx, setTdx] = useState("C>MA(C,5) AND V>REF(V,1)*2");
   const translate = useTranslateTdx();
   const result = translate.data;
+  const [text, setText] = useState("");
+  const ai = useTextToCondition();
   return (
     <Panel title="通达信公式导入" sub="只翻译与校验；执行用 python -m rquant.factor screen --tdx">
+      <div className="cond-row">
+        <input
+          aria-label="一句话条件"
+          placeholder="一句话描述条件，例如：站上20日线且放量一倍"
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          style={{ flex: 1 }}
+        />
+        <Button
+          size="sm"
+          disabled={ai.isPending || text.trim().length < 2}
+          onClick={() =>
+            ai.mutate(text, {
+              onSuccess: (d) => {
+                if (d.tdx) setTdx(d.tdx);
+                translate.reset();
+              },
+            })
+          }
+        >
+          {ai.isPending ? "生成中…" : "一句话生成"}
+        </Button>
+      </div>
+      {ai.data ? (
+        <output aria-label="生成结果" className="sub">
+          {ai.data.expression
+            ? `AI 公式：${ai.data.tdx} → 表达式：${ai.data.expression}`
+            : `AI 公式未通过校验：${ai.data.error ?? ""}`}
+        </output>
+      ) : ai.error ? (
+        <output className="sub">{String(ai.error)}</output>
+      ) : null}
       <textarea
         aria-label="通达信公式"
         rows={3}

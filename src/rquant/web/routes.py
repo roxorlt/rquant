@@ -52,6 +52,8 @@ from rquant.web.models import (
     ConditionListData,
     DataCenterData,
     Envelope,
+    EventStudy,
+    EventStudyListData,
     FactorDetailData,
     FactorListData,
     FactorSummary,
@@ -84,6 +86,8 @@ from rquant.web.models import (
     SignalItem,
     StrategyListData,
     StrategyRow,
+    TextToConditionData,
+    TextToConditionRequest,
     TranslateData,
     TranslateRequest,
 )
@@ -535,6 +539,41 @@ def translate_formula(body: TranslateRequest) -> TranslateData:
         return TranslateData(expression=translate_tdx(body.tdx), error=None)
     except TdxFormulaError as exc:
         return TranslateData(expression=None, error=str(exc))
+
+
+TEXT_TO_TDX_PROMPT = """把用户的一句话选股条件改写成一行通达信公式，只输出公式本身，不要解释。
+只能用：C O H L V AMOUNT，函数 MA REF HHV LLV SUM STD ABS CROSS，
+运算 + - * / > >= < <= = <>，AND OR NOT，括号，数字。不要用其它函数或变量。
+例：“站上20日线且放量一倍” -> C>MA(C,20) AND V>MA(V,5)*2"""
+
+
+@router.post("/formula/from-text", response_model=TextToConditionData,
+             summary="一句话生成条件（AI 写通达信公式，再本地翻译校验）")
+def formula_from_text(body: TextToConditionRequest, request: Request) -> TextToConditionData:
+    llm = getattr(request.app.state, "llm", None) or deepseek_complete()
+    if llm is None:
+        raise HTTPException(503, "AI 未配置（DEEPSEEK_API_KEY）")
+    complete, model = llm
+    try:
+        reply = complete([{"role": "system", "content": TEXT_TO_TDX_PROMPT},
+                          {"role": "user", "content": body.text}])
+    except Exception as exc:  # noqa: BLE001 - upstream model/network failure
+        raise HTTPException(502, f"AI 调用失败：{type(exc).__name__}") from exc
+    tdx = reply.strip().strip("`").removeprefix("tdx").strip().splitlines()[0].strip()[:500]
+    try:
+        return TextToConditionData(tdx=tdx, expression=translate_tdx(tdx), error=None,
+                                   model=model)
+    except TdxFormulaError as exc:
+        return TextToConditionData(tdx=tdx, expression=None, error=str(exc), model=model)
+
+
+@router.get("/event-studies", response_model=Envelope[EventStudyListData],
+            summary="通达信策略事件研究")
+def event_studies(request: Request, source: SourceDep) -> Envelope[EventStudyListData]:
+    base = Path(_research_root(request) or research_root()) / "event_study"
+    studies = [EventStudy.model_validate_json(p.read_text())
+               for p in sorted(base.glob("*.json"))] if base.is_dir() else []
+    return _envelope(source, EventStudyListData(studies=studies))
 
 
 @router.get("/conditions", response_model=Envelope[ConditionListData], summary="条件选股结果")

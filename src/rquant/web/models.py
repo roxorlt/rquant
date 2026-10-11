@@ -438,6 +438,41 @@ class TranslateData(BaseModel):
     error: str | None
 
 
+class TextToConditionRequest(BaseModel):
+    text: str = Field(min_length=2, max_length=300)
+
+
+class TextToConditionData(BaseModel):
+    tdx: str | None
+    expression: str | None
+    error: str | None
+    model: str
+
+
+class EventHorizon(BaseModel):
+    n: int
+    mean: float
+    median: float
+    win_rate: float
+    excess_mean: dict[str, float] = {}
+    excess_win_rate: dict[str, float] = {}
+
+
+class EventStudy(BaseModel):
+    slug: str
+    title: str
+    formula: str
+    window: list[str]
+    signals: int
+    per_year: dict[str, int] = {}
+    horizons: dict[str, EventHorizon] = {}
+    caveats: list[str] = []
+
+
+class EventStudyListData(BaseModel):
+    studies: list[EventStudy]
+
+
 class ConditionListData(BaseModel):
     runs: list[ConditionRun]
 
