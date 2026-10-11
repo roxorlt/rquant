@@ -53,7 +53,7 @@ def test_api_tasks_query_fundamentals(client):
 def test_viewer_cannot_query(client, monkeypatch):
     monkeypatch.setenv("RQUANT_WEB_ADMINS", "roxor")
     r = client.post("/api/v1/query", json={"sql": "select 1"},
-                    headers={"X-Forwarded-User": "guest"})
+                    headers={"X-Remote-User": "guest"})
     assert r.status_code == 403
 
 
@@ -70,3 +70,34 @@ def test_fetch_latest_period(tmp_path):
     assert rows[0].end_date == "20250630" and rows[0].values["roe"] is None
     save(tmp_path, rows)
     assert read(tmp_path).rows[0].code == "600519.SH"
+
+
+@pytest.mark.parametrize("sql", [
+    "select * from secret_table",
+    "with x as (select 1) select * from x join other.stock_basic using (ts_code)",
+    "select * from duckdb_settings()",
+    "select * from information_schema.tables",
+    "select getenv('HOME')",
+])
+def test_guard_table_allowlist_rejects(sql):
+    with pytest.raises(q.QueryError):
+        q.guard(sql)
+
+
+def test_guard_allowlist_accepts_cte_and_env_override(monkeypatch):
+    assert q.guard("with x as (select * from stock_basic) select * from x, main.signals")
+    monkeypatch.setenv("RQUANT_WEB_QUERY_TABLES", "signals")
+    with pytest.raises(q.QueryError):
+        q.guard("select * from stock_basic")
+
+
+def test_sandboxed_connection_blocks_file_access(tmp_path):
+    import duckdb
+
+    db = tmp_path / "s.duckdb"
+    duckdb.connect(str(db)).execute("create table stock_basic as select 1 x").close()
+    con = duckdb.connect(str(db), read_only=True)
+    con.execute("SET enable_external_access = false")
+    con.execute("SET lock_configuration = true")
+    with pytest.raises(duckdb.Error):
+        con.execute("SET enable_external_access = true")

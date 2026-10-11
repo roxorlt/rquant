@@ -272,10 +272,10 @@ def test_viewer_cannot_write_and_operations_list_web_writes(monkeypatch) -> None
     client = TestClient(app)
     rule = {"rule_id": "p2", "title": "二号池"}
     monkeypatch.setenv("RQUANT_WEB_ADMINS", "roxor")
-    viewer = {"X-Forwarded-User": "guest"}
+    viewer = {"X-Remote-User": "guest"}
     assert client.get("/api/v1/meta", headers=viewer).json()["data"]["role"] == "viewer"
     assert client.post("/api/v1/alert-rules", json=rule, headers=viewer).status_code == 403
-    admin = {"X-Forwarded-User": "roxor"}
+    admin = {"X-Remote-User": "roxor"}
     assert client.post("/api/v1/alert-rules", json=rule, headers=admin).status_code == 200
     assert client.post("/api/v1/alerts/ack", json={"alert_id": "b" * 64},
                        headers=admin).status_code == 200

@@ -38,7 +38,7 @@ class MetaData(BaseModel):
     generation: ServingMeta
     #: deploy-time banner (env ``RQUANT_WEB_NOTICE``), e.g. "回放数据 2026-09-25"
     notice: str | None = None
-    #: who is asking (nginx basic-auth user via X-Forwarded-User) and what they may do
+    #: who is asking (nginx basic-auth user via X-Remote-User) and what they may do
     user: str | None = None
     role: Literal["admin", "viewer"] = "admin"
 
