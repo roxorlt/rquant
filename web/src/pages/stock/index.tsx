@@ -1,18 +1,14 @@
 import { Link, useParams } from "react-router";
 import { useStock } from "@/api/endpoints";
-import { kpiTone } from "@/format/color";
 import { formatShanghaiDateTime } from "@/format/time";
-import { ChangeText, KpiStrip, PageHeader, Panel, Pill } from "@/ui";
+import { ChangeText, PageHeader, Panel, Pill } from "@/ui";
 import { QueryView } from "../shared";
 import { FlowPanel } from "./Flow";
 import { KlinePanel } from "./Kline";
+import { QuoteGrid } from "./QuoteGrid";
 import { TpoPanel } from "./Tpo";
 
-const pct = (v: number | null | undefined) =>
-  v == null ? "—" : `${v > 0 ? "+" : ""}${(v * 100).toFixed(2)}%`;
 const fix = (v: number | null | undefined, d = 2) => (v == null ? "—" : v.toFixed(d));
-/** Tushare total_mv is in 万元. */
-const yi = (wan: number | null | undefined) => (wan == null ? "—" : `${(wan / 1e4).toFixed(0)} 亿`);
 
 /** 个股档案 (F9-lite): quote, K-line, valuation, returns, fundamentals, pools, alerts. */
 export default function StockPage() {
@@ -38,24 +34,8 @@ export default function StockPage() {
               }
               note={last ? `截至 ${last.date}` : "没有行情"}
             />
-            <KpiStrip
-              label="估值与区间收益"
-              compact
-              items={[
-                { key: "pe", label: "PE(TTM)", value: fix(s.valuation?.pe_ttm, 1) },
-                { key: "pb", label: "PB", value: fix(s.valuation?.pb) },
-                { key: "mv", label: "总市值", value: yi(s.valuation?.total_mv) },
-                { key: "cmv", label: "流通市值", value: yi(s.valuation?.circ_mv) },
-                { key: "to", label: "换手率", value: fix(s.valuation?.turnover_rate), unit: "%" },
-                ...Object.entries(s.returns).map(([k, v]) => ({
-                  key: k,
-                  label: k,
-                  value: pct(v),
-                  tone: kpiTone(v),
-                })),
-              ]}
-            />
-            <KlinePanel code={s.code} bars={s.bars} />
+            <QuoteGrid s={s} />
+            <KlinePanel key={s.code} code={s.code} bars={s.bars} flow={s.flow} />
             <TpoPanel code={s.code} />
             <FlowPanel s={s} />
             <div className="risk-block">

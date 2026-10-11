@@ -4663,6 +4663,21 @@
             "title": "Pools",
             "type": "array"
           },
+          "quote": {
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "default": {},
+            "title": "Quote",
+            "type": "object"
+          },
           "returns": {
             "additionalProperties": {
               "anyOf": [
@@ -5165,6 +5180,17 @@
             ],
             "title": "Circ Mv"
           },
+          "dv_ttm": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dv Ttm"
+          },
           "pb": {
             "anyOf": [
               {
@@ -5186,6 +5212,17 @@
               }
             ],
             "title": "Pe Ttm"
+          },
+          "ps_ttm": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ps Ttm"
           },
           "total_mv": {
             "anyOf": [
@@ -5213,6 +5250,17 @@
               }
             ],
             "title": "Turnover Rate"
+          },
+          "turnover_rate_f": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Turnover Rate F"
           }
         },
         "required": [
