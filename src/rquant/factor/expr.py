@@ -41,6 +41,7 @@ FUNCS: Mapping[str, tuple[int, Callable[..., pd.DataFrame]]] = {
     "ts_delta": (2, lambda x, n: x - x.shift(n)),
     "ts_rank": (2, _ts_rank),
     "delay": (2, lambda x, n: x.shift(n)),
+    "ts_ema": (2, lambda x, n: x.ewm(span=n, adjust=False, min_periods=1).mean()),
     "cs_rank": (1, lambda x: x.rank(axis=1, pct=True)),
     "cs_zscore": (1, lambda x: x.sub(x.mean(axis=1), axis=0).div(x.std(axis=1), axis=0)),
     "log": (1, lambda x: np.log(x.where(x > 0))),
@@ -58,7 +59,7 @@ def _as_float(x: object) -> object:
 
 
 def validate(expression: str) -> ast.Expression:
-    if len(expression) > 500:
+    if len(expression) > 4000:  # inlined TDX formulas get long
         raise FactorExpressionError("表达式过长")
     try:
         tree = ast.parse(expression, mode="eval")

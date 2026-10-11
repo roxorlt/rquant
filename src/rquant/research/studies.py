@@ -60,70 +60,75 @@ def _save(root: Path, slug: str, body: dict) -> dict:
 # ---- 1. 黄金坑 at 14:50 ---------------------------------------------------------
 
 
-def hjk_1450(root: Path) -> dict:
+WINDOW_ROWS = 140  # history rows per evaluation (MA60/LLV/EMA warm-up)
+
+
+def intraday_study(root: Path, slug: str, title: str, formula: str, eod_preset: str) -> dict:
+    """Any TDX formula evaluated as of 14:50: for each day the panel is the real history
+    plus that day's 14:50 proxies (close/high/low so far, volume/amount scaled to a full
+    day), so nothing after 14:50 leaks in. Entry at the 14:50 price."""
+    from rquant.factor.expr import FIELDS, evaluate
+    from rquant.factor.tdx import translate
+
+    expr = translate(formula)
     icon = duckdb.connect(str(intraday_path(root)), read_only=True)
     b = icon.execute("SELECT * FROM bar_1450").df()
     icon.close()
     b["trade_date"] = pd.to_datetime(b["trade_date"])
     start, end = b["trade_date"].min(), b["trade_date"].max()
     con = duckdb.connect(str(db_path(root)), read_only=True)
-    w0 = start - pd.Timedelta(days=90)
+    w0 = start - pd.Timedelta(days=250)
     q = "FROM {t} WHERE trade_date BETWEEN ? AND ? AND ts_code NOT LIKE '%.BJ'"
-    C = _panel(con, f"SELECT trade_date, ts_code, close {q.format(t='daily_bar_hfq')}",
-               [w0, end], "close")
-    H = _panel(con, f"SELECT trade_date, ts_code, high {q.format(t='daily_bar_hfq')}",
-               [w0, end], "high").reindex_like(C)
-    O = _panel(con, f"SELECT trade_date, ts_code, open {q.format(t='daily_bar_hfq')}",
-               [w0, end], "open").reindex_like(C)
-    V = _panel(con, f"SELECT trade_date, ts_code, vol {q.format(t='daily_bar')}",
-               [w0, end], "vol").reindex_like(C)
+    panel = {f: _panel(con, f"SELECT trade_date, ts_code, {f} {q.format(t='daily_bar_hfq')}",
+                       [w0, end], f) for f in FIELDS}
+    C = panel["close"]
+    for f in FIELDS:
+        panel[f] = panel[f].reindex_like(C)
     A = _panel(con, f"SELECT trade_date, ts_code, adj_factor {q.format(t='adj_factor')}",
                [w0, end], "adj_factor").reindex_like(C)
-    pre = _panel(con, f"SELECT trade_date, ts_code, pre_close {q.format(t='daily_bar')}",
-                 [w0, end], "pre_close").reindex_like(C)
+    raw = {f: _panel(con, f"SELECT trade_date, ts_code, {f} {q.format(t='daily_bar')}",
+                     [w0, end], f).reindex_like(C) for f in ("pre_close", "vol", "amount")}
     lim = _panel(con, f"SELECT trade_date, ts_code, limit_pct {q.format(t='daily_state')}",
                  [w0, end], "limit_pct").reindex_like(C).fillna(0.1)
     st = {c for (c,) in con.execute(
         "SELECT ts_code FROM stock_basic WHERE name LIKE '%ST%' OR name LIKE '%退%'").fetchall()}
     idx = _panel(con, "SELECT trade_date, ts_code, close FROM index_daily "
                  "WHERE trade_date BETWEEN ? AND ?", [w0, end], "close").reindex(C.index)
-    eod = con.execute("SELECT trade_date, ts_code FROM screen_result "
-                      "WHERE preset_name = 'tdx_hjk-hold10'").df()
+    eod = con.execute("SELECT trade_date, ts_code FROM screen_result WHERE preset_name = ?",
+                      [eod_preset]).df()
     con.close()
+    panel["vol"], panel["amount"] = raw["vol"], raw["amount"]  # volume is not adjusted
 
     def piv(col: str) -> pd.DataFrame:
         return b.pivot(index="trade_date", columns="ts_code", values=col).reindex_like(C)
 
-    p, v, vday = piv("p1450"), piv("v1450"), piv("vday")
+    p, h, lo, v, amt, vday = (piv(c) for c in ("p1450", "h1450", "l1450", "v1450", "a1450",
+                                                "vday"))
     share = (v / vday).where(vday > 0)
     frac = share.shift(1).rolling(20, min_periods=5).median()
     frac = frac.fillna(float(np.nanmedian(share.to_numpy())))
-    unit = float(np.nanmedian((vday / V).to_numpy()))  # minute vol units per daily unit
-    C0, V0 = p * A, v / frac / unit
-
-    def ma_with_today(x: pd.DataFrame, x0: pd.DataFrame, n: int) -> pd.DataFrame:
-        return (x.shift(1).rolling(n - 1, min_periods=n - 1).sum() + x0) / n
-
-    aa, bb, cc = (ma_with_today(C, C0, n) for n in (5, 10, 30))
-    aa1, bb1 = C.rolling(5).mean().shift(1), C.rolling(10).mean().shift(1)
-    cc1 = C.rolling(30).mean().shift(1)
-    dd = H.rolling(20).max().shift(15)   # REF(HHV(H,20),15): history only
-    dd1 = dd.shift(1)
-    llv12 = np.minimum(V.shift(1).rolling(11, min_periods=11).min(), V0)
-    mav20 = ma_with_today(V, V0, 20)
-    sig = ((llv12 < mav20 * 0.6) & (mav20 * 1.2 < V0) & (dd < C0) & (C.shift(1) <= dd1)
-           & (cc > cc1) & (aa > bb) & (aa1 <= bb1))
-    sealed = p >= _limit(pre, lim) - 1e-6   # sealed at 14:50: practically unbuyable
-    sig = sig & ~sealed & C0.notna()
-    sig = sig.loc[start:end]
-    sig = sig.loc[:, [c for c in sig.columns if c not in st]]
-    s = sig.stack()
-    hits = s[s].index.to_frame(index=False)
-    hits.columns = ["trade_date", "ts_code"]
+    vunit = float(np.nanmedian((vday / raw["vol"]).to_numpy()))
+    aunit = float(np.nanmedian((amt / share / raw["amount"]).to_numpy()))
+    proxy = {"close": p * A, "high": h * A, "low": lo * A, "vol": v / frac / vunit,
+             "amount": amt / frac / aunit}
+    proxy["pct_chg"] = (p / raw["pre_close"] - 1) * 100
+    sealed = p >= _limit(raw["pre_close"], lim) - 1e-6
+    days = [d for d in C.index if start <= d <= end]
     pos = {d: i for i, d in enumerate(C.index)}
+    fired: list[tuple] = []
+    for d in days:
+        i = pos[d]
+        sl = {f: x.iloc[max(0, i - WINDOW_ROWS + 1): i + 1].copy() for f, x in panel.items()}
+        have = proxy["close"].loc[d].notna()
+        for f, x in proxy.items():
+            sl[f].iloc[-1] = x.loc[d].where(have)
+        row = evaluate(expr, sl).iloc[-1]
+        ok = row[(row > 0.5) & have & ~sealed.loc[d].fillna(False)]
+        fired += [(d, c) for c in ok.index if c not in st]
+    hits = pd.DataFrame(fired, columns=["trade_date", "ts_code"])
     rows = []
-    for d, code in zip(hits["trade_date"], hits["ts_code"], strict=True):
-        i, e = pos[d], C0.at[d, code]
+    for d, code in fired:
+        i, e = pos[d], proxy["close"].at[d, code]
         rec = {"trade_date": d, "ts_code": code}
         for k in (1, 2, 3, 5):
             if i + k < len(C.index):
@@ -133,14 +138,13 @@ def hjk_1450(root: Path) -> dict:
                         bench = idx[ic].iat[i + k] / idx[ic].iat[i] - 1
                         rec[f"x{k}_{name}"] = rec[f"c{k}"] - bench
         if i + 1 < len(C.index):
-            rec["o1"] = O[code].iat[i + 1] / e - 1
+            rec["o1"] = panel["open"][code].iat[i + 1] / e - 1
         rows.append(rec)
     r = pd.DataFrame(rows)
     eod_set = {(pd.Timestamp(d), c) for d, c in zip(eod["trade_date"], eod["ts_code"],
                                                     strict=True)}
     in_window = {k for k in eod_set if start <= k[0] <= end}
-    both = sum((d, c) in eod_set for d, c in zip(r.get("trade_date", []), r.get("ts_code", []),
-                                                  strict=True))
+    both = sum((d, c) in eod_set for d, c in fired)
     horizons = {}
     for label, col in (("T+1 开盘", "o1"), ("T+1 收盘", "c1"), ("T+2 收盘", "c2"),
                        ("T+3 收盘", "c3"), ("T+5 收盘", "c5")):
@@ -154,20 +158,32 @@ def hjk_1450(root: Path) -> dict:
             hz["excess_win_rate"] = {n: float((r[f"x{k}_{n}"] > 0).mean()) for n in BENCH
                                      if f"x{k}_{n}" in r}
         horizons[label] = hz
-    return _save(root, "hjk-1450", {
-        "title": "黄金坑 14:50 盘中版", "formula": "黄金坑（14:50 代理）",
-        "window": [str(start.date()), str(end.date())], "signals": int(len(r)),
+    return _save(root, slug, {
+        "title": title, "formula": formula,
+        "window": [str(start.date()), str(end.date())], "signals": int(len(hits)),
         "per_year": {str(y): int(n) for y, n in
-                     r.groupby(r["trade_date"].dt.year).size().items()} if len(r) else {},
+                     hits.groupby(hits["trade_date"].dt.year).size().items()} if len(hits) else {},
         "horizons": horizons,
         "notes": [f"覆盖：{b['ts_code'].nunique()} 只（全 A 非北交所）5 分钟线 "
                   f"{start.date()}~{end.date()}",
                   "量能代理：14:50 累计量 ÷ 该股前 20 日（滞后一日）14:50 累计量占全天比例中位数",
-                  f"与收盘版信号重合：{both}/{len(r)}（收盘版同期 {len(in_window)} 个）",
+                  f"与收盘版信号重合：{both}/{len(hits)}（收盘版同期 {len(in_window)} 个）",
                   "14:50 已封涨停的样本剔除（买不进）"],
         "caveats": ["ST/退市按当前名称过滤（前视/幸存者偏差）",
                     "按 14:50 收盘价成交，未计冲击成本与费用",
-                    "指数超额以信号日收盘为基准", "成交量未复权"]})
+                    "指数超额以信号日收盘为基准", "成交量未复权",
+                    f"EMA 每次只用最近 {WINDOW_ROWS} 根日线预热"]})
+
+
+INTRADAY_STUDIES = [("hjk-1450", "黄金坑 14:50 盘中版", "HJK", "tdx_hjk-hold10"),
+                    ("lyt-1450", "老鸭头 14:50 盘中版", "LYT", "tdx_lyt-hold10")]
+
+
+def run_intraday(root: Path) -> None:
+    from rquant.research import tdx_strategy
+
+    for slug, title, attr, preset in INTRADAY_STUDIES:
+        intraday_study(root, slug, title, getattr(tdx_strategy, attr), preset)
 
 
 # ---- 2. auction screen ------------------------------------------------------------

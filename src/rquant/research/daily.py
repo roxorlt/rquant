@@ -12,7 +12,7 @@ import shutil
 from datetime import date, timedelta
 from pathlib import Path
 
-from rquant.research.tdx_strategy import HJK
+from rquant.research.tdx_strategy import HJK, LYT
 
 log = logging.getLogger("rquant.research")
 
@@ -127,6 +127,7 @@ CONDITIONS = {
     "55 日新高": "C>=HHV(H,55)",
     "缩量回踩 10 日线": "C>MA(C,10) AND L<=MA(C,10)*1.01 AND V<MA(V,5)",
     "黄金坑": HJK,
+    "老鸭头": LYT,
 }
 
 
@@ -187,7 +188,7 @@ def run_intraday_studies(root: Path, db: Path) -> None:
         intraday.run(root, years=2, what=("auction", "limits"))
     except Exception as exc:  # noqa: BLE001 - data refresh is best effort
         log.warning("intraday refresh failed: %s", exc)
-    for name, fn in (("hjk-1450", studies.hjk_1450), ("auction-ths", studies.auction_study)):
+    for name, fn in (("1450", studies.run_intraday), ("auction-ths", studies.auction_study)):
         try:
             fn(root)
             log.info("study %s done", name)

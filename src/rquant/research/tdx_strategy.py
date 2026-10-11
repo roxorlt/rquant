@@ -24,8 +24,16 @@ HJK = ("AA:=MA(C,5); BB:=MA(C,10); CC:=MA(C,30); DD:=REF(HHV(H,20),15); "
        "EE:=LLV(V,12)<MA(V,20)*0.6; FF:=V>MA(V,20)*1.2; GG:=CROSS(C,DD); HH:=CC>REF(CC,1); "
        "II:=CROSS(AA,BB); XG:EE AND FF AND GG AND HH AND II;")
 
+LYT = ("AA:=MA(C,5); BB:=MA(C,10); CC:=MA(C,20); DD:=MA(C,60); "
+       "EE:=EMA(CLOSE,12)-EMA(CLOSE,26); FF:=EMA(EE,9); GG:=CROSS(AA,BB); "
+       "HH:=EE>0 AND FF>0 AND CROSS(EE,FF); II:=V>MA(V,20)*1.2; JJ:=REF(HHV(C,20),1); "
+       "KK:=C>JJ; LL:=LLV(L,15)>DD*0.97; MM:=LLV(V,15)<MA(V,20)*0.7; "
+       "NN:=AA>REF(AA,1) AND BB>REF(BB,1) AND CC>REF(CC,1) AND DD>REF(DD,1); "
+       "XG:GG AND HH AND II AND KK AND LL AND MM AND NN;")
+
 #: slug, title, condition name, formula, max positions, hold days
-TDX_STRATEGIES = [("hjk-hold10", "黄金坑 持有 10 日", "黄金坑", HJK, 10, 10)]
+TDX_STRATEGIES = [("hjk-hold10", "黄金坑 持有 10 日", "黄金坑", HJK, 10, 10),
+                  ("lyt-hold10", "老鸭头 持有 10 日", "老鸭头", LYT, 10, 10)]
 HORIZONS = (5, 10, 20)
 BENCH = {"沪深300": "000300.SH", "中证1000": "000852.SH"}
 
