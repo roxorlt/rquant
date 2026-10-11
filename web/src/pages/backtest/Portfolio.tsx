@@ -205,7 +205,11 @@ export function PortfolioRuns() {
     <QueryView query={query}>
       {(data) => (
         <>
-          <Panel title="组合回测" sub="python -m rquant.backtest 产出，点一行看净值与委托" flush>
+          <Panel
+            title={`组合回测 · ${data.runs.length}`}
+            sub="python -m rquant.backtest 产出，点一行看净值与委托"
+            flush
+          >
             <DataTable
               label="组合回测列表"
               rows={data.runs}
