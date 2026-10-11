@@ -1287,6 +1287,8 @@
 .tbl td.num,
 .tbl th.num {
   font-variant-numeric: tabular-nums;
+}
+
 /* ---------- research flow stepper ---------- */
 .flow-steps {
   display: flex;
