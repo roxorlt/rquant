@@ -1,0 +1,72 @@
+/* Screener condition area: filters and ranks side by side, funnel as one line. */
+.cond-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  gap: 6px 24px;
+}
+.cond-grid h3.sub {
+  margin: 0 0 6px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--muted);
+}
+.cond-grid .cond-row {
+  grid-template-columns: 18px minmax(0, 1.6fr) 64px minmax(0, 1fr) 24px;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+.cond-grid .cond-row > .mono {
+  color: var(--faint);
+  font-size: 11px;
+}
+.cond-grid .cond-row select,
+.cond-grid .cond-row input {
+  height: 28px;
+  background: var(--surface-2);
+  color: var(--ink);
+}
+.cond-grid .cond-row input {
+  font-family: var(--font-mono);
+  text-align: right;
+}
+.cond-none {
+  margin: 0 0 4px;
+  color: var(--faint);
+  font-size: 12px;
+}
+.funnel-inline {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  margin: 10px 0 0;
+  padding: 8px 0 0;
+  border-top: 1px dashed var(--rule);
+  list-style: none;
+  font-size: 12px;
+}
+.funnel-inline li {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: var(--sunken);
+  color: var(--muted);
+}
+.funnel-inline li + li::before {
+  content: "→";
+  margin: 0 6px 0 -4px;
+  color: var(--faint);
+}
+.funnel-inline li:last-child {
+  background: var(--accent-weak);
+  color: var(--accent-t);
+}
+.funnel-inline .fv {
+  color: var(--ink);
+  font-weight: 600;
+}
+.funnel-inline li:last-child .fv {
+  color: var(--accent-t);
+}
