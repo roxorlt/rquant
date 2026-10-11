@@ -748,6 +748,18 @@ def run_query(request: Request, source: SourceDep,
     return _envelope(source, sql_query.shape(rows))
 
 
+@router.get("/query/schema", response_model=Envelope[dict[str, list[list[str]]]],
+            summary="可查询表的字段")
+def query_schema(source: SourceDep) -> Envelope[dict[str, list[list[str]]]]:
+    allowed = sql_query.allowed_tables()
+    out: dict[str, list[list[str]]] = {}
+    for r in source.query("SELECT table_name, column_name, data_type FROM "
+                          "information_schema.columns ORDER BY table_name, ordinal_position"):
+        if r["table_name"] in allowed:
+            out.setdefault(r["table_name"], []).append([r["column_name"], r["data_type"]])
+    return _envelope(source, out)
+
+
 @router.get("/query/tables", response_model=Envelope[list[str]], summary="可查询的表")
 def query_tables(source: SourceDep) -> Envelope[list[str]]:
     rows = source.query("SELECT table_name FROM information_schema.tables ORDER BY 1")
