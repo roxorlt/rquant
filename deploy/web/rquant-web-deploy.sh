@@ -102,6 +102,7 @@ if [[ -e "$DEST" ]]; then
   mv "$DEST" "$DEST.replaced-$(date +%Y%m%d%H%M%S)"
 fi
 mv "$tmp/x" "$DEST"
+chmod a+x "$DEST" "$DEST/web"   # nginx (www) must traverse to web/dist
 chmod -R a+rX "$DEST/web/dist"
 
 log "uv sync --frozen into $DEST/.venv"
