@@ -134,6 +134,15 @@ class ScreenRow(BaseModel):
     pb: float | None = None
     total_mv: float | None = None  # 亿元
     turnover_rate: float | None = None
+    turnover_rate_f: float | None = None  # free-float turnover %
+    circ_mv: float | None = None  # 亿元
+    amount: float | None = None  # 亿元
+    amplitude: float | None = None  # %
+    vol_ratio: float | None = None  # 量比 (vs prior 5-day mean volume)
+    ret5: float | None = None  # %
+    ret20: float | None = None  # %
+    main_net: float | None = None  # 主力净流入 亿元 (大单+特大单)
+    main_net_5d: float | None = None
     roe: float | None = None
     netprofit_yoy: float | None = None
     or_yoy: float | None = None

@@ -4129,6 +4129,39 @@
       },
       "ScreenRow": {
         "properties": {
+          "amount": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Amount"
+          },
+          "amplitude": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Amplitude"
+          },
+          "circ_mv": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Circ Mv"
+          },
           "close": {
             "anyOf": [
               {
@@ -4161,6 +4194,28 @@
               }
             ],
             "title": "Industry"
+          },
+          "main_net": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Main Net"
+          },
+          "main_net_5d": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Main Net 5D"
           },
           "name": {
             "anyOf": [
@@ -4232,6 +4287,28 @@
             "title": "Preset",
             "type": "string"
           },
+          "ret20": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ret20"
+          },
+          "ret5": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ret5"
+          },
           "roe": {
             "anyOf": [
               {
@@ -4269,6 +4346,28 @@
               }
             ],
             "title": "Turnover Rate"
+          },
+          "turnover_rate_f": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Turnover Rate F"
+          },
+          "vol_ratio": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Vol Ratio"
           }
         },
         "required": [

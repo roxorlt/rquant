@@ -17,6 +17,7 @@ import {
   score,
 } from "./Builder";
 import { Conditions } from "./Conditions";
+import { FieldPicker } from "./FieldPicker";
 import { Schemes } from "./Schemes";
 
 function stepLabel(filters: Filter[], i: number): string {
@@ -43,17 +44,12 @@ function FilterRows({
         // biome-ignore lint/suspicious/noArrayIndexKey: rows are positional.
         <div className="cond-row" key={i}>
           <span className="mono">{i + 1}</span>
-          <select
-            aria-label="字段"
+          <FieldPicker
+            label="字段"
             value={f.field}
-            onChange={(e) => set(i, { field: e.target.value as Field })}
-          >
-            {Object.entries(fields).map(([k, v]) => (
-              <option key={k} value={k}>
-                {v}
-              </option>
-            ))}
-          </select>
+            fields={fields}
+            onChange={(v) => set(i, { field: v as Field })}
+          />
           <select
             aria-label="比较"
             value={f.op}
@@ -105,17 +101,12 @@ function RankRows({
         // biome-ignore lint/suspicious/noArrayIndexKey: rows are positional.
         <div className="cond-row" key={i}>
           <span className="mono">{i + 1}</span>
-          <select
-            aria-label="排名字段"
+          <FieldPicker
+            label="排名字段"
             value={r.field}
-            onChange={(e) => set(i, { field: e.target.value as Field })}
-          >
-            {Object.entries(fields).map(([k, v]) => (
-              <option key={k} value={k}>
-                {v}
-              </option>
-            ))}
-          </select>
+            fields={fields}
+            onChange={(v) => set(i, { field: v as Field })}
+          />
           <select
             aria-label="方向"
             value={r.desc ? "d" : "a"}

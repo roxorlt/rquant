@@ -331,6 +331,9 @@ def test_screen_rows_carry_valuation_fundamentals_and_factor_pct(tmp_path) -> No
     moutai = rows["600519.SH"]
     assert moutai["industry"] == "白酒" and moutai["pe_ttm"] is not None
     assert moutai["roe"] == 18.9
+    for k in ("circ_mv", "turnover_rate_f", "amount", "amplitude", "vol_ratio", "ret5", "ret20",
+              "main_net", "main_net_5d"):
+        assert moutai[k] is not None, k
     assert 0 < moutai["factors"]["演示动量因子"] <= 100
 
 

@@ -147,13 +147,60 @@ def enrich(con: duckdb.DuckDBPyConnection | None, codes: list[str], day: date) -
                    codes):
         out[r["ts_code"]]["industry"] = r["industry"]
     for r in _rows(con, f"""
-            SELECT ts_code, pe_ttm, pb, total_mv, turnover_rate FROM daily_basic
+            SELECT ts_code, pe_ttm, pb, total_mv, circ_mv, turnover_rate FROM daily_basic
             WHERE ts_code IN ({marks}) AND trade_date = (
               SELECT max(trade_date) FROM daily_basic WHERE trade_date <= ?)""", [*codes, day]):
         out[r["ts_code"]].update(
             pe_ttm=r["pe_ttm"], pb=r["pb"], turnover_rate=r["turnover_rate"],
-            total_mv=None if r["total_mv"] is None else round(r["total_mv"] / 1e4, 2))
+            total_mv=None if r["total_mv"] is None else round(r["total_mv"] / 1e4, 2),
+            circ_mv=None if r["circ_mv"] is None else round(r["circ_mv"] / 1e4, 2))
+    try:
+        for r in _rows(con, f"""
+                SELECT ts_code, turnover_rate_f FROM daily_basic WHERE ts_code IN ({marks})
+                AND trade_date = (SELECT max(trade_date) FROM daily_basic WHERE trade_date <= ?)""",
+                       [*codes, day]):
+            out[r["ts_code"]]["turnover_rate_f"] = r["turnover_rate_f"]
+    except duckdb.Error:
+        pass
+    _quote_stats(con, codes, marks, day, out)
+    try:
+        flows: dict[str, list[float]] = {}
+        for r in _rows(con, f"""
+                SELECT ts_code, buy_lg_amount + buy_elg_amount - sell_lg_amount - sell_elg_amount
+                       AS m FROM moneyflow WHERE ts_code IN ({marks})
+                AND trade_date BETWEEN ? - INTERVAL 14 DAY AND ? ORDER BY trade_date DESC""",
+                       [*codes, day, day]):
+            if r["m"] is not None:
+                flows.setdefault(r["ts_code"], []).append(r["m"] / 1e4)
+        for c, v in flows.items():
+            out[c].update(main_net=round(v[0], 3), main_net_5d=round(sum(v[:5]), 3))
+    except duckdb.Error:
+        pass
     return out
+
+
+def _quote_stats(con: duckdb.DuckDBPyConnection, codes: list[str], marks: str, day: date,
+                 out: dict[str, dict]) -> None:
+    """Amount (亿), amplitude %, volume ratio (vs the prior 5-day mean), 5/20-day returns."""
+    by: dict[str, list[dict]] = {}
+    for r in _rows(con, f"""
+            SELECT ts_code, high, low, close, pre_close, vol, amount FROM daily_bar
+            WHERE ts_code IN ({marks}) AND trade_date BETWEEN ? - INTERVAL 45 DAY AND ?
+            ORDER BY trade_date DESC""", [*codes, day, day]):
+        by.setdefault(r["ts_code"], []).append(r)
+    for c, rs in by.items():
+        t = rs[0]
+        o = out[c]
+        if t["amount"] is not None:
+            o["amount"] = round(t["amount"] / 1e5, 3)
+        if t["pre_close"] and t["high"] is not None and t["low"] is not None:
+            o["amplitude"] = round((t["high"] - t["low"]) / t["pre_close"] * 100, 2)
+        prior = [r["vol"] for r in rs[1:6] if r["vol"]]
+        if t["vol"] and prior:
+            o["vol_ratio"] = round(t["vol"] / (sum(prior) / len(prior)), 2)
+        for n in (5, 20):
+            if len(rs) > n and rs[n]["close"]:
+                o[f"ret{n}"] = round((t["close"] / rs[n]["close"] - 1) * 100, 2)
 
 
 def write_demo_market(root: Path, today: date) -> None:

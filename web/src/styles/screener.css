@@ -103,3 +103,66 @@
 .scheme-chip button:hover {
   color: var(--accent-t);
 }
+
+.fpick {
+  position: relative;
+  min-width: 150px;
+}
+.fpick-btn {
+  width: 100%;
+  display: flex;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 3px 8px;
+  background: var(--sunken);
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  color: var(--ink);
+  font: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+.fpick-pop {
+  position: absolute;
+  z-index: 30;
+  top: calc(100% + 4px);
+  left: 0;
+  width: 280px;
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  box-shadow: var(--shadow-pop);
+  padding: 6px;
+}
+.fpick-pop input {
+  width: 100%;
+  margin-bottom: 4px;
+}
+.fpick-list {
+  max-height: 320px;
+  overflow: auto;
+}
+.fpick-g {
+  font-size: 11px;
+  color: var(--muted);
+  padding: 6px 4px 2px;
+  position: sticky;
+  top: 0;
+  background: var(--surface);
+}
+.fpick-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 3px 8px;
+  background: none;
+  border: 0;
+  color: var(--ink);
+  font: inherit;
+  cursor: pointer;
+  border-radius: 3px;
+}
+.fpick-item:hover,
+.fpick-item.on {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+}

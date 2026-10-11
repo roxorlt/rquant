@@ -3,17 +3,30 @@ import type { ScreenRow } from "@/api/endpoints";
 /** Prototype-style condition builder over the published screen rows (client side). */
 /** A built-in numeric column, or "f:<factor name>" for a factor's cross-section percentile. */
 export type Field = string;
-export const BASE_FIELDS: Record<string, string> = {
-  pct_chg: "涨跌幅 %",
-  close: "收盘价",
-  pe_ttm: "PE(TTM)",
-  pb: "PB",
-  total_mv: "总市值(亿)",
-  turnover_rate: "换手率 %",
-  roe: "ROE %",
-  netprofit_yoy: "净利同比 %",
-  or_yoy: "营收同比 %",
-};
+export const FIELD_GROUPS: [string, Record<string, string>][] = [
+  [
+    "行情",
+    {
+      pct_chg: "涨跌幅 %",
+      close: "收盘价",
+      amount: "成交额(亿)",
+      amplitude: "振幅 %",
+      vol_ratio: "量比",
+      ret5: "5日涨幅 %",
+      ret20: "20日涨幅 %",
+      turnover_rate: "换手率 %",
+      turnover_rate_f: "换手率(自由流通) %",
+    },
+  ],
+  ["估值", { pe_ttm: "PE(TTM)", pb: "PB", total_mv: "总市值(亿)", circ_mv: "流通市值(亿)" }],
+  ["财务", { roe: "ROE %", netprofit_yoy: "净利同比 %", or_yoy: "营收同比 %" }],
+  ["资金", { main_net: "主力净流入(亿)", main_net_5d: "5日主力净流入(亿)" }],
+];
+
+export const BASE_FIELDS: Record<string, string> = Object.assign(
+  {},
+  ...FIELD_GROUPS.map(([, f]) => f),
+);
 
 /** Built-in fields plus one per factor seen in the rows. */
 export function fieldsFor(rows: readonly ScreenRow[]): Record<string, string> {
@@ -21,6 +34,16 @@ export function fieldsFor(rows: readonly ScreenRow[]): Record<string, string> {
   for (const r of rows)
     for (const name of Object.keys(r.factors ?? {})) out[`f:${name}`] = `因子·${name} 分位`;
   return out;
+}
+
+/** Groups for the picker: built-ins, then chip factors, then the other factor percentiles. */
+export function groupsFor(fields: Record<string, string>): [string, [string, string][]][] {
+  const fac = Object.entries(fields).filter(([k]) => k.startsWith("f:"));
+  return [
+    ...FIELD_GROUPS.map(([g, f]) => [g, Object.entries(f)] as [string, [string, string][]]),
+    ["筹码(分位)", fac.filter(([k]) => k.includes("筹码"))],
+    ["因子分位", fac.filter(([k]) => !k.includes("筹码"))],
+  ];
 }
 
 /** Kept for callers that only need labels of the built-ins. */
