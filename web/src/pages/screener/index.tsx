@@ -187,27 +187,29 @@ export default function ScreenerPage() {
         onChange={setPreset}
         options={[{ value: ALL, label: "全部" }, ...presets.map((p) => ({ value: p, label: p }))]}
       />
-      <Panel title="条件" sub={q ? `搜索：${q}` : "全部满足才保留；排名按加权分位打分"}>
-        <h3 className="sub">筛选条件（门槛）</h3>
-        <FilterRows filters={filters} onChange={setFilters} />
-        <h3 className="sub">排名条件（权重）</h3>
-        <RankRows ranks={ranks} onChange={setRanks} />
-      </Panel>
-      <section aria-label="逐条命中">
-        <div className="block-h">
-          <h2>逐条命中</h2>
-          <span className="hint">每加一条条件后剩下的股票数</span>
+      <Panel title="条件" sub={q ? `搜索：${q}` : "门槛全部满足才保留；排名按加权分位打分"}>
+        <div className="cond-grid">
+          <div>
+            <h3 className="sub">筛选（门槛）</h3>
+            {filters.length === 0 ? <p className="cond-none">无门槛，全部股票进入排名</p> : null}
+            <FilterRows filters={filters} onChange={setFilters} />
+          </div>
+          <div>
+            <h3 className="sub">排名（权重）</h3>
+            {ranks.length === 0 ? <p className="cond-none">未设排名，按原顺序输出</p> : null}
+            <RankRows ranks={ranks} onChange={setRanks} />
+          </div>
         </div>
-        <div className="funnel">
+        <ol className="funnel-inline" aria-label="逐条命中">
           {filtered.steps.map((n, i) => (
             // biome-ignore lint/suspicious/noArrayIndexKey: steps are positional.
-            <div className="fs" key={i}>
-              <div className="fl">{stepLabel(filters, i)}</div>
-              <div className="fv">{n}</div>
-            </div>
+            <li key={i}>
+              <span className="fl">{stepLabel(filters, i)}</span>
+              <span className="fv num">{n}</span>
+            </li>
           ))}
-        </div>
-      </section>
+        </ol>
+      </Panel>
       <QueryView query={query}>
         {() => (
           <Panel title={`结果 · 命中 ${filtered.rows.length} 只`} flush>
