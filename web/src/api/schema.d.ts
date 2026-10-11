@@ -141,6 +141,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/factors/correlation": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 因子相关性 */
+        get: operations["factor_correlation_api_v1_factors_correlation_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/factors/{factor_id}": {
         parameters: {
             query?: never;
@@ -1052,6 +1069,11 @@ export interface components {
             data: components["schemas"]["DataCenterData"];
             serving: components["schemas"]["ServingMeta"];
         };
+        /** Envelope[FactorCorrData] */
+        Envelope_FactorCorrData_: {
+            data: components["schemas"]["FactorCorrData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
         /** Envelope[FactorDetailData] */
         Envelope_FactorDetailData_: {
             data: components["schemas"]["FactorDetailData"];
@@ -1171,6 +1193,15 @@ export interface components {
             text: string;
             /** Unverified */
             unverified: string[];
+        };
+        /** FactorCorrData */
+        FactorCorrData: {
+            /** Ic Corr */
+            ic_corr: (number | null)[][];
+            /** Names */
+            names: string[];
+            /** Value Corr */
+            value_corr: (number | null)[][];
         };
         /** FactorDetailData */
         FactorDetailData: {
@@ -2181,6 +2212,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_FactorListData_"];
+                };
+            };
+        };
+    };
+    factor_correlation_api_v1_factors_correlation_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_FactorCorrData_"];
                 };
             };
         };
