@@ -26,7 +26,11 @@ export interface ServingQueryResult<T> {
 export function useServingQuery<T>(
   key: QueryKey,
   fetcher: () => Promise<ServingEnvelope<T>>,
-  options: { enabled?: boolean; staleTime?: number; refetchInterval?: number | false } = {},
+  options: {
+    enabled?: boolean;
+    staleTime?: number;
+    refetchInterval?: number | false | (() => number | false);
+  } = {},
 ): ServingQueryResult<T> {
   const query = useQuery({
     queryKey: key,

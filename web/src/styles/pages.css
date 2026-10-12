@@ -471,3 +471,63 @@ input:focus {
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   }
 }
+
+/* Intraday sparkline (pools page). */
+.sparkline {
+  display: block;
+  overflow: visible;
+}
+.sparkline-base {
+  stroke: var(--faint);
+  stroke-width: 1;
+  stroke-dasharray: 2 2;
+}
+.sparkline-noon {
+  stroke: var(--faint);
+  stroke-width: 1;
+  opacity: 0.25;
+}
+.sparkline-line {
+  fill: none;
+  stroke-width: 1.4;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+  stroke: var(--muted);
+}
+.sparkline-area {
+  stroke: none;
+  opacity: 0.14;
+  fill: var(--muted);
+}
+.sparkline-dot {
+  fill: var(--muted);
+}
+.sparkline.up .sparkline-line {
+  stroke: var(--up);
+}
+.sparkline.up .sparkline-area,
+.sparkline.up .sparkline-dot {
+  fill: var(--up);
+}
+.sparkline.down .sparkline-line {
+  stroke: var(--down);
+}
+.sparkline.down .sparkline-area,
+.sparkline.down .sparkline-dot {
+  fill: var(--down);
+}
+.live-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 6px;
+  border-radius: 50%;
+  background: var(--up);
+  vertical-align: middle;
+  animation: live-pulse 1.6s ease-in-out infinite;
+}
+@keyframes live-pulse {
+  50% {
+    opacity: 0.25;
+  }
+}

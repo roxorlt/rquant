@@ -99,6 +99,7 @@ from rquant.web.models import (
     TranslateRequest,
 )
 from rquant.web.overfit_stats import overfit_stats, sharpe_per_period
+from rquant.web.pool_live import PoolLiveData, load_pool_live
 from rquant.web.source import Source, SourceUnavailableError, table_missing
 from rquant.web.stocks import CODE_RE, StockProfile, enrich, load_profile, market
 
@@ -348,6 +349,20 @@ def _auction_pool_item(request: Request) -> PoolItem | None:  # noqa: D401
             f"{t.get('name')}{'(一字)' if t.get('limit_open') else ''}" for t in ths)
     return PoolItem(name=POOL_NAME, description=desc, pool_refs=[PRESET],
                     updated_at=pool.get("updated_at"), members=members)
+
+
+@router.get("/pools/auction/live", response_model=Envelope[PoolLiveData],
+            summary="竞价选股池：最新涨跌幅与分时（3 秒快照）")
+def auction_pool_live(request: Request, source: SourceDep) -> Envelope[PoolLiveData]:
+    from rquant.research.auction_pool import read_pool
+
+    root = Path(_research_root(request) or research_root())
+    pool = read_pool(root)
+    if not pool:
+        return _envelope(source, PoolLiveData(date=None, rows=[]))
+    codes = [p["ts_code"] for p in pool.get("picks") or []]
+    codes += [c["ts_code"] for c in pool.get("candidates") or [] if c["ts_code"] not in codes]
+    return _envelope(source, load_pool_live(root, str(pool["date"]), codes))
 
 
 _RUN_SQL = ("SELECT run_id, computed_at, start_date, end_date, entry_mode, profile_variant, "
