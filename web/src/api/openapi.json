@@ -2096,6 +2096,22 @@
         "title": "Envelope[PaperData]",
         "type": "object"
       },
+      "Envelope_PoolLiveData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/PoolLiveData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[PoolLiveData]",
+        "type": "object"
+      },
       "Envelope_PoolsData_": {
         "properties": {
           "data": {
@@ -4388,6 +4404,111 @@
           "members"
         ],
         "title": "PoolItem",
+        "type": "object"
+      },
+      "PoolLiveData": {
+        "properties": {
+          "date": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Date"
+          },
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/PoolLiveRow"
+            },
+            "title": "Rows",
+            "type": "array"
+          }
+        },
+        "required": [
+          "date",
+          "rows"
+        ],
+        "title": "PoolLiveData",
+        "type": "object"
+      },
+      "PoolLiveRow": {
+        "properties": {
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "pct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pct"
+          },
+          "pre_close": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pre Close"
+          },
+          "price": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Price"
+          },
+          "spark": {
+            "items": {
+              "type": "number"
+            },
+            "title": "Spark",
+            "type": "array"
+          },
+          "spark_t": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Spark T",
+            "type": "array"
+          },
+          "time": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Time"
+          }
+        },
+        "required": [
+          "code",
+          "price",
+          "pre_close",
+          "pct",
+          "time",
+          "spark",
+          "spark_t"
+        ],
+        "title": "PoolLiveRow",
         "type": "object"
       },
       "PoolMember": {
@@ -7000,6 +7121,24 @@
           }
         },
         "summary": "保存池子"
+      }
+    },
+    "/api/v1/pools/auction/live": {
+      "get": {
+        "operationId": "auction_pool_live_api_v1_pools_auction_live_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_PoolLiveData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "竞价选股池：最新涨跌幅与分时（3 秒快照）"
       }
     },
     "/api/v1/portfolio-backtests": {

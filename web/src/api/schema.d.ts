@@ -400,6 +400,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/pools/auction/live": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 竞价选股池：最新涨跌幅与分时（3 秒快照） */
+        get: operations["auction_pool_live_api_v1_pools_auction_live_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/portfolio-backtests": {
         parameters: {
             query?: never;
@@ -1381,6 +1398,11 @@ export interface components {
             data: components["schemas"]["PaperData"];
             serving: components["schemas"]["ServingMeta"];
         };
+        /** Envelope[PoolLiveData] */
+        Envelope_PoolLiveData_: {
+            data: components["schemas"]["PoolLiveData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
         /** Envelope[PoolsData] */
         Envelope_PoolsData_: {
             data: components["schemas"]["PoolsData"];
@@ -2114,6 +2136,30 @@ export interface components {
             pool_refs: string[];
             /** Updated At */
             updated_at: string | null;
+        };
+        /** PoolLiveData */
+        PoolLiveData: {
+            /** Date */
+            date: string | null;
+            /** Rows */
+            rows: components["schemas"]["PoolLiveRow"][];
+        };
+        /** PoolLiveRow */
+        PoolLiveRow: {
+            /** Code */
+            code: string;
+            /** Pct */
+            pct: number | null;
+            /** Pre Close */
+            pre_close: number | null;
+            /** Price */
+            price: number | null;
+            /** Spark */
+            spark: number[];
+            /** Spark T */
+            spark_t: string[];
+            /** Time */
+            time: string | null;
         };
         /** PoolMember */
         PoolMember: {
@@ -3303,6 +3349,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    auction_pool_live_api_v1_pools_auction_live_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_PoolLiveData_"];
                 };
             };
         };

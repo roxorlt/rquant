@@ -1,15 +1,25 @@
 import { Link } from "react-router";
-import { usePools } from "@/api/endpoints";
+import { inTradingHours, useAuctionPoolLive, usePools } from "@/api/endpoints";
 import { useUrlState } from "@/app/useUrlState";
 import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
 import { EmptyState, FlowSteps, PageHeader, Panel, Segmented } from "@/ui";
+import { ChangeText } from "@/ui/ChangeText";
+import { Sparkline } from "@/ui/Sparkline";
 import { StockLink } from "@/ui/StockLink";
 import { QueryView } from "../shared";
+
+const AUCTION_POOL = "竞价选股";
+type Member = NonNullable<ReturnType<typeof usePools>["data"]>["pools"][number]["members"][number];
 
 export default function PoolsPage() {
   const query = usePools();
   const [selected, setSelected] = useUrlState("pool");
+  const first = query.data?.pools[0]?.name;
+  const isAuction = (selected ?? first) === AUCTION_POOL;
+  const live = useAuctionPoolLive(isAuction);
+  const liveBy = new Map((live.data?.rows ?? []).map((r) => [r.code, r]));
+  const pctOf = (code: string) => liveBy.get(code)?.pct ?? null;
   return (
     <>
       <PageHeader
@@ -43,7 +53,25 @@ export default function PoolsPage() {
                 options={data.pools.map((p) => ({ value: p.name, label: p.name }))}
               />
               <Panel
-                title={`${pool.name} · ${pool.members.length} 只`}
+                title={
+                  pool.name === AUCTION_POOL && live.data?.date ? (
+                    <>
+                      {inTradingHours() ? <span className="live-dot" aria-hidden /> : null}
+                      {`${pool.name} · ${pool.members.length} 只`}
+                      <span
+                        className="faint"
+                        style={{ fontWeight: 400, marginLeft: 8, fontSize: 12 }}
+                      >
+                        {inTradingHours() ? "盘中每 10 秒刷新" : "已收盘"}
+                        {live.data.rows.find((r) => r.time)?.time
+                          ? ` · 行情 ${live.data.rows.reduce((m, r) => (r.time && r.time > m ? r.time : m), "")}`
+                          : ""}
+                      </span>
+                    </>
+                  ) : (
+                    `${pool.name} · ${pool.members.length} 只`
+                  )
+                }
                 sub={[
                   pool.description,
                   pool.pool_refs.join(" + "),
@@ -77,7 +105,72 @@ export default function PoolsPage() {
                       cell: (row) => <StockLink code={row.code} />,
                     },
                     { id: "name", header: "名称", value: (row) => row.name ?? null },
-                    { id: "preset", header: "来源", value: (row) => row.preset },
+                    ...(pool.name === AUCTION_POOL
+                      ? [
+                          {
+                            id: "stage",
+                            header: "阶段",
+                            value: (row: Member) =>
+                              row.detail?.stage === "pick"
+                                ? `终选 #${row.detail?.rank ?? ""}`
+                                : "候选",
+                            cell: (row: Member) =>
+                              row.detail?.stage === "pick" ? (
+                                <span className="up">终选 #{String(row.detail?.rank ?? "")}</span>
+                              ) : (
+                                <span className="muted">候选</span>
+                              ),
+                          },
+                          {
+                            id: "pct",
+                            header: "最新涨跌",
+                            numeric: true,
+                            value: (row: Member) => pctOf(row.code),
+                            cell: (row: Member) => {
+                              const r = liveBy.get(row.code);
+                              return (
+                                <span title={r?.time ? `${r.price ?? ""} @ ${r.time}` : undefined}>
+                                  <ChangeText value={r?.pct ?? null} />
+                                </span>
+                              );
+                            },
+                          },
+                          {
+                            id: "spark",
+                            header: "分时",
+                            sortable: false,
+                            value: (row: Member) => pctOf(row.code),
+                            cell: (row: Member) => {
+                              const r = liveBy.get(row.code);
+                              return r ? (
+                                <Sparkline
+                                  values={r.spark}
+                                  times={r.spark_t}
+                                  base={r.pre_close ?? null}
+                                  label={`${row.name ?? row.code} 分时`}
+                                />
+                              ) : (
+                                <span className="faint">{live.isLoading ? "…" : "—"}</span>
+                              );
+                            },
+                          },
+                          {
+                            id: "gap",
+                            header: "竞价涨幅",
+                            numeric: true,
+                            secondary: true,
+                            value: (row: Member) =>
+                              typeof row.detail?.gap === "number" ? row.detail.gap * 100 : null,
+                            cell: (row: Member) => (
+                              <ChangeText
+                                value={
+                                  typeof row.detail?.gap === "number" ? row.detail.gap * 100 : null
+                                }
+                              />
+                            ),
+                          },
+                        ]
+                      : [{ id: "preset", header: "来源", value: (row: Member) => row.preset }]),
                   ]}
                 />
               </Panel>

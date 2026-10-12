@@ -60,6 +60,27 @@ export function usePools(): ServingQueryResult<PoolsData> {
   });
 }
 
+/** A-share session (Shanghai): call auction through close, weekdays. */
+export function inTradingHours(now: Date = new Date()): boolean {
+  const sh = new Date(now.getTime() + (now.getTimezoneOffset() + 480) * 60_000);
+  const day = sh.getDay();
+  if (day === 0 || day === 6) return false;
+  const m = sh.getHours() * 60 + sh.getMinutes();
+  return (m >= 555 && m <= 692) || (m >= 779 && m <= 902); // 09:15-11:32, 12:59-15:02
+}
+
+/** 竞价选股 pool: latest pct + 1-min sparkline from 3s snapshots; 10s refresh in session. */
+export function useAuctionPoolLive(enabled: boolean): ServingQueryResult<Schemas["PoolLiveData"]> {
+  return useServingQuery(
+    ["pools", "auction", "live"],
+    async () => {
+      const { data, response } = await apiClient().GET("/api/v1/pools/auction/live");
+      return unwrap(data, response);
+    },
+    { enabled, refetchInterval: () => (inTradingHours() ? 10_000 : 60_000) },
+  );
+}
+
 export function useBacktests(): ServingQueryResult<Schemas["BacktestListData"]> {
   return useServingQuery(["backtests"], async () => {
     const { data, response } = await apiClient().GET("/api/v1/backtests");
