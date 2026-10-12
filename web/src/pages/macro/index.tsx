@@ -4,6 +4,7 @@ import { type LineSeries, TimeChart } from "@/charts/Chart";
 import { DataTable } from "@/table/DataTable";
 import { EmptyState, KpiStrip, PageHeader, Panel, Segmented } from "@/ui";
 import { QueryView } from "../shared";
+import { MacroOverlay } from "./Overlay";
 
 type Cols = NonNullable<MacroData["daily"]>;
 type Range = "1y" | "3y" | "5y" | "all";
@@ -361,6 +362,7 @@ function MacroBody({ data }: { data: MacroData }) {
     : [];
   return (
     <>
+      <MacroOverlay data={data} />
       <KpiStrip
         label="当前读数"
         items={[
