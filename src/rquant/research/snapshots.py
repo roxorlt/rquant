@@ -47,8 +47,11 @@ TICK_CAP = 80           # realtime_tick (tx pages, ~25s/symbol) after the close
 SINA_CAP = 300          # sina fallback: 3 requests of 100 per ~3s cycle
 DC_CAP = 30             # eastmoney fallback: one request per symbol
 BATCH = 100
-INTERVAL = 3.25         # rt_tick every 2nd cycle (6.5s, <=10/min), rt_k in between
-TS_TICK_MIN_GAP = 6.4
+INTERVAL = 3.25         # rt_k (level 1, full market) cadence
+TS_TICK_MIN_GAP = 40.0  # rt_tick is capped at 100 calls/HOUR: one 5-level snapshot per 40s (90/h)
+TS_K_RETRY = 6.0        # a non-rate-limit rt_k failure: retry soon, sina in between
+MAX_BACKOFF = 10.0      # never let failures stretch the poll loop past this
+_RATE_RE = re.compile(r"(\d+)\s*次/(分钟|小时|天)")
 FLUSH_EVERY = 30.0
 MAX_FAILED_CYCLES = 30
 LEVEL_COLS = [f"{s}{i}_{k}" for s in ("b", "a") for i in range(1, 6) for k in ("p", "v")]
@@ -317,8 +320,9 @@ def fetch_dc(codes: list[str]) -> pd.DataFrame:
 
 
 class Poller:
-    """Tushare first: full market per call, alternating rt_tick (5 levels, our account is
-    limited to 10 calls/min) and rt_k (level 1, 50/min). On Tushare failure fall back to
+    """Tushare first: full market per call. rt_k (level 1) every cycle; rt_tick (5 levels,
+    capped at 100 calls/hour) at most once per TS_TICK_MIN_GAP. 40203 limits are parsed and
+    paced per API. On Tushare failure fall back to
     sina for the priority universe (capped) and then eastmoney (per symbol, small cap)."""
 
     def __init__(self, codes: list[str], *, token: str | None = None,
@@ -334,6 +338,10 @@ class Poller:
         self.failed_cycles = 0
         self.slot = 0
         self.last_tick_call = 0.0
+        self.last_k_call = 0.0
+        self.tick_gap, self.k_gap = TS_TICK_MIN_GAP, 0.0
+        self.tick_cooldown_until = 0.0
+        self.k_cooldown_until = 0.0
         self.ts_cooldown_until = 0.0
         self.sina_cooldown_until = 0.0
 
@@ -343,27 +351,56 @@ class Poller:
                              for i in range(0, min(len(codes), self.sina_cap), BATCH)]
         self.dc_codes = codes[:self.dc_cap]
 
+    def _rate_limited(self, kind: str, exc: Exception) -> bool:
+        """Tushare 40203 ("N次/分钟|小时|天"): pace that API under its quota and cool it down.
+        Only the API that hit the limit is affected; the other keeps its own cadence."""
+        m = _RATE_RE.search(str(exc))
+        if "40203" not in str(exc) and m is None:
+            return False
+        n, unit = (int(m.group(1)), m.group(2)) if m else (0, "分钟")
+        span = {"分钟": 60.0, "小时": 3600.0, "天": 86400.0}[unit]
+        gap = span / n * 1.05 if n else 0.0
+        cool = {"分钟": 60.0, "小时": 300.0, "天": 6 * 3600.0}[unit]
+        t = time.monotonic()
+        if kind == "tick":
+            self.tick_gap = max(self.tick_gap, gap)
+            self.tick_cooldown_until = t + cool
+        else:
+            self.k_gap = max(self.k_gap, gap)
+            self.k_cooldown_until = t + cool
+        log.warning("tushare %s rate-limited (%s); min gap %.1fs, cooldown %.0fs",
+                    kind, m.group(0) if m else "40203", gap, cool)
+        return True
+
     def _tushare(self) -> pd.DataFrame | None:
-        if not self.token or time.monotonic() < self.ts_cooldown_until:
+        if not self.token:
             return None
-        use_tick = time.monotonic() - self.last_tick_call >= TS_TICK_MIN_GAP
-        attempts = (["tick", "k"] if use_tick else ["k"])
-        for kind in attempts:
+        t = time.monotonic()
+        if t >= self.tick_cooldown_until and t - self.last_tick_call >= self.tick_gap:
+            self.last_tick_call = t
             try:
-                if kind == "tick":
-                    self.last_tick_call = time.monotonic()
-                    df = norm_rt_tick(self.ts_call("rt_tick", {"ts_code": FULL_MARKET},
-                                                   TS_TICK_FIELDS, self.token))
-                else:
-                    df = norm_rt_k(self.ts_call("rt_k", {"ts_code": FULL_MARKET},
-                                                TS_K_FIELDS, self.token))
+                df = norm_rt_tick(self.ts_call("rt_tick", {"ts_code": FULL_MARKET},
+                                               TS_TICK_FIELDS, self.token))
                 if len(df):
                     return df
-                raise TushareError(f"empty {kind}")
+                raise TushareError("empty tick")
+            except Exception as exc:  # noqa: BLE001 - tick failure never delays rt_k
+                if not self._rate_limited("tick", exc):
+                    log.warning("tushare tick failed: %s", str(exc)[:160])
+        t = time.monotonic()
+        if t >= self.k_cooldown_until and t - self.last_k_call >= self.k_gap:
+            self.last_k_call = t
+            try:
+                df = norm_rt_k(self.ts_call("rt_k", {"ts_code": FULL_MARKET},
+                                            TS_K_FIELDS, self.token))
+                if len(df):
+                    return df
+                raise TushareError("empty k")
             except Exception as exc:  # noqa: BLE001
-                log.warning("tushare %s failed: %s", kind, str(exc)[:160])
-        self.ts_cooldown_until = time.monotonic() + 30
-        log.warning("tushare unavailable; fallback sources for 30s")
+                if not self._rate_limited("k", exc):
+                    log.warning("tushare k failed: %s; sina for %.0fs", str(exc)[:160],
+                                TS_K_RETRY)
+                    self.k_cooldown_until = time.monotonic() + TS_K_RETRY
         return None
 
     def _fallback(self) -> list[pd.DataFrame]:
@@ -401,7 +438,7 @@ class Poller:
     def backoff(self) -> float:
         if self.failed_cycles == 0:
             return 0.0
-        return min(60.0, INTERVAL * 2 ** min(self.failed_cycles, 5))
+        return min(MAX_BACKOFF, INTERVAL * 2 ** min(self.failed_cycles, 5))
 
 
 class Deduper:
@@ -622,7 +659,7 @@ def run(out: Path, *, force: bool = False, max_cycles: int | None = None, cap: i
             if max_cycles is not None and cycles >= max_cycles:
                 break
             wait = max(INTERVAL - (time.monotonic() - started), 0.2) + poller.backoff()
-            time.sleep(wait + random.uniform(-0.3, 0.3))
+            time.sleep(max(0.0, wait + random.uniform(-0.3, 0.3)))
     finally:
         write_part(d, buf)
         if scanner is not None:

@@ -121,3 +121,37 @@ def test_token_from_env_file(tmp_path, monkeypatch):
     f.write_text("# c\nTUSHARE_TOKEN_MAIN=abc123\nOTHER=1\n")
     monkeypatch.setenv("RQUANT_TUSHARE_ENV_FILE", str(f))
     assert s.tushare_token() == "abc123"
+
+
+def test_rt_tick_hourly_limit_never_blocks_rt_k():
+    calls = []
+
+    def ts_call(api, params, fields, token):
+        calls.append(api)
+        if api == "rt_tick":
+            raise s.TushareError("rt_tick code=40203 抱歉，您访问接口(rt_tick)频率超限(100次/小时)")
+        return _ts_items(api)
+
+    def never(codes):
+        raise AssertionError("fallback must not run")
+
+    p = s.Poller(["600000.SH"], token="t", ts_call=ts_call, sina=never, dc=never)
+    frames = [p.cycle() for _ in range(3)]
+    assert calls == ["rt_tick", "rt_k", "rt_k", "rt_k"]
+    assert all(f.iloc[0]["src"] == "ts_k" for f in frames)
+    assert p.tick_gap >= 36.0 and p.failed_cycles == 0 and p.backoff() == 0.0
+
+
+def test_rt_k_rate_limit_paces_k_and_uses_sina():
+    def ts_call(api, params, fields, token):
+        raise s.TushareError(f"{api} code=40203 频率超限(1000次/小时)")
+
+    p = s.Poller(["600000.SH"], token="t", ts_call=ts_call, sina=lambda c: _frame(c))
+    df = p.cycle()
+    assert set(df["src"]) == {"sina"} and p.k_gap >= 3.6 and p.failed_cycles == 0
+
+
+def test_backoff_is_capped():
+    p = s.Poller(["600000.SH"])
+    p.failed_cycles = 10
+    assert p.backoff() <= s.MAX_BACKOFF
