@@ -60,7 +60,7 @@ def test_today_skipped_while_collector_runs(tmp_path, monkeypatch):
     root = tmp_path / "snapshots"
     _day(root, "2026-10-12")
     r2 = FakeR2()
-    sa.run(root, 14, today=dt.date(2026, 10, 12), client=r2)
+    sa.run(root, 14, today=dt.date(2026, 10, 12), client=r2, wait_s=0)
     assert r2.objs == {}
 
 
@@ -92,3 +92,18 @@ def test_sigv4_known_shape():
     auth = captured["r"].headers["Authorization"]
     assert auth.startswith("AWS4-HMAC-SHA256 Credential=AK/20260101/auto/s3/aws4_request")
     assert captured["r"].full_url == "https://acct.r2.cloudflarestorage.com/b/snapshots/x"
+
+
+def test_wait_for_collector_tmp(tmp_path, monkeypatch):
+    from rquant.research import snapshot_archive as sa
+
+    d = tmp_path / "2026-10-12"
+    d.mkdir()
+    (d / "quotes.tmp").write_text("x")
+    monkeypatch.setattr(sa, "collector_active", lambda: False)
+    assert not sa._ready(d, "2026-10-12")
+    assert sa.wait_for_collector(d, wait_s=0, poll_s=0) is False
+    calls = []
+    monkeypatch.setattr(sa.time, "sleep", lambda s: (calls.append(s), (d / "quotes.tmp").unlink()))
+    assert sa.wait_for_collector(d, wait_s=60, poll_s=1) is True
+    assert calls == [1]
