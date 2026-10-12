@@ -41,8 +41,8 @@ jobs:
       - name: Python lint + API tests
         run: |
           uv run ruff check src/rquant/web src/rquant/backtest src/rquant/factor \
-            src/rquant/data_catalog src/rquant/alert_rules.py src/rquant/fundamentals.py src/rquant/research tests/web tests/unit/test_research_pipeline.py tests/unit/test_snapshots.py tests/unit/test_report_factors.py
-          uv run pytest -q tests/web tests/unit/test_research_pipeline.py tests/unit/test_intraday_studies.py tests/unit/test_snapshots.py tests/unit/test_snapshot_archive.py tests/unit/test_research_surge.py tests/unit/test_auction_pool.py tests/unit/test_report_factors.py
+            src/rquant/data_catalog src/rquant/alert_rules.py src/rquant/fundamentals.py src/rquant/research tests/web tests/unit/test_research_pipeline.py tests/unit/test_snapshots.py tests/unit/test_report_factors.py tests/unit/test_report_tracking.py
+          uv run pytest -q tests/web tests/unit/test_research_pipeline.py tests/unit/test_intraday_studies.py tests/unit/test_snapshots.py tests/unit/test_snapshot_archive.py tests/unit/test_research_surge.py tests/unit/test_auction_pool.py tests/unit/test_report_factors.py tests/unit/test_report_tracking.py
       - name: Roadmap module unit tests
         run: |
           uv run pytest -q tests/unit/test_perf_metrics.py tests/unit/test_portfolio_*.py \

@@ -2192,6 +2192,22 @@
         "title": "Envelope[ReportFactorsData]",
         "type": "object"
       },
+      "Envelope_ReportFactorsSummaryData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/ReportFactorsSummaryData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[ReportFactorsSummaryData]",
+        "type": "object"
+      },
       "Envelope_ScreenData_": {
         "properties": {
           "data": {
@@ -4802,12 +4818,45 @@
               }
             ],
             "title": "Results"
+          },
+          "summary": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Summary"
           }
         },
         "required": [
           "results"
         ],
         "title": "ReportFactorsData",
+        "type": "object"
+      },
+      "ReportFactorsSummaryData": {
+        "properties": {
+          "summary": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Summary"
+          }
+        },
+        "required": [
+          "summary"
+        ],
+        "title": "ReportFactorsSummaryData",
         "type": "object"
       },
       "SavePoolRequest": {
@@ -7297,6 +7346,24 @@
           }
         },
         "summary": "研报因子：目录与复现结果"
+      }
+    },
+    "/api/v1/report-factors/summary": {
+      "get": {
+        "operationId": "report_factors_summary_api_v1_report_factors_summary_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_ReportFactorsSummaryData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "研报挖掘：最近一次周度跟踪的变更摘要"
       }
     },
     "/api/v1/screen": {

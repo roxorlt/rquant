@@ -60,7 +60,7 @@ function IndexChart({ c, k = "csi300", name = "沪深300" }: { c: Cols; k?: stri
     <TimeChart
       label={name}
       dates={c.dates}
-      height={130}
+      height={96}
       bands={eventBands(c.dates)}
       format={(v) => v.toFixed(0)}
       series={[{ name, values: col(c, k), color: "var(--muted)" }]}
@@ -119,7 +119,7 @@ function Holders({ data }: { data: MacroData }) {
       <TimeChart
         label="季末沪深300"
         dates={dates}
-        height={120}
+        height={90}
         bands={bands}
         format={(v) => v.toFixed(0)}
         series={[{ name: "沪深300", values: qIdx, color: "var(--muted)" }]}
@@ -130,7 +130,7 @@ function Holders({ data }: { data: MacroData }) {
         dates={dates}
         bars
         baseline={0}
-        height={160}
+        height={120}
         bands={bands}
         format={(v) => `${v.toFixed(0)}亿`}
         series={[
@@ -141,7 +141,7 @@ function Holders({ data }: { data: MacroData }) {
       <TimeChart
         label="家数"
         dates={dates}
-        height={160}
+        height={120}
         bands={bands}
         format={(v) => v.toFixed(0)}
         series={[
@@ -220,7 +220,7 @@ function Banded({
       <TimeChart
         label={name}
         dates={c.dates}
-        height={180}
+        height={130}
         bands={eventBands(c.dates)}
         format={format}
         series={series}
@@ -271,7 +271,7 @@ function Options({ data }: { data: MacroData }) {
           <TimeChart
             label="PCR"
             dates={c.dates}
-            height={150}
+            height={110}
             baseline={1}
             bands={eventBands(c.dates)}
             format={(v) => v.toFixed(2)}
@@ -284,7 +284,7 @@ function Options({ data }: { data: MacroData }) {
           <TimeChart
             label="PCR(持仓) 布林"
             dates={c.dates}
-            height={130}
+            height={96}
             bands={eventBands(c.dates)}
             format={(v) => v.toFixed(2)}
             series={[
@@ -296,7 +296,7 @@ function Options({ data }: { data: MacroData }) {
           <TimeChart
             label="ATM IV"
             dates={c.dates}
-            height={130}
+            height={96}
             bands={eventBands(c.dates)}
             format={pct}
             series={[{ name: "ATM IV", values: col(c, "atm_iv"), color: "var(--up)" }]}
@@ -304,7 +304,7 @@ function Options({ data }: { data: MacroData }) {
           <TimeChart
             label="放量倍数"
             dates={c.dates}
-            height={120}
+            height={90}
             bars
             baseline={1}
             format={(v) => v.toFixed(1)}
@@ -397,117 +397,137 @@ function MacroBody({ data }: { data: MacroData }) {
           },
         ]}
       />
-      {buffett ? (
-        <Banded
-          title="巴菲特指标（A股总市值 / GDP）"
-          sub="总市值=daily_basic 全A total_mv 月末合计；GDP=cn_gdp 滚动4季，按季末+20天视为已公布。虚线=全样本20/80分位与均值"
-          c={buffett}
-          k="ratio"
-          name="总市值/GDP"
-          bands={bb}
-          format={pct}
-        />
-      ) : null}
-      <Segmented label="区间" value={range} onChange={setRange} options={RANGES} />
-      {daily ? (
-        <>
+      <div className="card-grid">
+        {buffett ? (
           <Banded
-            title="股债利差（沪深300）"
-            sub="1/PE_TTM − 中国10年国债收益率（AKShare）。虚线=全样本20/80分位"
-            c={daily}
-            k="erp"
-            name="股债利差%"
-            bands={eb}
-            format={(v) => `${v.toFixed(1)}%`}
+            title="巴菲特指标（A股总市值 / GDP）"
+            sub="总市值=daily_basic 全A total_mv 月末合计；GDP=cn_gdp 滚动4季，按季末+20天视为已公布。虚线=全样本20/80分位与均值"
+            c={buffett}
+            k="ratio"
+            name="总市值/GDP"
+            bands={bb}
+            format={pct}
           />
-          <Panel title="两融" sub="沪深两市合计；融资买入占比=融资买入额 ÷ 中证全指成交额">
-            <IndexChart c={daily} k="all_a" name="中证全指" />
-            <TimeChart
-              label="两融余额"
-              dates={daily.dates}
-              height={140}
-              bands={eventBands(daily.dates)}
-              format={yi}
-              series={[{ name: "两融余额", values: col(daily, "rzrqye"), color: "var(--accent)" }]}
+        ) : null}
+        <div className="span-all">
+          <Segmented label="区间" value={range} onChange={setRange} options={RANGES} />
+        </div>
+        {daily ? (
+          <>
+            <Banded
+              title="股债利差（沪深300）"
+              sub="1/PE_TTM − 中国10年国债收益率（AKShare）。虚线=全样本20/80分位"
+              c={daily}
+              k="erp"
+              name="股债利差%"
+              bands={eb}
+              format={(v) => `${v.toFixed(1)}%`}
             />
-            <TimeChart
-              label="融资买入占成交"
-              dates={daily.dates}
-              height={120}
-              bands={eventBands(daily.dates)}
-              format={pct}
-              series={[
-                { name: "融资买入占比", values: col(daily, "fin_buy_share"), color: "var(--warn)" },
-              ]}
-            />
-          </Panel>
+            <Panel title="两融" sub="沪深两市合计；融资买入占比=融资买入额 ÷ 中证全指成交额">
+              <IndexChart c={daily} k="all_a" name="中证全指" />
+              <TimeChart
+                label="两融余额"
+                dates={daily.dates}
+                height={104}
+                bands={eventBands(daily.dates)}
+                format={yi}
+                series={[
+                  { name: "两融余额", values: col(daily, "rzrqye"), color: "var(--accent)" },
+                ]}
+              />
+              <TimeChart
+                label="融资买入占成交"
+                dates={daily.dates}
+                height={90}
+                bands={eventBands(daily.dates)}
+                format={pct}
+                series={[
+                  {
+                    name: "融资买入占比",
+                    values: col(daily, "fin_buy_share"),
+                    color: "var(--warn)",
+                  },
+                ]}
+              />
+            </Panel>
+            <Panel
+              title="北向资金"
+              sub={`${data.north_regime_change} 起交易所停止披露北向每日净买入，此后 Tushare north_money 不再是净流入，改为展示北向成交额，两段不可比`}
+            >
+              <IndexChart c={daily} />
+              <TimeChart
+                label="北向累计净买入"
+                dates={daily.dates}
+                height={104}
+                bands={eventBands(daily.dates)}
+                format={(v) => `${(v / 100).toFixed(0)}亿`}
+                series={[
+                  {
+                    name: "累计净买入",
+                    values: col(daily, "north_net_cum"),
+                    color: "var(--accent)",
+                  },
+                ]}
+              />
+              <TimeChart
+                label="北向成交额（新口径）"
+                dates={daily.dates}
+                height={90}
+                bands={eventBands(daily.dates)}
+                format={(v) => `${(v / 100).toFixed(0)}亿`}
+                series={[
+                  {
+                    name: "北向成交额",
+                    values: col(daily, "north_turnover"),
+                    color: "var(--warn)",
+                  },
+                ]}
+              />
+            </Panel>
+          </>
+        ) : null}
+        <Holders data={data} />
+        {etf && etf.dates.length > 1 ? (
           <Panel
-            title="北向资金"
-            sub={`${data.north_regime_change} 起交易所停止披露北向每日净买入，此后 Tushare north_money 不再是净流入，改为展示北向成交额，两段不可比`}
+            title="宽基 ETF 份额与申赎（国家队代理）"
+            sub="510300/159919/510310/510330 份额合计（亿份）。汇金托底常以买入宽基ETF进行，份额陡增可作日频线索"
           >
-            <IndexChart c={daily} />
             <TimeChart
-              label="北向累计净买入"
-              dates={daily.dates}
-              height={140}
-              bands={eventBands(daily.dates)}
-              format={(v) => `${(v / 100).toFixed(0)}亿`}
-              series={[
-                { name: "累计净买入", values: col(daily, "north_net_cum"), color: "var(--accent)" },
-              ]}
+              label="300ETF份额"
+              dates={etf.dates}
+              height={120}
+              bands={eventBands(etf.dates)}
+              format={(v) => `${v.toFixed(0)}亿份`}
+              series={[{ name: "300ETF合计份额", values: etf300, color: "var(--accent)" }]}
             />
             <TimeChart
-              label="北向成交额（新口径）"
-              dates={daily.dates}
-              height={120}
-              bands={eventBands(daily.dates)}
-              format={(v) => `${(v / 100).toFixed(0)}亿`}
+              label="宽基ETF净申赎"
+              dates={etf.dates}
+              height={104}
+              bars
+              baseline={0}
+              bands={eventBands(etf.dates)}
+              format={(v) => `${v.toFixed(0)}亿份`}
               series={[
-                { name: "北向成交额", values: col(daily, "north_turnover"), color: "var(--warn)" },
+                {
+                  name: "宽基ETF份额日变动",
+                  values: etfAll.map((v, i) =>
+                    i && v != null && etfAll[i - 1] != null ? v - (etfAll[i - 1] as number) : null,
+                  ),
+                  color: "var(--accent)",
+                },
               ]}
             />
           </Panel>
-        </>
-      ) : null}
-      <Holders data={data} />
-      {etf && etf.dates.length > 1 ? (
-        <Panel
-          title="宽基 ETF 份额与申赎（国家队代理）"
-          sub="510300/159919/510310/510330 份额合计（亿份）。汇金托底常以买入宽基ETF进行，份额陡增可作日频线索"
-        >
-          <TimeChart
-            label="300ETF份额"
-            dates={etf.dates}
-            height={160}
-            bands={eventBands(etf.dates)}
-            format={(v) => `${v.toFixed(0)}亿份`}
-            series={[{ name: "300ETF合计份额", values: etf300, color: "var(--accent)" }]}
-          />
-          <TimeChart
-            label="宽基ETF净申赎"
-            dates={etf.dates}
-            height={140}
-            bars
-            baseline={0}
-            bands={eventBands(etf.dates)}
-            format={(v) => `${v.toFixed(0)}亿份`}
-            series={[
-              {
-                name: "宽基ETF份额日变动",
-                values: etfAll.map((v, i) =>
-                  i && v != null && etfAll[i - 1] != null ? v - (etfAll[i - 1] as number) : null,
-                ),
-                color: "var(--accent)",
-              },
-            ]}
-          />
-        </Panel>
-      ) : null}
-      <Options data={data} />
-      <Futures data={data} />
-      <Breadth data={data} />
-      <HkSystem data={data} />
-      <Studies data={data} />
+        ) : null}
+        <Options data={data} />
+        <Futures data={data} />
+        <Breadth data={data} />
+        <HkSystem data={data} />
+        <div className="span-all">
+          <Studies data={data} />
+        </div>
+      </div>
     </>
   );
 }
@@ -559,7 +579,7 @@ function Futures({ data }: { data: MacroData }) {
       <TimeChart
         label="基差"
         dates={c.dates}
-        height={140}
+        height={104}
         baseline={0}
         bands={eventBands(c.dates)}
         format={pct}
@@ -568,7 +588,7 @@ function Futures({ data }: { data: MacroData }) {
       <TimeChart
         label="前20净多"
         dates={c.dates}
-        height={140}
+        height={104}
         baseline={0}
         bands={eventBands(c.dates)}
         format={(v) => v.toFixed(0)}
@@ -604,7 +624,7 @@ function Breadth({ data }: { data: MacroData }) {
           key={p.variant}
           label={p.variant}
           dates={c.dates}
-          height={120}
+          height={90}
           bands={eventBands(c.dates)}
           format={(v) => (Math.abs(v) < 5 ? v.toFixed(2) : v.toFixed(0))}
           series={[
@@ -628,7 +648,7 @@ function HkSystem({ data }: { data: MacroData }) {
       <TimeChart
         label="沪深300与信号"
         dates={c.dates}
-        height={150}
+        height={110}
         bands={eventBands(c.dates)}
         format={(v) => v.toFixed(0)}
         series={[
@@ -639,7 +659,7 @@ function HkSystem({ data }: { data: MacroData }) {
       <TimeChart
         label="SMARTMONEY"
         dates={c.dates}
-        height={140}
+        height={104}
         bands={eventBands(c.dates)}
         format={(v) => v.toFixed(2)}
         series={[
@@ -651,7 +671,7 @@ function HkSystem({ data }: { data: MacroData }) {
         <TimeChart
           label="领先滞后相关"
           dates={data.leadlag.dates}
-          height={130}
+          height={96}
           baseline={0}
           bars
           format={(v) => v.toFixed(3)}
@@ -668,7 +688,7 @@ function HkSystem({ data }: { data: MacroData }) {
         <TimeChart
           label="滚动相关"
           dates={data.hk_rollcorr.dates}
-          height={110}
+          height={84}
           baseline={0}
           format={(v) => v.toFixed(2)}
           series={[

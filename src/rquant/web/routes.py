@@ -82,6 +82,7 @@ from rquant.web.models import (
     PortfolioRunListData,
     PortfolioRunSummary,
     ReportFactorsData,
+    ReportFactorsSummaryData,
     SavePoolRequest,
     ScreenData,
     ScreenRow,
@@ -629,9 +630,21 @@ def data_center(request: Request, source: SourceDep) -> Envelope[DataCenterData]
             summary="研报因子：目录与复现结果")
 def report_factors(request: Request, source: SourceDep) -> Envelope[ReportFactorsData]:
     from rquant.research.report_factors import read_results
+    from rquant.research.report_tracking import read_summary
 
-    return _envelope(source, ReportFactorsData(
-        results=read_results(Path(_research_root(request) or research_root()))))
+    root = Path(_research_root(request) or research_root())
+    return _envelope(source, ReportFactorsData(results=read_results(root),
+                                               summary=read_summary(root)))
+
+
+@router.get("/report-factors/summary", response_model=Envelope[ReportFactorsSummaryData],
+            summary="研报挖掘：最近一次周度跟踪的变更摘要")
+def report_factors_summary(request: Request, source: SourceDep
+                           ) -> Envelope[ReportFactorsSummaryData]:
+    from rquant.research.report_tracking import read_summary
+
+    return _envelope(source, ReportFactorsSummaryData(
+        summary=read_summary(Path(_research_root(request) or research_root()))))
 
 
 @router.get("/surge", response_model=Envelope[SurgeData], summary="量能异动（盘中扫描事件）")

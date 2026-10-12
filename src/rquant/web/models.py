@@ -529,6 +529,11 @@ class SurgeEvent(BaseModel):
 class ReportFactorsData(BaseModel):
     """研报因子: catalog + per-factor replication results (opaque chart series)."""
     results: dict[str, Any] | None
+    summary: dict[str, Any] | None = None  # weekly tracking change summary
+
+
+class ReportFactorsSummaryData(BaseModel):
+    summary: dict[str, Any] | None
 
 
 class SurgeData(BaseModel):

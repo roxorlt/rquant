@@ -22,7 +22,7 @@ const PAGE_COMPONENTS: Record<PageId, LazyPage> = {
   data: lazy(() => import("@/pages/data")),
   ops: lazy(() => import("@/pages/ops")),
   factor: lazy(() => import("@/pages/factor")),
-  reportfactors: lazy(() => import("@/pages/reportfactors")),
+  reportmining: lazy(() => import("@/pages/reportmining")),
   strategies: lazy(() => import("@/pages/strategies")),
   experiments: lazy(() => import("@/pages/experiments")),
   tasks: lazy(() => import("@/pages/tasks")),
@@ -41,6 +41,7 @@ export const appRoutes: RouteObject[] = [
         const Page = PAGE_COMPONENTS[page.id];
         return { path: page.id, element: <Page />, handle: { title: page.title } };
       }),
+      { path: "reportfactors", element: <Navigate to="/reportmining" replace /> },
       { path: "stock/:code", element: <StockPage />, handle: { title: "个股档案" } },
       { path: "*", element: <NotFound />, handle: { title: "页面不存在" } },
     ],

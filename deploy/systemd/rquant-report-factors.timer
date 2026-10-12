@@ -1,8 +1,8 @@
 [Unit]
-Description=研报因子 recompute Tue-Sat 06:30 (after the previous evening's minute backfill)
+Description=研报因子 recompute Tue-Fri 06:30 (Sat: weekly tracker) (after the previous evening's minute backfill)
 
 [Timer]
-OnCalendar=Tue..Sat *-*-* 06:30:00
+OnCalendar=Tue..Fri *-*-* 06:30:00
 Persistent=false
 Unit=rquant-report-factors.service
 
