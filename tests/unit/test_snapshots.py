@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from datetime import time as dtime
 
 import pandas as pd
@@ -97,8 +98,12 @@ def test_tushare_first_alternates_tick_and_k(tmp_path, monkeypatch):
         raise AssertionError("fallback must not run")
 
     p = s.Poller(["600000.SH"], token="t", ts_call=ts_call, sina=never, dc=never)
-    a, b = p.cycle(), p.cycle()
-    assert calls == ["rt_tick", "rt_k"]
+    p.collect_wait = 2.0
+    both = p.cycle()
+    while len(both) < 2:
+        both = pd.concat([both, p.cycle()], ignore_index=True)
+    assert sorted(calls) == ["rt_k", "rt_tick"]
+    a, b = both[both.src == "ts_tick"], both[both.src == "ts_k"]
     assert a.iloc[0]["src"] == "ts_tick" and a.iloc[0]["a5_p"] == 9.55
     assert a.iloc[0]["date"] == "20261009" and a.iloc[0]["time"] == "15:00:03"
     assert b.iloc[0]["src"] == "ts_k" and pd.isna(b.iloc[0]["a5_p"])
@@ -111,7 +116,10 @@ def test_tushare_failure_falls_back_to_sina():
         raise s.TushareError("rate")
 
     p = s.Poller(["600000.SH"], token="t", ts_call=ts_call, sina=lambda c: _frame(c))
+    p.collect_wait = 2.0
     df = p.cycle()
+    while not len(df):
+        df = p.cycle()
     assert set(df["src"]) == {"sina"} and p.failed_cycles == 0
 
 
@@ -136,9 +144,16 @@ def test_rt_tick_hourly_limit_never_blocks_rt_k():
         raise AssertionError("fallback must not run")
 
     p = s.Poller(["600000.SH"], token="t", ts_call=ts_call, sina=never, dc=never)
-    frames = [p.cycle() for _ in range(3)]
-    assert calls == ["rt_tick", "rt_k", "rt_k", "rt_k"]
-    assert all(f.iloc[0]["src"] == "ts_k" for f in frames)
+    p.collect_wait = 2.0
+    frames = []
+    for _ in range(3):
+        p.last_k_call = 0.0  # skip the stagger
+        f = p.cycle()
+        while not len(f):
+            f = p.cycle()
+        frames.append(f)
+    assert calls.count("rt_tick") == 1 and calls.count("rt_k") >= 3
+    assert all(set(f["src"]) == {"ts_k"} for f in frames)
     assert p.tick_gap >= 36.0 and p.failed_cycles == 0 and p.backoff() == 0.0
 
 
@@ -147,7 +162,10 @@ def test_rt_k_rate_limit_paces_k_and_uses_sina():
         raise s.TushareError(f"{api} code=40203 频率超限(1000次/小时)")
 
     p = s.Poller(["600000.SH"], token="t", ts_call=ts_call, sina=lambda c: _frame(c))
+    p.collect_wait = 2.0
     df = p.cycle()
+    while not len(df) or p._inflight:
+        df = p.cycle()
     assert set(df["src"]) == {"sina"} and p.k_gap >= 3.6 and p.failed_cycles == 0
 
 
@@ -155,3 +173,29 @@ def test_backoff_is_capped():
     p = s.Poller(["600000.SH"])
     p.failed_cycles = 10
     assert p.backoff() <= s.MAX_BACKOFF
+
+
+def test_two_rt_k_calls_overlap():
+    import threading
+
+    live, peak, lock = [0], [0], threading.Lock()
+
+    def ts_call(api, params, fields, token):
+        if api == "rt_tick":
+            raise s.TushareError("rt_tick code=40203 (100次/小时)")
+        with lock:
+            live[0] += 1
+            peak[0] = max(peak[0], live[0])
+        time.sleep(0.4)
+        with lock:
+            live[0] -= 1
+        return _ts_items(api)
+
+    p = s.Poller(["600000.SH"], token="t", ts_call=ts_call)
+    for _ in range(2):
+        p.last_k_call = 0.0
+        assert p.cycle().empty  # in flight: no fallback, no failure
+    time.sleep(0.6)
+    got = p.cycle()
+    p.close()
+    assert peak[0] == 2 and len(got) == 2 and p.failed_cycles == 0

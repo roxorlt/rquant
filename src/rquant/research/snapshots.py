@@ -49,6 +49,8 @@ DC_CAP = 30             # eastmoney fallback: one request per symbol
 BATCH = 100
 INTERVAL = 3.25         # rt_k (level 1, full market) cadence
 TS_TICK_MIN_GAP = 40.0  # rt_tick is capped at 100 calls/HOUR: one 5-level snapshot per 40s (90/h)
+LOOP_TICK = 0.5         # main loop: collect finished calls / launch due ones
+TS_K_PARALLEL = 2       # overlapping full-market rt_k calls (~5s each) -> one lands every ~3s
 TS_K_RETRY = 6.0        # a non-rate-limit rt_k failure: retry soon, sina in between
 MAX_BACKOFF = 10.0      # never let failures stretch the poll loop past this
 _RATE_RE = re.compile(r"(\d+)\s*次/(分钟|小时|天)")
@@ -343,6 +345,10 @@ class Poller:
         self.tick_cooldown_until = 0.0
         self.k_cooldown_until = 0.0
         self.ts_cooldown_until = 0.0
+        self.k_parallel = TS_K_PARALLEL
+        self.collect_wait = 0.0  # tests: wait this long for in-flight calls
+        self._pool: Any = None
+        self._inflight: dict[Any, str] = {}
         self.sina_cooldown_until = 0.0
 
     def set_codes(self, codes: list[str]) -> None:
@@ -372,36 +378,67 @@ class Poller:
                     kind, m.group(0) if m else "40203", gap, cool)
         return True
 
+    def _call(self, kind: str) -> pd.DataFrame:
+        if kind == "tick":
+            df = norm_rt_tick(self.ts_call("rt_tick", {"ts_code": FULL_MARKET},
+                                           TS_TICK_FIELDS, self.token))
+        else:
+            df = norm_rt_k(self.ts_call("rt_k", {"ts_code": FULL_MARKET},
+                                        TS_K_FIELDS, self.token))
+        if not len(df):
+            raise TushareError(f"empty {kind}")
+        return df
+
+    def _submit_due(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        if self._pool is None:
+            self._pool = ThreadPoolExecutor(self.k_parallel + 1, thread_name_prefix="ts")
+        kinds = list(self._inflight.values())
+        t = time.monotonic()
+        if ("tick" not in kinds and t >= self.tick_cooldown_until
+                and t - self.last_tick_call >= self.tick_gap):
+            self.last_tick_call = t
+            self._inflight[self._pool.submit(self._call, "tick")] = "tick"
+        # stagger: a new rt_k at most every INTERVAL, at most k_parallel in flight
+        if (kinds.count("k") < self.k_parallel and t >= self.k_cooldown_until
+                and t - self.last_k_call >= max(self.k_gap, INTERVAL * 0.9)):
+            self.last_k_call = t
+            self._inflight[self._pool.submit(self._call, "k")] = "k"
+
+    def _collect(self) -> list[pd.DataFrame]:
+        from concurrent.futures import FIRST_COMPLETED, wait
+
+        if self.collect_wait and self._inflight:
+            wait(list(self._inflight), timeout=self.collect_wait, return_when=FIRST_COMPLETED)
+        frames = []
+        for fut in [f for f in self._inflight if f.done()]:
+            kind = self._inflight.pop(fut)
+            try:
+                frames.append(fut.result())
+            except Exception as exc:  # noqa: BLE001 - one API's failure never blocks the other
+                if not self._rate_limited(kind, exc):
+                    log.warning("tushare %s failed: %s", kind, str(exc)[:160])
+                    if kind == "k":
+                        self.k_cooldown_until = time.monotonic() + TS_K_RETRY
+        return frames
+
     def _tushare(self) -> pd.DataFrame | None:
+        """Non-blocking: launch due calls, return whatever finished (empty frame while rt_k
+        is merely in flight, None when Tushare is unusable right now -> fallback)."""
         if not self.token:
             return None
-        t = time.monotonic()
-        if t >= self.tick_cooldown_until and t - self.last_tick_call >= self.tick_gap:
-            self.last_tick_call = t
-            try:
-                df = norm_rt_tick(self.ts_call("rt_tick", {"ts_code": FULL_MARKET},
-                                               TS_TICK_FIELDS, self.token))
-                if len(df):
-                    return df
-                raise TushareError("empty tick")
-            except Exception as exc:  # noqa: BLE001 - tick failure never delays rt_k
-                if not self._rate_limited("tick", exc):
-                    log.warning("tushare tick failed: %s", str(exc)[:160])
-        t = time.monotonic()
-        if t >= self.k_cooldown_until and t - self.last_k_call >= self.k_gap:
-            self.last_k_call = t
-            try:
-                df = norm_rt_k(self.ts_call("rt_k", {"ts_code": FULL_MARKET},
-                                            TS_K_FIELDS, self.token))
-                if len(df):
-                    return df
-                raise TushareError("empty k")
-            except Exception as exc:  # noqa: BLE001
-                if not self._rate_limited("k", exc):
-                    log.warning("tushare k failed: %s; sina for %.0fs", str(exc)[:160],
-                                TS_K_RETRY)
-                    self.k_cooldown_until = time.monotonic() + TS_K_RETRY
+        self._submit_due()
+        frames = self._collect()
+        if frames:
+            return pd.concat(frames, ignore_index=True)
+        if "k" in self._inflight.values() and time.monotonic() >= self.k_cooldown_until:
+            return _normalize(None, "ts_k")
         return None
+
+    def close(self) -> None:
+        if self._pool is not None:
+            self._pool.shutdown(wait=False, cancel_futures=True)
 
     def _fallback(self) -> list[pd.DataFrame]:
         frames = []
@@ -427,6 +464,8 @@ class Poller:
 
     def cycle(self) -> pd.DataFrame:
         ts_df = self._tushare()
+        if ts_df is not None and not len(ts_df):
+            return ts_df  # rt_k in flight: not a failure, no fallback
         frames = [ts_df] if ts_df is not None else self._fallback()
         self.failed_cycles = 0 if frames else self.failed_cycles + 1
         if not frames:
@@ -658,9 +697,11 @@ def run(out: Path, *, force: bool = False, max_cycles: int | None = None, cap: i
                 buf, last_flush = [], time.monotonic()
             if max_cycles is not None and cycles >= max_cycles:
                 break
-            wait = max(INTERVAL - (time.monotonic() - started), 0.2) + poller.backoff()
-            time.sleep(max(0.0, wait + random.uniform(-0.3, 0.3)))
+            # rt_k calls run in the background (staggered by INTERVAL); poll for results often
+            wait = max(LOOP_TICK - (time.monotonic() - started), 0.1) + poller.backoff()
+            time.sleep(max(0.0, wait + random.uniform(-0.1, 0.1)))
     finally:
+        poller.close()
         write_part(d, buf)
         if scanner is not None:
             try:
