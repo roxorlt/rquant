@@ -14,6 +14,25 @@ ENTITY_PATTERNS: dict[str, str] = {
 
 NORTH_REGIME_CHANGE = "20240819"
 
+
+def complete_dates(
+    df: pd.DataFrame, part: str, date: str = "trade_date", window: int = 20
+) -> pd.DataFrame:
+    """Keep only dates where every expected component of a summed series is present.
+
+    Tushare publishes per-exchange / per-code rows independently, so the newest date can
+    briefly hold only some of them (e.g. SSE margin before SZSE/BSE). Summing such a date
+    silently halves the total. A date is incomplete when it has fewer distinct ``part``
+    values than the max seen over the preceding ``window`` dates (so a component that is
+    added later, like BSE in 2021, raises the bar only once it exists)."""
+    if df.empty:
+        return df
+    n = df.groupby(date)[part].nunique().sort_index()
+    need = n.shift().rolling(window, min_periods=1).max().fillna(n)
+    ok = n.index[n >= need]
+    return df[df[date].isin(ok)]
+
+
 OPTION_UNDERLYINGS: dict[str, str] = {
     "OP510050.SH": "50ETF",
     "OP510300.SH": "沪300ETF",
@@ -279,7 +298,11 @@ def daily_panel(
     ix = index.pivot_table(index="trade_date", columns="ts_code", values="close")
     ix = ix.rename(columns={"000300.SH": "csi300", "000985.CSI": "all_a"})
     amt = index[index.ts_code == "000985.CSI"].set_index("trade_date").amount * 1e3  # 千元→元
-    m = margin.groupby("trade_date")[["rzye", "rzmre", "rzrqye"]].sum()
+    m = (
+        complete_dates(margin, "exchange_id")
+        .groupby("trade_date")[["rzye", "rzmre", "rzrqye"]]
+        .sum()
+    )
     p = ix[[c for c in ["csi300", "all_a"] if c in ix]].join(m, how="left")
     p["fin_buy_share"] = p.rzmre / amt.reindex(p.index)
     h = hsgt.set_index("trade_date")[["north_money"]].astype(float)
@@ -430,7 +453,7 @@ def hk_system(hk: pd.DataFrame, hk_etf: pd.DataFrame, index: pd.DataFrame) -> pd
     A-share HSTECH ETFs (513180/513130). SMARTMONEY = cumulative EMA5 of (HKTECH daily return ×
     ETF volume / its 20d mean); signal = SMARTMONEY > MA20 and 50/300/创业板 all up on the day."""
     h = hk.set_index("trade_date").close.sort_index().rename("hk")
-    v = hk_etf.groupby("trade_date").vol.sum().sort_index()
+    v = complete_dates(hk_etf, "ts_code").groupby("trade_date").vol.sum().sort_index()
     vr = (v / v.rolling(20, min_periods=10).mean()).rename("vr")
     ix = index.pivot_table(index="trade_date", columns="ts_code", values="close").sort_index()
     d = ix.join(h, how="inner").join(vr, how="left")
