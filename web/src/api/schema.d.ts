@@ -570,6 +570,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/report-factors/summary": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 研报挖掘：最近一次周度跟踪的变更摘要 */
+        get: operations["report_factors_summary_api_v1_report_factors_summary_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/screen": {
         parameters: {
             query?: never;
@@ -1392,6 +1409,11 @@ export interface components {
         /** Envelope[ReportFactorsData] */
         Envelope_ReportFactorsData_: {
             data: components["schemas"]["ReportFactorsData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[ReportFactorsSummaryData] */
+        Envelope_ReportFactorsSummaryData_: {
+            data: components["schemas"]["ReportFactorsSummaryData"];
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[ScreenData] */
@@ -2244,6 +2266,17 @@ export interface components {
         ReportFactorsData: {
             /** Results */
             results: {
+                [key: string]: unknown;
+            } | null;
+            /** Summary */
+            summary?: {
+                [key: string]: unknown;
+            } | null;
+        };
+        /** ReportFactorsSummaryData */
+        ReportFactorsSummaryData: {
+            /** Summary */
+            summary: {
                 [key: string]: unknown;
             } | null;
         };
@@ -3544,6 +3577,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_ReportFactorsData_"];
+                };
+            };
+        };
+    };
+    report_factors_summary_api_v1_report_factors_summary_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_ReportFactorsSummaryData_"];
                 };
             };
         };

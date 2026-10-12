@@ -445,3 +445,29 @@ input:focus {
   stroke: var(--border-strong, #555);
   stroke-dasharray: none;
 }
+
+/* Dense chart pages (宏观 / 研报挖掘): 2-column card grid on wide screens, compact panel heads. */
+.card-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+}
+.card-grid > * {
+  margin: 0;
+  min-width: 0;
+}
+.card-grid .span-all {
+  grid-column: 1 / -1;
+}
+.card-grid .panel-h {
+  padding: 8px 12px;
+}
+.card-grid .panel-h h2 {
+  font-size: 14px;
+}
+@media (min-width: 1200px) {
+  .card-grid {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+}

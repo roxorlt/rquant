@@ -1,0 +1,10 @@
+[Unit]
+Description=研报挖掘 weekly tracking Sat 06:30
+
+[Timer]
+OnCalendar=Sat *-*-* 06:30:00
+Persistent=false
+Unit=rquant-report-tracking.service
+
+[Install]
+WantedBy=timers.target

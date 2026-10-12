@@ -274,10 +274,23 @@ def run(minute: pd.DataFrame, daily: pd.DataFrame, basic: pd.DataFrame) -> dict:
                     k: round(float(v), 2) for k, v in (row.rank(pct=True) * 100).items()}
             print(key, r["test"]["rank_ic"], r["validated"], flush=True)
     corr_keys = list(out["factors"])
-    out["catalog"] = json.loads(CATALOG.read_text()) if CATALOG.exists() else []
+    out["catalog"] = load_catalog()
     out["order"] = corr_keys
     out["latest"] = {"factors": list(latest)}
     return {"results": out, "latest": latest}
+
+
+def load_catalog(root: Path | None = None) -> list[dict]:
+    """Repo catalog + reports appended by the weekly tracker (report_factors/catalog_extra.json)."""
+    base = json.loads(CATALOG.read_text()) if CATALOG.exists() else []
+    extra = (root or research_root()) / KIND / "catalog_extra.json"
+    if extra.exists():
+        try:
+            seen = {c["id"] for c in base}
+            base += [c for c in json.loads(extra.read_text()) if c.get("id") not in seen]
+        except (ValueError, KeyError, TypeError):
+            pass
+    return base
 
 
 def write(doc: dict, root: Path | None = None) -> Path:
@@ -318,13 +331,18 @@ def _load_db(database: Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="rquant.research.report_factors")
-    ap.add_argument("cmd", choices=["run"])
+    ap.add_argument("cmd", choices=["run", "weekly"])
     ap.add_argument("--database", type=Path, default=research_root() / "market.duckdb")
     ap.add_argument("--min-parquet")
     ap.add_argument("--daily-parquet")
     ap.add_argument("--basic-parquet")
     ap.add_argument("--out", type=Path)
     a = ap.parse_args(argv)
+    if a.cmd == "weekly":
+        from rquant.research.report_tracking import weekly
+
+        print(json.dumps(weekly(a.database, a.out), ensure_ascii=False)[:2000])
+        return 0
     if a.min_parquet:
         minute, daily, basic = (pd.read_parquet(x) for x in
                                 (a.min_parquet, a.daily_parquet, a.basic_parquet))
