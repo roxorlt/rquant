@@ -4440,6 +4440,28 @@
             "title": "Code",
             "type": "string"
           },
+          "intraday_pct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Intraday Pct"
+          },
+          "open": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Open"
+          },
           "pct": {
             "anyOf": [
               {
@@ -4504,6 +4526,8 @@
           "price",
           "pre_close",
           "pct",
+          "open",
+          "intraday_pct",
           "time",
           "spark",
           "spark_t"

@@ -2148,6 +2148,10 @@ export interface components {
         PoolLiveRow: {
             /** Code */
             code: string;
+            /** Intraday Pct */
+            intraday_pct: number | null;
+            /** Open */
+            open: number | null;
             /** Pct */
             pct: number | null;
             /** Pre Close */
