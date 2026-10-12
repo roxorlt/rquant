@@ -19,7 +19,9 @@ class PoolLiveRow(BaseModel):
     code: str
     price: float | None
     pre_close: float | None
-    pct: float | None  # percent, e.g. 3.21
+    pct: float | None  # percent vs prior close, e.g. 3.21
+    open: float | None
+    intraday_pct: float | None  # percent vs today's open
     time: str | None  # HH:MM:SS of the latest quote
     spark: list[float]  # 1-minute last prices, 09:30 -> latest
     spark_t: list[str]  # HH:MM of each spark point
@@ -32,7 +34,7 @@ class PoolLiveData(BaseModel):
 
 _CACHE: dict[tuple[str, float, tuple[str, ...]], pd.DataFrame] = {}
 _LOCK = threading.Lock()
-_COLS = ["ts_code", "time", "price", "pre_close"]
+_COLS = ["ts_code", "time", "price", "pre_close", "open"]
 
 
 def _read(path: Path, codes: tuple[str, ...]) -> pd.DataFrame:
@@ -45,7 +47,7 @@ def _read(path: Path, codes: tuple[str, ...]) -> pd.DataFrame:
     con = duckdb.connect()
     try:
         df = con.execute(
-            f"SELECT ts_code, time, price, pre_close FROM read_parquet(?) "
+            f"SELECT ts_code, time, price, pre_close, open FROM read_parquet(?) "
             f"WHERE ts_code IN ({ph}) AND price > 0", [str(path), *codes]).df()
     finally:
         con.close()
@@ -75,17 +77,21 @@ def load_pool_live(root: Path, day: str, codes: list[str]) -> PoolLiveData:
     for code in codes:
         g = df[df["ts_code"] == code].sort_values("time", kind="stable")
         if g.empty:
-            rows.append(PoolLiveRow(code=code, price=None, pre_close=None, pct=None, time=None,
+            rows.append(PoolLiveRow(code=code, price=None, pre_close=None, pct=None, open=None,
+                                    intraday_pct=None, time=None,
                                     spark=[], spark_t=[]))
             continue
         last = g.iloc[-1]
         pc = last["pre_close"]
         pre = float(pc) if pd.notna(pc) and pc else None
         price = float(last["price"])
+        op = last["open"]
+        opn = float(op) if pd.notna(op) and op else None
         spark = g.groupby(g["time"].str.slice(0, 5))["price"].last().astype(float).round(3)
         rows.append(PoolLiveRow(
             code=code, price=price, pre_close=pre,
-            pct=round((price / pre - 1) * 100, 2) if pre else None,
+            pct=round((price / pre - 1) * 100, 2) if pre else None, open=opn,
+            intraday_pct=round((price / opn - 1) * 100, 2) if opn else None,
             time=str(last["time"]), spark=spark.tolist(),
             spark_t=[str(t) for t in spark.index]))
     return PoolLiveData(date=day, rows=rows)

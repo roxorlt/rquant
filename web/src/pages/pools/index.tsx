@@ -136,6 +136,20 @@ export default function PoolsPage() {
                             },
                           },
                           {
+                            id: "intraday",
+                            header: "日内涨幅",
+                            numeric: true,
+                            value: (row: Member) => liveBy.get(row.code)?.intraday_pct ?? null,
+                            cell: (row: Member) => {
+                              const r = liveBy.get(row.code);
+                              return (
+                                <span title={r?.open ? `开盘 ${r.open}` : undefined}>
+                                  <ChangeText value={r?.intraday_pct ?? null} />
+                                </span>
+                              );
+                            },
+                          },
+                          {
                             id: "spark",
                             header: "分时",
                             sortable: false,
