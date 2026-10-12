@@ -75,7 +75,13 @@ def _codes(values: Iterable[object]) -> list[str]:
     return out
 
 
+def web_commands_dir() -> Path:
+    """Where the web's write sink (``rquant-web-commands``) records 加自选 etc."""
+    return Path(os.environ.get("RQUANT_WEB_COMMANDS_DIR") or Path.home() / "rquant-web-commands")
+
+
 def _watchlist_log(commands_dir: Path) -> list[str]:
+    """网页「加自选」— the only place web watchlist writes are persisted (no Serving table)."""
     path = commands_dir / "watchlist" / "items.jsonl"
     if not path.is_file():
         return []
@@ -101,8 +107,6 @@ def _serving(root: str | None) -> dict[str, list[str]]:
         return out
     src = ServingSource(root)
     queries = {
-        "serving_watchlist": "SELECT ts_code FROM manual_watchlist "
-                             "ORDER BY added_at DESC LIMIT 200",
         "pools": "SELECT DISTINCT ts_code FROM canvas_hit WHERE trade_date = "
                  "(SELECT max(trade_date) FROM canvas_hit) LIMIT 2000",
         "screen": "SELECT DISTINCT ts_code FROM screen_result WHERE trade_date = "
@@ -147,18 +151,16 @@ POOL_RELOAD_AT = dtime(9, 25, 45)  # after the 09:25:30 auction pick
 
 
 def build_universe(cap: int = DEFAULT_CAP) -> dict[str, Any]:
-    """Priority: extra env > 竞价选股 pool > watchlist (commands log, Serving) > pools > screen
+    """Priority: extra env > 竞价选股 pool > watchlist (web commands log) > pools > screen
     > condition."""
     from rquant.research.auction_pool import priority_codes
 
-    commands_dir = Path(os.environ.get("RQUANT_WEB_COMMANDS_DIR")
-                       or Path.home() / "rquant-web-commands")
+    commands_dir = web_commands_dir()
     serving = _serving(os.environ.get("RQUANT_SERVING_ROOT"))
     sources = {
         "extra": _codes(os.environ.get("RQUANT_SNAPSHOT_EXTRA", "").split(",")),
         "auction_pool": _safe_pool(priority_codes, now().date()),
         "watchlist": _watchlist_log(commands_dir),
-        "serving_watchlist": serving.get("serving_watchlist", []),
         "pools": serving.get("pools", []),
         "screen": serving.get("screen", []),
         "condition": _condition_hits(research_root()),

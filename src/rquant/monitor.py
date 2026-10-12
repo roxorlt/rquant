@@ -278,8 +278,23 @@ def _get_latest_screen_date(store: DuckDBStore) -> str | None:
     return row[0] if row and row[0] else None
 
 
-def load_manual_watchlist_codes(serving_root: str | Path | None = None) -> list[str]:
-    """网页「加自选」的股票（Serving ``manual_watchlist``）。读不到时返回空，不影响盯盘。"""
+def load_manual_watchlist_codes(
+    serving_root: str | Path | None = None, commands_dir: str | Path | None = None
+) -> list[str]:
+    """网页「加自选」的股票：web 写入落在 ``rquant-web-commands/watchlist/items.jsonl``
+    （主来源），再并上 Serving ``manual_watchlist``（若有发布）。读不到时返回空，不影响盯盘。"""
+    from rquant.research.snapshots import _watchlist_log, web_commands_dir
+
+    try:
+        logged = _watchlist_log(Path(commands_dir) if commands_dir else web_commands_dir())
+    except Exception as exc:  # noqa: BLE001 - optional input
+        logger.info(f"自选日志不可用：{type(exc).__name__}: {exc}")
+        logged = []
+    served = _serving_manual_codes(serving_root)
+    return logged + [c for c in served if c not in logged]
+
+
+def _serving_manual_codes(serving_root: str | Path | None) -> list[str]:
     from rquant.dashboard.serving_only_page_data import ServingFrameState, query_serving_frame
     from rquant.serving_paths import serving_root_from_env
 
