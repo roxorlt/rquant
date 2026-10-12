@@ -65,3 +65,13 @@ def test_load_codes_from_serving(tmp_path: Path) -> None:
         built_at=built,
     )
     assert load_manual_watchlist_codes(root) == ["600519.SH"]
+
+
+def test_load_codes_from_web_commands_log(tmp_path: Path) -> None:
+    """The web's 加自选 lands in rquant-web-commands/watchlist/items.jsonl (no Serving table)."""
+    log = tmp_path / "cmds" / "watchlist" / "items.jsonl"
+    log.parent.mkdir(parents=True)
+    log.write_text('{"command_id":"a","ts_code":"600519.SH","note":""}\n'
+                   '{"command_id":"b","ts_code":"000001.SZ","note":"x"}\n', encoding="utf-8")
+    codes = load_manual_watchlist_codes(tmp_path / "no-serving", commands_dir=tmp_path / "cmds")
+    assert codes == ["000001.SZ", "600519.SH"]
