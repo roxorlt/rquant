@@ -579,53 +579,39 @@ function Futures({ data }: { data: MacroData }) {
 }
 
 function Breadth({ data }: { data: MacroData }) {
-  const c = data.breadth;
-  if (!c) return null;
+  const c = data.breadth_sel;
+  if (!c || !data.breadth_picks.length) return null;
   return (
     <Panel
-      title="市场宽度"
-      sub="全A个股（后复权）：ADL 取10日EMA；麦克莱伦=净上涨比率EMA19−EMA39；新高新低=250日"
+      title="市场宽度（每类只保留一个）"
+      sub="4 类共 28 个原始/平滑变体，按训练期（2024-07 前）与中证全指未来20/60日收益的秩相关挑选，测试期同号才保留；IC 全为负 = 宽度在A股更像反向（均值回归）指标。其余变体只在事件研究表里"
     >
-      <IndexChart c={c} k="index" name="中证全指" />
-      <TimeChart
-        label="ADL"
-        dates={c.dates}
-        height={120}
-        bands={eventBands(c.dates)}
-        format={(v) => v.toFixed(0)}
-        series={[{ name: "ADL(EMA10)", values: col(c, "adl_ema"), color: "var(--accent)" }]}
-      />
-      <TimeChart
-        label="麦克莱伦"
-        dates={c.dates}
-        height={120}
-        bars
-        baseline={0}
-        bands={eventBands(c.dates)}
-        format={(v) => v.toFixed(0)}
-        series={[{ name: "麦克莱伦", values: col(c, "mcclellan"), color: "var(--accent)" }]}
-      />
-      <TimeChart
-        label="均线上方占比"
-        dates={c.dates}
-        height={130}
-        bands={eventBands(c.dates)}
-        format={pct}
-        series={[
-          { name: ">MA20", values: col(c, "pct_ma20"), color: "var(--accent)" },
-          { name: ">MA60", values: col(c, "pct_ma60"), color: "var(--warn)" },
+      <DataTable
+        label="宽度入选"
+        rows={data.breadth_picks}
+        rowKey={(r) => r.group}
+        columns={[
+          { id: "g", header: "类别", value: (r) => r.group },
+          { id: "v", header: "入选变体", value: (r) => r.variant },
+          { id: "tr", header: "训练IC", value: (r) => r.train_ic.toFixed(3) },
+          { id: "te", header: "测试IC", value: (r) => r.test_ic.toFixed(3) },
+          { id: "w", header: "理由", value: (r) => r.reason },
         ]}
       />
-      <TimeChart
-        label="新高-新低"
-        dates={c.dates}
-        height={120}
-        bars
-        baseline={0}
-        bands={eventBands(c.dates)}
-        format={(v) => v.toFixed(0)}
-        series={[{ name: "新高−新低", values: col(c, "nh_nl"), color: "var(--accent)" }]}
-      />
+      <IndexChart c={c} k="index" name="中证全指" />
+      {data.breadth_picks.map((p) => (
+        <TimeChart
+          key={p.variant}
+          label={p.variant}
+          dates={c.dates}
+          height={120}
+          bands={eventBands(c.dates)}
+          format={(v) => (Math.abs(v) < 5 ? v.toFixed(2) : v.toFixed(0))}
+          series={[
+            { name: `${p.group}：${p.variant}`, values: col(c, p.variant), color: "var(--accent)" },
+          ]}
+        />
+      ))}
     </Panel>
   );
 }
@@ -713,6 +699,11 @@ function Studies({ data }: { data: MacroData }) {
         rowKey={(r) => `${r.study}-${r.horizon}`}
         columns={[
           { id: "s", header: "信号", value: (r) => r.study },
+          {
+            id: "sp",
+            header: "样本",
+            value: (r) => (r.split === "train" ? "训练" : r.split === "test" ? "测试" : "全样本"),
+          },
           { id: "h", header: "持有天数", value: (r) => r.horizon },
           { id: "n", header: "次数", value: (r) => r.n },
           { id: "m", header: "平均收益", value: (r) => f(r.mean) },

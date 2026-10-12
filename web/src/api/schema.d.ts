@@ -1055,6 +1055,21 @@ export interface components {
             /** System */
             system: string;
         };
+        /** BreadthPick */
+        BreadthPick: {
+            /** Group */
+            group: string;
+            /** Reason */
+            reason: string;
+            /** Stable */
+            stable: boolean;
+            /** Test Ic */
+            test_ic: number;
+            /** Train Ic */
+            train_ic: number;
+            /** Variant */
+            variant: string;
+        };
         /** BrinsonData */
         BrinsonData: {
             /** Allocation */
@@ -1859,6 +1874,12 @@ export interface components {
             /** Available */
             available: boolean;
             breadth?: components["schemas"]["Columns"] | null;
+            /**
+             * Breadth Picks
+             * @default []
+             */
+            breadth_picks: components["schemas"]["BreadthPick"][];
+            breadth_sel?: components["schemas"]["Columns"] | null;
             buffett?: components["schemas"]["Columns"] | null;
             buffett_bands?: components["schemas"]["Bands"] | null;
             daily?: components["schemas"]["Columns"] | null;
@@ -2436,6 +2457,8 @@ export interface components {
             base_mean: number | null;
             /** Base Win */
             base_win: number | null;
+            /** Group */
+            group?: string | null;
             /** Horizon */
             horizon: number;
             /** Mean */
@@ -2444,6 +2467,8 @@ export interface components {
             median: number | null;
             /** N */
             n: number;
+            /** Split */
+            split?: string | null;
             /** Study */
             study: string;
             /** Win */
