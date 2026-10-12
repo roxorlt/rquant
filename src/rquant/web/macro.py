@@ -60,6 +60,17 @@ class StudyRow(BaseModel):
     win: float | None
     base_mean: float | None
     base_win: float | None
+    split: str | None = None
+    group: str | None = None
+
+
+class BreadthPick(BaseModel):
+    group: str
+    variant: str
+    train_ic: float
+    test_ic: float
+    stable: bool
+    reason: str
 
 
 class MacroData(BaseModel):
@@ -80,6 +91,8 @@ class MacroData(BaseModel):
     hk_rollcorr: Columns | None = None
     futures: dict[str, Columns] = {}
     studies: list[StudyRow] = []
+    breadth_picks: list[BreadthPick] = []
+    breadth_sel: Columns | None = None
 
 
 def _num(v: Any) -> float | None:
@@ -147,6 +160,8 @@ def load_macro(research: Path) -> MacroData:
             "SELECT * FROM macro_futures WHERE trade_date >= '20200101' ORDER BY sym, trade_date",
         )
         st = opt("macro_study", "SELECT * FROM macro_study")
+        bp = opt("macro_breadth_select", 'SELECT * FROM macro_breadth_select ORDER BY "group"')
+        bs = opt("macro_breadth_sel", "SELECT * FROM macro_breadth_sel ORDER BY trade_date")
     finally:
         con.close()
     h = h.astype(object).where(h.notna(), None)
@@ -227,11 +242,17 @@ def load_macro(research: Path) -> MacroData:
         if len(fu)
         else {},
         studies=[
-            StudyRow(**{k: (None if pd.isna(r[k]) else r[k]) for k in StudyRow.model_fields})
+            StudyRow(
+                **{k: (None if pd.isna(r.get(k)) else r.get(k)) for k in StudyRow.model_fields}
+            )
             for r in st.to_dict("records")
         ]
         if len(st)
         else [],
+        breadth_picks=[BreadthPick(**r) for r in bp.to_dict("records")] if len(bp) else [],
+        breadth_sel=_cols(bs, "trade_date", [c for c in bs.columns if c != "trade_date"])
+        if len(bs)
+        else None,
         etf_share=_cols(ep, "trade_date", [c for c in ep.columns if c != "trade_date"]),
     )
 

@@ -1142,6 +1142,44 @@
         "title": "BoardItem",
         "type": "object"
       },
+      "BreadthPick": {
+        "properties": {
+          "group": {
+            "title": "Group",
+            "type": "string"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          },
+          "stable": {
+            "title": "Stable",
+            "type": "boolean"
+          },
+          "test_ic": {
+            "title": "Test Ic",
+            "type": "number"
+          },
+          "train_ic": {
+            "title": "Train Ic",
+            "type": "number"
+          },
+          "variant": {
+            "title": "Variant",
+            "type": "string"
+          }
+        },
+        "required": [
+          "group",
+          "variant",
+          "train_ic",
+          "test_ic",
+          "stable",
+          "reason"
+        ],
+        "title": "BreadthPick",
+        "type": "object"
+      },
       "BrinsonData": {
         "properties": {
           "allocation": {
@@ -3619,6 +3657,24 @@
               }
             ]
           },
+          "breadth_picks": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/BreadthPick"
+            },
+            "title": "Breadth Picks",
+            "type": "array"
+          },
+          "breadth_sel": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Columns"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "buffett": {
             "anyOf": [
               {
@@ -5511,6 +5567,17 @@
             ],
             "title": "Base Win"
           },
+          "group": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Group"
+          },
           "horizon": {
             "title": "Horizon",
             "type": "integer"
@@ -5540,6 +5607,17 @@
           "n": {
             "title": "N",
             "type": "integer"
+          },
+          "split": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Split"
           },
           "study": {
             "title": "Study",

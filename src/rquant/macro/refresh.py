@@ -375,6 +375,21 @@ def derive(
         br = compute.breadth(bars, alla)
         out["macro_breadth"] = br
         studies += compute.breadth_studies(br, alla)
+        from rquant.macro import breadth as bv
+
+        panel, groups = bv.variants(bars)
+        scores, events = bv.evaluate(panel, groups, alla)
+        sel = bv.select(scores)
+        keep = list(sel.variant)
+        out["macro_breadth_select"] = sel
+        out["macro_breadth_scores"] = scores
+        out["macro_breadth_sel"] = (
+            panel[keep]
+            .assign(index=alla.reindex(panel.index))
+            .rename_axis("trade_date")
+            .reset_index()
+        )
+        studies += events.to_dict("records")
     out["macro_study"] = pd.DataFrame(studies)
     return out
 
