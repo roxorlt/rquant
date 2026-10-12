@@ -44,3 +44,40 @@ def test_gdp_ttm_and_buffett_no_lookahead() -> None:
 def test_implied_vol_roundtrip() -> None:
     p = compute._bs(3.0, 3.0, 0.1, 0.015, 0.2, True)
     assert compute.implied_vol(p, 3.0, 3.0, 0.1, True) == pytest.approx(0.2, abs=1e-4)
+
+
+def test_complete_dates_drops_partial_trailing_margin_date():
+    import pandas as pd
+
+    from rquant.macro.compute import complete_dates, daily_panel
+
+    rows = []
+    for d in ["20261008", "20261009"]:
+        for ex in ["SSE", "SZSE", "BSE"]:
+            if d == "20261009" and ex != "SSE":
+                continue
+            rows.append(dict(trade_date=d, exchange_id=ex, rzye=1.0, rzmre=1.0, rzrqye=1.0))
+    m = pd.DataFrame(rows)
+    assert sorted(complete_dates(m, "exchange_id").trade_date.unique()) == ["20261008"]
+    # an exchange added later (BSE 2021) does not invalidate the earlier two-exchange history
+    early = pd.DataFrame(
+        [dict(trade_date="20210101", exchange_id=e) for e in ["SSE", "SZSE"]]
+        + [dict(trade_date="20210102", exchange_id=e) for e in ["SSE", "SZSE", "BSE"]]
+    )
+    assert len(complete_dates(early, "exchange_id")) == 5
+    idx = pd.DataFrame(
+        [
+            dict(trade_date=d, ts_code=c, close=1.0, amount=1e6)
+            for d in ["20261008", "20261009"]
+            for c in ["000300.SH", "000985.CSI"]
+        ]
+    )
+    p = daily_panel(
+        idx,
+        m,
+        pd.DataFrame(dict(trade_date=["20261008"], north_money=[1.0])),
+        pd.DataFrame(dict(trade_date=["20261008"], pe_ttm=[10.0])),
+        pd.DataFrame(dict(date=["2026-10-08"], cn10y=[2.0])),
+    ).set_index("trade_date")
+    assert p.loc["20261008", "rzye"] == 3.0
+    assert pd.isna(p.loc["20261009", "rzye"])

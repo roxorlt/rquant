@@ -89,6 +89,13 @@ def _plus1(d: str) -> str:
     return (pd.Timestamp(d) + timedelta(days=1)).strftime("%Y%m%d")
 
 
+REPULL_DAYS = 10
+
+
+def _minus(d: str, days: int) -> str:
+    return (pd.Timestamp(d) - timedelta(days=days)).strftime("%Y%m%d")
+
+
 def _upsert(old: pd.DataFrame | None, new: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
     if old is None or old.empty:
         return new.reset_index(drop=True)
@@ -233,7 +240,9 @@ def pull(pro: Any, raw: dict[str, pd.DataFrame], today: str) -> dict[str, pd.Dat
         ("margin", pro.margin, ["trade_date", "exchange_id"]),
         ("hsgt", pro.moneyflow_hsgt, ["trade_date"]),
     ]:
-        start = _plus1(_last(raw, name)) if raw.get(name) is not None else s
+        # re-pull a trailing window: a date fetched before every exchange published is
+        # otherwise never revisited (incremental start = max stored date + 1)
+        start = _minus(_last(raw, name), REPULL_DAYS) if raw.get(name) is not None else s
         chunks = [
             _retry(fn, start_date=a.strftime("%Y%m%d"), end_date=b.strftime("%Y%m%d"))
             for a, b in _windows(start, today, 180)
@@ -271,7 +280,7 @@ def pull(pro: Any, raw: dict[str, pd.DataFrame], today: str) -> dict[str, pd.Dat
         )[["ts_code", "trade_date", "close"]],
         ["trade_date"],
     )
-    s = _plus1(_last(raw, "hk_etf")) if raw.get("hk_etf") is not None else "20200101"
+    s = _minus(_last(raw, "hk_etf"), REPULL_DAYS) if raw.get("hk_etf") is not None else "20200101"
     raw["hk_etf"] = _upsert(
         raw.get("hk_etf"),
         pd.concat(
