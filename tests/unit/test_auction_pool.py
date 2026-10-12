@@ -31,3 +31,47 @@ def test_push_priority():
             "amount": 1e8} for c, r in (("X", 9.0), ("P", 3.0))]
     _, body = format_push(evs, {"P"})
     assert body.index("★P") < body.index("X")
+
+
+def test_limit_open_skipped_and_ths_screen():
+    assert ap.limit_price(15.13, "002242.SZ") == 16.64
+    assert ap.limit_price(10.0, "300001.SZ") == 12.0
+    base = [{"ts_code": c, "name": c, "y_close": 10.0, "seal_ratio": s}
+            for c, s in (("A.SZ", 0.001), ("B.SZ", 0.002), ("C.SH", 0.05), ("D.SH", 0.003))]
+    cands = [b for b in base if b["seal_ratio"] <= ap.SEAL_MAX]
+    q = pd.DataFrame({"ts_code": ["A.SZ", "B.SZ", "C.SH", "D.SH"],
+                      "price": [11.0, 10.6, 10.45, 10.6], "pre_close": [10.0] * 4,
+                      "volume": [900, 300, 800, 100]})
+    picks = ap.rank_picks(cands, q)
+    assert [p["ts_code"] for p in picks] == ["B.SZ", "D.SH"]  # A opened at limit-up
+    ths = ap.ths_screen(base, q)
+    assert [(t["ts_code"], t["limit_open"]) for t in ths] == [
+        ("A.SZ", True), ("C.SH", False), ("B.SZ", False), ("D.SH", False)]
+
+
+def test_attribution_offline(monkeypatch):
+    from rquant.research import auction_attrib as aa
+
+    monkeypatch.setattr(aa, "ths_concepts", lambda codes: {
+        "A": ["影视概念", "AIGC"], "B": ["影视概念", "短剧"], "C": ["化纤"]})
+    monkeypatch.setattr(aa, "major_news", lambda s, u: [
+        {"title": "A公司AI电影定档", "pub_time": "2026-10-12 08:00:00", "src": "x"}])
+    monkeypatch.setattr(aa, "em_news", lambda *a, **k: [])
+    monkeypatch.setattr(aa, "em_anns", lambda *a, **k: [])
+    pool = {"date": "2026-10-12", "prior_date": "2026-10-09", "rule": "r",
+            "picks": [{"ts_code": c, "name": c, "gap": 0.07, "rank": i, "auction_vol": 1e6}
+                      for i, c in enumerate("ABC", 1)],
+            "ths_screen": [{"ts_code": "D", "name": "D", "gap": 0.1, "limit_open": True}]}
+    seen = {}
+
+    def fake(msgs):
+        seen["prompt"] = msgs[1]["content"]
+        return "AI电影消息带动影视传媒"
+
+    att = aa.attribute(pool, llm=(fake, "m"))
+    assert att["text"] == "AI电影消息带动影视传媒" and att["common_concepts"] == ["影视概念"]
+    assert "A公司AI电影定档" in seen["prompt"] and len(att["stocks"]) == 4
+    fallback = aa.attribute(pool, llm=False)
+    assert fallback["text"] == "共同概念：影视概念"
+    title, body = aa.format_push({**pool, "attribution": att})
+    assert title.endswith("A/B/C") and "D(一字)" in body

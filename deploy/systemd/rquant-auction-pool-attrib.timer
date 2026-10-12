@@ -1,0 +1,11 @@
+[Unit]
+Description=竞价选股 attribution + push Mon-Fri 09:27
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 09:27:00
+AccuracySec=1s
+Persistent=false
+Unit=rquant-auction-pool-attrib.service
+
+[Install]
+WantedBy=timers.target

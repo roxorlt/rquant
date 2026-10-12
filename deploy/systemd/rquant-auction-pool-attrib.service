@@ -1,0 +1,20 @@
+[Unit]
+Description=rQuant 竞价选股 pool: 09:27 attribution (news/concepts + DeepSeek) and PushDeer
+After=network-online.target
+
+[Service]
+Type=oneshot
+Slice=rquant-research.slice
+User=lighthouse
+Group=lighthouse
+WorkingDirectory=/home/lighthouse/rquant-web-rel/current
+EnvironmentFile=/etc/rquant-web.env
+# DEEPSEEK_* (read by systemd as root; the file is not readable by lighthouse)
+EnvironmentFile=-/etc/rquant-web.secrets.env
+Environment=RQUANT_DISABLE_DOTENV=1 TZ=Asia/Shanghai PYTHONWARNINGS=ignore
+ExecStart=/home/lighthouse/rquant-web-rel/current/.venv/bin/python -m rquant.research.auction_attrib
+TimeoutStartSec=240
+Nice=5
+MemoryMax=600M
+StandardOutput=journal
+StandardError=journal
