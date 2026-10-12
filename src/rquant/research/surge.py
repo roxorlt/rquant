@@ -9,7 +9,7 @@ Prior-day curve: the prior day's snapshot dir (if it covers the market), else 5-
 ``minute_bar`` in ``market.duckdb`` linearly interpolated.
 
 Events (from 09:35, cooldown per stock): ``ratio`` (ratio>=RATIO_MIN, cum amount>=AMOUNT_MIN)
-and ``accel`` (acc5>=ACC5_MIN, 5-min amount>=WIN_AMOUNT_MIN, ratio>=1.5). ST, BJ-less filters:
+and ``accel`` (acc5>=ACC5_MIN, 5-min amount>=WIN_AMOUNT_MIN, ratio>=ACC_RATIO_MIN). ST, BJ-less filters:
 names containing ST are skipped; limit-locked stocks (at limit with empty opposite book) skipped.
 
 Output under ``snapshots/YYYY-MM-DD/surge/``: ``events.jsonl`` (append, read by the web),
@@ -35,13 +35,16 @@ import pandas as pd
 
 log = logging.getLogger("rquant.surge")
 
-RATIO_MIN = float(os.environ.get("SURGE_RATIO_MIN", 3.0))
-AMOUNT_MIN = float(os.environ.get("SURGE_AMOUNT_MIN", 3e7))      # CNY, cumulative
-ACC5_MIN = float(os.environ.get("SURGE_ACC5_MIN", 5.0))
-WIN_AMOUNT_MIN = float(os.environ.get("SURGE_WIN_AMOUNT_MIN", 1e7))  # CNY in the 5-min window
+RATIO_MIN = float(os.environ.get("SURGE_RATIO_MIN", 8.0))
+AMOUNT_MIN = float(os.environ.get("SURGE_AMOUNT_MIN", 1e8))      # CNY, cumulative
+ACC5_MIN = float(os.environ.get("SURGE_ACC5_MIN", 10.0))
+ACC_RATIO_MIN = float(os.environ.get("SURGE_ACC_RATIO_MIN", 3.0))  # ratio floor for accel events
+WIN_AMOUNT_MIN = float(os.environ.get("SURGE_WIN_AMOUNT_MIN", 5e7))  # CNY in the 5-min window
 MIN_PRIOR_VOL = 1000.0     # shares at m in prior curve; below -> no ratio
 START_M = 5.0              # events from 09:35
 COOLDOWN_S = float(os.environ.get("SURGE_COOLDOWN_S", 900))
+# 2026-10-12 replay: old 3/30M + 5/10M/1.5 gave ~5.5k events; these give ~490 (139 stocks),
+# 42.6% closed above event price vs 37.5% for all events.
 PUSH_EVERY = 60.0
 PUSH_TOP = 10
 NM = 241
@@ -377,7 +380,7 @@ class SurgeScanner:
     def _events(self, f: pd.DataFrame, wall: float) -> pd.DataFrame:
         base = (f["m"] >= START_M) & ~f["st"] & ~f["locked"] & (f["pre_close"] > 0)
         r = base & (f["ratio"] >= RATIO_MIN) & (f["amount"] >= AMOUNT_MIN)
-        a = base & (f["acc5"] >= ACC5_MIN) & (f["amt5"] >= WIN_AMOUNT_MIN) & (f["ratio"] >= 1.5)
+        a = base & (f["acc5"] >= ACC5_MIN) & (f["amt5"] >= WIN_AMOUNT_MIN) & (f["ratio"] >= ACC_RATIO_MIN)
         out = []
         for kind, mask in (("ratio", r), ("accel", a)):
             for rec in f[mask].to_dict("records"):

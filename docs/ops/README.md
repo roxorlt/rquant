@@ -111,10 +111,10 @@ it never stops collection.
 - Factors: `ratio` = today cum vol / prior trading day cum vol at the same trading minute;
   `acc1`/`acc5` = last ~1/~5-min volume / prior day same interval. Prior curve: prior day's
   snapshot dir if it covers ≥3000 codes, else 5-min `minute_bar` (market.duckdb) interpolated.
-- Events (from 09:35): `ratio` ≥ 3 and cum amount ≥ 3000万; `accel`: acc5 ≥ 5, 5-min amount ≥
-  1000万, ratio ≥ 1.5. Skips ST names and limit-locked (at limit, empty opposite side). Cooldown
+- Events (from 09:35): `ratio` ≥ 8 and cum amount ≥ 1亿; `accel`: acc5 ≥ 10, 5-min amount ≥
+  5000万, ratio ≥ 3 (tightened 2026-10-12: ~5.5k → ~490 events/day). Skips ST names and limit-locked (at limit, empty opposite side). Cooldown
   15 min per stock per kind. Env overrides: `SURGE_RATIO_MIN`, `SURGE_AMOUNT_MIN`, `SURGE_ACC5_MIN`,
-  `SURGE_WIN_AMOUNT_MIN`, `SURGE_COOLDOWN_S`.
+  `SURGE_WIN_AMOUNT_MIN`, `SURGE_ACC_RATIO_MIN`, `SURGE_COOLDOWN_S`.
 - Output `snapshots/YYYY-MM-DD/surge/`: `events.jsonl` (live), `factors-HHMM.parquet` → merged
   `factors.parquet` + `events.parquet` at 15:00; `prior.npz`.
 - Web: 盯盘与告警 page → 「量能异动」 panel (`GET /api/v1/surge[?day=]`).
