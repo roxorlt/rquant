@@ -152,7 +152,7 @@ def _safe_pool(fn: Callable[[Path, date], list[str]], day: date) -> list[str]:
         return []
 
 
-POOL_RELOAD_AT = dtime(9, 25, 45)  # after the 09:25:30 auction pick
+POOL_RELOAD_AT = dtime(9, 26, 45)  # after the 09:26:30 auction pick
 
 
 def build_universe(cap: int = DEFAULT_CAP) -> dict[str, Any]:

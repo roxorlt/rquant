@@ -10,6 +10,22 @@ Times are Asia/Shanghai (server TZ = CST).
 | `lighthouse@82.156.0.68` (Tencent Lighthouse) | prod: web API, runtime, monitor, research, snapshot collector, R2 archive | SSH key (`rquant_deploy`) |
 | roxor's Mac | dev, launchd jobs (`deploy/launchd/`), local `.env` | — |
 
+**SSH from the box / executors: always pass the key** — `ssh -i ~/.ssh/rquant_deploy
+lighthouse@82.156.0.68` (a bare `ssh lighthouse@82.156.0.68` fails with
+`Permission denied (publickey)` because the default identities are not authorised). The box's
+`~/.ssh/config` also has a `Host rquant 82.156.0.68` entry (`User lighthouse`,
+`IdentityFile ~/.ssh/rquant_deploy`, `IdentitiesOnly yes`), so `ssh rquant` works too. Check
+scripts must use the key explicitly (`deploy/web/deploy-from-box.sh` honours
+`RQUANT_WEB_SSH_KEY`, default `~/.ssh/rquant_deploy`). To recreate the entry:
+
+```
+Host rquant 82.156.0.68
+    HostName 82.156.0.68
+    User lighthouse
+    IdentityFile ~/.ssh/rquant_deploy
+    IdentitiesOnly yes
+```
+
 ## Code releases (web/research code on the server)
 
 - Merge to `main` → **Web MVP** CI (`.github/workflows/web-mvp.yml`) → **Web release** builds
@@ -44,7 +60,7 @@ Times are Asia/Shanghai (server TZ = CST).
 | `rquant-report-tracking.timer` | Sat **06:30** | 研报挖掘 weekly: fxbaogao search for new 金工 factor reports → `report_factors/catalog_extra.json`, re-replicate, diff vs last week → **`~/rquant-research/report_factors/weekly_summary.json`** (+ `weekly/YYYY-MM-DD.json`); API `GET /api/v1/report-factors/summary` (`headline` for the daily report) | `deploy/systemd/` |
 | `rquant-surge-prior.timer` | Mon-Fri **09:02** | builds today's prior-day cumulative-volume curve → `snapshots/YYYY-MM-DD/surge/prior.npz` (oneshot, ~6s) | `deploy/systemd/` |
 | ↳ `rquant-snapshot-collector.service.d/surge-push.conf` | — | sets `SURGE_PUSH_ENV_FILE` (PushDeer key names read from `~/rquant/.env`) for the in-collector surge scanner | `deploy/systemd/rquant-snapshot-collector.service.d/` |
-| `rquant-auction-pool-candidates.timer` / `rquant-auction-pool-pick.timer` | Mon-Fri **08:40** / **09:25:30** | 竞价选股 pool: T-1 candidates (limit-up non-一字, 封单/流通市值 ≤0.94%, non-ST/BJ), then rt_k auction picks (gap ≥5.37%, top 3 by auction vol) → `pools/auction/YYYY-MM-DD.json`; web 池子 page, collector universe (top priority, reloaded 09:25:45), surge push ★ first | `deploy/systemd/`, `rquant.research.auction_pool` |
+| `rquant-auction-pool-candidates.timer` / `rquant-auction-pool-pick.timer` / `rquant-auction-pool-attrib.timer` | Mon-Fri **08:40** / **09:26:30** / **09:27** | 竞价选股 pool: T-1 candidates (limit-up non-一字, 封单/流通市值 ≤0.94%, non-ST/BJ; plus `base` = same without the seal filter), then rt_k auction picks at 09:26:30 after the auction settles (gap ≥5.37%, auction not already at limit-up, top 3 by auction vol) and `ths_screen` (raw 同花顺 screen: gap >4%, top 5 by vol, 一字 flagged) → `pools/auction/YYYY-MM-DD.json`; 09:27 attribution (`rquant.research.auction_attrib`: Tushare ths_member/ths_index concepts + major_news, Eastmoney news/announcements, DeepSeek via `/etc/rquant-web.secrets.env` or `~/rquant/.env`) stored as `attribution`, shown on the 池子 page and pushed once via PushDeer (`pushed_at`); collector universe (top priority, reloaded 09:26:45), surge push ★ first | `deploy/systemd/`, `rquant.research.auction_pool`, `rquant.research.auction_attrib` |
 | `rquant-snapshot-archive.timer` | Mon-Fri **16:20** | tar.gz finished day dirs → R2, verify, prune >14d (verified only) | `deploy/systemd/` |
 | `rquant-artifact-retention.timer` | every 5 min | artifact tiering/GC | `deploy/systemd/` |
 

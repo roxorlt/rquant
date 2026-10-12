@@ -4,11 +4,19 @@ Rule (``event_study/auction-ths.json`` rule 3, chosen on train win rate):
   T-1: closed at limit-up, not a one-price board (high > low), not ST/退, not BJ,
        封单/流通市值 (seal_ratio) <= SEAL_MAX
   T  : 09:25 auction gap vs T-1 close >= GAP_MIN; ranked by auction volume, top TOP_N.
+       Stocks whose auction price is already the limit-up price (一字开盘) are skipped: they
+       cannot be bought at the open and the study excludes them from every outcome.
 No sentiment filter (optional in the study; not applied here).
+
+Alongside the rule-3 picks the pool keeps ``ths_screen``: the raw 同花顺 screen the study
+replicates (T-1 limit-up non-one-word, gap > 4%, no ST/BJ, by auction volume, no seal
+filter), so the page can show where our refined rule deviates from the 同花顺 list.
 
 Stages, both written to ``$RQUANT_RESEARCH_ROOT/pools/auction/YYYY-MM-DD.json``:
     python -m rquant.research.auction_pool candidates [--day D]   # after T-1 close / pre-open
-    python -m rquant.research.auction_pool pick [--day D]          # ~09:25:30, Tushare rt_k
+    python -m rquant.research.auction_pool pick [--day D]          # 09:26:30, Tushare rt_k
+
+The pick runs at 09:26:30 (not 09:25:30) so the 09:25 match has settled in rt_k everywhere.
 
 The web 池子 page, the snapshot collector universe (top priority) and the surge push read it.
 """
@@ -34,8 +42,10 @@ PRESET = "auction-pick"
 SEAL_MAX = float(os.environ.get("AUCTION_POOL_SEAL_MAX", "0.0094"))
 GAP_MIN = float(os.environ.get("AUCTION_POOL_GAP_MIN", "0.0537"))
 TOP_N = int(os.environ.get("AUCTION_POOL_TOP", "3"))
+THS_GAP_MIN = 0.04  # the original 同花顺 screen: 竞价涨幅 > 4%
+THS_TOP = 5
 RULE_TEXT = (f"昨日涨停非一字 & 封单/流通市值≤{SEAL_MAX:.2%} & 非ST/退/北交所；"
-             f"今日竞价涨幅≥{GAP_MIN:.2%}，按竞价量降序前{TOP_N}")
+             f"今日竞价涨幅≥{GAP_MIN:.2%}且非一字开盘，按竞价量降序前{TOP_N}")
 
 
 def research_root() -> Path:
@@ -86,13 +96,26 @@ def _now() -> str:
 
 
 # --------------------------------------------------------------------------- candidates
-def filter_candidates(df: pd.DataFrame) -> pd.DataFrame:
-    """df: one row per T-1 limit-up stock with high, low, fd_amount, circ_mv (万元), is_st."""
+def filter_base(df: pd.DataFrame) -> pd.DataFrame:
+    """同花顺 base screen (T-1 part). df: one row per T-1 limit-up stock with high, low,
+    fd_amount, circ_mv (万元), is_st."""
     df = df.copy()
     df["seal_ratio"] = df["fd_amount"] / (df["circ_mv"] * 1e4)
     m = ((df["high"] > df["low"]) & ~df["is_st"].astype(bool)
-         & ~df["ts_code"].str.endswith(".BJ") & (df["seal_ratio"] <= SEAL_MAX))
+         & ~df["ts_code"].str.endswith(".BJ"))
     return df[m].sort_values("seal_ratio")
+
+
+def filter_candidates(df: pd.DataFrame) -> pd.DataFrame:
+    """Rule 3: the base screen plus 封单/流通市值 <= SEAL_MAX."""
+    df = filter_base(df)
+    return df[df["seal_ratio"] <= SEAL_MAX]
+
+
+def limit_price(pre_close: float, ts_code: str) -> float:
+    """Exchange limit-up price (ST names are filtered out upstream)."""
+    pct = 0.2 if ts_code[:3] in ("300", "301", "688", "689") else 0.1
+    return float(int(pre_close * (1 + pct) * 100 + 0.5 + 1e-9)) / 100
 
 
 def build_candidates(root: Path, day: date) -> dict[str, Any]:
@@ -123,19 +146,20 @@ def build_candidates(root: Path, day: date) -> dict[str, Any]:
         df["is_st"] = is_st(con, df["ts_code"], days).to_numpy() if len(df) else []
     finally:
         con.close()
-    cand = filter_candidates(df)
+    base = filter_base(df)
     rows = [{"ts_code": r.ts_code, "name": r.name, "y_close": float(r.close),
              "seal_ratio": round(float(r.seal_ratio), 6), "boards": int(r.limit_times or 1),
              "open_times": int(r.open_times or 0), "first_time": r.first_time,
-             "industry": r.industry} for r in cand.itertuples()]
+             "industry": r.industry} for r in base.itertuples()]
     return {"pool": POOL_NAME, "date": f"{day:%Y-%m-%d}", "prior_date": str(prior),
             "rule": RULE_TEXT, "stage": "candidates", "limit_ups": int(len(ll)),
-            "candidates": rows, "picks": [], "updated_at": _now()}
+            "candidates": [r for r in rows if r["seal_ratio"] <= SEAL_MAX],
+            "base": rows, "picks": [], "ths_screen": [], "updated_at": _now()}
 
 
 # --------------------------------------------------------------------------- picks
-def rank_picks(cands: list[dict], quotes: pd.DataFrame) -> list[dict]:
-    """quotes: ts_code, price (auction price), pre_close, volume (auction volume)."""
+def _auction_rows(cands: list[dict], quotes: pd.DataFrame, gap_min: float,
+                  strict: bool = False) -> list[dict]:
     q = quotes.drop_duplicates("ts_code", keep="last").set_index("ts_code")
     rows = []
     for c in cands:
@@ -147,12 +171,29 @@ def rank_picks(cands: list[dict], quotes: pd.DataFrame) -> list[dict]:
         if px <= 0 or vol <= 0:
             continue
         gap = px / pre - 1
-        if gap >= GAP_MIN:
-            rows.append({**c, "auction_price": px, "gap": round(gap, 5), "auction_vol": vol})
+        if gap > gap_min if strict else gap >= gap_min:
+            rows.append({**c, "auction_price": px, "gap": round(gap, 5), "auction_vol": vol,
+                         "auction_amount": round(px * vol, 2),
+                         "limit_open": px >= limit_price(pre, c["ts_code"]) - 1e-6})
     rows.sort(key=lambda x: -x["auction_vol"])
+    return rows
+
+
+def rank_picks(cands: list[dict], quotes: pd.DataFrame) -> list[dict]:
+    """quotes: ts_code, price (auction price), pre_close, volume (auction volume).
+    Rule 3 picks; 一字开盘 (auction at limit-up) are not buyable and are skipped."""
+    rows = [r for r in _auction_rows(cands, quotes, GAP_MIN) if not r["limit_open"]]
     for i, r in enumerate(rows, 1):
         r["rank"] = i
     return rows[:TOP_N]
+
+
+def ths_screen(base: list[dict], quotes: pd.DataFrame) -> list[dict]:
+    """The raw 同花顺 screen (gap > 4%, by auction volume, 一字 kept but flagged)."""
+    rows = _auction_rows(base, quotes, THS_GAP_MIN, strict=True)[:THS_TOP]
+    for i, r in enumerate(rows, 1):
+        r["rank"] = i
+    return rows
 
 
 def fetch_auction(codes: list[str]) -> pd.DataFrame:
@@ -184,7 +225,8 @@ def snapshot_quotes(root: Path, day: date, codes: list[str]) -> pd.DataFrame:
 def make_picks(root: Path, day: date) -> dict[str, Any]:
     pool = read_pool(root, day) or build_candidates(root, day)
     cands = pool.get("candidates") or []
-    codes = [c["ts_code"] for c in cands]
+    base = pool.get("base") or cands
+    codes = list(dict.fromkeys([c["ts_code"] for c in cands] + [c["ts_code"] for c in base]))
     src = "rt_k"
     quotes = pd.DataFrame()
     if codes:
@@ -195,7 +237,9 @@ def make_picks(root: Path, day: date) -> dict[str, Any]:
         if not len(quotes):
             src, quotes = "snapshots", snapshot_quotes(root, day, codes)
     picks = rank_picks(cands, quotes) if codes else []
-    pool.update(stage="final", picks=picks, quote_source=src, picked_at=_now(), updated_at=_now())
+    ths = ths_screen(base, quotes) if codes else []
+    pool.update(stage="final", picks=picks, ths_screen=ths, quote_source=src,
+                picked_at=_now(), updated_at=_now())
     return pool
 
 

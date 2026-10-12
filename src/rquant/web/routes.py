@@ -331,9 +331,21 @@ def _auction_pool_item(request: Request) -> PoolItem | None:  # noqa: D401
     members += [PoolMember(code=c["ts_code"], name=c.get("name"), preset=PRESET,
                            detail={**c, "date": pool["date"], "stage": "candidate"})
                 for c in pool.get("candidates") or [] if c["ts_code"] not in picks]
+    att = pool.get("attribution") or {}
+    for m in members:
+        info = next((s for s in att.get("stocks") or [] if s.get("ts_code") == m.code), None)
+        if info:
+            m.detail.update(concepts=info.get("concepts"), news=info.get("news"),
+                            anns=info.get("anns"))
     stage = "终选" if pool.get("stage") == "final" else "候选"
     desc = (f"{pool['date']} {stage}（T-1={pool.get('prior_date')}，候选 "
             f"{len(pool.get('candidates') or [])}，终选 {len(picks)}）· {pool.get('rule', '')}")
+    if att.get("text"):
+        desc = f"归因：{att['text']} ｜ " + desc
+    ths = pool.get("ths_screen") or []
+    if ths:
+        desc += " ｜ 同花顺榜(>4%)：" + "、".join(
+            f"{t.get('name')}{'(一字)' if t.get('limit_open') else ''}" for t in ths)
     return PoolItem(name=POOL_NAME, description=desc, pool_refs=[PRESET],
                     updated_at=pool.get("updated_at"), members=members)
 
