@@ -57,6 +57,35 @@ Status: `systemctl list-timers --all | grep rquant`; logs: `journalctl -u <unit>
 Start/stop: `sudo systemctl start|stop <unit>`; disable: `sudo systemctl disable --now <timer>`.
 Snapshot collector kill switch for today: `touch ~/rquant-research/snapshots/STOP`.
 
+## Production Serving publication (reference-slow → serving → web)
+
+Chain: `rquant-runtime-reference-slow-publisher@svc-62c9…` writes
+`data/runtime/live/reference-slow/serving-authority/current.json` →
+`rquant-runtime-serving@svc-63af…` publishes `data/runtime/serving/generations` → `rquant-web`
+(`/etc/rquant-web.env`, `RQUANT_SERVING_ROOT`).
+
+- **2026-10-12 root cause of "serving empty since 09-05"**: the publisher unit mounted all of
+  `live/reference-slow` read-only (`ReadOnlyPaths=`) and never granted the nested
+  `serving-authority` dir, so every round failed with `OSError: [Errno 30] Read-only file system:
+  'serving-authority'` and serving reported `current authority is unavailable`. Fixed in
+  `deploy/systemd/rquant-runtime-reference-slow-publisher@.service` (nested `ReadWritePaths=`,
+  no `-` prefix: a missing dir fails the start loudly). Test:
+  `tests/unit/test_runtime_systemd_schema_rollout_paths.py`.
+- **Applying it** (unit files are not shipped by `rquant-production-deploy.pyz`, which also
+  refuses restarts 09:15–15:10 on weekdays): outside that window,
+  `install -d -m 0700 ~/rquant/data/runtime/live/reference-slow/serving-authority`, then
+  `sudo install -m 644 deploy/systemd/rquant-runtime-reference-slow-publisher@.service /etc/systemd/system/ && sudo systemctl daemon-reload`.
+- The publisher only works if started **before 09:25** on a trading day ("started after 09:25"
+  otherwise, all day). Restart only that instance between 08:45 and 09:15 (backup first:
+  `tar czf ~/backup-refslow-$(date +%F).tgz -C ~/rquant/data/runtime control/reference-slow-publishers control/serving-publishers live/reference-slow`).
+  Do not touch the snapshot collector, surge scanner, auction pool or research timers.
+- Verify: publisher heartbeat `last_success_at` set; `serving-authority/current.json` exists;
+  serving heartbeat `last_success_at` set and `serving/generations` non-empty;
+  `curl 127.0.0.1:8768/api/v1/meta` ready (only after switching the web, below).
+- Switch web to production: back up `/etc/rquant-web.env`, set
+  `RQUANT_SERVING_ROOT=/home/lighthouse/rquant/data/runtime/serving`, drop `RQUANT_WEB_NOTICE`,
+  `sudo systemctl restart rquant-web`. Rollback: restore the backup env (replay path) and restart.
+
 ## Surge scanner (量能异动) + auction factors
 
 Runs **inside the snapshot collector** (`rquant.research.surge`), fed every ~3s cycle with the raw

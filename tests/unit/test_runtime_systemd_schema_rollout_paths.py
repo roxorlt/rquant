@@ -128,6 +128,9 @@ GRANTS_BEFORE_THE_RULING: dict[str, tuple[str, ...]] = {
     "rquant-runtime-reference-slow-publisher@.service": (
         f"{CONTROL_ROOT}/reference-slow-publishers/%i",
         f"{RUNTIME_ROOT}/authorities/reference-slow",
+        #: Added after the ruling (2026-10-12): the publisher writes the serving authority
+        #: under the source's spool, which the unit otherwise mounts read-only.
+        f"{RUNTIME_ROOT}/live/reference-slow/serving-authority",
     ),
     "rquant-runtime-reference-slow-source@.service": (
         f"{CONTROL_ROOT}/reference-slow-sources/%i",
@@ -287,3 +290,24 @@ def test_only_one_participant_is_there_for_a_consumer_receipt() -> None:
 
     assert consumers == {"rquant-runtime-serving@.service"}
     assert len(PARTICIPANTS) - len(consumers) == 15
+
+
+def test_reference_slow_publisher_may_write_its_serving_authority() -> None:
+    """The publisher writes `live/reference-slow/serving-authority`; the unit must grant it.
+
+    The unit mounts the whole `live/reference-slow` spool read-only, so without a nested
+    `ReadWritePaths=` grant every round failed with `OSError: [Errno 30] Read-only file
+    system: 'serving-authority'` and serving never published (2026-09-05 .. 2026-10-12).
+    The grant carries no `-` prefix: a missing directory must fail the start loudly.
+    """
+
+    from rquant.runtime_deployment_bundle import _serving_source_owner_root
+
+    authority_root = _serving_source_owner_root(Path(RUNTIME_ROOT), "reference_slow_authority")
+    unit = "rquant-runtime-reference-slow-publisher@.service"
+    entries = _directive(unit, "ReadWritePaths")[0].split()
+
+    assert str(authority_root) in entries
+    readonly = [entry.removeprefix("-") for entry in _directive(unit, "ReadOnlyPaths")[0].split()]
+    assert f"{RUNTIME_ROOT}/live/reference-slow" in readonly
+    assert str(authority_root) not in readonly
