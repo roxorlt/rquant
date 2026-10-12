@@ -40,77 +40,110 @@ def quarter_label(d: pd.Series) -> pd.Series:
 
 
 def holder_quarterly(holders: pd.DataFrame, prices: pd.DataFrame) -> pd.DataFrame:
-    """holders: entity, ts_code, ann_date, end_date, hold_amount (shares, one row per holder
-    account); prices: end_date, ts_code, close.  Returns one row per (entity, basis, quarter)
-    with basis 'report' (by end_date) or 'announce' (by quarter of the disclosure date)."""
+    """holders: entity, ts_code, ann_date, end_date, hold_amount (one row per holder account);
+    prices: end_date, ts_code, close (all stocks). One row per (entity, basis, quarter):
+    basis 'report' (by end_date) or 'announce' (by quarter of the disclosure date).
+
+    Data hygiene: a stock missing for exactly one period between two present ones is a
+    disclosure/data gap, not an exit+re-entry, so it is carried forward. Report periods whose
+    holding count is < 60% of the prior period are still being disclosed and are dropped."""
+    if "holder_name" not in holders:
+        holders = holders.assign(holder_name="")
+    holders = holders[holders.ts_code.str.match(r"^(00|30|60|68|43|8|92)\d+\.(SH|SZ|BJ)$")]
     h = holders.groupby(["entity", "ts_code", "end_date"], as_index=False).agg(
-        hold_amount=("hold_amount", "sum"), ann_date=("ann_date", "min")
+        ann_date=("ann_date", "min")
     )
-    h = h.merge(prices, on=["end_date", "ts_code"], how="left")
+    px = prices.pivot_table(index="ts_code", columns="end_date", values="close")
     periods = sorted(h.end_date.unique())
-    idx = {p: i for i, p in enumerate(periods)}
     rows = []
     for ent, g in h.groupby("entity"):
-        piv = g.pivot_table(
-            index="ts_code", columns="end_date", values="hold_amount", aggfunc="sum"
-        ).reindex(columns=periods)
-        cur = g.set_index(["ts_code", "end_date"])
-        for i, p in enumerate(periods):
-            now = piv[p].dropna()
-            prev = piv[periods[i - 1]].dropna() if i else pd.Series(dtype=float)
-            px = (
-                cur.xs(p, level="end_date")["close"]
-                if p in g.end_date.values
-                else pd.Series(dtype=float)
+        acct = (
+            holders[holders.entity == ent]
+            .pivot_table(
+                index=["ts_code", "holder_name"],
+                columns="end_date",
+                values="hold_amount",
+                aggfunc="sum",
             )
+            .reindex(columns=periods)
+        )
+        # one account missing for a single period between two present ones = data gap
+        gap = acct.isna() & acct.shift(1, axis=1).notna() & acct.shift(-1, axis=1).notna()
+        acct = acct.where(~gap, acct.shift(1, axis=1))
+        piv = acct.groupby(level="ts_code").sum(min_count=1)
+        ann = g.pivot_table(
+            index="ts_code", columns="end_date", values="ann_date", aggfunc="min"
+        ).reindex(columns=periods)
+        counts = piv.notna().sum()
+        keep = [
+            p for i, p in enumerate(periods) if i == 0 or counts[p] >= 0.6 * counts[periods[i - 1]]
+        ]
+        recs = []
+        for i, p in enumerate(keep):
+            now = piv[p].dropna()
+            prev = piv[keep[i - 1]].dropna() if i else pd.Series(dtype=float)
+            price = px[p] if p in px else pd.Series(dtype=float)
             codes = now.index.union(prev.index)
             delta = now.reindex(codes).fillna(0) - prev.reindex(codes).fillna(0)
-            # exits have no current-period price row; their value delta is left out (unknown px)
-            flow = (delta * px.reindex(codes)).sum(skipna=True)
-            mv = (now * px.reindex(now.index)).sum(skipna=True)
+            mv = (now * price.reindex(now.index)).sum(skipna=True)
+            flow = (delta * price.reindex(codes)).sum(skipna=True)
+            q = quarter_label(pd.Series([p])).iloc[0]
+            first = i == 0
             rows.append(
                 dict(
                     entity=ent,
                     basis="report",
-                    quarter=quarter_label(pd.Series([p])).iloc[0],
+                    quarter=q,
                     period=p,
                     n_hold=len(now),
-                    n_new=int((~now.index.isin(prev.index)).sum()) if i else None,
-                    n_exit=int((~prev.index.isin(now.index)).sum()) if i else None,
-                    n_add=int((delta > 0).sum()) if i else None,
-                    n_cut=int((delta < 0).sum()) if i else None,
-                    share_chg=float(delta.sum()) if i else None,
+                    n_new=None if first else int((~now.index.isin(prev.index)).sum()),
+                    n_exit=None if first else int((~prev.index.isin(now.index)).sum()),
+                    n_add=None if first else int((delta > 0).sum()),
+                    n_cut=None if first else int((delta < 0).sum()),
+                    share_chg=None if first else float(delta.sum()),
                     mv=float(mv),
-                    flow=float(flow) if i else None,
+                    flow=None if first else float(flow),
                 )
             )
-        # announce basis: each stock-period delta counted in the quarter it became public
-        g = g.sort_values(["ts_code", "end_date"])
-        g["prev_amt"] = g.groupby("ts_code").hold_amount.shift()
-        g["prev_end"] = g.groupby("ts_code").end_date.shift()
-        contiguous = g.prev_end.map(lambda x: idx.get(x, -9)) == g.end_date.map(idx) - 1
-        g["delta"] = np.where(contiguous, g.hold_amount - g.prev_amt, g.hold_amount)
-        g["is_new"] = ~contiguous
-        g["flowv"] = g.delta * g.close
-        g["aq"] = quarter_label(g.ann_date)
-        g = g[g.end_date > periods[0]]
-        for q, a in g.groupby("aq"):
-            rows.append(
-                dict(
-                    entity=ent,
-                    basis="announce",
-                    quarter=q,
-                    period=None,
-                    n_hold=len(a),
-                    n_new=int(a.is_new.sum()),
-                    n_exit=None,
-                    n_add=int((a.delta > 0).sum()),
-                    n_cut=int((a.delta < 0).sum()),
-                    share_chg=float(a.delta.sum()),
-                    mv=float((a.hold_amount * a.close).sum()),
-                    flow=float(a.flowv.sum()),
+            if first:
+                continue
+            a = ann[p].reindex(codes)
+            # exits have no own disclosure row: date them at the period's median disclosure
+            a = a.fillna(
+                ann[p].dropna().sort_values().iloc[ann[p].notna().sum() // 2]
+                if ann[p].notna().any()
+                else p
+            )
+            recs.append(
+                pd.DataFrame(
+                    {
+                        "delta": delta,
+                        "flowv": delta * price.reindex(codes),
+                        "new": ~codes.isin(prev.index),
+                        "exit": ~codes.isin(now.index),
+                        "aq": quarter_label(a.astype(str)),
+                    }
                 )
             )
+        if recs:
+            allr = pd.concat(recs)
+            for q, x in allr.groupby("aq"):
+                rows.append(
+                    dict(
+                        entity=ent,
+                        basis="announce",
+                        quarter=q,
+                        period=None,
+                        n_hold=int((x.delta != 0).sum()),
+                        n_new=int(x.new.sum()),
+                        n_exit=int(x.exit.sum()),
+                        n_add=int((x.delta > 0).sum()),
+                        n_cut=int((x.delta < 0).sum()),
+                        share_chg=float(x.delta.sum()),
+                        mv=None,
+                        flow=float(x.flowv.sum(skipna=True)),
+                    )
+                )
     return pd.DataFrame(rows)
 
 
