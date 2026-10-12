@@ -28,6 +28,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -38,6 +39,8 @@ log = logging.getLogger("rquant.snapshot_archive")
 DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 MARKER = ".r2_archived.json"
 PREFIX = "snapshots"
+#: how long a run waits for today's collector to finish compacting (unit timeout is 2h)
+WAIT_S = float(os.environ.get("SNAPSHOT_ARCHIVE_WAIT_S", 3600))
 COLLECTOR_UNIT = "rquant-snapshot-collector.service"
 
 
@@ -129,8 +132,24 @@ def collector_active() -> bool:
         return False
 
 
+def _busy(d: Path) -> bool:
+    """Collector still running or mid-compaction (quotes.tmp present)."""
+    return (d / "quotes.tmp").exists() or collector_active()
+
+
+def wait_for_collector(d: Path, wait_s: float, poll_s: float = 60.0) -> bool:
+    """Block until today's dir is no longer being written (True) or wait_s elapses."""
+    deadline = time.monotonic() + wait_s
+    while _busy(d):
+        if time.monotonic() >= deadline:
+            return False
+        log.info("collector still busy on %s; waiting", d.name)
+        time.sleep(poll_s)
+    return True
+
+
 def _ready(d: Path, today: str) -> bool:
-    if (d / MARKER).exists():
+    if (d / MARKER).exists() or (d / "quotes.tmp").exists():
         return False
     if any((d / "quotes").glob("part-*.parquet")) if (d / "quotes").is_dir() else False:
         return d.name != today  # uncompacted leftovers from a past day: archive as-is
@@ -183,13 +202,17 @@ def prune(client: R2, root: Path, keep_days: int, today: dt.date) -> list[str]:
 
 
 def run(root: Path, keep_days: int = 14, today: dt.date | None = None,
-        client: R2 | None = None) -> int:
+        client: R2 | None = None, wait_s: float | None = None) -> int:
     today = today or dt.date.today()
+    wait_s = WAIT_S if wait_s is None else wait_s
     if not root.is_dir():
         log.info("no snapshot root %s", root)
         return 0
     client = client or R2.from_env()
     rc = 0
+    td = root / today.isoformat()
+    if td.is_dir() and not (td / MARKER).exists() and not wait_for_collector(td, wait_s):
+        log.warning("collector still busy after %ss; today left for the next run", wait_s)
     for d in sorted(root.iterdir()):
         if d.is_dir() and DAY_RE.match(d.name) and _ready(d, today.isoformat()):
             try:

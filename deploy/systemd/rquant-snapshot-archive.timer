@@ -1,10 +1,10 @@
 [Unit]
-Description=Archive rQuant L1 snapshot day dirs to R2 after the collector's merge (Mon-Fri 16:20)
+Description=Archive rQuant L1 snapshot day dirs to R2 after the collector's merge (Mon-Fri 16:50)
 
 [Timer]
-# Collector compacts ~15:45; 16:20 leaves margin. If it is still active, today is skipped and
-# picked up by the next run (all unarchived past days are retried each run).
-OnCalendar=Mon..Fri *-*-* 16:20:00
+# Collector compacts ~15:45-16:30 (2026-10-12 finished 16:27). The run also waits up to 1h
+# while the collector is active or quotes.tmp exists; past unarchived days are retried each run.
+OnCalendar=Mon..Fri *-*-* 16:50:00
 Persistent=true
 Unit=rquant-snapshot-archive.service
 
