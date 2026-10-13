@@ -26,8 +26,8 @@ alert() {
   local subject="$1" body="$2"
   echo "ALERT: $subject"; echo "$body"
   [ -n "${PREMARKET_DRY_RUN:-}" ] && return 0
-  sudo -n -u lighthouse --preserve-env "$ALERT" alert --subject "$subject" --body "$body" \
-    --dedup-key "premarket-runtime:$MODE:$TODAY" --cooldown-seconds 600 \
+  (cd "$ROOT" && sudo -n -u lighthouse --preserve-env "$ALERT" alert --subject "$subject" --body "$body" \
+    --dedup-key "premarket-runtime:$MODE:$TODAY" --cooldown-seconds 600) \
     || echo "alert send failed" >&2
 }
 
