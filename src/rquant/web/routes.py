@@ -37,6 +37,7 @@ from rquant.web.chips import TPO_DEFAULT, TPO_PERIODS, ChipsData, load_chips
 from rquant.web.health_layers import build_layers
 from rquant.web.intraday import IntradayData, load_intraday
 from rquant.web.macro import MacroData, load_macro, load_summary
+from rquant.web.market_live import MarketLiveData, load_market_live
 from rquant.web.models import (
     AckAlertRequest,
     AddWatchRequest,
@@ -349,6 +350,24 @@ def _auction_pool_item(request: Request) -> PoolItem | None:  # noqa: D401
             f"{t.get('name')}{'(一字)' if t.get('limit_open') else ''}" for t in ths)
     return PoolItem(name=POOL_NAME, description=desc, pool_refs=[PRESET],
                     updated_at=pool.get("updated_at"), members=members)
+
+
+@router.get("/panorama/live", response_model=Envelope[MarketLiveData],
+            summary="市场全景（研究快照，盘中实时）")
+def panorama_live(request: Request, source: SourceDep, day: date | None = None,
+                  board: str | None = None) -> Envelope[MarketLiveData]:
+    root = Path(_research_root(request) or research_root())
+    snaps = root / "snapshots"
+    if day is None:
+        days = (sorted(p.name for p in snaps.glob("20??-??-??") if p.is_dir())
+                if snaps.is_dir() else [])
+        d = days[-1] if days else None
+    else:
+        d = day.isoformat()
+    if d is None:
+        return _envelope(source, MarketLiveData(date=None, time=None, pulse=None, curve=None,
+                                                boards=[], members=[], board=None))
+    return _envelope(source, load_market_live(root, d, board))
 
 
 @router.get("/pools/auction/live", response_model=Envelope[PoolLiveData],

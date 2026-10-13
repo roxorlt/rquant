@@ -81,6 +81,20 @@ export function useAuctionPoolLive(enabled: boolean): ServingQueryResult<Schemas
   );
 }
 
+/** 市场全景 (research 3s snapshots): breadth, minute curve, industry boards, members. */
+export function useMarketLive(board: string | null): ServingQueryResult<Schemas["MarketLiveData"]> {
+  return useServingQuery(
+    ["panorama", "live", board ?? ""],
+    async () => {
+      const { data, response } = await apiClient().GET("/api/v1/panorama/live", {
+        params: { query: board ? { board } : {} },
+      });
+      return unwrap(data, response);
+    },
+    { refetchInterval: () => (inTradingHours() ? 15_000 : false) },
+  );
+}
+
 export function useBacktests(): ServingQueryResult<Schemas["BacktestListData"]> {
   return useServingQuery(["backtests"], async () => {
     const { data, response } = await apiClient().GET("/api/v1/backtests");

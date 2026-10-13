@@ -98,7 +98,7 @@ describe("MVP pages render from the API", () => {
   it.each([
     ["/overview", "候选股"],
     ["/health", "rquant-monitor"],
-    ["/panorama", "跌停"],
+    ["/panorama", "今天还没有快照"],
     ["/screener", "贵州茅台"],
     ["/pools", "还没有池子"],
     ["/backtest", "还没有已发布的回测"],

@@ -2016,6 +2016,22 @@
         "title": "Envelope[MacroData]",
         "type": "object"
       },
+      "Envelope_MarketLiveData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/MarketLiveData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[MarketLiveData]",
+        "type": "object"
+      },
       "Envelope_MetaData_": {
         "properties": {
           "data": {
@@ -3673,6 +3689,260 @@
         "title": "Kpi",
         "type": "object"
       },
+      "LiveBoard": {
+        "properties": {
+          "amount": {
+            "title": "Amount",
+            "type": "number"
+          },
+          "broken": {
+            "title": "Broken",
+            "type": "integer"
+          },
+          "leader": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Leader"
+          },
+          "leader_pct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Leader Pct"
+          },
+          "limit_up": {
+            "title": "Limit Up",
+            "type": "integer"
+          },
+          "n": {
+            "title": "N",
+            "type": "integer"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "pct_median": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pct Median"
+          },
+          "up_ratio": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Up Ratio"
+          }
+        },
+        "required": [
+          "name",
+          "n",
+          "pct_median",
+          "up_ratio",
+          "amount",
+          "limit_up",
+          "broken",
+          "leader",
+          "leader_pct"
+        ],
+        "title": "LiveBoard",
+        "type": "object"
+      },
+      "LiveCurve": {
+        "properties": {
+          "broken": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Broken",
+            "type": "array"
+          },
+          "limit_up": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Limit Up",
+            "type": "array"
+          },
+          "t": {
+            "items": {
+              "type": "string"
+            },
+            "title": "T",
+            "type": "array"
+          },
+          "up_ratio": {
+            "items": {
+              "type": "number"
+            },
+            "title": "Up Ratio",
+            "type": "array"
+          }
+        },
+        "required": [
+          "t",
+          "up_ratio",
+          "limit_up",
+          "broken"
+        ],
+        "title": "LiveCurve",
+        "type": "object"
+      },
+      "LiveMember": {
+        "properties": {
+          "amount": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Amount"
+          },
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "pct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pct"
+          },
+          "state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "State"
+          }
+        },
+        "required": [
+          "code",
+          "name",
+          "pct",
+          "amount",
+          "state"
+        ],
+        "title": "LiveMember",
+        "type": "object"
+      },
+      "LivePulse": {
+        "properties": {
+          "amount": {
+            "title": "Amount",
+            "type": "number"
+          },
+          "broken": {
+            "title": "Broken",
+            "type": "integer"
+          },
+          "down": {
+            "title": "Down",
+            "type": "integer"
+          },
+          "flat": {
+            "title": "Flat",
+            "type": "integer"
+          },
+          "limit_down": {
+            "title": "Limit Down",
+            "type": "integer"
+          },
+          "limit_up": {
+            "title": "Limit Up",
+            "type": "integer"
+          },
+          "median_pct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Median Pct"
+          },
+          "total": {
+            "title": "Total",
+            "type": "integer"
+          },
+          "up": {
+            "title": "Up",
+            "type": "integer"
+          },
+          "up_ratio": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Up Ratio"
+          }
+        },
+        "required": [
+          "total",
+          "up",
+          "down",
+          "flat",
+          "limit_up",
+          "limit_down",
+          "broken",
+          "up_ratio",
+          "amount",
+          "median_pct"
+        ],
+        "title": "LivePulse",
+        "type": "object"
+      },
       "MacroData": {
         "properties": {
           "available": {
@@ -3847,6 +4117,88 @@
           "available"
         ],
         "title": "MacroData",
+        "type": "object"
+      },
+      "MarketLiveData": {
+        "properties": {
+          "board": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Board"
+          },
+          "boards": {
+            "items": {
+              "$ref": "#/components/schemas/LiveBoard"
+            },
+            "title": "Boards",
+            "type": "array"
+          },
+          "curve": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LiveCurve"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "date": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Date"
+          },
+          "members": {
+            "items": {
+              "$ref": "#/components/schemas/LiveMember"
+            },
+            "title": "Members",
+            "type": "array"
+          },
+          "pulse": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LivePulse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "time": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Time"
+          }
+        },
+        "required": [
+          "date",
+          "time",
+          "pulse",
+          "curve",
+          "boards",
+          "members",
+          "board"
+        ],
+        "title": "MarketLiveData",
         "type": "object"
       },
       "MarketPulse": {
@@ -7073,6 +7425,69 @@
           }
         },
         "summary": "市场全景"
+      }
+    },
+    "/api/v1/panorama/live": {
+      "get": {
+        "operationId": "panorama_live_api_v1_panorama_live_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "day",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Day"
+            }
+          },
+          {
+            "in": "query",
+            "name": "board",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Board"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_MarketLiveData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "市场全景（研究快照，盘中实时）"
       }
     },
     "/api/v1/paper": {
