@@ -4,8 +4,8 @@ Rule (``event_study/auction-ths.json`` rule 3, chosen on train win rate):
   T-1: closed at limit-up, not a one-price board (high > low), not ST/退, not BJ,
        封单/流通市值 (seal_ratio) <= SEAL_MAX
   T  : 09:25 auction gap vs T-1 close >= GAP_MIN; ranked by auction volume, top TOP_N.
-       Stocks whose auction price is already the limit-up price (一字开盘) are skipped: they
-       cannot be bought at the open and the study excludes them from every outcome.
+       Stocks whose auction price is already the limit-up price (一字开盘) are KEPT (the
+       #412 skip was removed); they carry ``limit_open: true`` and the page badges them.
 No sentiment filter (optional in the study; not applied here).
 
 Alongside the rule-3 picks the pool keeps ``ths_screen``: the raw 同花顺 screen the study
@@ -45,7 +45,7 @@ TOP_N = int(os.environ.get("AUCTION_POOL_TOP", "3"))
 THS_GAP_MIN = 0.04  # the original 同花顺 screen: 竞价涨幅 > 4%
 THS_TOP = 5
 RULE_TEXT = (f"昨日涨停非一字 & 封单/流通市值≤{SEAL_MAX:.2%} & 非ST/退/北交所；"
-             f"今日竞价涨幅≥{GAP_MIN:.2%}且非一字开盘，按竞价量降序前{TOP_N}")
+             f"今日竞价涨幅≥{GAP_MIN:.2%}（含竞价涨停），按竞价量降序前{TOP_N}")
 
 
 def research_root() -> Path:
@@ -181,8 +181,8 @@ def _auction_rows(cands: list[dict], quotes: pd.DataFrame, gap_min: float,
 
 def rank_picks(cands: list[dict], quotes: pd.DataFrame) -> list[dict]:
     """quotes: ts_code, price (auction price), pre_close, volume (auction volume).
-    Rule 3 picks; 一字开盘 (auction at limit-up) are not buyable and are skipped."""
-    rows = [r for r in _auction_rows(cands, quotes, GAP_MIN) if not r["limit_open"]]
+    Rule 3 picks; 一字开盘 (auction at limit-up) are kept and flagged ``limit_open``."""
+    rows = _auction_rows(cands, quotes, GAP_MIN)
     for i, r in enumerate(rows, 1):
         r["rank"] = i
     return rows[:TOP_N]
