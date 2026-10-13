@@ -1,0 +1,10 @@
+[Unit]
+Description=rQuant pre-market runtime restart (Mon-Fri 09:05, before 09:15/09:25)
+
+[Timer]
+# Not Persistent: a missed 09:05 must not fire mid-session after a reboot.
+OnCalendar=Mon..Fri *-*-* 09:05:00
+Unit=rquant-premarket-runtime-restart.service
+
+[Install]
+WantedBy=timers.target
