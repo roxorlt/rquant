@@ -56,7 +56,7 @@ from rquant.runtime_serving_snapshot import (
 )
 from rquant.source_quota_store import (
     SourceQuotaAttemptOutcome,
-    SourceQuotaConflictError,
+    SourceQuotaExhaustedError,
     SourceQuotaStore,
 )
 from rquant.source_quota_transport import QuotaBoundTransportObserver
@@ -147,7 +147,7 @@ def test_reference_source_quota_cannot_understate_six_external_calls(
     assert settings.quota_cost_per_capture == 6
 
 
-def test_reference_kill_is_durable_and_same_request_cannot_refetch(
+def test_reference_kill_is_durable_and_a_retry_takes_a_new_attempt_id(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -197,15 +197,19 @@ def test_reference_kill_is_durable_and_same_request_cannot_refetch(
         boot_id="boot-a",
         monotonic_ns=lambda: 61_000_000_000,
     )
+    #: same minute: the per-minute window is still exhausted, nothing is refetched
     kwargs["observed_at"] = OBSERVED_AT + timedelta(seconds=10)
-    with pytest.raises(SourceQuotaConflictError, match="already exists"):
+    with pytest.raises(SourceQuotaExhaustedError):
         runtime_service_builtin._capture_reference_with_quota(**kwargs)  # type: ignore[arg-type]
-
     assert calls == 1
     (attempt,) = quota.list_attempts(source=settings.source)
-    assert attempt.dispatched_at is not None
     assert attempt.outcome is SourceQuotaAttemptOutcome.UNKNOWN
-    assert quota.remaining(settings.source, now=OBSERVED_AT) == 0
+    #: next minute: the unknown attempt no longer locks the day; a fresh attempt id runs
+    kwargs["observed_at"] = OBSERVED_AT + timedelta(seconds=70)
+    with pytest.raises(KeyboardInterrupt):
+        runtime_service_builtin._capture_reference_with_quota(**kwargs)  # type: ignore[arg-type]
+    assert calls == 2
+    assert len({a.attempt_id for a in quota.list_attempts(source=settings.source)}) == 2
 
 
 def test_reference_explicit_revision_can_retry_same_trade_date(
@@ -250,12 +254,8 @@ def test_reference_explicit_revision_can_retry_same_trade_date(
 
     with pytest.raises(TimeoutError):
         runtime_service_builtin._capture_reference_with_quota(**kwargs)  # type: ignore[arg-type]
-    with pytest.raises(SourceQuotaConflictError, match="already exists"):
-        runtime_service_builtin._capture_reference_with_quota(**kwargs)  # type: ignore[arg-type]
-    result = runtime_service_builtin._capture_reference_with_quota(  # type: ignore[arg-type]
-        **kwargs,
-        retry_ordinal=1,
-    )
+    #: a failed attempt does not lock the trade date: the same revision retries
+    result = runtime_service_builtin._capture_reference_with_quota(**kwargs)  # type: ignore[arg-type]
 
     assert result is not None
     assert calls == 2
@@ -398,6 +398,7 @@ def test_reference_restart_aggregates_a_killed_last_call_as_unknown(
     def forbidden(**_kwargs: object) -> ReferenceSlowSourceSnapshot:
         nonlocal external_calls
         external_calls += 1
+        restarted_observer.observe("stock_st", lambda: None)
         return _snapshot()
 
     monkeypatch.setattr(
@@ -416,20 +417,21 @@ def test_reference_restart_aggregates_a_killed_last_call_as_unknown(
         window_kind="minute",
         clock=lambda: OBSERVED_AT + timedelta(seconds=10),
     )
-    with pytest.raises(SourceQuotaConflictError, match="unknown"):
-        runtime_service_builtin._capture_reference_with_quota(
-            settings=settings,
-            quota_store=restarted_store,
-            adapter=object(),  # type: ignore[arg-type]
-            calendar=calendar,
-            target_trade_date=TARGET_DATE,
-            observed_at=OBSERVED_AT + timedelta(seconds=10),
-            completion_clock=lambda: OBSERVED_AT + timedelta(seconds=10),
-            producer_commit=COMMIT,
-            transport_observer=restarted_observer,
-        )
+    result = runtime_service_builtin._capture_reference_with_quota(
+        settings=settings,
+        quota_store=restarted_store,
+        adapter=object(),  # type: ignore[arg-type]
+        calendar=calendar,
+        target_trade_date=TARGET_DATE,
+        observed_at=OBSERVED_AT + timedelta(seconds=10),
+        completion_clock=lambda: OBSERVED_AT + timedelta(seconds=10),
+        producer_commit=COMMIT,
+        transport_observer=restarted_observer,
+    )
 
-    assert external_calls == 0
+    #: the killed attempt stays UNKNOWN in the ledger; the retry runs under a new id
+    assert isinstance(result, ReferenceSlowQuotaCapture)
+    assert external_calls == 1
 
 
 def test_reference_source_retention_cannot_archive_revision_history(

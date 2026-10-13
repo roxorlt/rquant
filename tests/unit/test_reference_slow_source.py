@@ -265,9 +265,7 @@ def test_with_the_descriptor_refused_the_budget_decides_copy_or_in_place(
     ) as read_in_place:
         assert read_in_place.opened_through == "in_place"
         assert not list(Path(tempfile.gettempdir()).glob("rquant-reference-source-*"))
-        assert (
-            read_in_place.connection.execute("SELECT count(*) FROM daily_bar").fetchone()[0] == 2
-        )
+        assert read_in_place.connection.execute("SELECT count(*) FROM daily_bar").fetchone()[0] == 2
 
 
 def test_a_generation_over_the_copy_budget_is_read_in_place_and_copied_nowhere(
@@ -1775,9 +1773,10 @@ def test_a_failed_capture_stays_on_the_heartbeat_until_the_trade_date_rolls_over
 
     with pytest.raises(ReferenceSlowSourceError, match="missing columns: delist_date"):
         step()
-    #: the retry in the window: the same logical request id was already used (#295)
+    #: the retry in the window: a failed attempt no longer locks the day, so it really
+    #: retries (and fails the same way against this adapter)
     now[0] = datetime(2026, 7, 31, 1, 20, 51, tzinfo=UTC)
-    with pytest.raises(Exception, match="reference source attempt already exists"):
+    with pytest.raises(ReferenceSlowSourceError, match="missing columns: delist_date"):
         step()
 
     now[0] = datetime(2026, 7, 31, 1, 25, 30, tzinfo=UTC)

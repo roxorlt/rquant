@@ -208,6 +208,11 @@ class ReferenceSlowPublisherSettings(RuntimeContractModel):
         return value
 
 
+#: Upper bound on same-day capture attempts per (trade date, revision): the 09:20-09:25
+#: window at a 30 s step is ~10 iterations, so 32 is never the binding limit.
+_REFERENCE_MAX_CAPTURE_ATTEMPTS = 32
+
+
 def _capture_reference_with_quota(
     *,
     settings: ReferenceSlowSourceSettings,
@@ -227,14 +232,38 @@ def _capture_reference_with_quota(
     if type(retry_ordinal) is not int or retry_ordinal < 0:
         raise ValueError("retry_ordinal must be a nonnegative int")
 
-    logical_request_id = canonical_sha256(
-        {
+    def attempt_request_id(attempt_number: int) -> str:
+        # Attempt 0 keeps the v2 identity so ledgers written before this change line up.
+        payload: dict[str, object] = {
             "protocol": "reference-source-attempt-v2",
             "source": settings.source,
             "target_trade_date": target_trade_date,
             "logical_revision": retry_ordinal,
         }
-    )
+        if attempt_number:
+            payload["attempt"] = attempt_number
+        return canonical_sha256(payload)
+
+    def next_free_request_id(
+        outcome_of: Callable[[str], SourceQuotaAttemptOutcome | None],
+    ) -> str:
+        """First attempt id with no ledger entry for this (date, revision).
+
+        A failed or unknown attempt no longer locks the day: the next attempt gets a fresh
+        id (the per-minute window still charges every external call). Only an attempt still
+        PENDING (in flight) conflicts. Re-capture after a *successful* capture is prevented
+        upstream: once today's batch is sealed in the spool the runtime returns early and
+        never calls this, and the 09:25 cutoff still applies to every attempt.
+        """
+        for attempt_number in range(_REFERENCE_MAX_CAPTURE_ATTEMPTS):
+            request_id = attempt_request_id(attempt_number)
+            outcome = outcome_of(request_id)
+            if outcome is None:
+                return request_id
+            if outcome is SourceQuotaAttemptOutcome.PENDING:
+                raise SourceQuotaConflictError("reference source attempt already exists: pending")
+        raise SourceQuotaConflictError("reference source capture attempts exhausted for the day")
+
     if settings.quota_accounting_mode == "transport":
         if transport_observer is None:
             raise SourceQuotaConflictError("reference transport quota observer is required")
@@ -243,11 +272,7 @@ def _capture_reference_with_quota(
             now=observed_at,
             min_age=timedelta(seconds=settings.pending_recovery_min_age_seconds),
         )
-        existing_outcome = transport_observer.request_outcome(logical_request_id)
-        if existing_outcome is not None:
-            raise SourceQuotaConflictError(
-                f"reference source attempt already exists: {existing_outcome.value}"
-            )
+        logical_request_id = next_free_request_id(transport_observer.request_outcome)
         with transport_observer.scope(
             logical_request_id=logical_request_id,
             observed_at=observed_at,
@@ -289,12 +314,12 @@ def _capture_reference_with_quota(
         now=observed_at,
         min_age=timedelta(seconds=settings.pending_recovery_min_age_seconds),
     )
-    attempt_id = logical_request_id
-    existing = quota_store.get_attempt(attempt_id)
-    if existing is not None:
-        raise SourceQuotaConflictError(
-            f"reference source attempt already exists: {existing.outcome.value}"
-        )
+
+    def request_mode_outcome(request_id: str) -> SourceQuotaAttemptOutcome | None:
+        existing = quota_store.get_attempt(request_id)
+        return None if existing is None else existing.outcome
+
+    attempt_id = next_free_request_id(request_mode_outcome)
     attempt = quota_store.begin_attempt(
         source=settings.source,
         owner=f"reference-slow:{attempt_id}",
@@ -916,9 +941,7 @@ def auction_match_source_builder(
             try:
                 decision = decide_market_session(calendar, observed_at)
             except MarketSessionCalendarError as error:
-                return idle_result(
-                    (raise_or_label_calendar_refusal(calendar, observed_at, error),)
-                )
+                return idle_result((raise_or_label_calendar_refusal(calendar, observed_at, error),))
             if attempt_trade_date != decision.local_trade_date:
                 attempt_trade_date = decision.local_trade_date
                 attempts = 0
