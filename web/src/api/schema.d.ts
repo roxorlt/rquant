@@ -365,6 +365,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/panorama/live": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 市场全景（研究快照，盘中实时） */
+        get: operations["panorama_live_api_v1_panorama_live_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/paper": {
         parameters: {
             query?: never;
@@ -1373,6 +1390,11 @@ export interface components {
             data: components["schemas"]["MacroData"];
             serving: components["schemas"]["ServingMeta"];
         };
+        /** Envelope[MarketLiveData] */
+        Envelope_MarketLiveData_: {
+            data: components["schemas"]["MarketLiveData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
         /** Envelope[MetaData] */
         Envelope_MetaData_: {
             data: components["schemas"]["MetaData"];
@@ -1913,6 +1935,74 @@ export interface components {
             /** Value */
             value: string;
         };
+        /** LiveBoard */
+        LiveBoard: {
+            /** Amount */
+            amount: number;
+            /** Broken */
+            broken: number;
+            /** Leader */
+            leader: string | null;
+            /** Leader Pct */
+            leader_pct: number | null;
+            /** Limit Up */
+            limit_up: number;
+            /** N */
+            n: number;
+            /** Name */
+            name: string;
+            /** Pct Median */
+            pct_median: number | null;
+            /** Up Ratio */
+            up_ratio: number | null;
+        };
+        /** LiveCurve */
+        LiveCurve: {
+            /** Broken */
+            broken: number[];
+            /** Limit Up */
+            limit_up: number[];
+            /** T */
+            t: string[];
+            /** Up Ratio */
+            up_ratio: number[];
+        };
+        /** LiveMember */
+        LiveMember: {
+            /** Amount */
+            amount: number | null;
+            /** Code */
+            code: string;
+            /** Name */
+            name: string | null;
+            /** Pct */
+            pct: number | null;
+            /** State */
+            state: string | null;
+        };
+        /** LivePulse */
+        LivePulse: {
+            /** Amount */
+            amount: number;
+            /** Broken */
+            broken: number;
+            /** Down */
+            down: number;
+            /** Flat */
+            flat: number;
+            /** Limit Down */
+            limit_down: number;
+            /** Limit Up */
+            limit_up: number;
+            /** Median Pct */
+            median_pct: number | null;
+            /** Total */
+            total: number;
+            /** Up */
+            up: number;
+            /** Up Ratio */
+            up_ratio: number | null;
+        };
         /** MacroData */
         MacroData: {
             /** Available */
@@ -1967,6 +2057,21 @@ export interface components {
              * @default []
              */
             studies: components["schemas"]["StudyRow"][];
+        };
+        /** MarketLiveData */
+        MarketLiveData: {
+            /** Board */
+            board: string | null;
+            /** Boards */
+            boards: components["schemas"]["LiveBoard"][];
+            curve: components["schemas"]["LiveCurve"] | null;
+            /** Date */
+            date: string | null;
+            /** Members */
+            members: components["schemas"]["LiveMember"][];
+            pulse: components["schemas"]["LivePulse"] | null;
+            /** Time */
+            time: string | null;
         };
         /** MarketPulse */
         MarketPulse: {
@@ -3280,6 +3385,38 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_PanoramaData_"];
+                };
+            };
+        };
+    };
+    panorama_live_api_v1_panorama_live_get: {
+        parameters: {
+            query?: {
+                day?: string | null;
+                board?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_MarketLiveData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };

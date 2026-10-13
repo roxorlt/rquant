@@ -1,11 +1,12 @@
 import { useState } from "react";
 import { usePanorama } from "@/api/endpoints";
-import { formatAmount, formatCount } from "@/format/number";
+import { formatAmount } from "@/format/number";
 import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
-import { ChangeText, KpiStrip, PageHeader, Panel, Segmented } from "@/ui";
+import { ChangeText, PageHeader, Panel, Segmented } from "@/ui";
 import { QueryView } from "../shared";
 import { Heatmap } from "./Heatmap";
+import { LivePanorama } from "./Live";
 
 export default function PanoramaPage() {
   const query = usePanorama();
@@ -16,25 +17,17 @@ export default function PanoramaPage() {
       <PageHeader
         eyebrow="跟踪与告警"
         title="市场全景"
-        note={asOf ? `快照 ${formatShanghaiDateTime(asOf)}` : undefined}
+        note="全 A 股 3 秒快照 · 行业按 Tushare 分类"
       />
+      <LivePanorama />
       <QueryView query={query}>
         {(data) => {
+          if (!data.boards.length) return null;
           const systems = [...new Set(data.boards.map((b) => b.system))];
           return (
             <>
-              <KpiStrip
-                label="市场脉搏"
-                items={[
-                  { key: "up", label: "上涨", value: formatCount(data.pulse.up) },
-                  { key: "down", label: "下跌", value: formatCount(data.pulse.down) },
-                  { key: "flat", label: "平盘", value: formatCount(data.pulse.flat) },
-                  { key: "lu", label: "涨停", value: formatCount(data.pulse.limit_up) },
-                  { key: "ld", label: "跌停", value: formatCount(data.pulse.limit_down) },
-                ]}
-              />
               <Panel
-                title="板块热力图"
+                title={`东财板块热力图（Serving${asOf ? ` · ${formatShanghaiDateTime(asOf)}` : ""}）`}
                 sub="面积 = 成交额，颜色 = 成分股涨跌幅中位数（±3% 封顶）；取成交额前 80"
                 actions={
                   systems.length > 1 ? (
