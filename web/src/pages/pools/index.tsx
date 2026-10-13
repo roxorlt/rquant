@@ -116,7 +116,17 @@ export default function PoolsPage() {
                                 : "候选",
                             cell: (row: Member) =>
                               row.detail?.stage === "pick" ? (
-                                <span className="up">终选 #{String(row.detail?.rank ?? "")}</span>
+                                <span className="up">
+                                  终选 #{String(row.detail?.rank ?? "")}
+                                  {row.detail?.limit_open === true ? (
+                                    <span
+                                      className="badge-limit-open"
+                                      title="竞价价已是涨停价（一字开盘）"
+                                    >
+                                      竞价涨停
+                                    </span>
+                                  ) : null}
+                                </span>
                               ) : (
                                 <span className="muted">候选</span>
                               ),

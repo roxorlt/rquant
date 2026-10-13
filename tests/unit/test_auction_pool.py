@@ -33,7 +33,7 @@ def test_push_priority():
     assert body.index("★P") < body.index("X")
 
 
-def test_limit_open_skipped_and_ths_screen():
+def test_limit_open_kept_flagged_and_ths_screen():
     assert ap.limit_price(15.13, "002242.SZ") == 16.64
     assert ap.limit_price(10.0, "300001.SZ") == 12.0
     base = [{"ts_code": c, "name": c, "y_close": 10.0, "seal_ratio": s}
@@ -43,7 +43,10 @@ def test_limit_open_skipped_and_ths_screen():
                       "price": [11.0, 10.6, 10.45, 10.6], "pre_close": [10.0] * 4,
                       "volume": [900, 300, 800, 100]})
     picks = ap.rank_picks(cands, q)
-    assert [p["ts_code"] for p in picks] == ["B.SZ", "D.SH"]  # A opened at limit-up
+    # A opened at limit-up: kept (skip removed) and flagged
+    assert [(p["ts_code"], p["limit_open"]) for p in picks] == [
+        ("A.SZ", True), ("B.SZ", False), ("D.SH", False)]
+    assert "非一字开盘" not in ap.RULE_TEXT and "竞价涨停" in ap.RULE_TEXT
     ths = ap.ths_screen(base, q)
     assert [(t["ts_code"], t["limit_open"]) for t in ths] == [
         ("A.SZ", True), ("C.SH", False), ("B.SZ", False), ("D.SH", False)]

@@ -531,3 +531,13 @@ input:focus {
     opacity: 0.25;
   }
 }
+.badge-limit-open {
+  display: inline-block;
+  margin-left: 4px;
+  padding: 0 4px;
+  border-radius: 3px;
+  font-size: 11px;
+  line-height: 16px;
+  color: #fff;
+  background: var(--up, #e5484d);
+}
