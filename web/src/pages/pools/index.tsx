@@ -119,7 +119,10 @@ export default function PoolsPage() {
                                 <span className="up">
                                   终选 #{String(row.detail?.rank ?? "")}
                                   {row.detail?.limit_open === true ? (
-                                    <span className="badge-limit-open" title="竞价价已是涨停价（一字开盘）">
+                                    <span
+                                      className="badge-limit-open"
+                                      title="竞价价已是涨停价（一字开盘）"
+                                    >
                                       竞价涨停
                                     </span>
                                   ) : null}
