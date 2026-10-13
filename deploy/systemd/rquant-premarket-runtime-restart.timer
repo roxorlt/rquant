@@ -1,9 +1,9 @@
 [Unit]
-Description=rQuant pre-market runtime restart (Mon-Fri 09:05, before 09:15/09:25)
+Description=rQuant pre-market restart: reference-slow source+publisher, then serving (before 09:20) (timer)
 
 [Timer]
-# Not Persistent: a missed 09:05 must not fire mid-session after a reboot.
-OnCalendar=Mon..Fri *-*-* 09:05:00
+OnCalendar=Mon..Fri *-*-* 08:45:00
+AccuracySec=1s
 Unit=rquant-premarket-runtime-restart.service
 
 [Install]

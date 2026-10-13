@@ -1,0 +1,11 @@
+[Unit]
+Description=rQuant pre-market retry: restart chain again only if unhealthy (before 09:18)
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/home/lighthouse/rquant/.env
+ExecStart=/home/lighthouse/rquant/scripts/premarket-runtime.sh retry
+TimeoutStartSec=10min
+StandardOutput=journal
+StandardError=journal

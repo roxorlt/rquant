@@ -1,0 +1,11 @@
+[Unit]
+Description=rQuant pre-market preflight audit of reference-slow -> serving chain (alerts via PushDeer)
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/home/lighthouse/rquant/.env
+ExecStart=/home/lighthouse/rquant/scripts/premarket-runtime.sh preflight
+TimeoutStartSec=10min
+StandardOutput=journal
+StandardError=journal

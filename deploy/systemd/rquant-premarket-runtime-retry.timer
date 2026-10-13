@@ -1,0 +1,11 @@
+[Unit]
+Description=rQuant pre-market retry: restart chain again only if unhealthy (before 09:18) (timer)
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 09:00:00
+OnCalendar=Mon..Fri *-*-* 09:10:00
+AccuracySec=1s
+Unit=rquant-premarket-runtime-retry.service
+
+[Install]
+WantedBy=timers.target
