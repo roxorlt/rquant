@@ -1,15 +1,11 @@
 [Unit]
-Description=rQuant pre-market restart: reference-slow publisher, then serving (before the 09:25 start rule)
-OnFailure=rquant-alert@%n.service
+Description=rQuant pre-market restart: reference-slow source+publisher, then serving (before 09:20)
+After=network-online.target
 
 [Service]
-# Runs as root only to call systemctl. The reference-slow publisher refuses to start after 09:25
-# ("reference slow publisher started after 09:25"), and serving cannot publish without its
-# current pointer (2026-10-13: serving failed all day). Restart both at 09:05 every weekday.
 Type=oneshot
-ExecStart=/usr/bin/systemctl restart rquant-runtime-reference-slow-publisher@*.service
-ExecStartPost=/usr/bin/sleep 90
-ExecStartPost=/usr/bin/systemctl restart rquant-runtime-serving@*.service
+EnvironmentFile=-/home/lighthouse/rquant/.env
+ExecStart=/home/lighthouse/rquant/scripts/premarket-runtime.sh start
 TimeoutStartSec=10min
 StandardOutput=journal
 StandardError=journal

@@ -1,0 +1,11 @@
+[Unit]
+Description=rQuant pre-market preflight audit of reference-slow -> serving chain (alerts via PushDeer) (timer)
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 08:30:00
+OnCalendar=Mon..Fri *-*-* 17:45:00
+AccuracySec=1s
+Unit=rquant-premarket-preflight.service
+
+[Install]
+WantedBy=timers.target

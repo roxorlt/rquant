@@ -1,0 +1,10 @@
+[Unit]
+Description=rQuant post-capture check: today's reference-slow batch and serving-authority exist (timer)
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 09:27:00
+AccuracySec=1s
+Unit=rquant-premarket-verify.service
+
+[Install]
+WantedBy=timers.target
