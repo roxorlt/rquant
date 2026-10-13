@@ -17,24 +17,36 @@ TODAY="$(date +%F)"
 NOW="$(date +%H%M)"
 problems=()
 
-units() { systemctl list-units --all --plain --no-legend "$1" | awk '{print $1}'; }
-SRC="$(units 'rquant-runtime-reference-slow-source@*.service')"
-PUB="$(units 'rquant-runtime-reference-slow-publisher@*.service')"
-SRV="$(units 'rquant-runtime-serving@*.service')"
+PROFILE=/etc/rquant/production-runtime-profile.json
+# Only the instances of the CURRENT installed profile, and only if systemd has them loaded.
+# (list-units --all used to pick up leftover failed instances of older generations too.)
+units() {  # $1 = profile role, $2 = unit prefix
+  local inst
+  for inst in $(python3 -c 'import json,sys; print(" ".join(json.load(open(sys.argv[1]))["roles"][sys.argv[2]]["instances"]))' "$PROFILE" "$1" 2>/dev/null); do
+    [ "$(systemctl show -p LoadState --value "$2@$inst.service")" = loaded ] && echo "$2@$inst.service"
+  done
+}
+SRC="$(units reference_slow_source rquant-runtime-reference-slow-source)"
+PUB="$(units reference_slow_publisher rquant-runtime-reference-slow-publisher)"
+SRV="$(units serving_publisher rquant-runtime-serving)"
+jget() { python3 -c 'import json,sys
+d=json.load(open(sys.argv[1]))
+for k in sys.argv[2].split("."): d=(d or {}).get(k)
+print("" if d is None else d)' "$@" 2>/dev/null; }
 
 alert() {
   local subject="$1" body="$2"
   echo "ALERT: $subject"; echo "$body"
   [ -n "${PREMARKET_DRY_RUN:-}" ] && return 0
   (cd "$ROOT" && sudo -n -u lighthouse --preserve-env "$ALERT" alert --subject "$subject" --body "$body" \
-    --dedup-key "premarket-runtime:$MODE:$TODAY" --cooldown-seconds 600) \
+    --dedup-key "premarket-runtime:$MODE:$TODAY:$NOW" --cooldown-seconds 600) \
     || echo "alert send failed" >&2
 }
 
 is_trading_day() {
   local cal
   cal="$(ls -t "$RT"/authorities/market-calendar/generations/*.json 2>/dev/null | head -1)"
-  [ -n "$cal" ] && grep -q "\"$TODAY\"" "$cal"
+  [ -n "$cal" ] && python3 -c 'import json,sys; sys.exit(0 if sys.argv[2] in json.load(open(sys.argv[1]))["open_dates"] else 1)' "$cal" "$TODAY" 2>/dev/null
 }
 
 check_chain() {  # fills problems[]
@@ -69,9 +81,24 @@ check_chain() {  # fills problems[]
     [ -s "/etc/credstore.encrypted/rquant-runtime/instances/$inst/current.cred" ] || problems+=("credential missing for $inst")
   done
   local hb fails
-  for hb in "$RT"/control/reference-slow-sources/*/heartbeats/*.json "$RT"/control/serving-publishers/*/heartbeats/*.json; do
-    [ -f "$hb" ] || continue
-    [ $(( $(date +%s) - $(stat -c %Y "$hb") )) -lt 300 ] || problems+=("stale heartbeat $(basename "$(dirname "$(dirname "$hb")")")")
+  for u in $SRC $PUB $SRV; do
+    local inst="${u#*@}"; inst="${inst%.service}" found=0
+    for hb in "$RT"/control/*/"$inst"/heartbeats/*.json; do
+      [ -f "$hb" ] || continue; found=1
+      [ $(( $(date +%s) - $(stat -c %Y "$hb") )) -lt 300 ] || problems+=("stale heartbeat ${u%%@*} $inst")
+    done
+    [ "$found" = 1 ] || problems+=("no heartbeat for ${u%%@*} $inst")
+  done
+  # Publisher: before 09:25 it must not still be refusing with the post-09:25 guard, and must not be crash-failing.
+  for u in $PUB; do
+    local inst="${u#*@}"; inst="${inst%.service}"
+    for hb in "$RT"/control/reference-slow-publishers/"$inst"/heartbeats/*.json; do
+      [ -f "$hb" ] || continue
+      local err; err="$(jget "$hb" last_error)"
+      if [ "$((10#$NOW))" -lt 925 ] && [[ "$err" == *"after 09:25"* ]]; then
+        problems+=("publisher still reports the post-09:25 refusal before 09:25: ${err:0:160}")
+      fi
+    done
   done
 }
 
@@ -83,7 +110,7 @@ case "$MODE" in
     ;;
   start|retry)
     is_trading_day || { echo "not a trading day"; exit 0; }
-    if [ "$NOW" -ge 0918 ]; then
+    if [ "$((10#$NOW))" -ge 918 ]; then
       alert "🚨 [RQ] premarket $MODE skipped at $(date +%T)" "Too close to the 09:20-09:25 capture window; not restarting anything."
       exit 1
     fi
@@ -105,7 +132,8 @@ case "$MODE" in
     cur="$RT/live/reference-slow/current/reference_slow.json"
     [ -f "$cur" ] && [ "$(date -d @"$(stat -c %Y "$cur")" +%F)" = "$TODAY" ] || problems+=("no reference-slow batch captured today (09:20-09:25)")
     sa="$RT/live/reference-slow/serving-authority/current.json"
-    grep -q "\"published_at\":\"$(date -u +%F)" "$sa" 2>/dev/null || problems+=("serving-authority not published today")
+    pa="$(jget "$sa" published_at)"
+    [ -n "$pa" ] && [ "$(date -d "$pa" +%F)" = "$TODAY" ] || problems+=("serving-authority not published today (published_at=${pa:-none})")
     for hb in "$RT"/control/reference-slow-sources/*/heartbeats/*.json; do
       grep -q capture_failed "$hb" && problems+=("source heartbeat: $(grep -o 'capture_failed:[A-Za-z]*' "$hb")")
     done
