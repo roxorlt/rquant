@@ -74,3 +74,25 @@ export function colorMap(shown: Sector[]): Map<string, string> {
   }
   return m;
 }
+
+/** Default number of inflow and of outflow sectors drawn on the main chart (phone and desktop). */
+export const DEFAULT_TOP_N = 5;
+
+/**
+ * Collision nudging for line-end labels: given label y positions sorted ascending,
+ * push them apart to at least `gap` px and keep them within [top, bottom].
+ * If they can't fit, they are spread evenly across the range.
+ */
+export function layoutEndLabels(ys: number[], gap: number, top: number, bottom: number): number[] {
+  const n = ys.length;
+  if (n === 0) return [];
+  const g = n > 1 ? Math.min(gap, (bottom - top) / (n - 1)) : gap;
+  const out = Float64Array.from(ys, (y) => Math.max(top, Math.min(bottom, y)));
+  for (let i = 1; i < n; i++) out[i] = Math.max(out[i] as number, (out[i - 1] as number) + g);
+  const over = (out[n - 1] as number) - bottom;
+  if (over > 0) for (let i = 0; i < n; i++) out[i] = (out[i] as number) - over;
+  for (let i = n - 2; i >= 0; i--) out[i] = Math.min(out[i] as number, (out[i + 1] as number) - g);
+  const under = top - (out[0] as number);
+  if (under > 0) for (let i = 0; i < n; i++) out[i] = (out[i] as number) + under;
+  return Array.from(out);
+}
