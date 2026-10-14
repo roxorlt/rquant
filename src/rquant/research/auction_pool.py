@@ -1,4 +1,13 @@
-"""Auto-maintained pool 「竞价选股」 for the auction-ths strategy (rule 3 of the study).
+"""Auto-maintained pool 「竞价选股」 — since 2026-10-14 a WATCHLIST, not a buy signal.
+
+Current rule (the original 同花顺 screen, no seal filter):
+  T-1 limit-up, not 一字 (high > low), not ST/退, not BJ;
+  T 09:25 auction gap vs T-1 close > 4%; ranked by auction volume desc, all kept
+  (AUCTION_POOL_TOP > 0 truncates). seal_ratio is informational only. 竞价涨停 opens are
+  kept and flagged ``limit_open`` (page: 「竞价涨停·买不到」).
+The refined "rule 3" below is history; it failed to hold up out of sample.
+
+Previous rule-3 notes:
 
 Rule (``event_study/auction-ths.json`` rule 3, chosen on train win rate):
   T-1: closed at limit-up, not a one-price board (high > low), not ST/退, not BJ,
@@ -40,12 +49,12 @@ TZ = ZoneInfo("Asia/Shanghai")
 POOL_NAME = "竞价选股"
 PRESET = "auction-pick"
 SEAL_MAX = float(os.environ.get("AUCTION_POOL_SEAL_MAX", "0.0094"))
-GAP_MIN = float(os.environ.get("AUCTION_POOL_GAP_MIN", "0.0537"))
-TOP_N = int(os.environ.get("AUCTION_POOL_TOP", "3"))
-THS_GAP_MIN = 0.04  # the original 同花顺 screen: 竞价涨幅 > 4%
-THS_TOP = 5
-RULE_TEXT = (f"昨日涨停非一字 & 封单/流通市值≤{SEAL_MAX:.2%} & 非ST/退/北交所；"
-             f"今日竞价涨幅≥{GAP_MIN:.2%}（含竞价涨停），按竞价量降序前{TOP_N}")
+THS_GAP_MIN = float(os.environ.get("AUCTION_POOL_GAP_MIN", "0.04"))  # 竞价涨幅 > 4%
+TOP_N = int(os.environ.get("AUCTION_POOL_TOP", "0"))  # 0 = show all
+THS_TOP = TOP_N
+POOL_LABEL = "观察名单（同花顺原条件，非买入信号）"
+RULE_TEXT = (f"昨日涨停非一字 & 非ST/退/北交所；今日竞价涨幅>{THS_GAP_MIN:.0%}，按竞价量降序"
+             f"{'前' + str(TOP_N) if TOP_N else '全部'}；封单比仅展示不过滤；竞价涨停=买不到")
 
 
 def research_root() -> Path:
@@ -107,9 +116,8 @@ def filter_base(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def filter_candidates(df: pd.DataFrame) -> pd.DataFrame:
-    """Rule 3: the base screen plus 封单/流通市值 <= SEAL_MAX."""
-    df = filter_base(df)
-    return df[df["seal_ratio"] <= SEAL_MAX]
+    """The 同花顺 screen has no seal filter: candidates == base."""
+    return filter_base(df)
 
 
 def limit_price(pre_close: float, ts_code: str) -> float:
@@ -152,8 +160,8 @@ def build_candidates(root: Path, day: date) -> dict[str, Any]:
              "open_times": int(r.open_times or 0), "first_time": r.first_time,
              "industry": r.industry} for r in base.itertuples()]
     return {"pool": POOL_NAME, "date": f"{day:%Y-%m-%d}", "prior_date": str(prior),
-            "rule": RULE_TEXT, "stage": "candidates", "limit_ups": int(len(ll)),
-            "candidates": [r for r in rows if r["seal_ratio"] <= SEAL_MAX],
+            "rule": RULE_TEXT, "label": POOL_LABEL, "kind": "watchlist",
+            "stage": "candidates", "limit_ups": int(len(ll)), "candidates": rows,
             "base": rows, "picks": [], "ths_screen": [], "updated_at": _now()}
 
 
@@ -181,19 +189,17 @@ def _auction_rows(cands: list[dict], quotes: pd.DataFrame, gap_min: float,
 
 def rank_picks(cands: list[dict], quotes: pd.DataFrame) -> list[dict]:
     """quotes: ts_code, price (auction price), pre_close, volume (auction volume).
-    Rule 3 picks; 一字开盘 (auction at limit-up) are kept and flagged ``limit_open``."""
-    rows = _auction_rows(cands, quotes, GAP_MIN)
+    同花顺 screen: gap > 4%, by auction volume desc; 竞价涨停 kept, flagged ``limit_open``."""
+    rows = _auction_rows(cands, quotes, THS_GAP_MIN, strict=True)
+    rows = rows[:TOP_N] if TOP_N > 0 else rows
     for i, r in enumerate(rows, 1):
         r["rank"] = i
-    return rows[:TOP_N]
+    return rows
 
 
 def ths_screen(base: list[dict], quotes: pd.DataFrame) -> list[dict]:
     """The raw 同花顺 screen (gap > 4%, by auction volume, 一字 kept but flagged)."""
-    rows = _auction_rows(base, quotes, THS_GAP_MIN, strict=True)[:THS_TOP]
-    for i, r in enumerate(rows, 1):
-        r["rank"] = i
-    return rows
+    return rank_picks(base, quotes)
 
 
 def fetch_auction(codes: list[str]) -> pd.DataFrame:
@@ -222,14 +228,17 @@ def snapshot_quotes(root: Path, day: date, codes: list[str]) -> pd.DataFrame:
     return pd.concat(frames).sort_values("time")
 
 
-def make_picks(root: Path, day: date) -> dict[str, Any]:
+def make_picks(root: Path, day: date, source: str = "rt_k") -> dict[str, Any]:
     pool = read_pool(root, day) or build_candidates(root, day)
-    cands = pool.get("candidates") or []
-    base = pool.get("base") or cands
+    base = pool.get("base") or pool.get("candidates") or []
+    cands = base  # no seal filter any more
+    pool.update(candidates=base, rule=RULE_TEXT, label=POOL_LABEL, kind="watchlist")
     codes = list(dict.fromkeys([c["ts_code"] for c in cands] + [c["ts_code"] for c in base]))
     src = "rt_k"
     quotes = pd.DataFrame()
-    if codes:
+    if codes and source == "snapshots":
+        src, quotes = "snapshots", snapshot_quotes(root, day, codes)
+    elif codes:
         try:
             quotes = fetch_auction(codes)
         except Exception as exc:  # noqa: BLE001
@@ -237,7 +246,7 @@ def make_picks(root: Path, day: date) -> dict[str, Any]:
         if not len(quotes):
             src, quotes = "snapshots", snapshot_quotes(root, day, codes)
     picks = rank_picks(cands, quotes) if codes else []
-    ths = ths_screen(base, quotes) if codes else []
+    ths = picks
     pool.update(stage="final", picks=picks, ths_screen=ths, quote_source=src,
                 picked_at=_now(), updated_at=_now())
     return pool
@@ -249,6 +258,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("cmd", choices=["candidates", "pick", "show"])
     p.add_argument("--day", type=date.fromisoformat, default=None)
     p.add_argument("--force", action="store_true", help="run on non-trading days too")
+    p.add_argument("--source", choices=["rt_k", "snapshots"], default="rt_k",
+                   help="pick quotes: Tushare rt_k (default) or stored collector parts")
     a = p.parse_args(argv)
     root, day = research_root(), a.day or datetime.now(TZ).date()
     if a.cmd == "show":
@@ -260,7 +271,7 @@ def main(argv: list[str] | None = None) -> int:
         if not is_trading_day(day):
             log.info("%s not a trading day; skip", day)
             return 0
-    pool = build_candidates(root, day) if a.cmd == "candidates" else make_picks(root, day)
+    pool = build_candidates(root, day) if a.cmd == "candidates" else make_picks(root, day, a.source)
     path = _write(root, day, pool)
     log.info("%s %s: %d candidates, picks %s -> %s", a.cmd, day, len(pool["candidates"]),
              [(x["rank"], x["ts_code"], x["name"]) for x in pool["picks"]], path)

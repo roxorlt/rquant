@@ -339,15 +339,14 @@ def _auction_pool_item(request: Request) -> PoolItem | None:  # noqa: D401
         if info:
             m.detail.update(concepts=info.get("concepts"), news=info.get("news"),
                             anns=info.get("anns"))
-    stage = "终选" if pool.get("stage") == "final" else "候选"
-    desc = (f"{pool['date']} {stage}（T-1={pool.get('prior_date')}，候选 "
-            f"{len(pool.get('candidates') or [])}，终选 {len(picks)}）· {pool.get('rule', '')}")
+    label = pool.get("label") or "观察名单（同花顺原条件，非买入信号）"
+    stage = "已出观察" if pool.get("stage") == "final" else "仅候选（竞价未出）"
+    n_lim = sum(1 for p in picks.values() if p.get("limit_open"))
+    desc = (f"{label} · {pool['date']} {stage}（T-1={pool.get('prior_date')}，候选 "
+            f"{len(pool.get('candidates') or [])} / 观察 {len(picks)}"
+            f"{f'，其中竞价涨停·买不到 {n_lim}' if n_lim else ''}）· {pool.get('rule', '')}")
     if att.get("text"):
-        desc = f"归因：{att['text']} ｜ " + desc
-    ths = pool.get("ths_screen") or []
-    if ths:
-        desc += " ｜ 同花顺榜(>4%)：" + "、".join(
-            f"{t.get('name')}{'(一字)' if t.get('limit_open') else ''}" for t in ths)
+        desc += f" ｜ 归因：{att['text']}"
     return PoolItem(name=POOL_NAME, description=desc, pool_refs=[PRESET],
                     updated_at=pool.get("updated_at"), members=members)
 
