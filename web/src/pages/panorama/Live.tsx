@@ -42,6 +42,30 @@ export function LivePanorama() {
         const c = data.curve;
         const live = inTradingHours();
         const boards = data.boards;
+        const heatPanel = (
+          <Panel
+            title="行业热力图"
+            sub={`面积 = 成交额，颜色 = 行业内个股涨跌中位数（±3% 封顶）· ${phone ? "轻点" : "点击"}色块看成分股`}
+            flush
+          >
+            <Heatmap
+              phone={phone}
+              selected={board}
+              onSelect={(b) => open(b.board_name)}
+              boards={boards.map((b) => ({
+                system: "行业",
+                board_code: b.name,
+                board_name: b.name,
+                amount: b.amount,
+                main_net_amount: null,
+                pct_chg_median: b.pct_median ?? null,
+                limit_up_count: b.limit_up,
+                stock_count: b.n,
+                leading_stock: b.leader ?? null,
+              }))}
+            />
+          </Panel>
+        );
         return (
           <>
             <KpiStrip
@@ -87,6 +111,7 @@ export function LivePanorama() {
                 },
               ]}
             />
+            {phone ? heatPanel : null}
             <div className="card-grid">
               <Panel
                 title="赚钱效应（逐分钟）"
@@ -113,27 +138,7 @@ export function LivePanorama() {
                   ]}
                 />
               </Panel>
-              <Panel
-                title="行业热力图"
-                sub={`面积 = 成交额，颜色 = 行业内个股涨跌中位数（±3% 封顶）· ${phone ? "轻点" : "点击"}色块看成分股`}
-                flush
-              >
-                <Heatmap
-                  selected={board}
-                  onSelect={(b) => open(b.board_name)}
-                  boards={boards.map((b) => ({
-                    system: "行业",
-                    board_code: b.name,
-                    board_name: b.name,
-                    amount: b.amount,
-                    main_net_amount: null,
-                    pct_chg_median: b.pct_median ?? null,
-                    limit_up_count: b.limit_up,
-                    stock_count: b.n,
-                    leading_stock: b.leader ?? null,
-                  }))}
-                />
-              </Panel>
+              {phone ? null : heatPanel}
               <Panel
                 title={`行业 · ${boards.length}`}
                 sub={phone ? "轻点一行看成分股" : "点一行看成分股"}
