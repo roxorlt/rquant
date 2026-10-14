@@ -382,6 +382,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/panorama/sector-flow": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 板块资金流（主动买卖估算，自 09:25 累计） */
+        get: operations["panorama_sector_flow_api_v1_panorama_sector_flow_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/paper": {
         parameters: {
             query?: never;
@@ -1465,6 +1482,11 @@ export interface components {
             data: components["schemas"]["ScreenData"];
             serving: components["schemas"]["ServingMeta"];
         };
+        /** Envelope[SectorFlowData] */
+        Envelope_SectorFlowData_: {
+            data: components["schemas"]["SectorFlowData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
         /** Envelope[StockProfile] */
         Envelope_StockProfile_: {
             data: components["schemas"]["StockProfile"];
@@ -1723,6 +1745,19 @@ export interface components {
              */
             window_start: string;
         };
+        /** FlowLeader */
+        FlowLeader: {
+            /** Limit Up */
+            limit_up: number;
+            /** Name */
+            name: string;
+            /** Net */
+            net: number;
+            /** Pct */
+            pct: number | null;
+            /** Stocks */
+            stocks: components["schemas"]["FlowStock"][];
+        };
         /** FlowPoint */
         FlowPoint: {
             /**
@@ -1734,6 +1769,63 @@ export interface components {
             main_net: number;
             /** Net */
             net: number | null;
+        };
+        /** FlowSeries */
+        FlowSeries: {
+            /** Amount */
+            amount: number;
+            /** Limit Up */
+            limit_up: number;
+            /** N */
+            n: number;
+            /** Name */
+            name: string;
+            /** Net */
+            net: number;
+            /** Pct */
+            pct: number | null;
+            /** Pct Series */
+            pct_series: (number | null)[];
+            /** Ratio */
+            ratio: number[];
+            /** Series */
+            series: number[];
+        };
+        /** FlowStock */
+        FlowStock: {
+            /** Amount */
+            amount: number;
+            /** Code */
+            code: string;
+            /** Name */
+            name: string | null;
+            /** Net */
+            net: number;
+            /** Net Ratio */
+            net_ratio: number | null;
+            /** Pct */
+            pct: number | null;
+            /** Pre Close */
+            pre_close: number | null;
+            /** Sealed */
+            sealed: boolean;
+            /** Spark */
+            spark: (number | null)[];
+        };
+        /** FlowSummary */
+        FlowSummary: {
+            /** Amount */
+            amount: number;
+            /** Down */
+            down: number;
+            /** Limit Down */
+            limit_down: number;
+            /** Limit Up */
+            limit_up: number;
+            /** Net */
+            net: number;
+            /** Up */
+            up: number;
         };
         /** FreshnessItem */
         FreshnessItem: {
@@ -2511,6 +2603,46 @@ export interface components {
             turnover_rate_f?: number | null;
             /** Vol Ratio */
             vol_ratio?: number | null;
+        };
+        /** SectorFlowData */
+        SectorFlowData: {
+            /** Date */
+            date: string | null;
+            /**
+             * Days
+             * @default []
+             */
+            days: string[];
+            /**
+             * Leaders
+             * @default []
+             */
+            leaders: components["schemas"]["FlowLeader"][];
+            /**
+             * Sectors
+             * @default []
+             */
+            sectors: components["schemas"]["FlowSeries"][];
+            summary?: components["schemas"]["FlowSummary"] | null;
+            /**
+             * T
+             * @default []
+             */
+            t: string[];
+            /** Time */
+            time: string | null;
+            /**
+             * Unchanged
+             * @default false
+             */
+            unchanged: boolean;
+            /** Version */
+            version?: string | null;
+            /**
+             * Warming
+             * @default false
+             */
+            warming: boolean;
         };
         /** ServiceItem */
         ServiceItem: {
@@ -3408,6 +3540,38 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_MarketLiveData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    panorama_sector_flow_api_v1_panorama_sector_flow_get: {
+        parameters: {
+            query?: {
+                day?: string | null;
+                v?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_SectorFlowData_"];
                 };
             };
             /** @description Validation Error */

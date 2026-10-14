@@ -2256,6 +2256,22 @@
         "title": "Envelope[ScreenData]",
         "type": "object"
       },
+      "Envelope_SectorFlowData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/SectorFlowData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[SectorFlowData]",
+        "type": "object"
+      },
       "Envelope_StockProfile_": {
         "properties": {
           "data": {
@@ -3048,6 +3064,49 @@
         "title": "FactorTracking",
         "type": "object"
       },
+      "FlowLeader": {
+        "properties": {
+          "limit_up": {
+            "title": "Limit Up",
+            "type": "integer"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "net": {
+            "title": "Net",
+            "type": "number"
+          },
+          "pct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pct"
+          },
+          "stocks": {
+            "items": {
+              "$ref": "#/components/schemas/FlowStock"
+            },
+            "title": "Stocks",
+            "type": "array"
+          }
+        },
+        "required": [
+          "name",
+          "net",
+          "pct",
+          "limit_up",
+          "stocks"
+        ],
+        "title": "FlowLeader",
+        "type": "object"
+      },
       "FlowPoint": {
         "properties": {
           "date": {
@@ -3077,6 +3136,211 @@
           "net"
         ],
         "title": "FlowPoint",
+        "type": "object"
+      },
+      "FlowSeries": {
+        "properties": {
+          "amount": {
+            "title": "Amount",
+            "type": "number"
+          },
+          "limit_up": {
+            "title": "Limit Up",
+            "type": "integer"
+          },
+          "n": {
+            "title": "N",
+            "type": "integer"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "net": {
+            "title": "Net",
+            "type": "number"
+          },
+          "pct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pct"
+          },
+          "pct_series": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "title": "Pct Series",
+            "type": "array"
+          },
+          "ratio": {
+            "items": {
+              "type": "number"
+            },
+            "title": "Ratio",
+            "type": "array"
+          },
+          "series": {
+            "items": {
+              "type": "number"
+            },
+            "title": "Series",
+            "type": "array"
+          }
+        },
+        "required": [
+          "name",
+          "n",
+          "net",
+          "amount",
+          "pct",
+          "limit_up",
+          "series",
+          "ratio",
+          "pct_series"
+        ],
+        "title": "FlowSeries",
+        "type": "object"
+      },
+      "FlowStock": {
+        "properties": {
+          "amount": {
+            "title": "Amount",
+            "type": "number"
+          },
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "net": {
+            "title": "Net",
+            "type": "number"
+          },
+          "net_ratio": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Net Ratio"
+          },
+          "pct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pct"
+          },
+          "pre_close": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pre Close"
+          },
+          "sealed": {
+            "title": "Sealed",
+            "type": "boolean"
+          },
+          "spark": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "title": "Spark",
+            "type": "array"
+          }
+        },
+        "required": [
+          "code",
+          "name",
+          "pct",
+          "net",
+          "net_ratio",
+          "amount",
+          "sealed",
+          "spark",
+          "pre_close"
+        ],
+        "title": "FlowStock",
+        "type": "object"
+      },
+      "FlowSummary": {
+        "properties": {
+          "amount": {
+            "title": "Amount",
+            "type": "number"
+          },
+          "down": {
+            "title": "Down",
+            "type": "integer"
+          },
+          "limit_down": {
+            "title": "Limit Down",
+            "type": "integer"
+          },
+          "limit_up": {
+            "title": "Limit Up",
+            "type": "integer"
+          },
+          "net": {
+            "title": "Net",
+            "type": "number"
+          },
+          "up": {
+            "title": "Up",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "amount",
+          "net",
+          "up",
+          "down",
+          "limit_up",
+          "limit_down"
+        ],
+        "title": "FlowSummary",
         "type": "object"
       },
       "FreshnessItem": {
@@ -5674,6 +5938,101 @@
         "title": "ScreenRow",
         "type": "object"
       },
+      "SectorFlowData": {
+        "properties": {
+          "date": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Date"
+          },
+          "days": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Days",
+            "type": "array"
+          },
+          "leaders": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/FlowLeader"
+            },
+            "title": "Leaders",
+            "type": "array"
+          },
+          "sectors": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/FlowSeries"
+            },
+            "title": "Sectors",
+            "type": "array"
+          },
+          "summary": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FlowSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "t": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "T",
+            "type": "array"
+          },
+          "time": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Time"
+          },
+          "unchanged": {
+            "default": false,
+            "title": "Unchanged",
+            "type": "boolean"
+          },
+          "version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Version"
+          },
+          "warming": {
+            "default": false,
+            "title": "Warming",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "date",
+          "time"
+        ],
+        "title": "SectorFlowData",
+        "type": "object"
+      },
       "ServiceItem": {
         "properties": {
           "backlog_count": {
@@ -7488,6 +7847,69 @@
           }
         },
         "summary": "市场全景（研究快照，盘中实时）"
+      }
+    },
+    "/api/v1/panorama/sector-flow": {
+      "get": {
+        "operationId": "panorama_sector_flow_api_v1_panorama_sector_flow_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "day",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Day"
+            }
+          },
+          {
+            "in": "query",
+            "name": "v",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "V"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_SectorFlowData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "板块资金流（主动买卖估算，自 09:25 累计）"
       }
     },
     "/api/v1/paper": {
