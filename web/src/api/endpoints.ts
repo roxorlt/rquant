@@ -1,5 +1,6 @@
 /** Every API call the pages make. Types come only from the generated schema. */
 import { useMutation, useQueries, useQueryClient } from "@tanstack/react-query";
+import { useRef } from "react";
 import { ApiError, apiClient, type Schemas } from "./client";
 import { type ServingQueryResult, useServingQuery } from "./useServingQuery";
 
@@ -15,6 +16,8 @@ export type BacktestTrade = Schemas["BacktestTrade"];
 export type AlertItem = Schemas["AlertItem"];
 export type PaperData = Schemas["PaperData"];
 export type CommandReceipt = Schemas["CommandReceipt"];
+export type SectorFlowData = Schemas["SectorFlowData"];
+type SectorFlowEnvelope = Schemas["Envelope_SectorFlowData_"];
 
 function unwrap<T>(data: T | undefined, response: Response): T {
   if (data === undefined) {
@@ -92,6 +95,31 @@ export function useMarketLive(board: string | null): ServingQueryResult<Schemas[
       return unwrap(data, response);
     },
     { refetchInterval: () => (inTradingHours() ? 15_000 : false) },
+  );
+}
+
+/** 板块资金流: polls every 3 s in session; passes the last version so unchanged polls stay tiny. */
+export function useSectorFlow(day: string | null): ServingQueryResult<SectorFlowData> {
+  const last = useRef<SectorFlowEnvelope | null>(null);
+  return useServingQuery(
+    ["sector-flow", day ?? "today"],
+    async () => {
+      const prev = last.current && (!day || last.current.data.date === day) ? last.current : null;
+      const query: { day?: string; v?: string } = {};
+      if (day) query.day = day;
+      if (prev?.data.version) query.v = prev.data.version;
+      const { data, response } = await apiClient().GET("/api/v1/panorama/sector-flow", {
+        params: { query },
+      });
+      const env = unwrap(data, response);
+      if (env.data.unchanged && prev) return prev;
+      if (!env.data.warming) last.current = env;
+      return env;
+    },
+    {
+      refetchInterval: () =>
+        last.current == null ? 2_000 : !day && inTradingHours() ? 3_000 : false,
+    },
   );
 }
 

@@ -10,6 +10,7 @@ export type PageId =
   | "paper"
   | "monitor"
   | "panorama"
+  | "sectorflow"
   | "health"
   | "data"
   | "ops"
@@ -56,6 +57,7 @@ export const PAGES: readonly PageDef[] = [
   { id: "paper", path: "/paper", title: "模拟盘", group: "跟踪与告警" },
   { id: "monitor", path: "/monitor", title: "盯盘与告警", group: "跟踪与告警", phoneTab: "告警" },
   { id: "panorama", path: "/panorama", title: "市场全景", group: "跟踪与告警", phoneTab: "全景" },
+  { id: "sectorflow", path: "/sectorflow", title: "板块资金流", group: "跟踪与告警" },
   { id: "tasks", path: "/tasks", title: "任务与调度", group: "运维" },
   { id: "health", path: "/health", title: "系统健康", group: "运维", phoneTab: "健康" },
   { id: "ops", path: "/ops", title: "操作记录", group: "运维" },
