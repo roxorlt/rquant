@@ -1,0 +1,10 @@
+[Unit]
+Description=竞价选股 watchlist paper ledger Mon-Fri 21:10 (after daily bars land)
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 21:10:00
+Persistent=true
+Unit=rquant-auction-paper.service
+
+[Install]
+WantedBy=timers.target

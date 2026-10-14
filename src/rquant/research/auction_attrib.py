@@ -271,9 +271,12 @@ def main(argv: list[str] | None = None) -> int:
     log.info("attribution %s: %s", day, pool["attribution"]["text"])
     # 2026-10-14: the pool is a watchlist now, not a buy signal -> its push is paused
     # unless AUCTION_POOL_PUSH=1 (or --force-push).
-    paused = os.environ.get("AUCTION_POOL_PUSH", "0") != "1" and not a.force_push
+    from rquant.research.promotion_gate import gate_passed
+
+    paused = not a.force_push and (os.environ.get("AUCTION_POOL_PUSH", "0") != "1"
+                                   or not gate_passed(root, "auction-ths"))
     if paused:
-        log.info("auction-pick push paused (watchlist mode; set AUCTION_POOL_PUSH=1)")
+        log.info("auction-pick push paused (watchlist; needs AUCTION_POOL_PUSH=1 + gate)")
     if not a.no_push and not paused and (a.force_push or not pool.get("pushed_at")):
         title, body = format_push(pool)
         if push(title, body):

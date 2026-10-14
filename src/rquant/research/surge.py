@@ -209,7 +209,7 @@ class Pusher:
         """竞价选股 pool codes for today: pushed first, marked ★ (never raises).
 
         Paused since 2026-10-14 (pool is a watchlist, not a buy signal) unless
-        AUCTION_POOL_PUSH=1; the surge alerts themselves are unaffected."""
+        AUCTION_POOL_PUSH=1 and the promotion gate passed; surge alerts are unaffected."""
         if os.environ.get("AUCTION_POOL_PUSH", "0") != "1":
             return set()
         try:
@@ -217,7 +217,10 @@ class Pusher:
             from zoneinfo import ZoneInfo
 
             from rquant.research.auction_pool import priority_codes, research_root
+            from rquant.research.promotion_gate import gate_passed
 
+            if not gate_passed(research_root(), "auction-ths"):
+                return set()
             return set(priority_codes(research_root(), _dt.now(ZoneInfo("Asia/Shanghai")).date()))
         except Exception:  # noqa: BLE001
             return set()
