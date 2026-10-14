@@ -38,7 +38,6 @@ from rquant.web.health_layers import build_layers
 from rquant.web.intraday import IntradayData, load_intraday
 from rquant.web.macro import MacroData, load_macro, load_summary
 from rquant.web.market_live import MarketLiveData, load_market_live
-from rquant.web.sector_flow import SectorFlowData, load_sector_flow
 from rquant.web.models import (
     AckAlertRequest,
     AddWatchRequest,
@@ -102,6 +101,7 @@ from rquant.web.models import (
 )
 from rquant.web.overfit_stats import overfit_stats, sharpe_per_period
 from rquant.web.pool_live import PoolLiveData, load_pool_live
+from rquant.web.sector_flow import SectorFlowData, load_sector_flow
 from rquant.web.source import Source, SourceUnavailableError, table_missing
 from rquant.web.stocks import CODE_RE, StockProfile, enrich, load_profile, market
 

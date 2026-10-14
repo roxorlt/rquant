@@ -74,7 +74,7 @@ class _Day:
     def _ensure(self, codes: np.ndarray, names: np.ndarray) -> np.ndarray:
         new = [c for c in dict.fromkeys(codes) if c not in self.code_ix]
         if new:
-            nm = dict(zip(codes, names))
+            nm = dict(zip(codes, names, strict=True))
             for c in new:
                 self.code_ix[c] = len(self.codes)
                 self.codes.append(c)
