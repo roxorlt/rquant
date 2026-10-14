@@ -11,6 +11,7 @@ import { PHONE_QUERY, useMedia } from "../panorama/useMedia";
 import { FlowChart } from "./FlowChart";
 import {
   colorMap,
+  DEFAULT_TOP_N,
   defaultSelection,
   fmtAmountYi,
   fmtPct,
@@ -95,7 +96,7 @@ function Body({
   const leaders = cursor == null ? data.leaders : (asOf.data ?? data.leaders);
 
   const byName = useMemo(() => new Map(data.sectors.map((s) => [s.name, s])), [data.sectors]);
-  const sel = picked ?? defaultSelection(data.sectors, phone ? 3 : 5);
+  const sel = picked ?? defaultSelection(data.sectors, DEFAULT_TOP_N);
   const shown = sel.map((n) => byName.get(n)).filter((s): s is Sector => !!s);
   const colors = useMemo(() => colorMap(shown), [shown]);
   const toggle = (name: string) => {

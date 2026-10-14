@@ -1,5 +1,5 @@
 import { type PointerEvent, useEffect, useMemo, useRef, useState } from "react";
-import { fmtValue, type Mode, type Sector, SLOTS, seriesOf } from "./model";
+import { fmtValue, layoutEndLabels, type Mode, type Sector, SLOTS, seriesOf } from "./model";
 
 const AUCTION_W = 8; // the 09:25 auction gets its own band, ~8 minutes wide
 
@@ -89,23 +89,19 @@ export function FlowChart({ t, shown, colors, mode, upto, phone, focus, onFocus 
   };
 
   // end labels with collision avoidance
-  const gap = phone ? 13 : 15;
+  const gap = phone ? 12 : 15;
   const labs = shown
     .map((s, k) => ({ s, v: lastVal(vals[k] ?? []), y: Y(lastVal(vals[k] ?? [])) }))
     .sort((a, b) => a.y - b.y);
-  for (let i = 1; i < labs.length; i++) {
-    const a = labs[i - 1];
-    const b = labs[i];
-    if (a && b && b.y - a.y < gap) b.y = a.y + gap;
-  }
-  const lastLab = labs[labs.length - 1];
-  const over = lastLab ? lastLab.y - (m.t + ih) : 0;
-  if (over > 0) for (const l of labs) l.y -= over;
-  for (let i = labs.length - 2; i >= 0; i--) {
-    const a = labs[i];
-    const b = labs[i + 1];
-    if (a && b && b.y - a.y < gap) a.y = b.y - gap;
-  }
+  const laid = layoutEndLabels(
+    labs.map((l) => l.y),
+    gap,
+    m.t + 4,
+    m.t + ih,
+  );
+  labs.forEach((l, i) => {
+    l.y = laid[i] ?? l.y;
+  });
 
   const slotAt = (clientX: number): number => {
     const rect = box.current?.getBoundingClientRect();
