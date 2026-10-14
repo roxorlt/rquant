@@ -14,8 +14,17 @@ function fill(p: number | null | undefined): string {
 }
 
 /** Sector treemap: area = turnover, colour = median % change. */
-export function Heatmap({ boards }: { boards: readonly Board[] }) {
-  const ref = useRef<HTMLDivElement>(null);
+export function Heatmap({
+  boards,
+  onSelect,
+  selected,
+}: {
+  boards: readonly Board[];
+  /** When given, tiles become buttons that open the board's detail. */
+  onSelect?: (board: Board) => void;
+  selected?: string | null;
+}) {
+  const ref = useRef<HTMLElement>(null);
   const [w, setW] = useState(900);
   useEffect(() => {
     const el = ref.current;
@@ -37,7 +46,7 @@ export function Heatmap({ boards }: { boards: readonly Board[] }) {
   );
   if (!items.length) return <p className="hint pad">没有成交额数据，无法画热力图。</p>;
   return (
-    <div ref={ref} className="heatmap" style={{ height: h }} role="img" aria-label="板块热力图">
+    <section ref={ref} className="heatmap" style={{ height: h }} aria-label="板块热力图">
       {items.map((b, i) => {
         const r = rects[i];
         if (!r) return null;
@@ -45,7 +54,22 @@ export function Heatmap({ boards }: { boards: readonly Board[] }) {
         return (
           <div
             key={`${b.system}:${b.board_code}`}
-            className="hm-cell"
+            className={`hm-cell${onSelect ? " hm-tap" : ""}`}
+            data-selected={selected === b.board_code || undefined}
+            {...(onSelect
+              ? {
+                  role: "button",
+                  tabIndex: 0,
+                  "aria-label": `${b.board_name} ${b.pct_chg_median?.toFixed(2) ?? "—"}%`,
+                  onClick: () => onSelect(b),
+                  onKeyDown: (e: React.KeyboardEvent) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      onSelect(b);
+                    }
+                  },
+                }
+              : {})}
             style={{
               left: r.x,
               top: r.y,
@@ -68,6 +92,6 @@ export function Heatmap({ boards }: { boards: readonly Board[] }) {
           </div>
         );
       })}
-    </div>
+    </section>
   );
 }

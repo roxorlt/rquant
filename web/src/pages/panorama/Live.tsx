@@ -1,19 +1,38 @@
-import { useState } from "react";
+import { useCallback } from "react";
+import { useLocation, useNavigate, useSearchParams } from "react-router";
 import { inTradingHours, useMarketLive } from "@/api/endpoints";
 import { TimeChart } from "@/charts/Chart";
 import { formatAmount, formatCount } from "@/format/number";
 import { DataTable } from "@/table/DataTable";
 import { ChangeText, KpiStrip, Panel } from "@/ui";
-import { StockLink } from "@/ui/StockLink";
 import { QueryView } from "../shared";
+import { BoardDetail } from "./BoardDetail";
 import { Heatmap } from "./Heatmap";
+import { PHONE_QUERY, useMedia } from "./useMedia";
 
 const pct = (v: number) => `${(v * 100).toFixed(0)}%`;
 
 /** Live 市场全景 from the research 3-second snapshots (rebuild of the old Streamlit page). */
 export function LivePanorama() {
-  const [board, setBoard] = useState<string | null>(null);
-  const query = useMarketLive(board);
+  // The open board lives in the URL (?board=…) as its own history entry, so the iOS
+  // back-swipe / browser back closes the detail instead of leaving the page.
+  const [params, setParams] = useSearchParams();
+  const board = params.get("board");
+  const navigate = useNavigate();
+  const location = useLocation();
+  const phone = useMedia(PHONE_QUERY);
+  const open = useCallback(
+    (name: string) => {
+      if (name === board) return;
+      setParams({ board: name }, { replace: board != null, state: { sheet: true } });
+    },
+    [board, setParams],
+  );
+  const close = useCallback(() => {
+    if ((location.state as { sheet?: boolean } | null)?.sheet) navigate(-1);
+    else setParams({}, { replace: true });
+  }, [location.state, navigate, setParams]);
+  const query = useMarketLive(null);
   return (
     <QueryView query={query}>
       {(data) => {
@@ -23,7 +42,6 @@ export function LivePanorama() {
         const c = data.curve;
         const live = inTradingHours();
         const boards = data.boards;
-        const selected = data.board ?? board;
         return (
           <>
             <KpiStrip
@@ -97,10 +115,12 @@ export function LivePanorama() {
               </Panel>
               <Panel
                 title="行业热力图"
-                sub="面积 = 成交额，颜色 = 行业内个股涨跌中位数（±3% 封顶）"
+                sub={`面积 = 成交额，颜色 = 行业内个股涨跌中位数（±3% 封顶）· ${phone ? "轻点" : "点击"}色块看成分股`}
                 flush
               >
                 <Heatmap
+                  selected={board}
+                  onSelect={(b) => open(b.board_name)}
                   boards={boards.map((b) => ({
                     system: "行业",
                     board_code: b.name,
@@ -114,14 +134,18 @@ export function LivePanorama() {
                   }))}
                 />
               </Panel>
-              <Panel title={`行业 · ${boards.length}`} sub="点一行看右侧成分股" flush>
+              <Panel
+                title={`行业 · ${boards.length}`}
+                sub={phone ? "轻点一行看成分股" : "点一行看成分股"}
+                flush
+              >
                 <DataTable
                   label="行业"
                   rows={boards}
                   rowKey={(r) => r.name}
                   height={420}
-                  onSelect={(r) => setBoard(r.name)}
-                  selectedKey={selected}
+                  onSelect={(r) => open(r.name)}
+                  selectedKey={board}
                   initialSort={{ id: "amount", desc: true }}
                   columns={[
                     { id: "name", header: "行业", value: (r) => r.name },
@@ -161,61 +185,8 @@ export function LivePanorama() {
                   ]}
                 />
               </Panel>
-              <Panel
-                title={`${selected ?? ""} 成分 · ${data.members.length}`}
-                sub="按涨跌幅排序"
-                flush
-              >
-                <DataTable
-                  label="成分股"
-                  rows={data.members}
-                  rowKey={(r) => r.code}
-                  height={420}
-                  emptyText="在左侧选一个行业"
-                  initialSort={{ id: "pct", desc: true }}
-                  columns={[
-                    {
-                      id: "code",
-                      header: "代码",
-                      value: (r) => r.code,
-                      cell: (r) => <StockLink code={r.code} />,
-                    },
-                    { id: "name", header: "名称", value: (r) => r.name ?? null },
-                    {
-                      id: "pct",
-                      header: "涨跌",
-                      numeric: true,
-                      value: (r) => r.pct ?? null,
-                      cell: (r) => <ChangeText value={r.pct ?? null} />,
-                    },
-                    {
-                      id: "amount",
-                      header: "成交额",
-                      numeric: true,
-                      value: (r) => r.amount ?? null,
-                      cell: (r) => formatAmount(r.amount),
-                    },
-                    {
-                      id: "state",
-                      header: "状态",
-                      value: (r) => r.state ?? null,
-                      cell: (r) =>
-                        r.state ? (
-                          <span
-                            className={
-                              r.state === "跌停" ? "down" : r.state === "涨停" ? "up" : "muted"
-                            }
-                          >
-                            {r.state}
-                          </span>
-                        ) : (
-                          ""
-                        ),
-                    },
-                  ]}
-                />
-              </Panel>
             </div>
+            <BoardDetail board={board} boards={boards} phone={phone} onClose={close} />
           </>
         );
       }}
