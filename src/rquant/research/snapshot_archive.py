@@ -164,7 +164,8 @@ def archive_day(client: R2, d: Path) -> dict[str, Any]:
         tgz = Path(td) / f"{d.name}.tar.gz"
         with tarfile.open(tgz, "w:gz", compresslevel=6) as tar:
             for p in sorted(d.rglob("*")):
-                if p.name != MARKER:
+                # stream/ = transient 3s delta rounds (already inside the 30s shards)
+                if p.name != MARKER and p.relative_to(d).parts[0] != "stream":
                     tar.add(p, arcname=str(Path(d.name) / p.relative_to(d)), recursive=False)
         sha, size = _sha256_file(tgz), tgz.stat().st_size
         client.put_file(key, tgz, sha)

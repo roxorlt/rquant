@@ -49,3 +49,158 @@ def test_leaders_as_of_minute(tmp_path: Path) -> None:
     assert lead and lead[0].name == "银行"
     assert lead[0].stocks[0].net == 1e8
     assert len(lead[0].stocks[0].spark) == 1
+
+
+# ----------------------------------------------------------------- 3s delta stream overlay
+import os  # noqa: E402
+import time  # noqa: E402
+
+import pytest  # noqa: E402
+
+from rquant.research import snapshots as snap  # noqa: E402
+
+DAY = "2026-10-15"
+
+
+def _clear() -> None:
+    import threading
+
+    for t in threading.enumerate():  # background refreshes started by load_sector_flow
+        if t.name.startswith("sector-flow-2"):
+            t.join(10)
+    for c in (sf._DAYS, sf._RESULT, sf._FOOTER, sf._SECT, sf._CIRC):
+        c.clear()
+
+
+@pytest.fixture(autouse=True)
+def _fresh_caches():
+    _clear()
+    yield
+    _clear()
+
+
+def _market(root: Path) -> None:
+    con = duckdb.connect(str(root / "market.duckdb"))
+    con.execute("CREATE TABLE stock_basic (ts_code VARCHAR, industry VARCHAR)")
+    con.execute("INSERT INTO stock_basic VALUES ('000001.SZ','银行'), ('000002.SZ','地产'),"
+                "('600000.SH','银行')")
+    con.execute("CREATE TABLE daily_basic (ts_code VARCHAR, trade_date DATE, circ_mv DOUBLE)")
+    con.close()
+
+
+def _round(i: int) -> pd.DataFrame:
+    """Collector round i (3 s apart from 09:25:03): every code trades, alternating up/down."""
+    sec = 25 * 60 + 3 + 3 * i
+    t = f"09:{sec // 60:02d}:{sec % 60:02d}"
+    rows = []
+    for k, code in enumerate(("000001.SZ", "000002.SZ", "600000.SH")):
+        px = 10.0 + (0.01 * ((i + k) % 3))
+        rows.append({"ts_code": code, "name": code[:6], "date": "20261015", "time": t,
+                     "price": px, "pre_close": 10.0, "amount": 1e6 * (i + 1) * (k + 1),
+                     "b1_p": px - 0.01, "a1_p": px, "volume": 1e5 * (i + 1)})
+    fr = snap._normalize(pd.DataFrame(rows), "ts_k")
+    fr["local_ts"] = pd.Timestamp("2026-10-15 09:25:00") + pd.Timedelta(seconds=3 * i)
+    return fr
+
+
+def _nets(out) -> dict[str, float]:
+    return {s.name: round(s.net, 4) for s in out.sectors}
+
+
+def _reference(tmp: Path, rounds: list[pd.DataFrame]) -> dict[str, float]:
+    """Everything in one official shard, no stream."""
+    tmp.mkdir(parents=True)
+    _market(tmp)
+    snap.write_part(tmp / "snapshots" / DAY, rounds)
+    for c in (sf._DAYS, sf._RESULT):
+        c.clear()
+    out = sf._refresh(tmp, DAY)
+    for c in (sf._DAYS, sf._RESULT):
+        c.clear()
+    return _nets(out)
+
+
+def test_deltas_update_every_round_and_reconcile_without_double_count(tmp_path: Path) -> None:
+    frames = [_round(i) for i in range(9)]
+    refs = [_reference(tmp_path / f"ref{i}", frames[: i + 1]) for i in range(9)]
+    root = tmp_path / "live"
+    root.mkdir()
+    _market(root)
+    d = root / "snapshots" / DAY
+    stream = snap.DeltaStream(d, run="r1")
+    buf: list[pd.DataFrame] = []
+    versions = []
+    for i, fr in enumerate(frames):  # live state is folded incrementally across refreshes
+        buf.append(fr)
+        assert stream.write(fr) == i + 1
+        if i in (3, 7):  # a 30 s shard lands (covers seq 1..i+1), its deltas are dropped
+            meta = stream.meta()
+            snap.write_part(d, buf, meta)
+            buf = []
+            stream.shard_landed(meta["seq"])
+        out = sf._refresh(root, DAY)
+        assert out is not None
+        versions.append(out.version)
+        assert _nets(out) == refs[i], f"round {i}"
+        assert out.time == fr["time"].iloc[0]
+    assert len(set(versions)) == len(versions)  # a new data version every round
+    assert versions[3] == "1-09:25:12" and versions[4].startswith("1+r1.5-")
+    assert versions[8].startswith("2+r1.9-")
+    assert sorted(p.name for p in (d / "stream").iterdir()) == ["d-r1-00000009.parquet"]
+    assert len(sf._DAYS[DAY].keys) == 2  # official state holds only the two shards
+    stream.close()
+    assert not (d / "stream").exists()
+
+
+def test_landed_shard_drops_lingering_deltas(tmp_path: Path) -> None:
+    """Race: the shard is on disk but the collector has not deleted its deltas yet."""
+    _market(tmp_path)
+    d = tmp_path / "snapshots" / DAY
+    stream = snap.DeltaStream(d, run="r1")
+    frames = [_round(i) for i in range(4)]
+    for fr in frames:
+        stream.write(fr)
+    snap.write_part(d, frames[:3], {"run": "r1", "seq": 3})  # deltas 1-3 still present
+    out = sf._refresh(tmp_path, DAY)
+    assert _nets(out) == _reference(tmp_path / "ref", frames)
+    assert out.version.startswith("1+r1.4-")
+
+
+def test_deltas_before_first_shard_and_stale_ignored(tmp_path: Path) -> None:
+    _market(tmp_path)
+    d = tmp_path / "snapshots" / DAY
+    stream = snap.DeltaStream(d, run="r1")
+    stream.write(_round(0))
+    out = sf._refresh(tmp_path, DAY)
+    assert out is not None and out.t == ["09:25"] and out.version.startswith("0+r1.1-")
+    old = time.time() - sf.DELTA_MAX_AGE - 10
+    for p in (d / "stream").iterdir():
+        os.utime(p, (old, old))
+    sf._RESULT.clear()
+    assert sf._refresh(tmp_path, DAY) is None  # collector stalled: provisional data expires
+
+
+def test_vanished_delta_refolds_shard(tmp_path: Path, monkeypatch) -> None:
+    """Shard lands and its deltas are deleted between listing and reading."""
+    _market(tmp_path)
+    d = tmp_path / "snapshots" / DAY
+    stream = snap.DeltaStream(d, run="r1")
+    frames = [_round(i) for i in range(3)]
+    for fr in frames:
+        stream.write(fr)
+    real = sf._update
+    calls = {"n": 0}
+
+    def update(root, day):
+        calls["n"] += 1
+        if calls["n"] == 2:  # after the first fold: shard lands, deltas removed
+            snap.write_part(d, frames, stream.meta())
+            stream.shard_landed(3)
+        return real(root, day)
+
+    monkeypatch.setattr(sf, "_update", update)
+    sf._refresh(tmp_path, DAY)  # first call folds nothing official, overlay from deltas
+    sf._RESULT.clear()
+    out = sf._refresh(tmp_path, DAY)
+    assert _nets(out) == _reference(tmp_path / "ref", frames)
+    assert out.version.startswith("1-")

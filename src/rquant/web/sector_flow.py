@@ -9,11 +9,22 @@ as 市场全景). This is a Lee-Ready style *estimate*, not exchange-reported or
 Incremental: one state per day; each new parquet chunk is folded in once (carry = last row per
 code), keeping only dense per-sector-minute sums, per-code cumulative net and a float32
 per-code-minute price matrix (~6 MB). Nothing re-reads the whole day per request.
+
+3-second updates: the collector also writes each ~3s round as a delta file under
+``snapshots/<day>/stream/`` (``rquant.research.snapshots.DeltaStream``). The official state is
+folded only from the 30s shards (source of truth). On refresh, the pending deltas (rounds whose
+seq is above the latest *folded* shard's recorded ``{"run","seq"}``) are folded onto a throwaway
+clone of the official state, so the served result moves every round; when the covering shard
+lands those deltas are dropped by seq and the same rows enter the official state exactly once.
 """
 
 from __future__ import annotations
 
+import json
+import os
+import re
 import threading
+import time
 from collections.abc import Callable
 from datetime import date as _date
 from pathlib import Path
@@ -75,6 +86,20 @@ class _Day:
         self.carry: pd.DataFrame | None = None
         self.last_time: str | None = None
         self.max_slot = -1
+        self.landed: dict[str, int] = {}  # collector run -> max delta seq inside folded shards
+
+    def clone(self) -> _Day:
+        """A copy for folding provisional deltas (the official state is never touched)."""
+        c = _Day.__new__(_Day)
+        c.lock = threading.Lock()
+        c.keys = list(self.keys)
+        c.code_ix, c.codes, c.names = dict(self.code_ix), list(self.codes), list(self.names)
+        for a in ("pre", "net", "amt", "px", "cnm", "am", "sec_of", "sec_min", "sec_amt"):
+            setattr(c, a, getattr(self, a).copy())
+        c.sector_names, c.sec_ix, c.sectors = self.sector_names, self.sec_ix, self.sectors
+        c.carry, c.last_time, c.max_slot = self.carry, self.last_time, self.max_slot
+        c.landed = dict(self.landed)
+        return c
 
     def _ensure(self, codes: np.ndarray, names: np.ndarray) -> np.ndarray:
         new = [c for c in dict.fromkeys(codes) if c not in self.code_ix]
@@ -241,6 +266,31 @@ def _files(d: Path) -> list[Path]:
     return files
 
 
+_FOOTER: dict[str, tuple[float, int, tuple[str, int] | None]] = {}
+_STREAM_KEY = b"rquant_stream"
+
+
+def _footer(f: Path) -> tuple[float, int, tuple[str, int] | None]:
+    """(mtime, row groups, (run, seq) the shard covers). Parts are immutable: cached by mtime."""
+    mt = f.stat().st_mtime
+    hit = _FOOTER.get(str(f))
+    if hit and hit[0] == mt:
+        return hit
+    md = pq.read_metadata(f)
+    cover = None
+    raw = (md.metadata or {}).get(_STREAM_KEY)
+    if raw:
+        try:
+            j = json.loads(raw)
+            cover = (str(j["run"]), int(j["seq"]))
+        except (ValueError, KeyError, TypeError):
+            cover = None
+    if len(_FOOTER) > 5000:
+        _FOOTER.clear()
+    _FOOTER[str(f)] = out = (mt, md.num_row_groups, cover)
+    return out
+
+
 def _update(root: Path, day: str) -> _Day | None:
     sectors = _industries(root)
     if sectors is None:
@@ -253,11 +303,11 @@ def _update(root: Path, day: str) -> _Day | None:
             st = _DAYS[day] = _Day(sectors)
     with st.lock:
         keys: list[tuple] = []
+        covers: dict[str, tuple[str, int] | None] = {}
         files = _files(root / "snapshots" / day)
         for f in files:
             try:
-                mt = f.stat().st_mtime
-                n = pq.ParquetFile(f).num_row_groups
+                mt, n, covers[str(f)] = _footer(f)
             except (OSError, ValueError):
                 break
             keys += [(str(f), mt, i) for i in range(n)]
@@ -277,6 +327,9 @@ def _update(root: Path, day: str) -> _Day | None:
                     break  # part being written/renamed; retry next call
                 st.fold(df)
                 st.keys.append(k)
+                cov = covers.get(k[0])
+                if cov and cov[1] > st.landed.get(cov[0], 0):
+                    st.landed[cov[0]] = cov[1]
         finally:
             if release:
                 st.lock.release()
@@ -295,7 +348,7 @@ def _limit_up(codes: list[str], names: list, pre: np.ndarray) -> tuple[np.ndarra
     return np.round(pre * (1 + lp) + 1e-9, 2), np.round(pre * (1 - lp) + 1e-9, 2)
 
 
-def _compute(st: _Day, root: Path, day: str) -> SectorFlowData:
+def _compute(st: _Day, root: Path, day: str, version: str | None = None) -> SectorFlowData:
     upto = st.max_slot
     nsec = len(st.sector_names)
     cum = np.cumsum(st.sec_min[:, : upto + 1], axis=1)
@@ -332,7 +385,8 @@ def _compute(st: _Day, root: Path, day: str) -> SectorFlowData:
         series=np.round(cum[i] / 1e8, 2).tolist(), ratio=np.round(ratio[i], 2).tolist(),
         pct_series=[r(v) for v in smean[i]]) for i in order if counts[i]]
     leaders = leaders_at(st, root, day, upto)
-    return SectorFlowData(date=day, time=st.last_time, version=f"{len(st.keys)}-{st.last_time}",
+    return SectorFlowData(date=day, time=st.last_time,
+                          version=version or f"{len(st.keys)}-{st.last_time}",
                           t=MINUTES[: upto + 1], summary=summary, sectors=sectors,
                           leaders=leaders)
 
@@ -390,16 +444,88 @@ def load_leaders_at(root: Path, day: str, m: int) -> list[FlowLeader]:
         return leaders_at(st, root, day, m)
 
 
+DELTA_RE = re.compile(r"^d-([0-9A-Za-z]+)-(\d{1,12})\.parquet$")
+DELTA_MAX_AGE = 300.0  # s: never show provisional rounds older than this (collector stalled)
+
+
+def _deltas(root: Path, day: str) -> list[tuple[str, int, Path]]:
+    """Delta files present now: (run, seq, path), oldest first."""
+    sd = root / "snapshots" / day / "stream"
+    if not sd.is_dir():
+        return []
+    out = []
+    cutoff = time.time() - DELTA_MAX_AGE
+    try:
+        entries = list(os.scandir(sd))
+    except OSError:
+        return []
+    for e in entries:
+        m = DELTA_RE.match(e.name)
+        if not m:
+            continue
+        try:
+            if e.stat().st_mtime < cutoff:
+                continue
+        except OSError:
+            continue
+        out.append((m.group(1), int(m.group(2)), Path(e.path)))
+    out.sort(key=lambda r: (r[0], r[1]))
+    return out
+
+
+def _pending(st: _Day, found: list[tuple[str, int, Path]]) -> list[tuple[str, int, Path]]:
+    """Reconciliation: drop rounds already inside a folded shard (seq <= landed[run])."""
+    return [r for r in found if r[1] > st.landed.get(r[0], 0)]
+
+
+def _read_deltas(pend: list[tuple[str, int, Path]]) -> pd.DataFrame | None:
+    """None when a delta vanished mid-read (its shard just landed -> refold first)."""
+    frames = []
+    for _, _, p in pend:
+        try:
+            frames.append(pq.read_table(p, columns=_COLS).to_pandas())
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError):
+            continue  # unreadable round: the shard will carry it
+    frames = [f for f in frames if len(f)]
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=_COLS)
+
+
 def _refresh(root: Path, day: str) -> SectorFlowData | None:
-    st = _update(root, day)
-    if st is None or st.max_slot < 0:
-        return None
-    sig = (len(st.keys), st.last_time)
-    hit = _RESULT.get(day)
-    if hit and hit[0] == sig:
-        return hit[1]
-    with st.lock:
-        out = _compute(st, root, day)
+    found = _deltas(root, day)  # listed before folding: a shard landing in between is caught
+    for _ in range(2):
+        st = _update(root, day)
+        if st is None:
+            return None
+        pend = _pending(st, found)
+        extra = (pend[-1][0], pend[-1][1], len(pend)) if pend else None
+        sig = (len(st.keys), st.last_time, extra)
+        hit = _RESULT.get(day)
+        if hit and hit[0] == sig:
+            return hit[1]
+        df = _read_deltas(pend) if pend else None
+        if pend and df is None:  # a delta vanished: its shard landed after _update -> refold
+            found = _deltas(root, day)
+            continue
+        break
+    else:
+        pend, extra, df = [], None, None
+        sig = (len(st.keys), st.last_time, None)
+    version = f"{len(st.keys)}-{st.last_time}"
+    if pend and df is not None:
+        with st.lock:
+            view = st.clone()
+        view.fold(df)
+        if view.max_slot < 0:
+            return None
+        version = f"{len(st.keys)}+{extra[0]}.{extra[1]}-{view.last_time}"
+        out = _compute(view, root, day, version)
+    else:
+        if st.max_slot < 0:
+            return None
+        with st.lock:
+            out = _compute(st, root, day, version)
     with _GLOCK:
         if len(_RESULT) > 4:
             _RESULT.clear()
@@ -434,12 +560,12 @@ def _in_session() -> bool:
 
 
 def start_warmer(root: Path, latest: Callable[[], str | None]) -> None:
-    """Keep today's state folded every 3 s in session so requests never block on I/O."""
+    """Keep today's state (shards + pending 3s deltas) folded every 1.5 s in session so requests
+    never block on I/O and each ~3s collector round shows up within one poll."""
     if "w" in _WARMER and _WARMER["w"].is_alive():
         return
 
     def loop() -> None:
-        import time
         while True:
             try:
                 d = latest()
@@ -447,7 +573,7 @@ def start_warmer(root: Path, latest: Callable[[], str | None]) -> None:
                     _refresh(root, d)
             except Exception:  # noqa: BLE001 - never let the warmer die
                 pass
-            time.sleep(3 if _in_session() else 60)
+            time.sleep(1.5 if _in_session() else 60)
 
     _WARMER["w"] = threading.Thread(target=loop, name="sector-flow-warmer", daemon=True)
     _WARMER["w"].start()

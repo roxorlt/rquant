@@ -6,6 +6,12 @@
 
 ### Added
 
+- **板块资金流真 3 秒更新**：采集器每轮（~3s）把去重后的行情写成 `snapshots/<day>/stream/d-<run>-<seq>.parquet`
+  （原子写），30 秒正式分片仍是唯一真相并在 parquet 元数据里记下所含最后一轮 `seq`；web 只把 seq 大于已折叠分片的
+  delta 叠在官方状态的临时副本上计算，分片落盘即按 seq 丢弃对应 delta，不会重复计数。采集器在分片落盘后删对应 delta、
+  启动时清空、收盘停采时删除目录；超过 300 秒的 delta 忽略；`SNAPSHOT_DELTA=0` 可关。web 预热 1.5 秒一次、分片 footer
+  按 mtime 缓存。收盘后重启采集器只做收盘后步骤（不重写 universe/分片，已有 ticks.parquet 不重拉）。
+
 - **路线 A 单日回放工具 `scripts/route_a_day_replay.py`（包 AH）**：在一个 0700 的沙箱里，用真实的 role 入口
   （`runtime_service_main.run` + wrapper 自己派生的 argv 与环境）把一个录下的交易日从 09:15 走到收盘：参考批次与
   竞价批次按原样重新封签，分钟线来自副本里当天的 `minute_bar`（缺的代码可用 `--tushare` 补），时钟由回放推进，
