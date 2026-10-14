@@ -23,10 +23,14 @@ export default function PoolsPage() {
   const auctionPool = query.data?.pools.find((p) => p.name === AUCTION_POOL);
   const auctionDate = auctionPool?.members[0]?.detail?.date;
   const nWatch = auctionPool?.members.filter((m) => m.detail?.stage === "pick").length ?? 0;
-  const nCand = auctionPool?.members.length ?? 0;
+  const nCandRaw = auctionPool?.members[0]?.detail?.n_candidates;
+  const nCand = typeof nCandRaw === "number" ? nCandRaw : null;
+  const lockedAt = auctionPool?.members[0]?.detail?.locked_at;
   const headerNote =
     isAuction && auctionPool
-      ? `${typeof auctionDate === "string" ? auctionDate : ""} · 候选 ${nCand} / 观察 ${nWatch}`
+      ? `${typeof auctionDate === "string" ? auctionDate : ""} · 观察 ${nWatch}${
+          typeof lockedAt === "string" ? " · 09:30 已锁定" : ""
+        }${nCand !== null ? `（候选 ${nCand}）` : ""}`
       : (query.data?.trade_date ?? undefined);
   return (
     <>

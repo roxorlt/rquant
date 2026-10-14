@@ -1,8 +1,12 @@
 [Unit]
-Description=竞价选股 pool pick Mon-Fri 09:26:30
+Description=竞价选股 pool pick Mon-Fri 09:26:30 + re-rank 09:27:30/09:28:30/09:29:30, lock 09:30:05
 
 [Timer]
 OnCalendar=Mon..Fri *-*-* 09:26:30
+OnCalendar=Mon..Fri *-*-* 09:27:30
+OnCalendar=Mon..Fri *-*-* 09:28:30
+OnCalendar=Mon..Fri *-*-* 09:29:30
+OnCalendar=Mon..Fri *-*-* 09:30:05
 AccuracySec=1s
 Persistent=false
 Unit=rquant-auction-pool-pick.service
