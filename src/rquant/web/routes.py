@@ -38,6 +38,7 @@ from rquant.web.health_layers import build_layers
 from rquant.web.intraday import IntradayData, load_intraday
 from rquant.web.macro import MacroData, load_macro, load_summary
 from rquant.web.market_live import MarketLiveData, load_market_live
+from rquant.web.sector_flow import SectorFlowData, load_sector_flow
 from rquant.web.models import (
     AckAlertRequest,
     AddWatchRequest,
@@ -367,6 +368,21 @@ def panorama_live(request: Request, source: SourceDep, day: date | None = None,
         return _envelope(source, MarketLiveData(date=None, time=None, pulse=None, curve=None,
                                                 boards=[], members=[], board=None))
     return _envelope(source, load_market_live(root, d, board))
+
+
+@router.get("/panorama/sector-flow", response_model=Envelope[SectorFlowData],
+            summary="板块资金流（主动买卖估算，自 09:25 累计）")
+def panorama_sector_flow(request: Request, source: SourceDep,
+                         day: date | None = None) -> Envelope[SectorFlowData]:
+    root = Path(_research_root(request) or research_root())
+    snaps = root / "snapshots"
+    days = (sorted((p.name for p in snaps.glob("20??-??-??") if p.is_dir()), reverse=True)
+            if snaps.is_dir() else [])
+    d = day.isoformat() if day else (days[0] if days else None)
+    if d is None:
+        return _envelope(source, SectorFlowData(date=None, time=None, t=[], sectors=[],
+                                                leaders=[], days=[]))
+    return _envelope(source, load_sector_flow(root, d, days[:30]))
 
 
 @router.get("/pools/auction/live", response_model=Envelope[PoolLiveData],
