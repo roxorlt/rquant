@@ -102,6 +102,21 @@ Chain: `rquant-runtime-reference-slow-publisher@svc-62c9…` writes
   `RQUANT_SERVING_ROOT=/home/lighthouse/rquant/data/runtime/serving`, drop `RQUANT_WEB_NOTICE`,
   `sudo systemctl restart rquant-web`. Rollback: restore the backup env (replay path) and restart.
 
+## 板块资金流 3-second delta stream
+
+The collector writes every non-empty ~3s round as `snapshots/YYYY-MM-DD/stream/d-<run>-<seq>.parquet`
+(atomic tmp+rename; columns ts_code/name/time/price/pre_close/amount/b1_p/a1_p, ~tens of KB).
+The 30s parts in `quotes/` stay the source of truth: each part stores `{"run","seq"}` (last round it
+contains) in its parquet key-value metadata `rquant_stream`. `rquant-web` (read-only) folds the
+official parts as before and, per refresh (warmer every 1.5 s in session), folds only deltas with
+`seq` above the latest folded part's seq onto a throwaway copy → the page's data version moves every
+round; when the part lands those deltas are ignored by seq, so nothing is counted twice. Deltas older
+than 300 s are ignored. The collector deletes a part's deltas right after writing it, wipes
+`stream/` at startup and removes it at the end of polling (the R2 archive also skips it).
+Disable: `SNAPSHOT_DELTA=0` in the collector drop-in env (page falls back to 30 s steps).
+Restarting the collector after 15:00:30 only runs the post-close steps (no universe/shard writes;
+ticks are refetched only if `ticks.parquet` is missing).
+
 ## Surge scanner (量能异动) + auction factors
 
 Runs **inside the snapshot collector** (`rquant.research.surge`), fed every ~3s cycle with the raw

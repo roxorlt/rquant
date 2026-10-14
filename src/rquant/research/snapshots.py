@@ -4,7 +4,10 @@ Polls Tushare Pro ``rt_tick`` (5-level) / ``rt_k`` (level 1) for the FULL A-shar
 (one call each), falling back to ``realtime_quote`` sina/dc for the priority universe, during the
 A-share sessions (09:15-11:30, 13:00-15:00 Asia/Shanghai, trading days only) for a bounded
 universe (manual watchlist + pools + latest screen/condition hits, capped), and appends
-small parquet part files under ``$RQUANT_RESEARCH_ROOT/snapshots/YYYY-MM-DD/quotes/``.
+small parquet part files under ``$RQUANT_RESEARCH_ROOT/snapshots/YYYY-MM-DD/quotes/``
+(the official ~30s shards). Each ~3s round is also written as a tiny delta file under
+``.../YYYY-MM-DD/stream/`` (see :class:`DeltaStream`) so the web can update every round; the
+shards stay the source of truth and record which rounds they cover.
 After the close it fetches ``tushare.realtime_tick`` (same-day aggregated ticks) for the
 same universe and compacts the parts into ``quotes.parquet``.
 
@@ -516,7 +519,13 @@ def _schema():
     return pa.schema(fields)
 
 
-def write_part(d: Path, frames: list[pd.DataFrame]) -> Path | None:
+STREAM_META_KEY = b"rquant_stream"
+
+
+def write_part(d: Path, frames: list[pd.DataFrame],
+               stream: dict[str, Any] | None = None) -> Path | None:
+    """One official shard. ``stream`` = ``{"run": ..., "seq": N}``: this shard contains every
+    delta round of that collector run up to seq N (stored in the parquet key-value metadata)."""
     import pyarrow as pa
     import pyarrow.parquet as pq
 
@@ -530,10 +539,110 @@ def write_part(d: Path, frames: list[pd.DataFrame]) -> Path | None:
     df = df[[f.name for f in schema]]
     path = parts / f"part-{now():%H%M%S%f}-{os.getpid()}.parquet"
     tmp = path.with_suffix(".tmp")
-    pq.write_table(pa.Table.from_pandas(df, schema=schema, preserve_index=False), tmp,
-                   compression="zstd")
+    tbl = pa.Table.from_pandas(df, schema=schema, preserve_index=False)
+    if stream:
+        meta = dict(tbl.schema.metadata or {})
+        meta[STREAM_META_KEY] = json.dumps(stream).encode()
+        tbl = tbl.replace_schema_metadata(meta)
+    pq.write_table(tbl, tmp, compression="zstd")
     tmp.rename(path)
     return path
+
+
+# --------------------------------------------------------------------------- 3s delta stream
+DELTA_COLS = ["ts_code", "name", "time", "price", "pre_close", "amount", "b1_p", "a1_p"]
+DELTA_RE = re.compile(r"^d-([0-9A-Za-z]+)-(\d{1,12})\.parquet$")
+DELTA_MAX_ERRORS = 20
+
+
+class DeltaStream:
+    """Per-round delta files for ~3s consumers (板块资金流), next to the 30s shards.
+
+    Every non-empty deduped round gets the next ``seq`` and is written atomically (tmp +
+    rename) as ``stream/d-<run>-<seq>.parquet`` with just the columns the sector-flow fold needs.
+    The shard that later contains those rounds records ``{"run", "seq"}`` (max seq included);
+    readers ignore deltas with seq <= the latest landed shard's seq for that run, so nothing is
+    counted twice. After a shard lands its deltas are deleted; the directory is wiped at startup
+    (stale rounds from an earlier/crashed run) and at the end of the run, so it never grows past
+    ~one shard's worth of rounds. Best effort: write errors never affect collection, and after
+    ``DELTA_MAX_ERRORS`` consecutive errors the stream switches itself off (shards continue).
+    Disable with ``SNAPSHOT_DELTA=0``."""
+
+    def __init__(self, d: Path, *, enabled: bool | None = None, run: str | None = None) -> None:
+        self.dir = d / "stream"
+        self.enabled = (os.environ.get("SNAPSHOT_DELTA", "1") != "0") if enabled is None \
+            else enabled
+        self.run = run or f"{now():%H%M%S}p{os.getpid()}"
+        self.seq = 0          # last seq assigned (a round in the buffer)
+        self.landed = 0       # last seq contained in a written shard
+        self.errors = 0
+        self._written: list[tuple[int, Path]] = []
+        if self.enabled:
+            try:
+                self.dir.mkdir(parents=True, exist_ok=True)
+                self._wipe()
+            except OSError as exc:
+                log.warning("delta stream off: %s", exc)
+                self.enabled = False
+
+    def _wipe(self) -> None:
+        for p in self.dir.iterdir():
+            if p.is_file():
+                p.unlink(missing_ok=True)
+
+    def write(self, df: pd.DataFrame) -> int | None:
+        """Assign the round a seq (when it has rows) and write its delta file."""
+        if df is None or not len(df):
+            return None
+        self.seq += 1
+        if not self.enabled:
+            return self.seq
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+
+            path = self.dir / f"d-{self.run}-{self.seq:08d}.parquet"
+            tmp = self.dir / f".{path.name}.tmp"
+            tbl = pa.Table.from_pandas(df[DELTA_COLS], preserve_index=False)
+            pq.write_table(tbl, tmp, compression="zstd")
+            os.replace(tmp, path)
+            self._written.append((self.seq, path))
+            self.errors = 0
+        except Exception as exc:  # noqa: BLE001 - the stream must never break collection
+            self.errors += 1
+            log.warning("delta write error %d: %s", self.errors, str(exc)[:200])
+            if self.errors >= DELTA_MAX_ERRORS:
+                log.error("delta stream disabled after %d errors", self.errors)
+                self.enabled = False
+        return self.seq
+
+    def meta(self) -> dict[str, Any] | None:
+        return {"run": self.run, "seq": self.seq} if self.seq else None
+
+    def shard_landed(self, seq: int) -> None:
+        """A shard containing rounds <= seq is on disk: drop those delta files."""
+        self.landed = max(self.landed, seq)
+        keep = []
+        for s_, p in self._written:
+            if s_ <= self.landed:
+                try:
+                    p.unlink(missing_ok=True)
+                except OSError as exc:
+                    log.warning("delta cleanup: %s", exc)
+                    keep.append((s_, p))
+            else:
+                keep.append((s_, p))
+        self._written = keep
+
+    def close(self) -> None:
+        if not self.dir.is_dir():
+            return
+        try:
+            self._wipe()
+            self.dir.rmdir()
+        except OSError as exc:
+            log.warning("delta stream close: %s", exc)
+        self._written = []
 
 
 def compact(d: Path) -> dict[str, Any]:
@@ -632,9 +741,11 @@ def run(out: Path, *, force: bool = False, max_cycles: int | None = None, cap: i
     if stop_requested():
         log.info("STOP file present (%s); exit", _STOP_FILE)
         return 0
+    d = day_dir(out, today)
+    if not force and now() >= datetime.combine(today, SESSIONS[-1][1], TZ):
+        return _after_close(out, today, d, ticks=ticks, tick_limit=tick_limit, cap=cap)
     uni = build_universe(cap)
     codes = uni["codes"]
-    d = day_dir(out, today)
     d.mkdir(parents=True, exist_ok=True)
     (d / "universe.json").write_text(json.dumps(uni, ensure_ascii=False, indent=1), "utf-8")
     log.info("universe %d symbols %s -> %s", len(codes), uni["counts"], d)
@@ -647,12 +758,20 @@ def run(out: Path, *, force: bool = False, max_cycles: int | None = None, cap: i
     socket.setdefaulttimeout(10)  # the SDK passes no timeout to requests
     poller = Poller(codes, token=token)
     dedup = Deduper()
+    stream = DeltaStream(d)
     scanner = _start_scanner(out, today, d)
     scan_errors = 0
     buf: list[pd.DataFrame] = []
     last_flush, cycles, rc = time.monotonic(), 0, 0
     reloaded = False
     end_of_day = datetime.combine(today, SESSIONS[-1][1], TZ)
+
+    def flush() -> None:
+        nonlocal buf
+        meta = stream.meta()
+        if write_part(d, buf, meta) is not None and meta:
+            stream.shard_landed(meta["seq"])
+        buf = []
     try:
         while not stop_requested():
             t = now()
@@ -661,8 +780,7 @@ def run(out: Path, *, force: bool = False, max_cycles: int | None = None, cap: i
                     break
                 if not in_session(t.time()):
                     nxt = next_session_start(t.time())
-                    write_part(d, buf)
-                    buf = []
+                    flush()
                     if nxt is None or not _sleep_until(datetime.combine(today, nxt, TZ)):
                         break
                     continue
@@ -686,15 +804,17 @@ def run(out: Path, *, force: bool = False, max_cycles: int | None = None, cap: i
                     if scan_errors >= 20:
                         log.error("surge scanner disabled after 20 errors")
                         scanner = None
-            buf.append(dedup(raw))
+            kept = dedup(raw)
+            buf.append(kept)
+            stream.write(kept)
             cycles += 1
             if poller.failed_cycles >= MAX_FAILED_CYCLES:
                 log.error("%d consecutive failed cycles; stopping collector", poller.failed_cycles)
                 rc = 3
                 break
             if time.monotonic() - last_flush >= FLUSH_EVERY:
-                write_part(d, buf)
-                buf, last_flush = [], time.monotonic()
+                flush()
+                last_flush = time.monotonic()
             if max_cycles is not None and cycles >= max_cycles:
                 break
             # rt_k calls run in the background (staggered by INTERVAL); poll for results often
@@ -702,7 +822,8 @@ def run(out: Path, *, force: bool = False, max_cycles: int | None = None, cap: i
             time.sleep(max(0.0, wait + random.uniform(-0.1, 0.1)))
     finally:
         poller.close()
-        write_part(d, buf)
+        flush()
+        stream.close()
         if scanner is not None:
             try:
                 scanner.close()
@@ -712,6 +833,33 @@ def run(out: Path, *, force: bool = False, max_cycles: int | None = None, cap: i
     if ticks and not stop_requested() and (
             force or _sleep_until(datetime.combine(today, TICK_AT, TZ))):
         fetch_ticks(d, codes[:tick_limit or TICK_CAP])
+    return _finish(out, today, d, rc)
+
+
+def _after_close(out: Path, today: date, d: Path, *, ticks: bool, tick_limit: int | None,
+                 cap: int) -> int:
+    """(Re)started after the close, e.g. a restart to pick up a new release: do not touch the
+    day's universe.json, scanner or shards; fetch after-close ticks only when today's
+    ticks.parquet is missing, then compact (no-op when already compacted)."""
+    log.info("started after the close; post-close steps only")
+    d.mkdir(parents=True, exist_ok=True)
+    stale = d / "stream"
+    if stale.is_dir():  # a crashed run's leftover deltas
+        DeltaStream(d, enabled=True).close()
+    tick_file = d / "ticks.parquet"
+    if ticks and not stop_requested() and not (tick_file.is_file() and tick_file.stat().st_size):
+        try:
+            codes = json.loads((d / "universe.json").read_text("utf-8"))["codes"]
+        except (OSError, ValueError, KeyError, TypeError):
+            codes = build_universe(cap)["codes"]
+        if _sleep_until(datetime.combine(today, TICK_AT, TZ)):
+            fetch_ticks(d, codes[:tick_limit or TICK_CAP])
+    elif tick_file.is_file():
+        log.info("ticks.parquet already present; not refetching")
+    return _finish(out, today, d, 0)
+
+
+def _finish(out: Path, today: date, d: Path, rc: int) -> int:
     compact(d)
     try:
         from rquant.research.auction import write_auction_factors

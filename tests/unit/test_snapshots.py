@@ -199,3 +199,114 @@ def test_two_rt_k_calls_overlap():
     got = p.cycle()
     p.close()
     assert peak[0] == 2 and len(got) == 2 and p.failed_cycles == 0
+
+
+# ----------------------------------------------------------------- 3s delta stream
+def test_delta_stream_lifecycle(tmp_path):
+    import pyarrow.parquet as pq
+
+    d = tmp_path / "2026-10-15"
+    (d / "stream").mkdir(parents=True)
+    (d / "stream" / "d-old-00000007.parquet").write_bytes(b"stale")  # crashed run leftover
+    st = s.DeltaStream(d, run="r1")
+    assert list((d / "stream").iterdir()) == []
+    assert st.write(s._normalize(None, "ts_k")) is None  # empty round: no seq
+    fr = _frame(["600000.SH", "000001.SZ"])
+    fr["local_ts"] = pd.Timestamp("2026-10-15 09:30:00")
+    assert st.write(fr) == 1 and st.write(fr) == 2
+    files = sorted(p.name for p in (d / "stream").iterdir())
+    assert files == ["d-r1-00000001.parquet", "d-r1-00000002.parquet"]
+    t = pq.read_table(d / "stream" / files[0])
+    assert t.column_names == s.DELTA_COLS and t.num_rows == 2
+    part = s.write_part(d, [fr, fr], st.meta())
+    md = pq.read_metadata(part).metadata
+    assert json.loads(md[s.STREAM_META_KEY]) == {"run": "r1", "seq": 2}
+    st.shard_landed(2)
+    assert list((d / "stream").iterdir()) == []
+    st.write(fr)
+    st.close()
+    assert not (d / "stream").exists()
+    assert len(pd.read_parquet(part)) == 4  # shards unaffected
+
+
+def test_delta_write_errors_never_raise(tmp_path):
+    st = s.DeltaStream(tmp_path / "d", run="r1")
+    st.dir = tmp_path / "missing" / "stream"  # every write fails
+    fr = _frame(["600000.SH"])
+    for i in range(s.DELTA_MAX_ERRORS + 3):
+        assert st.write(fr) == i + 1  # seq keeps counting: shards still record coverage
+    assert not st.enabled and st.errors == s.DELTA_MAX_ERRORS
+
+
+def test_delta_stream_can_be_disabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("SNAPSHOT_DELTA", "0")
+    st = s.DeltaStream(tmp_path / "d", run="r1")
+    assert st.write(_frame(["600000.SH"])) == 1
+    assert not (tmp_path / "d" / "stream").exists()
+
+
+def test_run_writes_deltas_each_round_and_shards_cover_them(tmp_path, monkeypatch):
+    import pyarrow.parquet as pq
+
+    seen = []
+
+    class FakePoller:
+        failed_cycles = 0
+
+        def __init__(self, codes, token=None):
+            self.n = 0
+
+        def set_codes(self, codes):
+            pass
+
+        def cycle(self):
+            seen.append(sorted(p.name for p in (tmp_path / "out").rglob("d-*.parquet")))
+            self.n += 1
+            fr = _frame(["600000.SH"], src="ts_k", vol=100.0 * self.n)
+            fr["local_ts"] = pd.Timestamp("2026-10-15 09:30:00")
+            return fr
+
+        def backoff(self):
+            return 0.0
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(s, "Poller", FakePoller)
+    monkeypatch.setattr(s, "build_universe", lambda cap=300: {"codes": ["600000.SH"],
+                                                              "counts": {}})
+    monkeypatch.setattr(s, "tushare_token", lambda: "tok")
+    monkeypatch.setattr(s, "FLUSH_EVERY", 1e9)  # no mid-run shard: deltas accumulate
+    monkeypatch.setattr(s, "LOOP_TICK", 0.0)
+    monkeypatch.setattr(s.time, "sleep", lambda x: None)
+    monkeypatch.setenv("SURGE_SCAN", "0")
+    out = tmp_path / "out"
+    assert s.run(out, force=True, max_cycles=3, ticks=False) == 0
+    # before round k the stream held k-1 delta files (one per finished round)
+    assert [len(x) for x in seen] == [0, 1, 2]
+    day = next(out.glob("20??-??-??"))
+    assert not (day / "stream").exists()  # cleaned at the end of the run
+    assert pq.read_metadata(day / "quotes.parquet").num_rows == 3
+
+
+def test_restart_after_close_touches_nothing(tmp_path, monkeypatch):
+    from datetime import datetime
+
+    out = tmp_path / "snapshots"
+    d = out / "2026-10-15"
+    (d / "stream").mkdir(parents=True)
+    (d / "stream" / "d-x-00000001.parquet").write_bytes(b"x")
+    (d / "universe.json").write_text('{"codes": ["600000.SH"]}')
+    pd.DataFrame({"a": [1]}).to_parquet(d / "ticks.parquet")
+    monkeypatch.setattr(s, "now", lambda: datetime(2026, 10, 15, 15, 40, tzinfo=s.TZ))
+    monkeypatch.setattr(s, "is_trading_day", lambda day: True)
+
+    def boom(*a, **k):
+        raise AssertionError("must not run after the close")
+
+    monkeypatch.setattr(s, "build_universe", boom)
+    monkeypatch.setattr(s, "fetch_ticks", boom)
+    monkeypatch.setattr(s, "Poller", boom)
+    assert s.run(out) == 0
+    assert (d / "universe.json").read_text() == '{"codes": ["600000.SH"]}'
+    assert not (d / "stream").exists()
