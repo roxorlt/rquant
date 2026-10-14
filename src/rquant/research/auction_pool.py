@@ -229,8 +229,71 @@ def snapshot_quotes(root: Path, day: date, codes: list[str]) -> pd.DataFrame:
     return pd.concat(frames).sort_values("time")
 
 
-def make_picks(root: Path, day: date, source: str = "rt_k") -> dict[str, Any]:
+LOCK_TIME = "09:30:00"  # continuous trading opens: watch list membership freezes
+
+
+def is_locked(pool: dict[str, Any] | None) -> bool:
+    return bool(pool and pool.get("locked_at"))
+
+
+def lock_due(day: date, now: datetime | None = None) -> bool:
+    """True once `day` has reached 09:30 (or `day` is in the past)."""
+    now = now or datetime.now(TZ)
+    today = now.date()
+    return day < today or (day == today and now.strftime("%H:%M:%S") >= LOCK_TIME)
+
+
+def lock_pool(pool: dict[str, Any], now: datetime | None = None) -> dict[str, Any]:
+    """Freeze today's watch members: ``frozen_members`` (codes, rank order) + ``locked_at``.
+    Idempotent: an already locked pool is returned unchanged."""
+    if is_locked(pool):
+        return pool
+    picks = sorted(pool.get("picks") or [], key=lambda x: x.get("rank", 0))
+    pool.update(locked_at=(now or datetime.now(TZ)).isoformat(timespec="seconds"),
+                frozen=True, frozen_members=[p["ts_code"] for p in picks])
+    return pool
+
+
+def watch_members(pool: dict[str, Any] | None) -> list[dict]:
+    """The (at most TOP_N) watch picks to show; when locked, exactly the frozen codes."""
+    if not pool:
+        return []
+    picks = sorted(pool.get("picks") or [], key=lambda x: x.get("rank", 0))
+    if is_locked(pool):
+        by = {p["ts_code"]: p for p in picks}
+        return [by[c] for c in pool.get("frozen_members") or [] if c in by]
+    return picks
+
+
+def ensure_locked(root: Path, day: date, now: datetime | None = None) -> dict[str, Any] | None:
+    """Read the pool for `day`; if 09:30 has passed and it is not locked yet, lock it and
+    persist (atomic write) so restarts / later pick runs never re-rank it."""
+    pool = read_pool(root, day)
+    now = now or datetime.now(TZ)
+    # an empty final list is only locked once the day is over: the 09:30 pick run gets a
+    # chance to rank it from pre-open snapshot data first
+    if (pool and not is_locked(pool) and pool.get("stage") == "final" and lock_due(day, now)
+            and (pool.get("picks") or day < now.date())):
+        lock_pool(pool, now)
+        _write(root, day, pool)
+        log.info("locked %s watch list: %s", day, pool["frozen_members"])
+    return pool
+
+
+def make_picks(root: Path, day: date, source: str = "rt_k",
+               now: datetime | None = None) -> dict[str, Any]:
+    """Rank (09:25–09:29:59 re-runs may change membership). From 09:30 the list is locked:
+    a locked pool is returned untouched; an unlocked one is ranked once more from
+    pre-09:30 data (only if it has no picks yet) and then locked."""
     pool = read_pool(root, day) or build_candidates(root, day)
+    if is_locked(pool):
+        log.info("%s already locked at %s; not re-ranking", day, pool["locked_at"])
+        return pool
+    due = lock_due(day, now)
+    if due and pool.get("stage") == "final" and pool.get("picks"):
+        return lock_pool(pool, now)
+    if due and source == "rt_k":
+        source = "snapshots"  # after the open rt_k is no longer the auction print
     base = pool.get("base") or pool.get("candidates") or []
     cands = base  # no seal filter any more
     pool.update(candidates=base, rule=RULE_TEXT, label=POOL_LABEL, kind="watchlist")
@@ -250,13 +313,13 @@ def make_picks(root: Path, day: date, source: str = "rt_k") -> dict[str, Any]:
     ths = picks
     pool.update(stage="final", picks=picks, ths_screen=ths, quote_source=src,
                 picked_at=_now(), updated_at=_now())
-    return pool
+    return lock_pool(pool, now) if due else pool
 
 
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     p = argparse.ArgumentParser(prog="python -m rquant.research.auction_pool")
-    p.add_argument("cmd", choices=["candidates", "pick", "show"])
+    p.add_argument("cmd", choices=["candidates", "pick", "lock", "show"])
     p.add_argument("--day", type=date.fromisoformat, default=None)
     p.add_argument("--force", action="store_true", help="run on non-trading days too")
     p.add_argument("--source", choices=["rt_k", "snapshots"], default="rt_k",
@@ -272,6 +335,13 @@ def main(argv: list[str] | None = None) -> int:
         if not is_trading_day(day):
             log.info("%s not a trading day; skip", day)
             return 0
+    if a.cmd == "lock":
+        pool = ensure_locked(root, day)
+        log.info("lock %s: %s", day, (pool or {}).get("frozen_members"))
+        return 0
+    if a.cmd == "candidates" and is_locked(read_pool(root, day)):
+        log.info("%s already locked; candidates not rebuilt", day)
+        return 0
     pool = build_candidates(root, day) if a.cmd == "candidates" else make_picks(root, day, a.source)
     path = _write(root, day, pool)
     log.info("%s %s: %d candidates, picks %s -> %s", a.cmd, day, len(pool["candidates"]),

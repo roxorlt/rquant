@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -323,23 +324,36 @@ def pools(source: SourceDep, request: Request = None) -> Envelope[PoolsData]:  #
     return _envelope(source, PoolsData(trade_date=trade_date, pools=out))
 
 
+def _auction_pool_locked(request: Request) -> dict[str, Any] | None:
+    """Newest auction pool; once 09:30 has passed it is locked and persisted (idempotent)."""
+    from rquant.research.auction_pool import ensure_locked, read_pool
+
+    root = Path(_research_root(request) or research_root())
+    pool = read_pool(root)
+    if pool and not pool.get("locked_at"):
+        # read-only root: still serve, the 09:30 pick run persists the lock
+        with contextlib.suppress(OSError):
+            pool = ensure_locked(root, date.fromisoformat(str(pool["date"]))) or pool
+    return pool
+
+
 def _auction_pool_item(request: Request) -> PoolItem | None:  # noqa: D401
     """Research-side auto pool 「竞价选股」 (rquant.research.auction_pool), newest day."""
-    from rquant.research.auction_pool import POOL_NAME, PRESET, read_pool
+    from rquant.research.auction_pool import POOL_NAME, PRESET, watch_members
 
     try:
-        pool = read_pool(Path(_research_root(request) or research_root()))
+        pool = _auction_pool_locked(request)
     except Exception:  # noqa: BLE001 - optional
         return None
     if not pool:
         return None
-    picks = {p["ts_code"]: p for p in pool.get("picks") or []}
+    # only the watch list is listed (candidates are a count in the description)
+    picks = {p["ts_code"]: p for p in watch_members(pool)}
     members = [PoolMember(code=p["ts_code"], name=p.get("name"), preset=PRESET,
-                          detail={**p, "date": pool["date"], "stage": "pick"})
-               for p in sorted(picks.values(), key=lambda x: x["rank"])]
-    members += [PoolMember(code=c["ts_code"], name=c.get("name"), preset=PRESET,
-                           detail={**c, "date": pool["date"], "stage": "candidate"})
-                for c in pool.get("candidates") or [] if c["ts_code"] not in picks]
+                          detail={**p, "date": pool["date"], "stage": "pick",
+                                  "n_candidates": len(pool.get("candidates") or []),
+                                  "locked_at": pool.get("locked_at")})
+               for p in picks.values()]
     att = pool.get("attribution") or {}
     for m in members:
         info = next((s for s in att.get("stocks") or [] if s.get("ts_code") == m.code), None)
@@ -347,7 +361,8 @@ def _auction_pool_item(request: Request) -> PoolItem | None:  # noqa: D401
             m.detail.update(concepts=info.get("concepts"), news=info.get("news"),
                             anns=info.get("anns"))
     label = pool.get("label") or "观察名单（同花顺原条件，非买入信号）"
-    stage = "已出观察" if pool.get("stage") == "final" else "仅候选（竞价未出）"
+    stage = ("已锁定" if pool.get("locked_at") else
+             "已出观察" if pool.get("stage") == "final" else "仅候选（竞价未出）")
     n_lim = sum(1 for p in picks.values() if p.get("limit_open"))
     desc = (f"{label} · {pool['date']} {stage}（T-1={pool.get('prior_date')}，候选 "
             f"{len(pool.get('candidates') or [])} / 观察 {len(picks)}"
@@ -416,14 +431,14 @@ def panorama_sector_flow_leaders(request: Request, source: SourceDep, at: int,
 @router.get("/pools/auction/live", response_model=Envelope[PoolLiveData],
             summary="竞价选股池：最新涨跌幅与分时（3 秒快照）")
 def auction_pool_live(request: Request, source: SourceDep) -> Envelope[PoolLiveData]:
-    from rquant.research.auction_pool import read_pool
+
+    from rquant.research.auction_pool import watch_members
 
     root = Path(_research_root(request) or research_root())
-    pool = read_pool(root)
+    pool = _auction_pool_locked(request)
     if not pool:
         return _envelope(source, PoolLiveData(date=None, rows=[]))
-    codes = [p["ts_code"] for p in pool.get("picks") or []]
-    codes += [c["ts_code"] for c in pool.get("candidates") or [] if c["ts_code"] not in codes]
+    codes = [p["ts_code"] for p in watch_members(pool)]  # live data for the 10 only
     return _envelope(source, load_pool_live(root, str(pool["date"]), codes))
 
 
