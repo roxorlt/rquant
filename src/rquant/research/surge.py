@@ -206,7 +206,12 @@ class Pusher:
 
     @staticmethod
     def priority() -> set[str]:
-        """竞价选股 pool codes for today: pushed first, marked ★ (never raises)."""
+        """竞价选股 pool codes for today: pushed first, marked ★ (never raises).
+
+        Paused since 2026-10-14 (pool is a watchlist, not a buy signal) unless
+        AUCTION_POOL_PUSH=1; the surge alerts themselves are unaffected."""
+        if os.environ.get("AUCTION_POOL_PUSH", "0") != "1":
+            return set()
         try:
             from datetime import datetime as _dt
             from zoneinfo import ZoneInfo

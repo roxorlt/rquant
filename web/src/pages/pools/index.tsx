@@ -20,14 +20,17 @@ export default function PoolsPage() {
   const live = useAuctionPoolLive(isAuction);
   const liveBy = new Map((live.data?.rows ?? []).map((r) => [r.code, r]));
   const pctOf = (code: string) => liveBy.get(code)?.pct ?? null;
+  const auctionPool = query.data?.pools.find((p) => p.name === AUCTION_POOL);
+  const auctionDate = auctionPool?.members[0]?.detail?.date;
+  const nWatch = auctionPool?.members.filter((m) => m.detail?.stage === "pick").length ?? 0;
+  const nCand = auctionPool?.members.length ?? 0;
+  const headerNote =
+    isAuction && auctionPool
+      ? `${typeof auctionDate === "string" ? auctionDate : ""} · 候选 ${nCand} / 观察 ${nWatch}`
+      : (query.data?.trade_date ?? undefined);
   return (
     <>
-      <PageHeader
-        eyebrow="研究"
-        title="池子"
-        note={query.data?.trade_date ?? undefined}
-        actions={<FlowSteps />}
-      />
+      <PageHeader eyebrow="研究" title="池子" note={headerNote} actions={<FlowSteps />} />
       <QueryView query={query}>
         {(data) => {
           if (!data.pools.length)
@@ -112,18 +115,18 @@ export default function PoolsPage() {
                             header: "阶段",
                             value: (row: Member) =>
                               row.detail?.stage === "pick"
-                                ? `终选 #${row.detail?.rank ?? ""}`
+                                ? `观察 #${row.detail?.rank ?? ""}${row.detail?.limit_open === true ? " 竞价涨停·买不到" : ""}`
                                 : "候选",
                             cell: (row: Member) =>
                               row.detail?.stage === "pick" ? (
                                 <span className="up">
-                                  终选 #{String(row.detail?.rank ?? "")}
+                                  观察 #{String(row.detail?.rank ?? "")}
                                   {row.detail?.limit_open === true ? (
                                     <span
                                       className="badge-limit-open"
-                                      title="竞价价已是涨停价（一字开盘）"
+                                      title="竞价价已是涨停价（一字开盘），实际买不到"
                                     >
-                                      竞价涨停
+                                      竞价涨停·买不到
                                     </span>
                                   ) : null}
                                 </span>
@@ -177,6 +180,20 @@ export default function PoolsPage() {
                                 <span className="faint">{live.isLoading ? "…" : "—"}</span>
                               );
                             },
+                          },
+                          {
+                            id: "seal",
+                            header: "封单比(参考)",
+                            numeric: true,
+                            secondary: true,
+                            value: (row: Member) =>
+                              typeof row.detail?.seal_ratio === "number"
+                                ? row.detail.seal_ratio * 100
+                                : null,
+                            cell: (row: Member) =>
+                              typeof row.detail?.seal_ratio === "number"
+                                ? `${(row.detail.seal_ratio * 100).toFixed(2)}%`
+                                : "—",
                           },
                           {
                             id: "gap",

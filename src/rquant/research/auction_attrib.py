@@ -269,7 +269,12 @@ def main(argv: list[str] | None = None) -> int:
     pool["attribution"] = attribute(pool)
     _write(root, day, pool)
     log.info("attribution %s: %s", day, pool["attribution"]["text"])
-    if not a.no_push and (a.force_push or not pool.get("pushed_at")):
+    # 2026-10-14: the pool is a watchlist now, not a buy signal -> its push is paused
+    # unless AUCTION_POOL_PUSH=1 (or --force-push).
+    paused = os.environ.get("AUCTION_POOL_PUSH", "0") != "1" and not a.force_push
+    if paused:
+        log.info("auction-pick push paused (watchlist mode; set AUCTION_POOL_PUSH=1)")
+    if not a.no_push and not paused and (a.force_push or not pool.get("pushed_at")):
         title, body = format_push(pool)
         if push(title, body):
             pool["pushed_at"] = _now()
