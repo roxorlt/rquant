@@ -28,7 +28,9 @@ export interface FlowChartProps {
 
 export function FlowChart({ t, shown, colors, mode, upto, phone, focus, onFocus }: FlowChartProps) {
   const box = useRef<HTMLDivElement>(null);
-  const [w, setW] = useState(800);
+  const [w, setW] = useState(() =>
+    typeof window !== "undefined" ? Math.min(800, window.innerWidth - 40) : 800,
+  );
   const [hover, setHover] = useState<number | null>(null);
   const press = useRef<{ timer: number; scrub: boolean; id: number } | null>(null);
   useEffect(() => {

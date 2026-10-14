@@ -229,7 +229,7 @@ function Body({ data, phone, live }: { data: SectorFlowData; phone: boolean; liv
             />
           ) : null}
         </div>
-        <Leaders data={data} ranked={data.sectors} />
+        <Leaders data={data} ranked={data.sectors} phone={phone} />
         {phone ? (
           <Bars
             ranked={ranked}
@@ -263,6 +263,7 @@ function Bars({
   upto,
   t,
   all,
+  lim: limit = 8,
   onAll,
 }: {
   ranked: Sector[];
@@ -273,11 +274,12 @@ function Bars({
   upto: number;
   t: string[];
   all: boolean;
+  lim?: number;
   onAll?: () => void;
 }) {
   const ins = ranked.filter((s) => at(s) > 0);
   const outs = ranked.filter((s) => at(s) <= 0).reverse();
-  const lim = all ? 999 : 8;
+  const lim = all ? 999 : limit;
   const max = Math.max(1e-9, ...ranked.map((s) => Math.abs(at(s))));
   const row = (s: Sector) => {
     const on = sel.includes(s.name);
@@ -331,8 +333,7 @@ function Bars({
   );
 }
 
-function Spark({ s }: { s: Stock }) {
-  const w = 88;
+function Spark({ s, w = 88 }: { s: Stock; w?: number }) {
   const h = 30;
   const pts = s.spark
     .map((v, i) => [i, v] as const)
@@ -363,7 +364,15 @@ function Spark({ s }: { s: Stock }) {
   );
 }
 
-function Leaders({ data, ranked }: { data: SectorFlowData; ranked: Sector[] }) {
+function Leaders({
+  data,
+  ranked,
+  phone,
+}: {
+  data: SectorFlowData;
+  ranked: Sector[];
+  phone: boolean;
+}) {
   const outs = ranked
     .filter((s) => s.net < 0)
     .slice(-3)
@@ -407,7 +416,7 @@ function Leaders({ data, ranked }: { data: SectorFlowData; ranked: Sector[] }) {
                 </div>
               </div>
               <div className={`p ${tone(s.pct)}`}>{fmtPct(s.pct)}</div>
-              <Spark s={s} />
+              <Spark s={s} w={phone ? 76 : 88} />
             </div>
           ))}
         </div>

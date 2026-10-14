@@ -637,3 +637,43 @@
 .sf-phone .sf-day {
   min-height: 34px;
 }
+.sf .sf-chip button {
+  appearance: none;
+  font: inherit;
+  background: none;
+  border: none;
+  box-shadow: none;
+  color: inherit;
+  padding: 0;
+  margin: 0;
+  min-height: 0;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.sf .sf-chip button.x {
+  color: var(--sf-mute);
+  padding: 0 3px;
+  font-size: 13px;
+}
+.sf-phone .sf-chip button.x {
+  padding: 4px 6px;
+}
+.sf .sf-chart {
+  overflow: hidden;
+  min-width: 0;
+  max-width: 100%;
+}
+.sf {
+  min-width: 0;
+  max-width: 100%;
+}
+.sf-grid > *,
+.sf-main > * {
+  min-width: 0;
+  max-width: 100%;
+}
+.sf-phone .sf-stk {
+  grid-template-columns: minmax(0, 1fr) 56px 76px;
+}
