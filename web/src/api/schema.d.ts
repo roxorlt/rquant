@@ -399,6 +399,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/panorama/sector-flow/leaders": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 板块资金流：某一分钟时点的资金领先股（回放） */
+        get: operations["panorama_sector_flow_leaders_api_v1_panorama_sector_flow_leaders_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/paper": {
         parameters: {
             query?: never;
@@ -1533,6 +1550,12 @@ export interface components {
             data: {
                 [key: string]: string[][];
             };
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[list[FlowLeader]] */
+        Envelope_list_FlowLeader__: {
+            /** Data */
+            data: components["schemas"]["FlowLeader"][];
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[list[TaskRow]] */
@@ -3572,6 +3595,38 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_SectorFlowData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    panorama_sector_flow_leaders_api_v1_panorama_sector_flow_leaders_get: {
+        parameters: {
+            query: {
+                at: number;
+                day?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_list_FlowLeader__"];
                 };
             };
             /** @description Validation Error */

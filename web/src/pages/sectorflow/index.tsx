@@ -1,5 +1,10 @@
 import { useMemo, useState } from "react";
-import { inTradingHours, type SectorFlowData, useSectorFlow } from "@/api/endpoints";
+import {
+  inTradingHours,
+  type SectorFlowData,
+  useSectorFlow,
+  useSectorLeadersAt,
+} from "@/api/endpoints";
 import { PageHeader } from "@/ui";
 import { StockLink } from "@/ui/StockLink";
 import { PHONE_QUERY, useMedia } from "../panorama/useMedia";
@@ -62,13 +67,23 @@ export default function SectorFlowPage() {
         <p className="hint pad">今天还没有快照（09:25 集合竞价后出现）。</p>
       ) : null}
       {data && !data.warming && data.sectors.length ? (
-        <Body key={data.date} data={data} phone={phone} live={!day && inTradingHours()} />
+        <Body key={data.date} day={day} data={data} phone={phone} live={!day && inTradingHours()} />
       ) : null}
     </div>
   );
 }
 
-function Body({ data, phone, live }: { data: SectorFlowData; phone: boolean; live: boolean }) {
+function Body({
+  day,
+  data,
+  phone,
+  live,
+}: {
+  day: string | null;
+  data: SectorFlowData;
+  phone: boolean;
+  live: boolean;
+}) {
   const [mode, setMode] = useState<Mode>("net");
   const [picked, setPicked] = useState<string[] | null>(null);
   const [focus, setFocus] = useState<string | null>(null);
@@ -76,6 +91,8 @@ function Body({ data, phone, live }: { data: SectorFlowData; phone: boolean; liv
   const [allBars, setAllBars] = useState(false);
   const last = data.t.length - 1;
   const upto = cursor == null ? last : Math.min(cursor, last);
+  const asOf = useSectorLeadersAt(day ?? data.date ?? null, cursor == null ? null : upto);
+  const leaders = cursor == null ? data.leaders : (asOf.data ?? data.leaders);
 
   const byName = useMemo(() => new Map(data.sectors.map((s) => [s.name, s])), [data.sectors]);
   const sel = picked ?? defaultSelection(data.sectors, phone ? 3 : 5);
@@ -229,7 +246,12 @@ function Body({ data, phone, live }: { data: SectorFlowData; phone: boolean; liv
             />
           ) : null}
         </div>
-        <Leaders data={data} ranked={data.sectors} phone={phone} />
+        <Leaders
+          leaders={leaders}
+          asOf={cursor == null ? null : (data.t[upto] ?? null)}
+          ranked={data.sectors}
+          phone={phone}
+        />
         {phone ? (
           <Bars
             ranked={ranked}
@@ -365,11 +387,13 @@ function Spark({ s, w = 88 }: { s: Stock; w?: number }) {
 }
 
 function Leaders({
-  data,
+  leaders,
+  asOf,
   ranked,
   phone,
 }: {
-  data: SectorFlowData;
+  leaders: Leader[];
+  asOf: string | null;
   ranked: Sector[];
   phone: boolean;
 }) {
@@ -380,11 +404,13 @@ function Leaders({
   return (
     <aside className="sf-card sf-rank">
       <div className="sf-ch">
-        <h3>流入前三 · 领涨股</h3>
-        <span className="sf-pill">净流入/流通市值</span>
+        <h3>流入前三 · 资金领先股</h3>
+        <span className={`sf-pill ${asOf ? "replay" : ""}`}>
+          {asOf ? `回放 ${asOf}` : "净流入/流通市值"}
+        </span>
       </div>
-      {data.leaders.length === 0 ? <p className="sf-sub">暂无净流入板块。</p> : null}
-      {data.leaders.map((l, k) => (
+      {leaders.length === 0 ? <p className="sf-sub">暂无净流入板块。</p> : null}
+      {leaders.map((l, k) => (
         <div key={l.name} className="sf-sec">
           <div className="sf-sh">
             <span className="rank">{k + 1}</span>
@@ -433,7 +459,8 @@ function Leaders({
         ))}
       </div>
       <p className="sf-note">
-        领涨股门槛：流通市值 ≥30 亿且成交额 ≥1 亿；按自 09:25 净流入 ÷ 流通市值排序。
+        资金领先股门槛：流通市值 ≥30 亿且成交额 ≥1 亿；按自 09:25 净流入 ÷
+        流通市值排序；回放时按该分钟重新计算。
       </p>
     </aside>
   );

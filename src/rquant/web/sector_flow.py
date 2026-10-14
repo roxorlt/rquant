@@ -64,6 +64,8 @@ class _Day:
         self.net = np.zeros(0)
         self.amt = np.zeros(0)
         self.px = np.full((0, len(MINUTES)), np.nan, dtype=np.float32)
+        self.cnm = np.zeros((0, len(MINUTES)), dtype=np.float32)  # net per code-minute
+        self.am = np.full((0, len(MINUTES)), np.nan, dtype=np.float32)  # cum turnover
         self.sec_of = np.zeros(0, dtype=np.int32)
         self.sector_names = sorted(set(sectors.values()))
         self.sec_ix = {s: i for i, s in enumerate(self.sector_names)}
@@ -87,6 +89,8 @@ class _Day:
             self.net = np.concatenate([self.net, np.zeros(k)])
             self.amt = np.concatenate([self.amt, np.zeros(k)])
             self.px = np.vstack([self.px, np.full((k, len(MINUTES)), np.nan, np.float32)])
+            self.cnm = np.vstack([self.cnm, np.zeros((k, len(MINUTES)), np.float32)])
+            self.am = np.vstack([self.am, np.full((k, len(MINUTES)), np.nan, np.float32)])
             unk = len(self.sector_names)
             self.sec_of = np.concatenate([self.sec_of, np.array(
                 [self.sec_ix.get(self.sectors.get(c, ""), unk) for c in new], np.int32)])
@@ -119,6 +123,7 @@ class _Day:
         ix_all = self._ensure(df["ts_code"].to_numpy(), df["name"].to_numpy())
         slots = _slot(df["time"].str.slice(0, 5))
         np.add.at(self.net, ix_all, flow)
+        np.add.at(self.cnm, (ix_all, slots), flow.astype(np.float32))
         np.add.at(self.sec_min, (self.sec_of[ix_all], slots), flow)
         np.add.at(self.sec_amt, (self.sec_of[ix_all], slots), np.where(newm, d, 0.0))
         # last price per code-minute (rows sorted by time within code)
@@ -126,6 +131,7 @@ class _Day:
         self.px[ixn, sn] = new["price"].to_numpy(np.float32)
         self.pre[ixn] = new["pre_close"].to_numpy()
         self.amt[ixn] = new["amount"].to_numpy()
+        self.am[ixn, sn] = new["amount"].to_numpy(np.float32)
         self.max_slot = max(self.max_slot, int(sn.max()))
         t = str(new["time"].max())
         self.last_time = max(self.last_time or t, t)
@@ -325,28 +331,63 @@ def _compute(st: _Day, root: Path, day: str) -> SectorFlowData:
         amount=float(camt[i, -1]), pct=r(smean[i, -1]), limit_up=int(lu_sec[i]),
         series=np.round(cum[i] / 1e8, 2).tolist(), ratio=np.round(ratio[i], 2).tolist(),
         pct_series=[r(v) for v in smean[i]]) for i in order if counts[i]]
-    circ = _circ(root, day)
-    codes = np.array(st.codes)
-    leaders = []
-    for i in order[:3]:
-        if cum[i, -1] <= 0:
-            break
-        mem = np.nonzero(st.sec_of == i)[0]
-        cm = np.array([circ.get(c, np.nan) for c in codes[mem]])
-        rt = st.net[mem] / cm
-        good = np.isfinite(rt) & (cm >= MIN_CIRC) & (st.amt[mem] >= MIN_AMT)
-        pick = mem[good][np.argsort(-rt[good])][:3]
-        stocks = [FlowStock(
-            code=str(codes[j]), name=(st.names[j] or "").strip() or None, pct=r(nowp[j]),
-            net=float(st.net[j]), net_ratio=float(st.net[j] / circ[codes[j]]),
-            amount=float(st.amt[j]), sealed=bool(sealed[j]),
-            spark=[None if not np.isfinite(v) else round(float(v), 3) for v in px[j]],
-            pre_close=float(st.pre[j]) if st.pre[j] > 0 else None) for j in pick]
-        leaders.append(FlowLeader(name=st.sector_names[i], net=float(cum[i, -1]),
-                                  pct=r(smean[i, -1]), limit_up=int(lu_sec[i]), stocks=stocks))
+    leaders = leaders_at(st, root, day, upto)
     return SectorFlowData(date=day, time=st.last_time, version=f"{len(st.keys)}-{st.last_time}",
                           t=MINUTES[: upto + 1], summary=summary, sectors=sectors,
                           leaders=leaders)
+
+
+def leaders_at(st: _Day, root: Path, day: str, m: int) -> list[FlowLeader]:
+    """资金领先股 as of minute slot m (same rule as the replay video export): top-3 sectors by
+    cumulative net at m; in each, top-3 by cumulative net / float cap among stocks with float
+    cap >= 30亿 and cumulative turnover >= 1亿 at m."""
+    m = max(0, min(m, st.max_slot))
+    nsec = len(st.sector_names)
+    cnet = st.cnm[:, : m + 1].sum(axis=1, dtype=np.float64)
+    scum = np.bincount(st.sec_of, weights=cnet, minlength=nsec + 1)[:nsec]
+    px = pd.DataFrame(st.px[:, : m + 1]).ffill(axis=1).to_numpy()
+    amt = pd.DataFrame(st.am[:, : m + 1]).ffill(axis=1).to_numpy()[:, -1]
+    amt = np.nan_to_num(amt)
+    pre = np.where(st.pre > 0, st.pre, np.nan)
+    pct = (px[:, -1] / pre - 1) * 100
+    upx, _ = _limit_up(st.codes, st.names, st.pre)
+    sealed = np.isfinite(px[:, -1]) & (px[:, -1] >= upx - 1e-6) & (st.pre > 0)
+    circ = _circ(root, day)
+    codes = np.array(st.codes)
+    cm_all = np.array([circ.get(c, np.nan) for c in st.codes])
+
+    def r(v: float) -> float | None:
+        return None if not np.isfinite(v) else round(float(v), 2)
+
+    out = []
+    for i in [int(i) for i in np.argsort(-scum)][:3]:
+        if scum[i] <= 0:
+            break
+        mem = np.nonzero(st.sec_of == i)[0]
+        cm = cm_all[mem]
+        good = (cm >= MIN_CIRC) & (amt[mem] >= MIN_AMT)
+        rt = cnet[mem] / cm
+        pick = mem[good][np.argsort(-rt[good])][:3]
+        stocks = [FlowStock(
+            code=str(codes[j]), name=(st.names[j] or "").strip() or None, pct=r(pct[j]),
+            net=float(cnet[j]), net_ratio=float(cnet[j] / cm_all[j]), amount=float(amt[j]),
+            sealed=bool(sealed[j]),
+            spark=[None if not np.isfinite(v) else round(float(v), 3) for v in px[j]],
+            pre_close=float(st.pre[j]) if st.pre[j] > 0 else None) for j in pick]
+        sp = pct[mem]
+        sp = sp[np.isfinite(sp)]
+        out.append(FlowLeader(name=st.sector_names[i], net=float(scum[i]),
+                              pct=r(float(sp.mean())) if len(sp) else None,
+                              limit_up=int(sealed[mem].sum()), stocks=stocks))
+    return out
+
+
+def load_leaders_at(root: Path, day: str, m: int) -> list[FlowLeader]:
+    st = _DAYS.get(day)
+    if st is None or st.max_slot < 0:
+        return []
+    with st.lock:
+        return leaders_at(st, root, day, m)
 
 
 def _refresh(root: Path, day: str) -> SectorFlowData | None:

@@ -40,3 +40,12 @@ def test_tick_rule_and_auction(tmp_path: Path) -> None:
     assert out.summary is not None and out.summary.amount == 1.7e8 + 2e8
     again = sf.load_sector_flow(tmp_path, "2026-10-14", [], known=out.version)
     assert again.unchanged
+
+
+def test_leaders_as_of_minute(tmp_path: Path) -> None:
+    test_tick_rule_and_auction(tmp_path)
+    # float cap 50亿 passes; turnover 1.7亿 at the end but only 1亿 at 09:25 (>= floor)
+    lead = sf.load_leaders_at(tmp_path, "2026-10-14", 0)
+    assert lead and lead[0].name == "银行"
+    assert lead[0].stocks[0].net == 1e8
+    assert len(lead[0].stocks[0].spark) == 1
