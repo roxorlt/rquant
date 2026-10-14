@@ -18,39 +18,49 @@ export function Heatmap({
   boards,
   onSelect,
   selected,
+  phone = false,
 }: {
   boards: readonly Board[];
   /** When given, tiles become buttons that open the board's detail. */
   onSelect?: (board: Board) => void;
   selected?: string | null;
+  /** iPhone: fewer, taller tiles so labels stay readable on a ~360px-wide canvas. */
+  phone?: boolean;
 }) {
   const ref = useRef<HTMLElement>(null);
-  const [w, setW] = useState(900);
+  const [w, setW] = useState(phone ? 360 : 900);
   useEffect(() => {
     const el = ref.current;
     if (!el) return;
     const ro = new ResizeObserver(([e]) => {
-      if (e) setW(Math.max(300, Math.floor(e.contentRect.width)));
+      if (e) setW(Math.max(phone ? 240 : 300, Math.floor(e.contentRect.width)));
     });
     ro.observe(el);
     return () => ro.disconnect();
-  }, []);
+  }, [phone]);
   const items = boards
     .filter((b) => (b.amount ?? 0) > 0)
     .sort((a, b) => (b.amount ?? 0) - (a.amount ?? 0))
-    .slice(0, 80);
-  const h = Math.round(Math.min(520, Math.max(260, w * 0.45)));
+    .slice(0, phone ? 40 : 80);
+  const h = phone
+    ? Math.round(Math.min(560, Math.max(380, w * 1.3)))
+    : Math.round(Math.min(520, Math.max(260, w * 0.45)));
   const rects = squarify(
     items.map((b) => b.amount ?? 0),
     { x: 0, y: 0, w, h },
   );
   if (!items.length) return <p className="hint pad">没有成交额数据，无法画热力图。</p>;
   return (
-    <section ref={ref} className="heatmap" style={{ height: h }} aria-label="板块热力图">
+    <section
+      ref={ref}
+      className={`heatmap${phone ? " hm-phone" : ""}`}
+      style={{ height: h }}
+      aria-label="板块热力图"
+    >
       {items.map((b, i) => {
         const r = rects[i];
         if (!r) return null;
-        const big = r.w > 70 && r.h > 34;
+        const big = phone ? r.w > 46 && r.h > 30 : r.w > 70 && r.h > 34;
         return (
           <div
             key={`${b.system}:${b.board_code}`}

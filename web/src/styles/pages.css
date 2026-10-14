@@ -154,6 +154,14 @@ input:focus {
 .hm-pct {
   font-weight: 600;
 }
+.hm-phone {
+  margin: 0 8px 8px;
+}
+.hm-phone .hm-cell {
+  font-size: 11px;
+  line-height: 1.2;
+  padding: 0 2px;
+}
 .query-grid {
   display: grid;
   grid-template-columns: 240px minmax(0, 1fr);
