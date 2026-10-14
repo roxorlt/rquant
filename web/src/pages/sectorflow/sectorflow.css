@@ -677,3 +677,7 @@
 .sf-phone .sf-stk {
   grid-template-columns: minmax(0, 1fr) 56px 76px;
 }
+.sf-pill.replay {
+  color: var(--accent);
+  border-color: var(--accent);
+}

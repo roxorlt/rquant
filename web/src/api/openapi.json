@@ -2454,6 +2454,26 @@
         "title": "Envelope[dict[str, list[list[str]]]]",
         "type": "object"
       },
+      "Envelope_list_FlowLeader__": {
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/FlowLeader"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[list[FlowLeader]]",
+        "type": "object"
+      },
       "Envelope_list_TaskRow__": {
         "properties": {
           "data": {
@@ -7910,6 +7930,62 @@
           }
         },
         "summary": "板块资金流（主动买卖估算，自 09:25 累计）"
+      }
+    },
+    "/api/v1/panorama/sector-flow/leaders": {
+      "get": {
+        "operationId": "panorama_sector_flow_leaders_api_v1_panorama_sector_flow_leaders_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "at",
+            "required": true,
+            "schema": {
+              "title": "At",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "day",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Day"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_list_FlowLeader__"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "板块资金流：某一分钟时点的资金领先股（回放）"
       }
     },
     "/api/v1/paper": {

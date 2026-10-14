@@ -123,6 +123,25 @@ export function useSectorFlow(day: string | null): ServingQueryResult<SectorFlow
   );
 }
 
+/** 资金领先股 as of a replay minute (slot index into SectorFlowData.t). */
+export function useSectorLeadersAt(
+  day: string | null,
+  at: number | null,
+): ServingQueryResult<SectorFlowData["leaders"]> {
+  return useServingQuery(
+    ["sector-flow", "leaders", day ?? "today", at ?? -1],
+    async () => {
+      const query: { day?: string; at: number } = { at: at ?? 0 };
+      if (day) query.day = day;
+      const { data, response } = await apiClient().GET("/api/v1/panorama/sector-flow/leaders", {
+        params: { query },
+      });
+      return unwrap(data, response);
+    },
+    { enabled: at != null, staleTime: 60_000 },
+  );
+}
+
 export function useBacktests(): ServingQueryResult<Schemas["BacktestListData"]> {
   return useServingQuery(["backtests"], async () => {
     const { data, response } = await apiClient().GET("/api/v1/backtests");

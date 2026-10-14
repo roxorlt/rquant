@@ -101,7 +101,13 @@ from rquant.web.models import (
 )
 from rquant.web.overfit_stats import overfit_stats, sharpe_per_period
 from rquant.web.pool_live import PoolLiveData, load_pool_live
-from rquant.web.sector_flow import SectorFlowData, load_sector_flow, start_warmer
+from rquant.web.sector_flow import (
+    FlowLeader,
+    SectorFlowData,
+    load_leaders_at,
+    load_sector_flow,
+    start_warmer,
+)
 from rquant.web.source import Source, SourceUnavailableError, table_missing
 from rquant.web.stocks import CODE_RE, StockProfile, enrich, load_profile, market
 
@@ -393,6 +399,18 @@ def panorama_sector_flow(request: Request, source: SourceDep, day: date | None =
     if d is None:
         return _envelope(source, SectorFlowData(date=None, time=None))
     return _envelope(source, load_sector_flow(root, d, days[:30], known=v))
+
+
+@router.get("/panorama/sector-flow/leaders", response_model=Envelope[list[FlowLeader]],
+            summary="板块资金流：某一分钟时点的资金领先股（回放）")
+def panorama_sector_flow_leaders(request: Request, source: SourceDep, at: int,
+                                 day: date | None = None) -> Envelope[list[FlowLeader]]:
+    root = Path(_research_root(request) or research_root())
+    snaps = root / "snapshots"
+    days = (sorted((p.name for p in snaps.glob("20??-??-??") if p.is_dir()), reverse=True)
+            if snaps.is_dir() else [])
+    d = day.isoformat() if day else (days[0] if days else None)
+    return _envelope(source, load_leaders_at(root, d, at) if d else [])
 
 
 @router.get("/pools/auction/live", response_model=Envelope[PoolLiveData],
