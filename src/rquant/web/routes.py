@@ -348,6 +348,12 @@ def _auction_pool_item(request: Request) -> PoolItem | None:  # noqa: D401
             f"{f'，其中竞价涨停·买不到 {n_lim}' if n_lim else ''}）· {pool.get('rule', '')}")
     if att.get("text"):
         desc += f" ｜ 归因：{att['text']}"
+    try:
+        from rquant.research.auction_paper import stats_text
+
+        desc += " ｜ " + stats_text(Path(_research_root(request) or research_root()))
+    except Exception:  # noqa: BLE001 - optional
+        pass
     return PoolItem(name=POOL_NAME, description=desc, pool_refs=[PRESET],
                     updated_at=pool.get("updated_at"), members=members)
 

@@ -49,8 +49,9 @@ TZ = ZoneInfo("Asia/Shanghai")
 POOL_NAME = "竞价选股"
 PRESET = "auction-pick"
 SEAL_MAX = float(os.environ.get("AUCTION_POOL_SEAL_MAX", "0.0094"))
-THS_GAP_MIN = float(os.environ.get("AUCTION_POOL_GAP_MIN", "0.04"))  # 竞价涨幅 > 4%
-TOP_N = int(os.environ.get("AUCTION_POOL_TOP", "0"))  # 0 = show all
+from rquant.research.auction_bt import GAP_MIN as THS_GAP_MIN  # noqa: E402  竞价涨幅 > 4%
+from rquant.research.auction_bt import TOP_N, select_top  # noqa: E402  shared with research
+
 THS_TOP = TOP_N
 POOL_LABEL = "观察名单（同花顺原条件，非买入信号）"
 RULE_TEXT = (f"昨日涨停非一字 & 非ST/退/北交所；今日竞价涨幅>{THS_GAP_MIN:.0%}，按竞价量降序"
@@ -191,10 +192,10 @@ def rank_picks(cands: list[dict], quotes: pd.DataFrame) -> list[dict]:
     """quotes: ts_code, price (auction price), pre_close, volume (auction volume).
     同花顺 screen: gap > 4%, by auction volume desc; 竞价涨停 kept, flagged ``limit_open``."""
     rows = _auction_rows(cands, quotes, THS_GAP_MIN, strict=True)
-    rows = rows[:TOP_N] if TOP_N > 0 else rows
-    for i, r in enumerate(rows, 1):
-        r["rank"] = i
-    return rows
+    if not rows:
+        return []
+    top = select_top(pd.DataFrame(rows), "auction_vol", day_col=None)
+    return [{**r, "rank": int(r["rank"])} for r in top.to_dict("records")]
 
 
 def ths_screen(base: list[dict], quotes: pd.DataFrame) -> list[dict]:

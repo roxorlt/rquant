@@ -206,7 +206,8 @@ def run_intraday_studies(root: Path, db: Path) -> None:
         for old in list_conditions(root):
             if old.name == cname:
                 shutil.rmtree(root / KIND / old.run_id, ignore_errors=True)
-        save_condition(cname, "昨日涨停非一字 & 竞价涨幅>4% & 非ST/退市，竞价量降序前5",
+        save_condition(cname,
+                       f"昨日涨停非一字 & 竞价涨幅>4% & 非ST/退市，竞价量降序前{studies.TOP_N}",
                        None, studies.latest_picks(root), root=root)
         sig = studies.signals_for_backtest(root)
         con = duckdb.connect(str(db))
@@ -219,9 +220,10 @@ def run_intraday_studies(root: Path, db: Path) -> None:
             first, last = con.execute("SELECT MIN(trade_date), MAX(trade_date) FROM _s").fetchone()
         finally:
             con.close()
-        spec = StrategySpec(slug=AUCTION_SLUG, title="竞价选股 前5 开盘买次日开盘卖",
+        n = studies.TOP_N
+        spec = StrategySpec(slug=AUCTION_SLUG, title=f"竞价选股 前{n} 开盘买次日开盘卖",
                             preset=AUCTION_PRESET, config=BacktestConfig(
-                                hold_days=1, weights=PortfolioWeightRule(max_positions=5)))
+                                hold_days=1, weights=PortfolioWeightRule(max_positions=n)))
         save_version(spec, root)
         version = resolve(AUCTION_SLUG, root)
         run_and_save(db, AUCTION_PRESET, first, last, version.spec.config, root=root,

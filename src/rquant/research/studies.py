@@ -20,11 +20,14 @@ import duckdb
 import numpy as np
 import pandas as pd
 
+from rquant.research.auction_bt import COST, TOP_N, net_trades, select_top  # noqa: E402
 from rquant.research.ingest import db_path
 from rquant.research.intraday import connect as intraday_connect
 from rquant.research.tdx_strategy import BENCH, study_path
 
-TOP_N = 5
+# Fixed train/test split for the auction study (was a moving 60% of days).
+SPLIT_DATE = pd.Timestamp("2025-07-01")
+N_SHUFFLE = 200
 
 
 def _stats(r: pd.Series) -> dict:
@@ -269,7 +272,10 @@ def auction_frame(root: Path) -> pd.DataFrame:
 
 
 def _outcome(df: pd.DataFrame) -> dict:
-    b = df[~df["one_word"]]
+    """After-cost outcomes of the buyable (non-一字) trades (auction_bt.net_trades)."""
+    b = net_trades(df)
+    b = b.assign(r_close=b["r_close"] - COST, r_n_open=b["r_n_open_net"],
+                 r_n_close=b["r_n_close_net"])
     return {"n": int(len(b)), "days": int(b["trade_date"].nunique()),
             "hit_up": float(b["hit_up"].mean()) if len(b) else 0.0,
             "close_up": float(b["close_up"].mean()) if len(b) else 0.0,
@@ -294,15 +300,10 @@ def _apply(df: pd.DataFrame, rule: list[tuple[str, str, float]]) -> pd.DataFrame
     m = pd.Series(True, index=df.index)
     for f, op, x in rule:
         m &= (df[f] >= x) if op == ">=" else (df[f] <= x)
-    out = df[m].copy()
-    out["rank"] = out.groupby("trade_date")["vol_x"].rank(ascending=False, method="first")
-    return out[out["rank"] <= TOP_N]
+    return select_top(df[m], "vol_x")
 
 
-def search_rules(df: pd.DataFrame, split: pd.Timestamp, min_n: int = 120) -> list[dict]:
-    """Single and paired tertile thresholds, chosen on train win rate (T+1 open); a rule
-    must keep >= min_n train picks and is reported on the untouched test period."""
-    train = df[df["trade_date"] < split]
+def _candidate_rules(train: pd.DataFrame) -> list[list[tuple[str, str, float]]]:
     cands: list[list[tuple[str, str, float]]] = []
     for f in FEATURES:
         x = train[f].dropna()
@@ -316,11 +317,66 @@ def search_rules(df: pd.DataFrame, split: pd.Timestamp, min_n: int = 120) -> lis
         for bb in singles[i + 1:]:
             if a[0][0] != bb[0][0]:
                 cands.append(a + bb)
+    return cands
+
+
+def _score_rules(train: pd.DataFrame, cands: list, min_n: int) -> list[tuple]:
     scored = []
     for rule in cands:
         o = _outcome(_apply(train, rule))
         if o["n"] >= min_n:
             scored.append((o["win_n_open"], o["r_n_open"], rule))
+    return scored
+
+
+def luck_check(train: pd.DataFrame, cands: list, best: float, min_n: int,
+               runs: int = N_SHUFFLE, seed: int = 0) -> dict:
+    """Shuffle the outcome columns across rows `runs` times and re-run the search: how
+    often does pure luck reach the real best train mean (after cost, T+1 open)?"""
+    rng = np.random.default_rng(seed)
+    outs = ["r_n_open", "r_n_close", "r_close", "hit_up", "close_up", "one_word"]
+    hits, bests = 0, []
+    for _ in range(runs):
+        sh = train.copy()
+        idx = rng.permutation(len(sh))
+        for c in outs:
+            sh[c] = sh[c].to_numpy()[idx]
+        sc = _score_rules(sh, cands, min_n)
+        b = max((s[1] for s in sc), default=float("-inf"))
+        bests.append(b)
+        hits += b >= best
+    return {"runs": runs, "real_best_mean": best, "p_value": (hits + 1) / (runs + 1),
+            "shuffled_best_median": float(np.median(bests)) if bests else None}
+
+
+def registry_append(root: Path | None, rec: dict) -> None:
+    """Every rule-search trial goes into research/registry.jsonl (append-only)."""
+    if root is None:
+        return
+    p = Path(root) / "registry.jsonl"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({"at": datetime.now(UTC).isoformat(), **rec},
+                           ensure_ascii=False, default=str) + "\n")
+
+
+def search_rules(df: pd.DataFrame, split: pd.Timestamp, min_n: int = 120,
+                 root: Path | None = None, shuffles: int = 0) -> list[dict]:
+    """Single and paired tertile thresholds, chosen on train win rate (T+1 open, after
+    cost); a rule must keep >= min_n train picks and is reported on the untouched test
+    period. Every trial is logged to the registry; optional shuffled-returns luck check."""
+    train = df[df["trade_date"] < split]
+    cands = _candidate_rules(train)
+    scored = _score_rules(train, cands, min_n)
+    luck = None
+    if shuffles and scored:
+        luck = luck_check(train, cands, max(s[1] for s in scored), min_n, shuffles)
+    # one line per search, every trial inside (rule, train win, train after-cost mean)
+    registry_append(root, {"study": "auction-ths", "split": split, "top_n": TOP_N,
+                           "cost": COST, "n_candidates": len(cands), "n_scored": len(scored),
+                           "trials": [[rule, round(w, 4), round(r, 5)]
+                                      for w, r, rule in scored],
+                           "luck_check": luck})
     scored.sort(key=lambda s: (s[0], s[1]), reverse=True)
     picked: list[dict] = []
     for _w, _r, rule in scored:
@@ -331,6 +387,8 @@ def search_rules(df: pd.DataFrame, split: pd.Timestamp, min_n: int = 120) -> lis
                        "test": _outcome(_apply(df[df["trade_date"] >= split], rule))})
         if len(picked) == 3:
             break
+    for p in picked:
+        p["luck"] = luck
     return picked
 
 
@@ -342,9 +400,10 @@ def auction_study(root: Path) -> dict:
     df = auction_frame(root)
     df["trade_date"] = pd.to_datetime(df["trade_date"])
     days = sorted(df["trade_date"].unique())
-    split = days[int(len(days) * 0.6)] if days else pd.Timestamp("2100-01-01")
-    top = df[df["rank"] <= TOP_N]
-    rules = search_rules(df, split)
+    split = SPLIT_DATE
+    df = select_top(df, "vol_x", top_n=0)  # re-rank all by auction volume
+    top = select_top(df, "vol_x")
+    rules = search_rules(df, split, root=root, shuffles=N_SHUFFLE)
     base_rows = [_row("全部候选", _outcome(df)), _row(f"成交量前 {TOP_N}", _outcome(top)),
                  _row(f"前 {TOP_N}·训练", _outcome(top[top["trade_date"] < split])),
                  _row(f"前 {TOP_N}·测试", _outcome(top[top["trade_date"] >= split]))]
@@ -360,8 +419,8 @@ def auction_study(root: Path) -> dict:
         "signals": int(len(top)),
         "per_year": {str(y): int(n) for y, n in top.groupby(top["trade_date"].dt.year).size()
                      .items()},
-        "horizons": {"T+1 开盘": _stats(top[~top["one_word"]]["r_n_open"]),
-                     "T+1 收盘": _stats(top[~top["one_word"]]["r_n_close"])},
+        "horizons": {"T+1 开盘(扣费)": _stats(net_trades(top)["r_n_open_net"]),
+                     "T+1 收盘(扣费)": _stats(net_trades(top)["r_n_close_net"])},
         "tables": [{"title": f"基线（每日前 {TOP_N}，开盘买入；一字开盘剔除 {_pct(one_word)}）",
                     "columns": COLS, "rows": base_rows},
                    {"title": f"加条件（训练 < {split.date()} ≤ 测试；"
@@ -369,10 +428,12 @@ def auction_study(root: Path) -> dict:
                     "columns": COLS, "rows": rule_rows}],
         "rules": [{"rule": [list(x) for x in r["rule"]], "train": r["train"],
                    "test": r["test"]} for r in rules],
+        "luck_check": rules[0]["luck"] if rules else None,
+        "cost": COST, "split": str(split.date()),
         "notes": ["竞价数据：Tushare stk_auction（09:25 集合竞价真实成交）",
                   "连板/封板时间/封单/开板：limit_list_d", "开→收 当日不可卖（T+1），仅作参考"],
         "caveats": ["ST/退 按 namechange 时点名称过滤",
-                    "未计费用与冲击成本（竞价量小的股票尤其明显）",
+                    f"已扣费用 0.11% + 滑点 0.2%（合计 {COST:.2%}/笔）",
                     "阈值在训练期选出，测试期只看一次；候选规则数多，仍有数据挖掘偏差",
                     "开盘价=竞价价，一字开盘视为买不进"]})
 
@@ -386,7 +447,7 @@ def latest_picks(root: Path, rule: list | None = None) -> tuple:
         return None, 0, []
     last = df["trade_date"].max()
     day = df[df["trade_date"] == last]
-    day = _apply(day, [tuple(x) for x in rule]) if rule else day[day["rank"] <= TOP_N]
+    day = _apply(day, [tuple(x) for x in rule]) if rule else select_top(day, "vol_x")
     hits = [ConditionHit(code=r.ts_code, close=float(r.close), pct_chg=float(r.gap * 100))
             for r in day.sort_values("rank").itertuples()]
     return pd.Timestamp(last).date(), int(len(df[df["trade_date"] == last])), hits
@@ -396,6 +457,6 @@ def signals_for_backtest(root: Path) -> pd.DataFrame:
     """Daily top-N picks keyed on the PREVIOUS trading day, so the engine's next-open
     fill lands on the auction day's open."""
     df = auction_frame(root)
-    top = df[df["rank"] <= TOP_N]
+    top = select_top(df, "vol_x")
     return pd.DataFrame({"trade_date": top["y_trade_date"], "ts_code": top["ts_code"],
                          "score": TOP_N + 1 - top["rank"]})
