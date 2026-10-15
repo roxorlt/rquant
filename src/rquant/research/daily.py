@@ -74,6 +74,15 @@ def run(years: int = 5, minutes: int = 300, ingest: bool = True, end: date | Non
         first = con.execute("SELECT MIN(trade_date) FROM daily_bar").fetchone()[0]
         bt_start = max(first + timedelta(days=200), last - timedelta(days=365 * 3))
         log.info("screens: %d rows", screens.build(con, bt_start - timedelta(days=10), last))
+        try:  # shared negative-factor flags (point-in-time, for decisions on the next day)
+            import os
+
+            from rquant.risk import neg_filter
+
+            pro = ing.Pro(os.environ.get("TUSHARE_TOKEN_MAIN") or os.environ["TUSHARE_TOKEN"])
+            log.info("risk_flags_daily %s: %d rows", last, neg_filter.run_daily(con, pro, last))
+        except Exception:  # noqa: BLE001 - must not break the daily research job
+            log.exception("risk_flags_daily build failed")
         write_report(audit(con, last, 30, extra=ing.RESEARCH_TABLES), root)
     finally:
         con.close()

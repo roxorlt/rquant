@@ -1,7 +1,8 @@
 # ruff: noqa: E501 - SQL and preset tables read better unwrapped
 """Research presets -> screen_result in market.duckdb (input pools for portfolio backtests).
 
-Each preset picks up to 30 names per trading day from liquid, non-ST stocks
+Each preset picks up to 30 names per trading day from liquid stocks that were not ST/退 on
+that day (point-in-time via namechange)
 (circulating cap top 1500, listed > 1 year). `extra` carries {"score": ...}.
 """
 
@@ -10,6 +11,8 @@ from __future__ import annotations
 from datetime import date
 
 import duckdb
+
+from rquant.risk.neg_filter import st_pit_sql
 
 UNIVERSE = """
 WITH b AS (
@@ -28,11 +31,13 @@ WITH b AS (
          row_number() OVER (PARTITION BY b.trade_date ORDER BY d.circ_mv DESC NULLS LAST) AS mv_rank
   FROM b JOIN daily_basic d USING (ts_code, trade_date)
   JOIN stock_basic s USING (ts_code)
-  WHERE s.name NOT LIKE '%ST%' AND s.list_date <= b.trade_date - INTERVAL 365 DAY
+  WHERE NOT {ST_PIT} AND s.list_date <= b.trade_date - INTERVAL 365 DAY
     AND b.trade_date BETWEEN ? AND ?
 )
 SELECT * FROM u WHERE mv_rank <= 1500
 """
+# point-in-time ST/退 (namechange) instead of today's name: no look-ahead / survivorship bias
+UNIVERSE = UNIVERSE.replace("{ST_PIT}", st_pit_sql("b.ts_code", "b.trade_date"))
 
 PRESETS = {
     "research_mom20": ("20 日动量前 30", "r20", "DESC", "r20 IS NOT NULL"),

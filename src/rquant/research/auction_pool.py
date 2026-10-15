@@ -130,7 +130,7 @@ def limit_price(pre_close: float, ts_code: str) -> float:
 def build_candidates(root: Path, day: date) -> dict[str, Any]:
     import duckdb
 
-    from rquant.research.pit import is_st
+    from rquant.risk import neg_filter as nf
 
     icon = duckdb.connect(str(root / "intraday.duckdb"), read_only=True)
     try:
@@ -152,14 +152,22 @@ def build_candidates(root: Path, day: date) -> dict[str, Any]:
         df = df.merge(mv, on="ts_code", how="left")
         df["circ_mv"] = df["circ_mv"].fillna(df["float_mv"] / 1e4)
         days = pd.Series([pd.Timestamp(day)] * len(df))
-        df["is_st"] = is_st(con, df["ts_code"], days).to_numpy() if len(df) else []
+        df["is_st"] = nf.st_pit(con, df["ts_code"], days).to_numpy() if len(df) else []
+        flags = nf.load_risk_flags(con, before=day)
     finally:
         con.close()
-    base = filter_base(df)
+    # shared risk filter (short-term policy): drop hard flags, keep soft/info as labels
+    base = nf.apply(filter_base(df), flags, policy="short_term")
+    dropped = base[base["risk_hard"]]
+    if len(dropped):
+        log.info("risk filter dropped %d: %s", len(dropped),
+                 dict(zip(dropped["ts_code"], dropped["risk_flags"], strict=True)))
+    base = base[~base["risk_hard"]]
     rows = [{"ts_code": r.ts_code, "name": r.name, "y_close": float(r.close),
              "seal_ratio": round(float(r.seal_ratio), 6), "boards": int(r.limit_times or 1),
              "open_times": int(r.open_times or 0), "first_time": r.first_time,
-             "industry": r.industry} for r in base.itertuples()]
+             "industry": r.industry, "risk_flags": list(r.risk_flags)}
+            for r in base.itertuples()]
     return {"pool": POOL_NAME, "date": f"{day:%Y-%m-%d}", "prior_date": str(prior),
             "rule": RULE_TEXT, "label": POOL_LABEL, "kind": "watchlist",
             "stage": "candidates", "limit_ups": int(len(ll)), "candidates": rows,

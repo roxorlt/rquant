@@ -392,7 +392,7 @@ class TestLimitPrices:
     def test_matches_derive_state(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """对拍：add_limit_prices 的涨停/跌停价必须与 derive_state 逐票一致。
 
-        覆盖主板 10% / 创业板 20% / 科创板 20% / 北交所 30% / ST 5%，
+        覆盖主板 10% / 创业板 20% / 科创板 20% / 北交所 30% / 主板 ST 10%（2026-07-06 起），
         且含 half-up 舍入敏感样本（3.30×1.05=3.465 → 3.47，银行家舍入会给 3.46）。
         """
         _kill_em_spot_tiers(monkeypatch)
@@ -401,7 +401,7 @@ class TestLimitPrices:
         for _, row in snap.iterrows():
             daily = pd.DataFrame(
                 {
-                    "trade_date": [date(2026, 7, 3)],
+                    "trade_date": [date(2026, 7, 6)],  # live snapshot = after 主板 ST 10% (2026-07-06)
                     "open": [row["open"]],
                     "high": [row["high"]],
                     "low": [row["low"]],
@@ -415,7 +415,7 @@ class TestLimitPrices:
             status = pd.DataFrame(
                 {
                     "ts_code": [row["ts_code"]],
-                    "trade_date": [date(2026, 7, 3)],
+                    "trade_date": [date(2026, 7, 6)],
                     "name": [row["name"]],
                     "is_st": pd.Series(
                         [compact_name.startswith(("ST", "*ST", "SST"))],
@@ -435,8 +435,8 @@ class TestLimitPrices:
         monkeypatch.setattr(panorama_data, "_fetch_spot", _sina_spot_df)
         snap = add_limit_prices(fetch_market_snapshot())
         st_row = snap[snap["ts_code"] == "600222.SH"].iloc[0]
-        assert st_row["limit_pct"] == 0.05
-        assert st_row["limit_up_price"] == pytest.approx(3.47)  # half-up，非 3.46
+        assert st_row["limit_pct"] == 0.10  # 主板 ST 10% since 2026-07-06 (live snapshot = today)
+        assert st_row["limit_up_price"] == pytest.approx(3.63)
 
     def test_empty_passthrough(self) -> None:
         assert add_limit_prices(pd.DataFrame()).empty
