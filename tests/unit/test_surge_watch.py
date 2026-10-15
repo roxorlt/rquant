@@ -2630,3 +2630,65 @@ class TestPulseWiring:
         pulse_file = tmp_path / f"pulse-{day.isoformat()}.jsonl"
         assert pulse_file.exists()
         assert pulse_file.read_text(encoding="utf-8").count("\n") == 2
+
+
+# ── 批量 stk_mins（一个请求多只）与逐只结果一致 ─────────────────────────────────
+
+
+class TestBatchMinuteFetch:
+    CODES = [f"30000{i}.SZ" for i in range(1, 9)]
+
+    def _bars_for(self, code: str) -> pd.DataFrame:
+        d = date(2026, 7, 6)
+        k = int(code[5])
+        b = mk_minute_bars({d - timedelta(days=i): [1e4 * k] * 241 for i in (1, 2, 3)})
+        b["ts_code"] = code
+        return b
+
+    def _snap(self) -> pd.DataFrame:
+        rows = []
+        for c in self.CODES:
+            amt = rel_amount(self._bars_for(c), 30, 4.0) if c != "300008.SZ" else 1.0
+            rows.append({"ts_code": c, "price": 100.0, "pre_close": 90, "pct_chg": 5,
+                         "volume": 1e6, "amount": amt})
+        return mk_snap(rows)
+
+    def _run(self, batched: bool) -> tuple[SurgeWatcher, list]:
+        calls: list = []
+
+        def single(code: str, d: date) -> pd.DataFrame:
+            calls.append(code)
+            return self._bars_for(code)
+
+        def batch(codes: list[str], d: date) -> pd.DataFrame:
+            calls.append(tuple(codes))
+            return pd.concat([self._bars_for(c) for c in codes if c != "300007.SZ"])
+
+        base = mk_baseline({c: 1.0 for c in self.CODES}, curve=flat_curve())
+        w = SurgeWatcher(base, config=SurgeConfig(tushare_rate_per_min=2, stk_mins_batch_size=5),
+                         minute_fetcher=single, batch_minute_fetcher=batch if batched else None)
+        w.tick(self._snap(), datetime(2026, 7, 6, 10, 0, tzinfo=CST))
+        return w, calls
+
+    def test_batch_same_decisions_fewer_requests(self) -> None:
+        ws, calls_s = self._run(False)
+        wb, calls_b = self._run(True)
+        assert len(calls_s) == 2 and len(ws.confirm_cache) == 2  # 逐只：2 次/分钟只能拉 2 只
+        assert len(calls_b) == 2 and len(wb.confirm_cache) == 8  # 批量：2 次拉完 8 只
+        for c in ws.confirm_cache:
+            np.testing.assert_array_equal(ws.confirm_cache[c].cum_median,
+                                          wb.confirm_cache[c].cum_median)
+        # 批量结果缺该只 → 空基线（同逐只空返回）
+        assert wb.confirm_cache["300007.SZ"].days_used == 0
+        assert ws.pushed_today <= wb.pushed_today
+
+    def test_batch_error_requeues_each(self) -> None:
+        def boom(codes: list[str], d: date) -> pd.DataFrame:
+            raise RuntimeError("quota")
+
+        base = mk_baseline({c: 1.0 for c in self.CODES}, curve=flat_curve())
+        w = SurgeWatcher(base, config=SurgeConfig(), minute_fetcher=lambda c, d: pd.DataFrame(),
+                         batch_minute_fetcher=boom)
+        w.tick(self._snap(), datetime(2026, 7, 6, 10, 0, tzinfo=CST))
+        assert not w.confirm_cache
+        assert set(w._pending_fetch) == set(self.CODES)

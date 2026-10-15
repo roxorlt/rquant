@@ -356,6 +356,8 @@ class SurgeConfig(BaseModel):
     silent_until_hhmm: str = "09:31"  # 该时刻前只收集不推送（用户要求 9:31 起就推）
     tushare_rate_per_min: int = 2  # 确认层 stk_mins 限频（次/分）
     tushare_max_retries: int = 3  # 单候选取数失败重试上限（延后不阻塞队列）
+    # 确认层一次 stk_mins 合并取几只（8 日窗口 ≤6 交易日×241×5 < 8000 行上限）
+    stk_mins_batch_size: int = 5
     miss_circuit_threshold: int = 5  # 快照连续 miss 触发降级告警 + 退避
     # 检测范围（不是取数范围）：全市场快照在检测层按此过滤。默认创业+科创，
     # RQUANT_SURGE_BOARDS 可覆盖（default_factory 构造时读 env）。
@@ -1074,12 +1076,15 @@ class SurgeWatcher:
         minute_fetcher: Callable[[str, date], pd.DataFrame] | None = None,
         today_cum_fetcher: Callable[[str, date], pd.DataFrame] | None = None,
         theme_map: dict[str, str] | None = None,
+        batch_minute_fetcher: Callable[[list[str], date], pd.DataFrame] | None = None,
         push_history: SurgePushHistory | None = None,
     ) -> None:
         self.baseline = baseline
         self.config = config or SurgeConfig()
         # 默认取数器在 run 注入；tick 单测必须显式传 fetcher（不碰网络）
         self._minute_fetcher = minute_fetcher or _default_minute_fetcher
+        # 批量 stk_mins（一个请求多只，按 ts_code 拆分）；None → 逐只（单测/simulate 默认）
+        self._batch_minute_fetcher = batch_minute_fetcher
         # 今日累计精确取数（rt_min_daily）；None → 确认层今日累计退回快照累加器近似值。
         # 刻意 opt-in：直接驱动 tick 的单测/simulate 不注入即走累加器近似（离线、不碰网络），
         # 只有 run（真实盘中）注入 rt_min_daily 网络取数器取精确当日累计。
@@ -1150,7 +1155,9 @@ class SurgeWatcher:
         """
         budget = self.config.tushare_rate_per_min
         requeue: list[str] = []
-        while budget > 0 and self._pending_fetch:
+        if self._batch_minute_fetcher is not None:
+            self._drain_batched(snapshot, now, gi, budget, requeue)
+        while self._batch_minute_fetcher is None and budget > 0 and self._pending_fetch:
             code = self._pending_fetch.popleft()
             self._queued.discard(code)
             if code in self.pushed_today:
@@ -1180,6 +1187,97 @@ class SurgeWatcher:
             if code not in self.pushed_today:
                 self._queued.add(code)
                 self._pending_fetch.append(code)
+
+    def _fail(self, code: str, e: Exception, requeue: list[str]) -> None:
+        self._fetch_fail[code] = self._fetch_fail.get(code, 0) + 1
+        logger.warning(
+            f"surge 确认取数失败 {code}"
+            f"（第 {self._fetch_fail[code]}/{self.config.tushare_max_retries} 次）:"
+            f" {type(e).__name__}: {e}"
+        )
+        if self._fetch_fail[code] < self.config.tushare_max_retries:
+            requeue.append(code)
+
+    def _drain_batched(
+        self, snapshot: pd.DataFrame, now: datetime, gi: int, budget: int, requeue: list[str]
+    ) -> None:
+        """批量版：每个请求合并 ``stk_mins_batch_size`` 只，同样每 tick 至多 budget 次请求。
+
+        与逐只版判定完全一致（同一 build_three_day_baseline），只是吞吐 ×batch_size。
+        结果超过 stk_mins 8000 行上限（可能被截断）的批次退回逐只拉取。
+        """
+        assert self._batch_minute_fetcher is not None
+        size = max(1, self.config.stk_mins_batch_size)
+        while budget > 0 and self._pending_fetch:
+            batch: list[str] = []
+            while self._pending_fetch and len(batch) < size:
+                code = self._pending_fetch.popleft()
+                self._queued.discard(code)
+                if code in self.pushed_today:
+                    continue
+                if code in self.confirm_cache:
+                    self._evaluate(code, snapshot, now, gi)
+                    continue
+                batch.append(code)
+            if not batch:
+                continue
+            budget -= 1
+            try:
+                bars = self._batch_minute_fetcher(batch, now.date())
+                if bars is not None and len(bars) >= STK_MINS_ROW_LIMIT and len(batch) > 1:
+                    raise _BatchTruncatedError(len(bars))
+            except _BatchTruncatedError:
+                logger.warning(f"surge 批量 stk_mins 达行数上限，{len(batch)} 只改逐只")
+                for code in batch:  # back to the head of the queue, fetched singly
+                    self._queued.add(code)
+                    self._pending_fetch.appendleft(code)
+                saved, self._batch_minute_fetcher = self._batch_minute_fetcher, None
+                try:
+                    self._drain_single(snapshot, now, gi, budget, requeue)
+                finally:
+                    self._batch_minute_fetcher = saved
+                return
+            except Exception as e:
+                for code in batch:
+                    self._fail(code, e, requeue)
+                continue
+            groups = (
+                dict(tuple(bars.groupby(bars["ts_code"].astype(str))))
+                if bars is not None and not bars.empty and "ts_code" in bars.columns
+                else {}
+            )
+            for code in batch:
+                part = groups.get(code)
+                self.confirm_cache[code] = build_three_day_baseline(
+                    part if part is not None else pd.DataFrame(),
+                    now.date(),
+                    self.config.cum_lookback_days,
+                )
+                self._fetch_today_cum(code, now.date(), gi)
+                self._evaluate(code, snapshot, now, gi)
+
+    def _drain_single(
+        self, snapshot: pd.DataFrame, now: datetime, gi: int, budget: int, requeue: list[str]
+    ) -> None:
+        while budget > 0 and self._pending_fetch:
+            code = self._pending_fetch.popleft()
+            self._queued.discard(code)
+            if code in self.pushed_today:
+                continue
+            if code in self.confirm_cache:
+                self._evaluate(code, snapshot, now, gi)
+                continue
+            budget -= 1
+            try:
+                bars = self._minute_fetcher(code, now.date())
+            except Exception as e:
+                self._fail(code, e, requeue)
+                continue
+            self.confirm_cache[code] = build_three_day_baseline(
+                bars, now.date(), self.config.cum_lookback_days
+            )
+            self._fetch_today_cum(code, now.date(), gi)
+            self._evaluate(code, snapshot, now, gi)
 
     def _fetch_today_cum(self, code: str, today: date, required_gi: int) -> None:
         """拉 rt_min_daily 精确累计与价格方向；已覆盖当前格即复用缓存。
@@ -1557,6 +1655,22 @@ def load_recent_push_history(
 # ── 默认取数器（run 用；tick 单测注入 fake，不碰网络） ──────────────────────────
 
 
+STK_MINS_ROW_LIMIT = 8000
+
+
+class _BatchTruncatedError(Exception):
+    pass
+
+
+def _default_batch_minute_fetcher(ts_codes: list[str], today: date) -> pd.DataFrame:
+    """批量 stk_mins：一个请求多只（ts_code 逗号分隔，2026-10-15 实测可用），同 8 日窗口。"""
+    from rquant.adapter.tushare import TushareAdapter
+
+    start = datetime.combine(today - timedelta(days=8), dt_time(9, 0))
+    end = datetime.combine(today - timedelta(days=1), CLOSE_TIME)
+    return TushareAdapter().stk_mins(",".join(ts_codes), "1min", start, end)
+
+
 def _default_minute_fetcher(ts_code: str, today: date) -> pd.DataFrame:
     """默认 stk_mins 取数：拉 today 前 ~8 日窗口 1min bars（含足够 3 交易日历史）。"""
     from rquant.adapter.tushare import TushareAdapter
@@ -1703,6 +1817,9 @@ def run_surge_watch(
         snapshot_fetcher = _rt_min_snapshot
     if today_cum_fetcher is None and use_real_sources:
         today_cum_fetcher = _default_today_cum_fetcher
+    batch_minute_fetcher = (
+        _default_batch_minute_fetcher if (minute_fetcher is None and use_real_sources) else None
+    )
 
     watcher = SurgeWatcher(
         baseline,
@@ -1710,6 +1827,7 @@ def run_surge_watch(
         minute_fetcher=minute_fetcher,
         today_cum_fetcher=today_cum_fetcher,
         push_history=push_history,
+        batch_minute_fetcher=batch_minute_fetcher,
     )
     events_path = live_dir / f"events-{day.isoformat()}.jsonl"
 
