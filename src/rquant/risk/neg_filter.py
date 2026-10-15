@@ -179,11 +179,12 @@ def build_risk_flags(con: duckdb.DuckDBPyConnection, pro: Pro, day: date,
     if not h.empty:
         h = h[h["in_de"] == "DE"]
         add(h["ts_code"].unique(), "holder_reduce", "近30日减持公告")
-    fc = _safe(pro, "forecast", start_date=_ymd(day - timedelta(days=5)), end_date=ds)
+    fc = pd.concat([_safe(pro, "forecast", ann_date=_ymd(day - timedelta(days=k))) for k in range(5)])
     if not fc.empty:
         neg = fc[fc["type"].isin(["预减", "首亏", "续亏", "略减"])]
         add(neg["ts_code"], "forecast_negative", neg["type"])
-    sf = _safe(pro, "share_float", start_date=_ymd(day + timedelta(days=1)), end_date=_ymd(day + timedelta(days=8)))
+    # per float_date (a date range is capped at 6000 rows and silently truncated)
+    sf = pd.concat([_safe(pro, "share_float", float_date=_ymd(day + timedelta(days=k))) for k in range(1, 8)])
     if not sf.empty:
         sf["float_ratio"] = pd.to_numeric(sf["float_ratio"], errors="coerce")
         g = sf.groupby("ts_code")["float_ratio"].sum()
@@ -212,7 +213,10 @@ def build_risk_flags(con: duckdb.DuckDBPyConnection, pro: Pro, day: date,
         sev = tl[rs.str.contains("严重异常")]
         add(sev["ts_code"].unique(), "severe_abnormal", "交易所公告严重异常波动")
         announced_today = set(tl.loc[rs.str.contains("偏离值累计"), "ts_code"])
-    pl = _safe(pro, "pledge_stat", end_date=ds)
+    fri = day - timedelta(days=(day.weekday() - 4) % 7)  # pledge_stat is weekly (Friday end_date)
+    pl = _safe(pro, "pledge_stat", end_date=_ymd(fri))
+    if pl.empty:
+        pl = _safe(pro, "pledge_stat", end_date=_ymd(fri - timedelta(days=7)))
     if not pl.empty:
         pl = pl.sort_values("end_date").groupby("ts_code").tail(1)
         hi = pl[pd.to_numeric(pl["pledge_ratio"], errors="coerce") >= 50]

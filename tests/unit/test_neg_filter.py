@@ -80,3 +80,20 @@ def test_load_flags_point_in_time() -> None:
     nf.store(con, df)
     got = nf.load_risk_flags(con, before=date(2026, 10, 14))
     assert got["ts_code"].tolist() == ["A"]  # flags built on D are not visible for decisions on D
+
+
+def test_multi_stock_matches_single() -> None:
+    rets = {"600001.SH": [0.0] * 5 + [0.1, 0.1, 0.1, 0.0, 0.0],
+            "300001.SZ": [0.0] * 8 + [0.05, 0.10],
+            "000001.SZ": [np.nan, 0.02, 0.1, np.nan, 0.1, 0.1, 0.0, -0.1, 0.0, 0.05]}
+    sr, ir = _frames(rets, 10)
+    allr = ab.compute(sr, ir)
+    for c in rets:
+        one = ab.compute(sr[[c]], ir)
+        pd.testing.assert_series_equal(allr.dev3[c], one.dev3[c])
+        pd.testing.assert_series_equal(allr.near_abn_up[c], one.near_abn_up[c])
+    # suspended days are skipped: window = last 3 TRADED days (idx 1, 2, 4) -> 23.42% triggers,
+    # then the counter restarts on the next day
+    assert round(allr.dev3["000001.SZ"].iloc[4], 4) == round((1.02 * 1.1 * 1.1 - 1) * 100, 4)
+    assert allr.abnormal["000001.SZ"].iloc[4] == 1
+    assert round(allr.dev3["000001.SZ"].iloc[5], 4) == 10.0

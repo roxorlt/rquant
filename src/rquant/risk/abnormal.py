@@ -82,13 +82,14 @@ def compute(stock_ret: pd.DataFrame, index_ret: pd.DataFrame, st: pd.DataFrame |
     cs_s = np.vstack([np.zeros(nc), np.cumsum(lr_s, axis=0)])
     cs_i = np.vstack([np.zeros(nc), np.cumsum(lr_i, axis=0)])
     tcount = np.vstack([np.zeros(nc), np.cumsum(traded, axis=0)])
+    cols = np.arange(nc)
     for t in range(nd):
         d = days[t].date() if hasattr(days[t], "date") else days[t]
         thr = np.where(gemstar, 30.0,
                        np.where(stv[t] & (d < MAIN_ST_10_PERCENT_START), 12.0, 20.0))
         # window = last 3 TRADED days of this stock, not before `start`
         lo = np.maximum(start, _nth_traded_back(tcount, t, 3))
-        s = (np.expm1(cs_s[t + 1] - cs_s[lo]) - np.expm1(cs_i[t + 1] - cs_i[lo])) * 100
+        s = (np.expm1(cs_s[t + 1] - cs_s[lo, cols]) - np.expm1(cs_i[t + 1] - cs_i[lo, cols])) * 100
         s = np.where(traded[t] & valid_col, s, np.nan)
         dev3[t] = s
         up, dn = s >= thr, s <= -thr
@@ -120,7 +121,7 @@ def compute(stock_ret: pd.DataFrame, index_ret: pd.DataFrame, st: pd.DataFrame |
     for t in range(nd):  # vectorized per day (cheap); last row is what matters
         st_win = _window_start_after(abn, ann, t)
         lo = np.maximum(st_win, _nth_traded_back(tcount, t, 2))
-        part = (np.expm1(cs_s[t + 1] - cs_s[lo]) - np.expm1(cs_i[t + 1] - cs_i[lo])) * 100
+        part = (np.expm1(cs_s[t + 1] - cs_s[lo, cols]) - np.expm1(cs_i[t + 1] - cs_i[lo, cols])) * 100
         part = np.where(valid_col, part, np.nan)
         near_u[t] = (part + lim >= thr_n) & ~(abn[t] != 0)
         near_d[t] = (part - lim <= -thr_n) & ~(abn[t] != 0)
@@ -136,12 +137,10 @@ def compute(stock_ret: pd.DataFrame, index_ret: pd.DataFrame, st: pd.DataFrame |
 def _nth_traded_back(tcount: np.ndarray, t: int, n: int) -> np.ndarray:
     """Per stock: index of the earliest day such that days [idx..t] contain the last n traded
     days (for stocks with fewer, 0)."""
-    target = tcount[t + 1] - n  # cumulative traded count just before the window
-    # earliest idx with tcount[idx] >= target → searchsorted per column
-    out = np.empty(tcount.shape[1], dtype=np.int64)
-    for j in range(tcount.shape[1]):
-        out[j] = np.searchsorted(tcount[: t + 2, j], max(target[j], 0), side="right") - 1
-    return np.clip(out, 0, t)
+    target = np.maximum(tcount[t + 1] - n, 0)  # cumulative traded count just before the window
+    # per column: last idx with tcount[idx] <= target (tcount is non-decreasing) == searchsorted
+    out = (tcount[: t + 2] <= target[None, :]).sum(0) - 1
+    return np.clip(out, 0, t).astype(np.int64)
 
 
 def _window_start_after(abn: np.ndarray, ann: np.ndarray, t: int) -> np.ndarray:
