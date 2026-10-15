@@ -497,7 +497,7 @@ def add_limit_prices(snapshot: pd.DataFrame) -> pd.DataFrame:
     boards = df["ts_code"].map(_classify_board)
     is_st = df["name"].map(_detect_st)
     limit_pct = pd.Series(
-        [_limit_pct(s, b) for s, b in zip(is_st, boards, strict=True)],
+        [_limit_pct(s, b, None) for s, b in zip(is_st, boards, strict=True)],
         index=df.index,
         dtype="float64",
     )

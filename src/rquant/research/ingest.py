@@ -115,14 +115,10 @@ def _upsert(con: duckdb.DuckDBPyConnection, table: str, df: pd.DataFrame) -> int
     return len(df)
 
 
-def _limit_pct(code: str, name: str) -> float:
-    if "ST" in (name or ""):
-        return 0.05
-    if code.startswith(("300", "301", "688", "689")):
-        return 0.20
-    if code.endswith(".BJ"):
-        return 0.30
-    return 0.10
+def _limit_pct(code: str, name: str, day=None) -> float:
+    from rquant.limit_rules import board_of, limit_pct
+
+    return limit_pct("ST" in (name or "").upper(), board_of(code), day)
 
 
 def refresh_reference(con: duckdb.DuckDBPyConnection, pro: Pro, start: date, end: date) -> None:
@@ -197,7 +193,7 @@ def ingest_day(con: duckdb.DuckDBPyConnection, pro: Pro, day: date,
                               "limit_pct": pct})
     else:
         state = pd.DataFrame({"ts_code": bar["ts_code"], "trade_date": day,
-                              "limit_pct": [_limit_pct(c, names.get(c, "")) for c in bar["ts_code"]]})
+                              "limit_pct": [_limit_pct(c, names.get(c, ""), day) for c in bar["ts_code"]]})
     _upsert(con, "daily_state", state)
     return n
 

@@ -341,10 +341,9 @@ MIN_AMT = 1e8  # and turnover >= 1亿
 
 
 def _limit_up(codes: list[str], names: list, pre: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    c = pd.Series(codes)
-    lp = np.where(c.str.startswith(("30", "68")), 0.2, 0.1)
-    lp = np.where(c.str.endswith(".BJ"), 0.3, lp)
-    lp = np.where(pd.Series(names).fillna("").str.contains("ST"), 0.05, lp)
+    from rquant.limit_rules import limit_pct_vec
+
+    lp = limit_pct_vec(codes, pd.Series(names, dtype=object).fillna("").to_numpy())
     return np.round(pre * (1 + lp) + 1e-9, 2), np.round(pre * (1 - lp) + 1e-9, 2)
 
 

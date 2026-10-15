@@ -100,13 +100,11 @@ def _detect_st(name: str | None) -> bool:
     return normalized.startswith(("ST", "*ST", "SST"))
 
 
-def _limit_pct(is_st: bool, board_type: str) -> float:
-    """Return the current simplified exchange limit percentage."""
-    if board_type == "bj":
-        return 0.30
-    if board_type in ("gem", "star"):
-        return 0.20
-    return 0.05 if is_st else 0.10
+def _limit_pct(is_st: bool, board_type: str, trade_date: date | None = None) -> float:
+    """Exchange limit percentage on ``trade_date`` (default: today CST); see rquant.limit_rules."""
+    from rquant.limit_rules import limit_pct
+
+    return limit_pct(is_st, board_type, trade_date)
 
 
 def _historical_limit_pct(
@@ -114,9 +112,7 @@ def _historical_limit_pct(
     board_type: str,
     trade_date: date,
 ) -> float:
-    if board_type == "gem" and trade_date < CHINEXT_20_PERCENT_START:
-        return 0.05 if is_st else 0.10
-    return _limit_pct(is_st, board_type)
+    return _limit_pct(is_st, board_type, trade_date)
 
 
 def _requires_five_day_listing_window(

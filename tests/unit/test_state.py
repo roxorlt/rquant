@@ -38,7 +38,11 @@ class TestBoardClassify:
 
 class TestLimitPct:
     def test_st_main(self) -> None:
-        assert _limit_pct(is_st=True, board_type="main") == 0.05
+        from datetime import date
+
+        assert _limit_pct(is_st=True, board_type="main", trade_date=date(2026, 7, 3)) == 0.05
+        assert _limit_pct(is_st=True, board_type="main", trade_date=date(2026, 7, 6)) == 0.10
+        assert _limit_pct(is_st=True, board_type="main") == 0.10
 
     def test_main_normal(self) -> None:
         assert _limit_pct(is_st=False, board_type="main") == 0.10

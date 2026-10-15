@@ -286,12 +286,10 @@ def format_push(evs: list[dict], priority: set[str] | None = None) -> tuple[str,
 
 
 # --------------------------------------------------------------------------- scanner
-def limit_pct(code: np.ndarray, name: np.ndarray) -> np.ndarray:
-    code = code.astype(str)
-    st = np.char.find(np.char.upper(name.astype(str)), "ST") >= 0
-    star_gem = np.char.startswith(code, "688") | np.char.startswith(code, "30")
-    bj = np.char.endswith(code, ".BJ")
-    return np.where(bj, 0.30, np.where(star_gem, 0.20, np.where(st, 0.05, 0.10)))
+def limit_pct(code: np.ndarray, name: np.ndarray, trade_date=None) -> np.ndarray:
+    from rquant.limit_rules import limit_pct_vec
+
+    return limit_pct_vec(code, pd.Series(name, dtype=object).fillna("").to_numpy(), trade_date)
 
 
 class SurgeScanner:
