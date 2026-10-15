@@ -9,7 +9,9 @@ per code per minute and cached by (path, mtime, chunk), so a refresh only reads 
 
 from __future__ import annotations
 
+import contextlib
 import threading
+import time
 from pathlib import Path
 
 import duckdb
@@ -142,6 +144,28 @@ def _state(price: pd.Series, high: pd.Series, up: pd.Series, down: pd.Series) ->
     return s
 
 
+_LATEST: dict[tuple[str, str | None], tuple[float, MarketLiveData]] = {}
+_INFLIGHT: set[tuple] = set()
+#: serve the previous result while a newer one is computed in the background (a full
+#: recompute takes several seconds once the day has many snapshot parts)
+_STALE_OK_S = 90.0
+
+
+def _refresh(root: Path, day: str, chunks: list[pd.DataFrame], board: str | None,
+             sig: tuple) -> MarketLiveData:
+    try:
+        out = _compute(root, day, chunks, board)
+        with _LOCK:
+            if len(_RESULT) > 64:
+                _RESULT.clear()
+            _RESULT[sig] = out
+            _LATEST[(day, board)] = (time.monotonic(), out)
+        return out
+    finally:
+        with _LOCK:
+            _INFLIGHT.discard(sig)
+
+
 def load_market_live(root: Path, day: str, board: str | None = None) -> MarketLiveData:
     d = root / "snapshots" / day
     chunks = _chunks(d)
@@ -149,14 +173,30 @@ def load_market_live(root: Path, day: str, board: str | None = None) -> MarketLi
         keys = sorted(k for k in _CACHE if k[0].startswith(str(d)))
         sig = (day, board, len(chunks), tuple(keys[-1:]))
         hit = _RESULT.get(sig)
+        prev = _LATEST.get((day, board))
+        busy = sig in _INFLIGHT
+        stale = prev is not None and time.monotonic() - prev[0] < _STALE_OK_S
+        if hit is None and (stale or busy):
+            if not busy:
+                _INFLIGHT.add(sig)
+                threading.Thread(target=_refresh, args=(root, day, chunks, board, sig),
+                                 daemon=True, name="market-live-refresh").start()
+            if prev is not None:
+                return prev[1]
+        elif hit is None:
+            _INFLIGHT.add(sig)
     if hit is not None:
         return hit
-    out = _compute(root, day, chunks, board)
-    with _LOCK:
-        if len(_RESULT) > 64:
-            _RESULT.clear()
-        _RESULT[sig] = out
-    return out
+    return _refresh(root, day, chunks, board, sig)
+
+
+def warm_market_live(root: Path) -> None:
+    """Fill the snapshot/result caches for the latest day (run once at startup, off-thread)."""
+    snaps = root / "snapshots"
+    days = sorted(p.name for p in snaps.glob("20??-??-??") if p.is_dir()) if snaps.is_dir() else []
+    if days:
+        with contextlib.suppress(Exception):  # best effort; first request computes it instead
+            load_market_live(root, days[-1], None)
 
 
 def _compute(root: Path, day: str, chunks: list[pd.DataFrame], board: str | None,

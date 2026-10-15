@@ -12,6 +12,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 from fastapi import FastAPI, Request
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -33,7 +34,17 @@ def create_app(source: Source | None = None, dist: Path | None = DIST,
     app = FastAPI(title="rQuant web API", version=_version())
     #: portfolio backtest results (files); None → $RQUANT_RESEARCH_ROOT or data/research
     app.state.research_root = research_root
+    app.add_middleware(GZipMiddleware, minimum_size=2048)
     if source is None:
+        if os.environ.get("RQUANT_WEB_WARM", "1") == "1":
+            import threading
+
+            from rquant.backtest.store import research_root as _rr
+            from rquant.web.market_live import warm_market_live
+
+            threading.Thread(target=warm_market_live,
+                             args=(Path(research_root or _rr()),), daemon=True,
+                             name="market-live-warm").start()
         root = os.environ.get("RQUANT_SERVING_ROOT")
         if not root:
             from rquant.serving_paths import serving_root_from_env

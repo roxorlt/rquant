@@ -32,6 +32,9 @@ from rquant.research.auction_pool import TZ, _now, _write, read_pool, research_r
 log = logging.getLogger("rquant.auction_attrib")
 ENV_FILE = os.environ.get("AUCTION_ATTRIB_ENV_FILE") or os.path.expanduser("~/rquant/.env")
 MAX_TARGETS = 6
+# Leave headroom under systemd TimeoutStartSec (was 240; now 600). Soft budget
+# aborts remaining network work and falls back to concept-only text.
+SOFT_DEADLINE_S = float(__import__("os").environ.get("AUCTION_ATTRIB_SOFT_DEADLINE_S", "200"))
 UA = {"User-Agent": "Mozilla/5.0", "Referer": "https://www.eastmoney.com/"}
 # broad index/membership tags that explain nothing
 NOISE = ("样本股", "成份股", "成分股", "融资融券", "沪股通", "深股通", "标普", "MSCI", "富时",
@@ -144,7 +147,7 @@ def deepseek() -> tuple[Callable[[list[dict[str, str]]], str], str] | None:
                            "max_tokens": 4000}).encode()
         req = urllib.request.Request(f"{base}/chat/completions", body, {
             "Content-Type": "application/json", "Authorization": f"Bearer {key}"})
-        with urllib.request.urlopen(req, timeout=60) as r:  # noqa: S310
+        with urllib.request.urlopen(req, timeout=45) as r:  # noqa: S310
             msg = json.loads(r.read())["choices"][0]["message"]
         text = (msg.get("content") or "").strip()
         if not text:
@@ -191,22 +194,32 @@ def attribute(pool: dict, now: datetime | None = None,
     stocks = list(seen.values())
     if not stocks:
         return {"text": "今日无竞价选股结果", "stocks": [], "at": _now()}
+    import time as _time
+    t0 = _time.monotonic()
+    def _over() -> bool:
+        return _time.monotonic() - t0 > SOFT_DEADLINE_S
     prior = date.fromisoformat(str(pool.get("prior_date") or pool["date"])[:10])
     since = datetime(prior.year, prior.month, prior.day, 15, 0, tzinfo=TZ)
-    concepts = ths_concepts([s["ts_code"] for s in stocks])
-    mnews = major_news(since, now)
+    concepts = ths_concepts([s["ts_code"] for s in stocks]) if not _over() else {}
+    if _over():
+        log.warning("auction_attrib soft deadline after concepts (%.0fs)", _time.monotonic() - t0)
+    mnews = major_news(since, now) if not _over() else []
     for s in stocks:
         s["concepts"] = concepts.get(s["ts_code"], [])
         nm = s.get("name") or ""
         hits = [{"time": m["pub_time"], "title": m["title"], "src": m["src"]}
                 for m in mnews if nm and nm in str(m["title"])]
+        if _over():
+            s["news"] = hits[:4]
+            s["anns"] = []
+            continue
         s["news"] = (hits + em_news(nm, since, now))[:4] if nm else hits
         s["anns"] = em_anns(s["ts_code"], prior - timedelta(days=3))
     pick_codes = [s["ts_code"] for s in stocks if s["is_pick"]] or [s["ts_code"] for s in stocks]
     common = common_concepts(concepts, pick_codes)
     pool = {**pool, "_market_news": [m["title"] for m in mnews[:15]]}
     text, model = "", None
-    client = deepseek() if llm is True else (llm or None)
+    client = (deepseek() if llm is True else (llm or None)) if not _over() else None
     if client:
         complete, model = client
         try:
@@ -214,6 +227,8 @@ def attribute(pool: dict, now: datetime | None = None,
                              {"role": "user", "content": build_prompt(pool, stocks)}])
         except Exception as exc:  # noqa: BLE001
             log.warning("deepseek failed: %s", str(exc)[:160])
+    elif _over():
+        log.warning("auction_attrib soft deadline before deepseek (%.0fs)", _time.monotonic() - t0)
     if not text:
         text = ("共同概念：" + "、".join(common[:4])) if common else "暂无明确共同驱动"
         model = None
