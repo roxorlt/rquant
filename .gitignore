@@ -20,18 +20,15 @@ wheels/
 .installed.cfg
 *.egg
 MANIFEST
-
 # Virtual environments
 .venv/
 venv/
 ENV/
 env/
 .python-version
-
 # uv / poetry
 .uv/
 poetry.lock
-
 # Testing
 .pytest_cache/
 .coverage
@@ -43,24 +40,20 @@ coverage.xml
 *.cover
 *.py,cover
 .hypothesis/
-
 # Type checking
 .mypy_cache/
 .pyre/
 .pytype/
 .ruff_cache/
-
 # Jupyter
 .ipynb_checkpoints
 */.ipynb_checkpoints/*
-
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
-
 # OS
 .DS_Store
 .DS_Store?
@@ -69,7 +62,6 @@ coverage.xml
 .Trashes
 ehthumbs.db
 Thumbs.db
-
 # 项目本地数据（不进 git）
 data/
 # 云端定时恢复快照（运行时工件，不参与代码提交纯净度判断）
@@ -87,16 +79,13 @@ data/surge_live/
 *.sqlite
 *.sqlite3
 *.db
-
 # 例外：随包分发的标定产物必须进 git（上面 data/ 规则会误伤 src/rquant/data/）
 !src/rquant/data/
 !src/rquant/data/*.json
 !src/rquant/data/*.py
-
 # 日志
 logs/
 *.log
-
 # 秘钥与环境变量
 .env
 .env.*
@@ -108,24 +97,24 @@ secrets/
 *.p12
 *.pfx
 id_rsa*
-
 # Streamlit
 .streamlit/secrets.toml
-
 # Claude Code
 .mcp.json
-
 # Git worktrees (本地隔离开发分支)
 .worktrees/
-
 # 临时文件
 tmp/
 temp/
 .cache/
-
 # React MVP build output and tooling (built in CI / on deploy, never committed)
 web/dist/
 web/node_modules/
 web/test-results/
 web/playwright-report/
 !web/src/pages/data/
+notch_app/wuhu_token
+notch_app/.build/
+notch_app/build/
+notch_app/.bin/
+RQuantNotch-src.tgz
