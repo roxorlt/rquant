@@ -104,6 +104,17 @@ export function IntradayPanel({ code, span = 1 }: { code: string; span?: 1 | 5 }
   const rets = bars.map((b, i) => b.close / (i ? (bars[i - 1]?.close ?? b.open) : pc) - 1);
   const rsd = Math.sqrt(rets.reduce((s, r) => s + r * r, 0) / (rets.length || 1));
   const at = hover ?? bars.length - 1;
+  const scrub = (el: Element, clientX: number, touch: boolean) => {
+    const r = el.getBoundingClientRect();
+    let xm = clientX - r.left;
+    // a finger may overshoot the plot edges; clamp so the crosshair sticks to the ends
+    if (touch) xm = Math.min(plotR, Math.max(P.left, xm));
+    let best = 0;
+    bars.forEach((_, i) => {
+      if (Math.abs(X(i) - xm) < Math.abs(X(best) - xm)) best = i;
+    });
+    setHover(xm >= P.left && xm <= plotR ? best : null);
+  };
   const hb = bars[at];
   const hv = vw[at];
   const pct = (v: number) => `${v >= pc ? "+" : ""}${(((v - pc) / pc) * 100).toFixed(2)}%`;
@@ -186,15 +197,14 @@ export function IntradayPanel({ code, span = 1 }: { code: string; span?: 1 | 5 }
           role="img"
           aria-label="分时图"
           onMouseLeave={() => setHover(null)}
-          onMouseMove={(e) => {
-            const r = e.currentTarget.getBoundingClientRect();
-            const xm = e.clientX - r.left;
-            let best = 0;
-            bars.forEach((_, i) => {
-              if (Math.abs(X(i) - xm) < Math.abs(X(best) - xm)) best = i;
-            });
-            setHover(xm >= P.left && xm <= plotR ? best : null);
+          className="touch-scrub"
+          onPointerDown={(e) => {
+            if (e.pointerType !== "mouse") scrub(e.currentTarget, e.clientX, true);
           }}
+          onPointerMove={(e) => {
+            if (e.pointerType !== "mouse") scrub(e.currentTarget, e.clientX, true);
+          }}
+          onMouseMove={(e) => scrub(e.currentTarget, e.clientX, false)}
         >
           <defs>
             <clipPath id="id-above">

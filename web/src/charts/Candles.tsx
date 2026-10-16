@@ -157,6 +157,23 @@ export function Candles({
   const h = hover == null ? bars[bars.length - 1] : bars[hover];
   const anchorAt = anchor == null ? null : anchor - s0;
   const bw = Math.max(1, step * 0.7);
+  const scrub = (e: {
+    currentTarget: Element;
+    clientX: number;
+    clientY: number;
+    pointerType?: string;
+  }) => {
+    const r = e.currentTarget.getBoundingClientRect();
+    const touch = e.pointerType != null && e.pointerType !== "mouse";
+    let i = Math.floor((e.clientX - r.left - PAD.left) / step);
+    // a finger can overshoot the edges; clamp so the crosshair sticks to the first/last bar
+    if (touch) i = Math.min(bars.length - 1, Math.max(0, i));
+    const next = i >= 0 && i < bars.length ? i : null;
+    const yy = e.clientY - r.top;
+    setHy(yy >= PAD.top && yy <= PAD.top + priceH ? yy : null);
+    setHover(next);
+    onHover?.(next == null ? null : next + s0);
+  };
   return (
     <div className="candles" ref={ref}>
       {h ? (
@@ -172,7 +189,7 @@ export function Candles({
       {/* biome-ignore lint/a11y/useKeyWithClickEvents: picking an anchor is a pointer shortcut; a default anchor is always set */}
       <svg
         ref={svgRef}
-        className={onView ? "pannable" : undefined}
+        className={onView ? "pannable touch-scrub" : "touch-scrub"}
         width={w}
         height={height}
         viewBox={`0 0 ${w} ${height}`}
@@ -188,7 +205,16 @@ export function Candles({
           if (hover != null) onPick?.(hover + s0);
         }}
         onPointerDown={(e) => {
+          if (e.pointerType !== "mouse") {
+            // touch / pen: drag scrubs the crosshair (pan-y keeps vertical page scroll)
+            drag.current = null;
+            scrub(e);
+            return;
+          }
           drag.current = { x: e.clientX, view: [s0, e0], moved: false };
+        }}
+        onPointerMove={(e) => {
+          if (e.pointerType !== "mouse") scrub(e);
         }}
         onPointerUp={() => {
           setTimeout(() => {
@@ -204,13 +230,7 @@ export function Candles({
             onView(clampView(d.view[0] + shift, d.view[1] + shift, all.length));
             return;
           }
-          const r = e.currentTarget.getBoundingClientRect();
-          const i = Math.floor((e.clientX - r.left - PAD.left) / step);
-          const next = i >= 0 && i < bars.length ? i : null;
-          const yy = e.clientY - r.top;
-          setHy(yy >= PAD.top && yy <= PAD.top + priceH ? yy : null);
-          setHover(next);
-          onHover?.(next == null ? null : next + s0);
+          scrub(e);
         }}
       >
         {ticks.map((t) => (

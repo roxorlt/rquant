@@ -392,7 +392,7 @@ input:focus {
 
 .candles svg.pannable {
   cursor: crosshair;
-  touch-action: none;
+  touch-action: pan-y;
 }
 .candles svg.pannable:active {
   cursor: grabbing;
@@ -826,4 +826,19 @@ input:focus {
 fieldset.bd-sort {
   border: 0;
   min-inline-size: 0;
+}
+
+/* Charts: a finger drag scrubs the crosshair instead of selecting text.
+   pan-y leaves vertical page scrolling to the browser; horizontal drags reach
+   the chart as pointer events. The crosshair stays where the finger lifted. */
+.touch-scrub,
+.candles,
+.candles .chart-readout {
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+}
+svg.touch-scrub {
+  touch-action: pan-y;
 }
