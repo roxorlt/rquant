@@ -525,5 +525,7 @@ macOS 还使用同一稳定私有根中的 `rquant.lab-install.json`、活动
 
 ## 旧脚本边界
 
+L2 日终归档使用独立入口 `scripts/deploy-production.sh --component l2-archive`。它验证归档自己的源树与实际 R2 往返证明，以及已经正式部署的核心20股证明。首次安装和回退只操作归档组件；不重启核心采集器或 API。参数、调度、恢复和限制见 [L2归档操作说明](l2-archive.md)。归档候选尚未激活时，不能将代码验证当作已安装 timer 的证据。
+
 `scripts/deploy.sh` 保留给 systemd unit 等人工基础设施部署。它会执行交互式 sudo，且不具备
 精确 target、交易时段保护和自动回滚，因此不得用于 Codex 无人值守发布。

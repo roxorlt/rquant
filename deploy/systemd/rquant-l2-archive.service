@@ -1,0 +1,29 @@
+[Unit]
+Description=rQuant verified L2 daily archive
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/home/lighthouse/rquant-l2-state/cache
+
+[Service]
+Type=oneshot
+User=lighthouse
+Group=lighthouse
+WorkingDirectory=/home/lighthouse/rquant-l2-archive-state
+EnvironmentFile=/etc/rquant-r2.env
+Environment=PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 TZ=Asia/Shanghai RQUANT_DISABLE_DOTENV=1 PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/env /home/lighthouse/rquant-l2-archive-rel/current/.venv/bin/python -m rquant.l2.archive run --cache-root /home/lighthouse/rquant-l2-state/cache --state-root /home/lighthouse/rquant-l2-archive-state
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+PrivateTmp=yes
+ReadOnlyPaths=/home/lighthouse/rquant-l2-state/cache
+ReadWritePaths=/home/lighthouse/rquant-l2-archive-state
+InaccessiblePaths=/home/lighthouse/rquant-l2-private
+Nice=15
+CPUQuota=20%
+IOWeight=20
+MemoryMax=384M
+TimeoutStartSec=2h
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal

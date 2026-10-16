@@ -95,26 +95,62 @@ class R2:
         req = urllib.request.Request(self.endpoint + path, data=body, method=method, headers=h)
         return urllib.request.urlopen(req, timeout=600)
 
-    def put_file(self, key: str, src: Path, sha: str) -> None:
+    def put_file(self, key: str, src: Path, sha: str, *, if_match: str | None = None,
+                 if_none_match: str | None = None) -> None:
+        if (if_match is not None and if_none_match is not None
+                or if_none_match is not None and if_none_match != "*"
+                or if_match is not None and (not isinstance(if_match, str) or not if_match
+                                             or any(ord(c) < 33 or ord(c) > 126
+                                                    for c in if_match))):
+            raise ValueError("invalid conditional write")
         size = src.stat().st_size
+        headers = {"content-length": str(size), "x-amz-meta-sha256": sha,
+                   "content-type": "application/octet-stream"}
+        if if_match is not None:
+            headers["if-match"] = if_match
+        if if_none_match is not None:
+            headers["if-none-match"] = if_none_match
         with src.open("rb") as f:
-            self._request("PUT", key, body=f, payload_sha=sha, headers={
-                "content-length": str(size), "x-amz-meta-sha256": sha,
-                "content-type": "application/octet-stream"}).close()
+            try:
+                self._request("PUT", key, body=f, payload_sha=sha, headers=headers).close()
+            except urllib.error.HTTPError as error:
+                error.close()
+                raise
 
-    def head(self, key: str) -> dict[str, Any] | None:
+    def head(self, key: str, *, include_etag: bool = False) -> dict[str, Any] | None:
         try:
             with self._request("HEAD", key) as r:
-                return {"size": int(r.headers["Content-Length"]),
-                        "sha256": r.headers.get("x-amz-meta-sha256")}
+                result = {"size": int(r.headers["Content-Length"]),
+                          "sha256": r.headers.get("x-amz-meta-sha256")}
+                if include_etag:
+                    result["etag"] = r.headers.get("ETag")
+                return result
         except urllib.error.HTTPError as e:
+            e.close()
             if e.code == 404:
                 return None
             raise
 
-    def get_file(self, key: str, dest: Path) -> None:
-        with self._request("GET", key) as r, dest.open("wb") as f:
-            shutil.copyfileobj(r, f, 1 << 20)
+    def get_file(self, key: str, dest: Path, *, maximum_bytes: int | None = None) -> None:
+        if maximum_bytes is None:
+            with self._request("GET", key) as r, dest.open("wb") as f:
+                shutil.copyfileobj(r, f, 1 << 20)
+            return
+        if type(maximum_bytes) is not int or maximum_bytes < 0:
+            raise ValueError("invalid download bound")
+        try:
+            with self._request("GET", key) as r, dest.open("wb") as f:
+                remaining = maximum_bytes
+                while chunk := r.read(min(1 << 20, remaining + 1)):
+                    if len(chunk) > remaining:
+                        raise ValueError("download exceeds bound")
+                    f.write(chunk)
+                    remaining -= len(chunk)
+        except BaseException as error:
+            if isinstance(error, urllib.error.HTTPError):
+                error.close()
+            dest.unlink(missing_ok=True)
+            raise
 
     def delete(self, key: str) -> None:
         self._request("DELETE", key).close()
