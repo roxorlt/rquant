@@ -53,7 +53,7 @@ def proof(count: int = 20, *, attempted: int | None = None) -> dict:
                     "received_at": (origin + timedelta(seconds=last_seed + second)).isoformat(), "ids": [101 + step]}
                     for step, second in enumerate((5, 35, 65, 85))]})
     batch_count = 3 * attempted + 12 * count
-    value = {"schema": "rquant-l2-acceptance-v2", "source_commit": TARGET, "source_tree": TREE,
+    value = {"schema": "rquant-l2-acceptance-v3", "source_commit": TARGET, "source_tree": TREE,
         "duration_seconds": 1200, "run_elapsed_seconds": 1200, "collector_started_at": origin.isoformat(), "connections": 1,
         "max_symbols": count, "highest_verified_tier": count, "verified_symbols": list(SYMBOLS[:count]),
         "attempted_symbols": list(SYMBOLS[:attempted]), "issued_requests": issued,
@@ -69,6 +69,12 @@ def proof(count: int = 20, *, attempted: int | None = None) -> dict:
                  "windows": {"early": 3, "mid": 3, "late": 3}, "proof_sha256": "f" * 64,
                  "consumer_sequences": [{"first_sequence": 1, "last_sequence": batch_count,
                      "batch_count": batch_count, "sha256": "d" * 64} for _ in range(2)]},
+        "websocket": {"connections": 2, "failed_connections": 0, "successful_messages": 6,
+            "failed_messages": 0, "extra_upstream_sends": 0, "proof_sha256": "5" * 64,
+            "max_consumer_lag_seconds": 1, "all_clients_closed": True, "consumer_workers_alive": [False, False],
+            "consumer_sequences": [{"first_sequence": 1, "last_sequence": batch_count,
+                "batch_count": batch_count, "sha256": "d" * 64,
+                "windows": {"early": 1, "mid": 1, "late": 1}} for _ in range(2)]},
         "cleanup": {"worker_alive": False, "http_worker_alive": False,
                     "all_upstream_sockets_closed": True, "proof_sha256": "1" * 64}, "streams": streams,
         "resources": {"sample_interval_seconds": 1, "startup_settle_seconds": 10, "cpu_window_seconds": 30,
@@ -137,6 +143,31 @@ def test_acceptance_requires_each_consumer_to_match_cache_chain(digests: tuple[s
     for consumer, digest in zip(value["http"]["consumer_sequences"], digests):
         consumer["sha256"] = digest
     with pytest.raises(d.DeployError, match="acceptance_consumers"):
+        d.validate_acceptance(value, TREE)
+
+
+@pytest.mark.parametrize('bad', ['missing', 'v2', 'connections', 'failed_connection', 'messages', 'failed_message',
+    'extra', 'lag', 'consumer_count', 'head', 'sha', 'both_sha', 'early', 'missing_late', 'client_open', 'worker_alive'])
+def test_v3_requires_actual_websocket_proof(bad: str) -> None:
+    d = deployer(); value = proof(); ws = value['websocket']
+    if bad == 'missing': value.pop('websocket')
+    elif bad == 'v2': value['schema'] = 'rquant-l2-acceptance-v2'
+    elif bad == 'connections': ws['connections'] = 1
+    elif bad == 'failed_connection': ws['failed_connections'] = 1
+    elif bad == 'messages': ws['successful_messages'] = 5
+    elif bad == 'failed_message': ws['failed_messages'] = 1
+    elif bad == 'extra': ws['extra_upstream_sends'] = 1
+    elif bad == 'lag': ws['max_consumer_lag_seconds'] = 5.01
+    elif bad == 'consumer_count': ws['consumer_sequences'].pop()
+    elif bad == 'head': ws['consumer_sequences'][0]['last_sequence'] -= 1
+    elif bad == 'sha': ws['consumer_sequences'][0]['sha256'] = '0'*64
+    elif bad == 'both_sha':
+        for consumer in ws['consumer_sequences']: consumer['sha256'] = '0'*64
+    elif bad == 'early': ws['consumer_sequences'][0]['windows']['early'] = 0
+    elif bad == 'missing_late': ws['consumer_sequences'][1]['windows'].pop('late')
+    elif bad == 'client_open': ws['all_clients_closed'] = False
+    else: ws['consumer_workers_alive'][1] = True
+    with pytest.raises(d.DeployError):
         d.validate_acceptance(value, TREE)
 
 

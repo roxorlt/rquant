@@ -111,7 +111,7 @@ def validate_acceptance(proof: dict[str, Any], target_tree: str) -> dict[str, An
         duration, elapsed = proof["duration_seconds"], proof["run_elapsed_seconds"]
         ledger, termination = proof["issued_requests"], proof["termination"]
         cache, http, cleanup = proof["cache"], proof["http"], proof["cleanup"]
-        if (proof["schema"] != "rquant-l2-acceptance-v2" or not hex_value(proof["source_commit"], 40)
+        if (proof["schema"] != "rquant-l2-acceptance-v3" or not hex_value(proof["source_commit"], 40)
                 or proof["source_tree"] != target_tree or not hex_value(target_tree, 40)
                 or type(highest) is not int or highest not in (20, 40, 80, 100) or len(verified) != highest
                 or attempted[:highest] != verified or type(maximum) is not int or not 20 <= maximum <= highest
@@ -152,6 +152,23 @@ def validate_acceptance(proof: dict[str, Any], target_tree: str) -> dict[str, An
                 or c["batch_count"] != cache["batch_count"] or not hex_value(c["sha256"])
                 or c["sha256"] != cache["export_sha256"] for c in consumers):
             raise DeployError("acceptance_consumers")
+        ws = proof["websocket"]
+        if (any(type(ws[k]) is not int or ws[k] != value for k, value in
+                (("connections", 2), ("failed_connections", 0), ("failed_messages", 0), ("extra_upstream_sends", 0)))
+                or type(ws["successful_messages"]) is not int or ws["successful_messages"] < 6
+                or not numeric(ws["max_consumer_lag_seconds"]) or not 0 <= ws["max_consumer_lag_seconds"] <= 5
+                or not hex_value(ws["proof_sha256"]) or ws["all_clients_closed"] is not True
+                or len(ws["consumer_workers_alive"]) != 2 or any(v is not False for v in ws["consumer_workers_alive"])):
+            raise DeployError("acceptance_websocket")
+        consumers = ws["consumer_sequences"]
+        if len(consumers) != 2 or any(type(c[k]) is not int or c[k] != value for c in consumers
+                for k, value in (("first_sequence", 1), ("last_sequence", cache["last_sequence"]),
+                                 ("batch_count", cache["batch_count"]))):
+            raise DeployError("acceptance_websocket_consumers")
+        if any(c["sha256"] != cache["export_sha256"]
+                or any(type(c["windows"][w]) is not int or c["windows"][w] < 1 for w in ("early", "mid", "late"))
+                for c in consumers):
+            raise DeployError("acceptance_websocket_consumers")
         resource = proof["resources"]
         limits = {"http_p95_seconds": 1, "http_p99_seconds": 2, "max_http_seconds": 5,
             "max_consumer_lag_seconds": 5, "max_combined_rss_bytes": 1024**3,

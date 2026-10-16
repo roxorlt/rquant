@@ -20,11 +20,13 @@ bash scripts/deploy-production.sh --component l2 \
 
 正式执行使用相同参数去掉 `--dry-run`。门禁验证 main 祖先关系、精确目标的 Web MVP push CI 三个 job 全部成功、正式 release asset SHA256、`RELEASE.commit` 与整棵源码树；`uv sync --frozen --no-dev` 后核实际解释器、导入路径和 unit 内容。网络、digest 或源树证据缺失即拒绝，不接受浮动引用、布尔自证或隔离测试制品冒充正式发布。所有门禁完成前不会停已受管采集器。
 
-容量验收使用 `rquant-l2-acceptance-v2`，绑定同一源树、股票清单与每股成交/买委托/卖委托 3N 流。阶梯仅为 20→40→80→100；100 是本轮预算上限，不能宣称数据源极限。`verified_symbols` / `highest_verified_tier` 与 `attempted_symbols` 分开，生产策略不超过最高完整认证阶梯，首次 desired 只初始化已验证列表前 20 股，不自动启动全部已测股票。
+容量验收使用 `rquant-l2-acceptance-v3`，保留所有 v2 谓词，绑定同一源树、股票清单与每股成交/买委托/卖委托 3N 流。先完成20股全部60流持续验收与正式常驻，再扩大测试稳定容量；100只是当前代码边界，不能宣称实测容量或数据源极限。`verified_symbols` / `highest_verified_tier` 与 `attempted_symbols` 分开，生产策略不超过最高完整认证阶梯，首次 desired 只初始化已验证列表前20股，不自动启动全部已测股票。
 
 每个认证阶梯在最后一个种子之后具有共同 90 秒窗口。全部 3N 流各自必须有实际种子、向前新 ID、至少 60 秒跨度、三个 30 秒桶及窗口最后 60 秒至少两批向前数据。种子、心跳、同 ID 值变化不能替代新事件。完整 run 最多 1200 秒、单连接、零重连，最多一次会话发送加 300 次业务发送；actual completed send ledger 保留每个绑定、请求 ID 与发送起止时间，并核下一次发送距上次完成至少一秒，部分发送必须明确诊断。
 
 验收还包括真实回环 HTTP 动态追加/并发重复、重复零额外发送、双独立消费者在采集结束后完整 drain 到最终缓存序号、全缓存连续性与哈希、worker/socket/HTTP 全关闭。固定每秒资源采样、启动 settle 10 秒、CPU 30 秒窗口；认证窗口要求 HTTP p95≤1 秒、p99≤2 秒、单次≤5 秒、接收至消费 lag≤5 秒、合计 RSS≤1 GiB、主机可用内存≥20%、CPU≤主机核数的 80%、缓存低于 4 GiB、剩余磁盘≥5 GiB，完整 run 的资源越界原因不得丢弃。未知、鉴权、协议或完整性阻断不得用早先已通过的小阶梯掩盖；后续明确事件不足或可诊断本地容量/资源限制才可单独保留先前完整阶梯的实测下界。
+
+v3另须两个真实 WS 消费者。二者的完整序号、批次数和链 SHA 均须等于最终缓存，lag≤5秒，握手/消息/额外上游发送失败数为0，客户端全部关闭、两个 worker均退出。每个 WS 消费者在共同90秒窗口的三个三分段中都须至少收到一次实际 candidate_push 向前数据；raw counter须超过其自身种子/先前最高值。seed、心跳、重复值/style和窗口后重放不计。先停止采集器并固定缓存头，再让两 HTTP、两 WS 全部追平并核哈希，之后关闭四消费者、API与原始记录。任一 WS 失败均阻断整个证明；旧v2/HTTP-only证据只保留为历史记录。
 
 组件代码为 `/home/lighthouse/rquant-l2-rel/<完整SHA>`；current 仅指向已验证组件。独立 state 包含 `cache`、`control/desired.json`、只读 `capacity.json`、部署锁和审计。策略由验收门禁生成 `max_symbols`、`source_tree`、`acceptance_sha256`。目录 0700、私有文件 0600；API 仅写 control、读缓存和策略，不能读取 `/home/lighthouse/rquant-l2-private` 会员输入。组件不接管现有生产工作区、Web current 或数据库。
 
