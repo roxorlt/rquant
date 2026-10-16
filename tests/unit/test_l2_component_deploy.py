@@ -190,6 +190,8 @@ class FakeHost:
         self.on_stop = None
         self.fail_install_after_copy = False
         self.api_never_active = False
+        self.committed = []
+        self.batch_cursors = []
 
     def command(self, argv: list[str], cwd: Path | None = None) -> str:
         self.commands.append(list(argv))
@@ -223,7 +225,12 @@ class FakeHost:
             if action in {"start", "restart", "enable"}:
                 if self.api_never_active and args[-1] == self.d.UNITS[0]: return ""
                 self.active[args[-1]] = True
-                if args[-1] == self.d.UNITS[1]: self.epoch += 1
+                if args[-1] == self.d.UNITS[1]:
+                    self.epoch += 1
+                    for identity in sorted(self.d.EXPECTED, key=lambda item: item[-1]):
+                        self.committed.append({"local_batch_sequence": len(self.committed) + 1,
+                            "epoch_id": f"synthetic-{self.epoch}", "delivery": "seed",
+                            "binding": dict(zip(("code", "market", "kind", "side", "page_id"), identity))})
             elif action in {"stop", "disable"}:
                 self.active[args[-1]] = False
                 if action == "stop" and args[-1] == self.d.UNITS[1] and self.on_stop: self.on_stop()
@@ -234,7 +241,14 @@ class FakeHost:
         return {"state": "blocked" if running and self.collector_error else "listening_candidate" if running else "unconfigured",
                 "error_code": "protocol_error" if running and self.collector_error else None,
                 "epoch_id": f"synthetic-{self.epoch}" if self.epoch else None,
-                "seed_queries": 6 if running else 0, "market_batch_count": 6 if running else 0, "last_sequence": 6 if running else 0}
+                "seed_queries": 6 if running else 0, "market_batch_count": 6 if running else 0,
+                "last_sequence": len(self.committed)}
+
+    def batches(self, after: int) -> dict:
+        self.batch_cursors.append(after)
+        rows = [row for row in self.committed if row["local_batch_sequence"] > after][:8]
+        return {"batches": rows, "next_sequence": rows[-1]["local_batch_sequence"] if rows else after,
+                "status": self.health()}
 
     def mutations(self) -> list[list[str]]:
         return [a for a in self.commands if a[:2] == ["sudo", "-n"]]
@@ -252,7 +266,7 @@ def deployment(tmp_path: Path):
 
 def run_deploy(d, host: FakeHost, args, api: dict):
     return d.deploy(args, paths=host.paths, api=api.__getitem__, command=host.command,
-        health=host.health, now=lambda: host.at, sleep=lambda _: None)
+        health=host.health, batches=host.batches, now=lambda: host.at, sleep=lambda _: None)
 
 
 def test_first_install_and_bad_receipt_before_mutation(tmp_path: Path) -> None:
@@ -329,6 +343,7 @@ def next_release(tmp_path: Path, d, host: FakeHost, args) -> dict:
 def test_recorded_previous_rollback_restores_api_without_collector_start(tmp_path: Path) -> None:
     d, host, args, old_api = deployment(tmp_path); run_deploy(d, host, args, old_api)
     api = next_release(tmp_path, d, host, args); run_deploy(d, host, args, api)
+    assert host.batch_cursors == [0, 6]
     args = d.parse_cli(["--rollback", "--target", TARGET]); host.commands.clear()
     assert run_deploy(d, host, args, old_api)["status"] == "rolled_back"
     assert host.paths.current.resolve() == host.paths.releases / TARGET
@@ -385,7 +400,7 @@ def test_initial_second_preflight_refuses_writer_started_during_build(tmp_path: 
         return result
     try:
         with pytest.raises(d.DeployError):
-            d.deploy(args, paths=host.paths, api=api.__getitem__, command=command, health=host.health,
+            d.deploy(args, paths=host.paths, api=api.__getitem__, command=command, health=host.health, batches=host.batches,
                      now=lambda: host.at, sleep=lambda _: None)
         assert host.mutations() == [] and not host.paths.current.exists()
     finally:
@@ -412,3 +427,54 @@ def test_api_health_cannot_substitute_for_active_managed_service(tmp_path: Path)
     d, host, args, api = deployment(tmp_path); host.api_never_active = True
     with pytest.raises(d.DeployError): run_deploy(d, host, args, api)
     assert not host.paths.current.exists() and not any(host.active.values())
+
+
+@pytest.mark.parametrize("seed_case", ["missing_with_push", "last_pending", "four_orders", "old_epoch", "complete", "paginated"])
+def test_persist_f1_requires_six_committed_seed_bindings(monkeypatch, seed_case: str) -> None:
+    d = deployer(); bindings = [dict(zip(("code", "market", "kind", "side", "page_id"), identity))
+                               for identity in sorted(d.EXPECTED, key=lambda item: item[-1])]
+    rows = [{"local_batch_sequence": i + 1, "epoch_id": "new", "delivery": "seed", "binding": binding}
+            for i, binding in enumerate(bindings)]
+    if seed_case == "missing_with_push": rows[-1]["delivery"] = "candidate_push"
+    elif seed_case == "last_pending": rows[-1]["binding"] = rows[0]["binding"]; rows[-1]["delivery"] = "candidate_push"
+    elif seed_case == "four_orders":
+        for row in rows:
+            if row["binding"]["kind"] == "vendor4013": row["delivery"] = "candidate_push"
+    elif seed_case == "old_epoch":
+        for row in rows: row["epoch_id"] = "old"
+    elif seed_case == "paginated":
+        rows = [{**row, "epoch_id": "old"} for row in rows] + [
+            {**row, "local_batch_sequence": row["local_batch_sequence"] + 6} for row in rows]
+    status = {"state": "listening_candidate", "epoch_id": "new", "error_code": None,
+              "seed_queries": 6, "market_batch_count": len(rows), "last_sequence": len(rows)}
+    cursors = []
+    def batches(after: int) -> dict:
+        cursors.append(after); selected = [row for row in rows if row["local_batch_sequence"] > after][:8]
+        return {"batches": selected, "next_sequence": selected[-1]["local_batch_sequence"] if selected else after,
+                "status": status}
+    monkeypatch.setattr(d, "health_batches", batches, raising=False)
+    if seed_case in {"complete", "paginated"}:
+        d.wait_health(lambda: status, lambda _: None, collector=True, old_epoch="old")
+        assert cursors == ([0] if seed_case == "complete" else [0, 8])
+    else:
+        with pytest.raises(d.DeployError, match="collector_health_failed"):
+            d.wait_health(lambda: status, lambda _: None, collector=True, old_epoch="old")
+
+
+@pytest.mark.parametrize("peer,pid,rejected", [
+    ("[::ffff:122.9.43.156]:9528", 999, True),
+    ("122.9.43.156:9528", 102, False),
+    ("[::ffff:122.9.43.156]:9528", 102, False),
+    ("[::ffff:198.18.0.2]:9528", 999, False),
+])
+def test_persist_f2_normalizes_upstream_peer(tmp_path: Path, peer: str, pid: int, rejected: bool) -> None:
+    d, host, _, _ = deployment(tmp_path); host.paths.cache.mkdir(mode=0o700)
+    views = {unit: {"MainPID": str(102 if unit == d.UNITS[1] else 0), "ActiveState": "active"} for unit in d.UNITS}
+    def command(argv: list[str], cwd: Path | None = None) -> str:
+        if "-ltnp" in argv: return ""
+        return f'ESTAB 0 0 [::ffff:198.18.0.1]:12345 {peer} users:(("python",pid={pid},fd=5))\n'
+    if rejected:
+        with pytest.raises(d.DeployError, match="foreign_socket"):
+            d.socket_writer_preflight(host.paths, views, command)
+    else:
+        d.socket_writer_preflight(host.paths, views, command)

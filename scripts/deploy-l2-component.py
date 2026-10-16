@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 import fcntl
 import hashlib
 import io
+import ipaddress
 import json
 import math
 import os
@@ -421,7 +422,16 @@ def socket_writer_preflight(paths: Paths, views: dict[str, dict[str, str]], comm
             fields = line.split()
             if len(fields) < 5:
                 raise DeployError("socket_inspection_failed")
-            relevant = fields[3].rsplit(":", 1)[-1] == "8771" if listening else fields[4] == "122.9.43.156:9528"
+            relevant = fields[3].rsplit(":", 1)[-1] == "8771" if listening else False
+            if not listening:
+                host, _, port = fields[4].rpartition(":")
+                try:
+                    peer = ipaddress.ip_address(host.strip("[]"))
+                    if isinstance(peer, ipaddress.IPv6Address) and peer.ipv4_mapped is not None:
+                        peer = peer.ipv4_mapped
+                    relevant = str(peer) == "122.9.43.156" and int(port) == 9528
+                except ValueError:
+                    pass
             if not relevant: continue
             pids = {int(n) for n in re.findall(r"pid=(\d+)", line)}
             expected = api_pid if listening else collector_pid
@@ -504,19 +514,30 @@ def change_current(paths: Paths, target: str) -> None:
     finally: os.close(descriptor)
 
 
-def health_status() -> dict[str, Any]:
+def read_cache_api(path: str, limit: int) -> dict[str, Any]:
     try:
-        with urlopen("http://127.0.0.1:8771/api/v1/l2/status", timeout=2) as response:
-            data = response.read((2 << 20) + 1)
-        if len(data) > 2 << 20:
+        with urlopen("http://127.0.0.1:8771/api/v1/l2/" + path, timeout=2) as response:
+            data = response.read(limit + 1)
+        if len(data) > limit:
             raise DeployError("api_health_failed")
         return json_object(data)
     except Exception:
         raise DeployError("api_health_failed") from None
 
 
+def health_status() -> dict[str, Any]:
+    return read_cache_api("status", 2 << 20)
+
+
+def health_batches(after_sequence: int) -> dict[str, Any]:
+    return read_cache_api(f"batches?after_sequence={after_sequence}&limit=8", 16 << 20)
+
+
 def wait_health(health: Callable[[], dict[str, Any]], sleep: Callable[[float], None], *, collector: bool,
-                old_epoch: str | None = None) -> None:
+                old_epoch: str | None = None, after_sequence: int = 0,
+                batches: Callable[[int], dict[str, Any]] | None = None) -> None:
+    cursor, epoch, seeds = after_sequence, None, set()
+    deadline = time.monotonic() + 20
     for _ in range(20 if collector else 5):
         try:
             value = health()
@@ -524,11 +545,32 @@ def wait_health(health: Callable[[], dict[str, Any]], sleep: Callable[[float], N
                 raise DeployError("api_health_failed")
             if collector and (value.get("state") == "blocked" or value.get("error_code") not in {None, "restart_gap", "signal_stop", "duration_limit"}):
                 raise DeployError("collector_health_failed")
-            if not collector or (value.get("state") in {"seeded_waiting", "listening_candidate"}
-                                 and isinstance(value.get("epoch_id"), str) and value["epoch_id"] != old_epoch
-                                 and value.get("seed_queries") == 6 and value.get("market_batch_count", 0) >= 6
-                                 and value.get("last_sequence", 0) >= 6):
+            if not collector:
                 return
+            observed_epoch = value.get("epoch_id")
+            if isinstance(observed_epoch, str) and observed_epoch and observed_epoch != old_epoch:
+                if epoch is not None and observed_epoch != epoch:
+                    raise DeployError("collector_health_failed")
+                epoch = observed_epoch
+                while cursor < value["last_sequence"] and time.monotonic() < deadline:
+                    page = (batches or health_batches)(cursor)
+                    rows = page.get("batches")
+                    if not isinstance(rows, list) or not 1 <= len(rows) <= 8:
+                        raise DeployError("api_health_failed")
+                    if (type(page.get("next_sequence")) is not int or page["next_sequence"] != cursor + len(rows)
+                            or any(type(row.get("local_batch_sequence")) is not int
+                                or row["local_batch_sequence"] != cursor + offset
+                                for offset, row in enumerate(rows, 1))):
+                        raise DeployError("api_health_failed")
+                    for row in rows:
+                        cursor += 1
+                        if row.get("epoch_id") == epoch and row.get("delivery") == "seed":
+                            binding = row.get("binding", {})
+                            identity = tuple(binding.get(key) for key in ("code", "market", "kind", "side", "page_id"))
+                            if identity in EXPECTED: seeds.add(identity)
+                if (value.get("state") in {"seeded_waiting", "listening_candidate"}
+                        and value.get("seed_queries") == 6 and seeds == EXPECTED):
+                    return
         except DeployError as error:
             if str(error) != "api_health_failed": raise
         sleep(1)
@@ -559,6 +601,7 @@ def parse_cli(argv: list[str] | None = None) -> argparse.Namespace:
 
 def deploy(args: argparse.Namespace, *, paths: Paths = Paths(), api: Callable[[str], dict[str, Any]] = github_json,
            command: Command = execute, health: Callable[[], dict[str, Any]] = health_status,
+           batches: Callable[[int], dict[str, Any]] = health_batches,
            now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
            sleep: Callable[[float], None] = time.sleep) -> dict[str, Any]:
     proof_data = None
@@ -650,11 +693,15 @@ def deploy(args: argparse.Namespace, *, paths: Paths = Paths(), api: Callable[[s
             action(["sudo", "-n", SYSTEMCTL, "restart" if old else "enable", *([] if old else ["--now"]), UNITS[0]])
             wait_health(health, sleep, collector=False)
             if not args.rollback:
-                baseline_epoch = health().get("epoch_id")
+                baseline = health()
+                baseline_epoch, baseline_cursor = baseline.get("epoch_id"), baseline.get("last_sequence")
+                if type(baseline_cursor) is not int or baseline_cursor < 0:
+                    raise DeployError("api_health_failed")
                 intent["last_collector_start"] = now().isoformat(); save_json(intent_path, intent)
                 collector_started = True
                 action(["sudo", "-n", SYSTEMCTL, "start" if old else "enable", *([] if old else ["--now"]), UNITS[1]])
-                wait_health(health, sleep, collector=True, old_epoch=baseline_epoch)
+                wait_health(health, sleep, collector=True, old_epoch=baseline_epoch,
+                            after_sequence=baseline_cursor, batches=batches)
             active = managed_units(paths, candidate, command)
             if any(active[u]["ActiveState"] != "active" or int(active[u]["MainPID"]) <= 0
                    for u in (UNITS[:1] if args.rollback else UNITS)):
