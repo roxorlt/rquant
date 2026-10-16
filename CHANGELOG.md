@@ -6,6 +6,8 @@
 
 ### Added
 
+- **L2 股票列表订阅与原始批次接口**：显式回环控制 API 合并多调用方列表，唯一上游连接统一节流；独立 API 新增单向 WebSocket，复用原始缓存批次和持久游标，HTTP 保留订阅管理与断点补取。WS最多8连接、单页有界、5秒发送超时，生产门禁升级为双HTTP与双WS完整链及持续向前数据的v3验收。先完成20股全部三路持续验收并常驻，再扩大测试容量；100仅代码边界，候选尚未认证上线。
+
 - **板块资金流真 3 秒更新**：采集器每轮（~3s）把去重后的行情写成 `snapshots/<day>/stream/d-<run>-<seq>.parquet`
   （原子写），30 秒正式分片仍是唯一真相并在 parquet 元数据里记下所含最后一轮 `seq`；web 只把 seq 大于已折叠分片的
   delta 叠在官方状态的临时副本上计算，分片落盘即按 seq 丢弃对应 delta，不会重复计数。采集器在分片落盘后删对应 delta、
@@ -217,6 +219,9 @@
   **`deploy/systemd/` 改动，部署前必须在云端 `systemd-analyze verify` 通过。**
 
 ### Fixed
+
+- **Web CI 离线研究测试**：使用合成风险源并保留真实风险落表与幂等断言，避免假 token 触发外部请求退避耗尽 CI。
+- **L2 控制消息载体尾字节**：与 canonical JSON 编码分离处理，保留完整头部与八字段 schema 校验，控制消息不计入行情或触发重试。
 
 - **健康看板 `dashboard/app.py` 遇到新运行时的空值 / 过期日期直接崩溃，往下所有 section 都不渲染**：`dashboard_summary`
   汇总行由新 runtime_health 权威产出，旧库计数（`daily_bar_rows`、`monitor_event_rows`、`latest_daily_bar`、

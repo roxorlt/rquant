@@ -1,0 +1,22 @@
+[Unit]
+Description=rQuant local L2 raw cache API
+After=network.target
+
+[Service]
+Type=simple
+User=lighthouse
+WorkingDirectory=/home/lighthouse/rquant-l2-state
+ExecStart=/usr/bin/env -i PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 TZ=Asia/Shanghai PYTHONDONTWRITEBYTECODE=1 RQUANT_DISABLE_DOTENV=1 RQUANT_WEB_WARM=0 /home/lighthouse/rquant-l2-rel/current/.venv/bin/python -m rquant.l2.api --cache-root /home/lighthouse/rquant-l2-state/cache --control-root /home/lighthouse/rquant-l2-state/control --capacity-file /home/lighthouse/rquant-l2-state/capacity.json
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+PrivateTmp=yes
+ReadOnlyPaths=/home/lighthouse/rquant-l2-state/cache /home/lighthouse/rquant-l2-state/capacity.json
+ReadWritePaths=/home/lighthouse/rquant-l2-state/control
+InaccessiblePaths=/home/lighthouse/rquant-l2-private
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
