@@ -4,6 +4,7 @@ import datetime as dt
 import hashlib
 import json
 from pathlib import Path
+from typing import Any
 
 from rquant.research import snapshot_archive as sa
 
@@ -107,3 +108,78 @@ def test_wait_for_collector_tmp(tmp_path, monkeypatch):
     monkeypatch.setattr(sa.time, "sleep", lambda s: (calls.append(s), (d / "quotes.tmp").unlink()))
     assert sa.wait_for_collector(d, wait_s=60, poll_s=1) is True
     assert calls == [1]
+
+
+def test_r2_bounded_get_closes_and_removes_oversize_partial(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    import io
+
+    import pytest
+
+    response = io.BytesIO(b"x" * 101)
+    monkeypatch.setattr(sa.R2, "_request", lambda *a, **kw: response)
+    dest = tmp_path / "bounded"
+    with pytest.raises(ValueError):
+        sa.R2("https://synthetic.invalid", "b", "k", "s").get_file("x", dest, maximum_bytes=100)
+    assert response.closed and not dest.exists()
+
+
+def test_r2_conditional_headers_and_optional_head_etag(tmp_path: Path, monkeypatch: Any) -> None:
+    import io
+
+    import pytest
+
+    captured = []
+
+    class Response(io.BytesIO):
+        headers = {"Content-Length": "3", "x-amz-meta-sha256": "a" * 64, "ETag": '"opaque"'}
+
+    def request(self: Any, method: str, key: str, **kwargs: Any) -> Any:
+        captured.append((method, kwargs))
+        return Response(b"abc")
+
+    monkeypatch.setattr(sa.R2, "_request", request)
+    client = sa.R2("https://synthetic.invalid", "b", "k", "s")
+    src = tmp_path / "src"
+    src.write_bytes(b"abc")
+    client.put_file("x", src, "a" * 64, if_none_match="*")
+    assert captured[-1][1]["headers"]["if-none-match"] == "*"
+    client.put_file("x", src, "a" * 64, if_match='"opaque"')
+    assert captured[-1][1]["headers"]["if-match"] == '"opaque"'
+    assert client.head("x") == {"size": 3, "sha256": "a" * 64}
+    assert client.head("x", include_etag=True)["etag"] == '"opaque"'
+    with pytest.raises(ValueError):
+        client.put_file("x", src, "a" * 64, if_match="x", if_none_match="*")
+
+
+def test_r2_bounded_and_conditional_http_errors_close_response(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    import io
+    import urllib.error
+
+    import pytest
+
+    handles = []
+    errors = []
+
+    def request(*args: Any, **kwargs: Any) -> Any:
+        handle = io.BytesIO(b"synthetic refusal")
+        handles.append(handle)
+        error = urllib.error.HTTPError("synthetic", 412, "conflict", {}, handle)
+        errors.append(error)
+        raise error
+
+    monkeypatch.setattr(sa.R2, "_request", request)
+    client = sa.R2("https://synthetic.invalid", "b", "k", "s")
+    src = tmp_path / "src"
+    src.write_bytes(b"abc")
+    for call in (
+        lambda: client.put_file("x", src, "a" * 64, if_none_match="*"),
+        lambda: client.get_file("x", tmp_path / "dest", maximum_bytes=3),
+        lambda: client.head("x", include_etag=True),
+    ):
+        with pytest.raises(urllib.error.HTTPError):
+            call()
+    assert all(handle.closed for handle in handles)

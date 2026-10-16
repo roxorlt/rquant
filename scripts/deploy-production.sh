@@ -6,6 +6,10 @@ PYTHON_BIN="${RQUANT_DEPLOY_PYTHON:-${PROJECT_DIR}/.venv/bin/python}"
 UV_BIN="${RQUANT_DEPLOY_UV:-}"
 
 if [[ "${1:-}" == "--component" ]]; then
+    if [[ "${2:-}" == "l2-archive" ]]; then
+        shift 2
+        exec /usr/bin/python3.11 -I -S "${PROJECT_DIR}/scripts/deploy-l2-archive.py" "$@"
+    fi
     if [[ "${2:-}" != "l2" ]]; then
         printf 'Unsupported deployment component\n' >&2
         exit 2
