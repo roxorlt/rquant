@@ -31,3 +31,46 @@ def test_diff_flags():
     assert [x["id"] for x in d["lost_passing"]] == ["a"]
     assert [x["id"] for x in d["decayed"]] == ["a"]
     assert sorted(x["id"] for x in d["new_passing"]) == ["b", "c"]
+
+
+def test_discover_pages_newest_first_until_cutoff(monkeypatch):
+    import time as _t
+    from datetime import UTC, datetime, timedelta
+
+    from rquant.research import report_tracking as t
+
+    monkeypatch.setattr(_t, "sleep", lambda s: None)
+    now = datetime.now(UTC)
+    calls = []
+
+    def search(kw, page=1):
+        calls.append((kw, page))
+        if page == 1:  # full page, all recent -> must fetch page 2
+            return [{"docId": f"{kw}{i}", "title": f"分钟 因子 新研究{kw}{i}", "orgName": "X",
+                     "pubTime": (now - timedelta(days=1)).timestamp()} for i in range(20)]
+        return [{"docId": f"{kw}old", "title": "分钟 因子 旧", "orgName": "X",
+                 "pubTime": (now - timedelta(days=40)).timestamp()}]
+
+    monkeypatch.setattr(t, "KEYWORDS", ("k",))
+    new = t.discover([], search=search)
+    assert calls == [("k", 1), ("k", 2)]
+    assert len(new) == 20 and all(n["status"] == "pending_impl" for n in new)
+
+
+def test_daily_report_weekly_lines(tmp_path):
+    import json
+    from datetime import date
+
+    from rquant.health import research_weekly_lines
+
+    d = tmp_path / "report_factors"
+    d.mkdir()
+    (d / "weekly_summary.json").write_text(json.dumps({
+        "week_of": "2026-10-17", "headline": "研报挖掘周报：新收录 1 篇",
+        "new_reports": [{"date": "2026-10-14", "broker": "华泰证券", "title": "T",
+                         "status": "pending_impl"}],
+        "new_passing": [], "lost_passing": [{"name": "A"}], "decayed": []}, ensure_ascii=False))
+    lines = research_weekly_lines(date(2026, 10, 17), tmp_path)
+    assert "新收录 1 篇" in lines[1] and "华泰证券" in lines[2] and lines[3] == "- 失效: A"
+    assert research_weekly_lines(date(2026, 10, 21), tmp_path) == []
+    assert research_weekly_lines(date(2026, 10, 17), tmp_path / "none") == []

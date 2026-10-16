@@ -387,6 +387,34 @@ def build_daily_report(
 # ---------- 顶层入口 ----------
 
 
+def research_weekly_lines(today: date, root: Path | None = None, days: int = 3) -> list[str]:
+    """研报挖掘周报（report_tracking 周六 06:30 写 weekly_summary.json）→ 日报尾部几行。
+
+    只在周报生成后 ``days`` 天内带出（周六/周日/周一）；文件缺失或损坏时静默跳过。"""
+    import json
+    import os
+
+    base = root or Path(os.environ.get("RQUANT_RESEARCH_ROOT")
+                        or Path.home() / "rquant-research")
+    p = base / "report_factors" / "weekly_summary.json"
+    try:
+        doc = json.loads(p.read_text(encoding="utf-8"))
+        week_of = date.fromisoformat(str(doc.get("week_of")))
+    except (OSError, ValueError, TypeError):
+        return []
+    if not 0 <= (today - week_of).days < days:
+        return []
+    lines = ["", f"## 📚 {doc.get('headline') or '研报挖掘周报'}（{week_of.isoformat()}）"]
+    for n in (doc.get("new_reports") or [])[:8]:
+        lines.append(f"- 新研报 {n.get('date', '')} {n.get('broker', '')}《{n.get('title', '')}》"
+                     f" · {n.get('status', '')}")
+    for key, label in (("new_passing", "新通过"), ("lost_passing", "失效"), ("decayed", "新衰减")):
+        names = [r.get("name", r.get("id", "?")) for r in doc.get(key) or []]
+        if names:
+            lines.append(f"- {label}: {'、'.join(names)}")
+    return lines
+
+
 def _read_recent_alert_failures(log_dir: Path, today: date) -> list[dict]:
     """读 alert-failures.jsonl 中今日的"未送达告警"（PR2-E 兜底带出）。
 
@@ -461,6 +489,10 @@ def generate_and_send_daily_report(
                 f"- {f.get('failed_at', '?')} `{f.get('unit', '?')}` — {f.get('subject', '')}"
             )
         body += "\n" + "\n".join(lines)
+
+    weekly = research_weekly_lines(today)
+    if weekly:
+        body += "\n" + "\n".join(weekly)
 
     logger.info(f"日报 subject: {subject}")
     logger.info(f"日报 body:\n{body}")
