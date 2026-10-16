@@ -32,32 +32,57 @@ def deployer():
     return module
 
 
-def proof() -> dict:
+SYMBOLS = tuple(f"600{index:03d}" for index in range(100))
+
+
+def proof(count: int = 20, *, attempted: int | None = None) -> dict:
     origin = datetime(2026, 10, 19, 1, 30, tzinfo=timezone.utc)
-    streams = []
-    for code, market, base in (("603258", 17, 10117), ("300006", 33, 10127)):
+    attempted = count if attempted is None else attempted
+    streams, issued = [], []
+    last_seed = (3 * count - 1) * 1.02 + 0.02
+    for slot, code in enumerate(SYMBOLS[:attempted]):
         for offset, (kind, side) in enumerate((("vendor4013", None), ("vendor4027", "buy"), ("vendor4027", "sell"))):
-            index = len(streams)
-            streams.append({"binding": {"code": code, "market": market, "kind": kind, "side": side,
-                                         "page_id": base + offset}, "epoch_id": "synthetic",
-                "seed_ids": [100], "seed_sequence": index + 1,
-                "forward_batches": [{"sequence": 7 + step * 6 + index,
-                    "received_at": (origin + timedelta(seconds=second)).isoformat(), "ids": [101 + step]}
-                    for step, second in enumerate((10, 80, 250, 290))]})
-    return {"schema": "rquant-l2-acceptance-v1", "source_commit": TARGET, "source_tree": TREE,
-        "duration_seconds": 300, "collector_started_at": origin.isoformat(), "connections": 1,
-        "upstream_sends": 7, "reconnect_attempts": 0, "minimum_query_spacing_seconds": 1.01,
-        "cache": {"first_sequence": 1, "last_sequence": 30, "batch_count": 30, "seed_batches": 6,
+            index = len(issued)
+            binding = {"code": code, "market": 17, "kind": kind, "side": side, "page_id": 10117 + 10 * slot + offset}
+            issued.append({"binding": binding, "request_id": 3 + index,
+                "sent_started_elapsed_seconds": index * 1.02, "sent_completed_elapsed_seconds": index * 1.02 + .01})
+            if slot >= count: continue
+            streams.append({"binding": binding, "epoch_id": "synthetic", "seed_ids": [100], "seed_sequence": index + 1,
+                "seed_received_at": (origin + timedelta(seconds=index * 1.02 + .02)).isoformat(),
+                "forward_batches": [{"sequence": 3 * attempted + 1 + step * 3 * count + index,
+                    "received_at": (origin + timedelta(seconds=last_seed + second)).isoformat(), "ids": [101 + step]}
+                    for step, second in enumerate((5, 35, 65, 85))]})
+    batch_count = 3 * attempted + 12 * count
+    value = {"schema": "rquant-l2-acceptance-v2", "source_commit": TARGET, "source_tree": TREE,
+        "duration_seconds": 1200, "run_elapsed_seconds": 1200, "collector_started_at": origin.isoformat(), "connections": 1,
+        "max_symbols": count, "highest_verified_tier": count, "verified_symbols": list(SYMBOLS[:count]),
+        "attempted_symbols": list(SYMBOLS[:attempted]), "issued_requests": issued,
+        "upstream_sends": 1 + len(issued), "send_attempts": 1 + len(issued), "reconnect_attempts": 0,
+        "minimum_query_spacing_seconds": 1.01,
+        "certification_window": {"started_at": (origin + timedelta(seconds=last_seed)).isoformat(),
+            "ended_at": (origin + timedelta(seconds=last_seed + 90)).isoformat()},
+        "termination": {"classification": "completed" if count == attempted else "insufficient_events",
+                        "blocking_error": None, "partial_send": False},
+        "cache": {"first_sequence": 1, "last_sequence": batch_count, "batch_count": batch_count, "seed_batches": 3 * attempted,
                   "export_sha256": "d" * 64, "integrity_proof_sha256": "e" * 64},
         "http": {"successful_requests": 9, "failed_requests": 0, "extra_upstream_sends": 0,
-                 "windows": {"early": 3, "mid": 3, "late": 3}, "proof_sha256": "f" * 64},
+                 "windows": {"early": 3, "mid": 3, "late": 3}, "proof_sha256": "f" * 64,
+                 "consumer_sequences": [{"first_sequence": 1, "last_sequence": batch_count,
+                     "batch_count": batch_count, "sha256": str(i) * 64} for i in (2, 3)]},
         "cleanup": {"worker_alive": False, "http_worker_alive": False,
-                    "all_upstream_sockets_closed": True, "proof_sha256": "1" * 64}, "streams": streams}
+                    "all_upstream_sockets_closed": True, "proof_sha256": "1" * 64}, "streams": streams,
+        "resources": {"sample_interval_seconds": 1, "startup_settle_seconds": 10, "cpu_window_seconds": 30,
+            "http_p95_seconds": .1, "http_p99_seconds": .2, "max_http_seconds": .5, "max_consumer_lag_seconds": 1,
+            "max_combined_rss_bytes": 100_000_000, "min_host_available_fraction": .5, "max_cpu_core_fraction": .2,
+            "max_cache_bytes": 100_000_000, "min_disk_free_bytes": 10 * 1024**3, "proof_sha256": "4" * 64}}
+    return value
 
 
 def artifact(tmp_path: Path, target: str = TARGET) -> tuple[Path, dict[str, bytes], list[dict]]:
     files = {"uv.lock": b"synthetic lock", "src/rquant/l2/api.py": b"# synthetic API\n",
-             "src/rquant/l2/__main__.py": b"# synthetic collector\n"}
+             "src/rquant/l2/__main__.py": b"# synthetic collector\n",
+             "src/rquant/l2/symbols.py": b"# synthetic symbol routing\n",
+             "src/rquant/l2/subscriptions.py": b"# synthetic durable control\n"}
     for unit in ("api", "collector"):
         files[f"deploy/systemd/rquant-l2-{unit}.service"] = (ROOT / f"deploy/systemd/rquant-l2-{unit}.service").read_bytes()
     tree = [{"path": name, "type": "blob", "mode": "100644",
@@ -100,13 +125,36 @@ def github(archive: Path, tree: list[dict], target: str = TARGET):
 
 def test_acceptance_recomputes_six_streams_and_dynamic_late_window() -> None:
     d = deployer()
-    assert d.validate_acceptance(proof(), TREE)["streams"] == 6
-    longer = proof(); longer["duration_seconds"] = 1200
-    for stream in longer["streams"]:
-        for batch in stream["forward_batches"][-2:]:
-            at = datetime.fromisoformat(batch["received_at"])
-            batch["received_at"] = (at + timedelta(seconds=900)).isoformat()
-    assert d.validate_acceptance(longer, TREE)["late_window_seconds"] == [1140, 1200]
+    result = d.validate_acceptance(proof(), TREE)
+    assert result["streams"] == 60 and result["max_symbols"] == 20
+    assert result["late_window_seconds"][1] - result["late_window_seconds"][0] == 60
+    assert d.validate_acceptance(proof(20, attempted=40), TREE)["max_symbols"] == 20
+
+
+@pytest.mark.parametrize("bad", ["legacy", "missing_stream", "capacity", "wrong_symbol", "missing_send", "short_window",
+                                  "protocol", "partial_unknown", "resource", "consumer_gap"])
+def test_batch_v2_capacity_and_ledger_gates(tmp_path: Path, bad: str) -> None:
+    d = deployer(); value = proof()
+    if bad == "legacy":
+        value.update(schema="rquant-l2-acceptance-v1", upstream_sends=7)
+        value["cache"].update(last_sequence=30, batch_count=30, seed_batches=6)
+        value["streams"] = value["streams"][:6]
+        for index, stream in enumerate(value["streams"]):
+            slot, offset = divmod(index, 3)
+            stream["binding"].update(code=("603258", "300006")[slot], market=(17, 33)[slot], page_id=10117 + 10*slot + offset)
+            for step, batch in enumerate(stream["forward_batches"]):
+                batch.update(sequence=7+step*6+index, received_at=(datetime(2026, 10, 19, 1, 30, tzinfo=timezone.utc)
+                    + timedelta(seconds=(1010, 1080, 1150, 1190)[step])).isoformat())
+    elif bad == "missing_stream": value["streams"].pop()
+    elif bad == "capacity": value["max_symbols"] = 40
+    elif bad == "wrong_symbol": value["streams"][0]["binding"] = {**value["streams"][0]["binding"], "code": "000001"}
+    elif bad == "missing_send": value["issued_requests"].pop(1)
+    elif bad == "short_window": value["certification_window"]["ended_at"] = value["certification_window"]["started_at"]
+    elif bad == "protocol": value["termination"]["blocking_error"] = "protocol_error"
+    elif bad == "partial_unknown": value["termination"].update(classification="unknown", partial_send=True)
+    elif bad == "resource": value["resources"]["http_p99_seconds"] = 3
+    else: value["http"]["consumer_sequences"][1]["last_sequence"] -= 1
+    with pytest.raises(d.DeployError): d.validate_acceptance(value, TREE)
 
 
 @pytest.mark.parametrize("bad", ["five", "duplicate", "seed_replay", "same_late_batch", "short_span", "two_windows", "old_late", "wrong_tree", "cache_hole", "http_extra"])
@@ -120,7 +168,7 @@ def test_acceptance_rejects_false_sustained_proof(bad: str) -> None:
     elif bad == "two_windows":
         for batch in value["streams"][0]["forward_batches"]:
             batch["received_at"] = "2026-10-19T01:34:10+00:00"
-    elif bad == "old_late": value["duration_seconds"] = 1200
+    elif bad == "old_late": value["certification_window"] = {"started_at": "2026-10-19T01:40:00+00:00", "ended_at": "2026-10-19T01:42:00+00:00"}
     elif bad == "wrong_tree": value["source_tree"] = "9" * 40
     elif bad == "cache_hole": value["cache"]["last_sequence"] += 1
     elif bad == "http_extra": value["http"]["extra_upstream_sends"] = 1
@@ -192,6 +240,8 @@ class FakeHost:
         self.api_never_active = False
         self.committed = []
         self.batch_cursors = []
+        self.on_api_stop = None
+        self.on_api_start = None
 
     def command(self, argv: list[str], cwd: Path | None = None) -> str:
         self.commands.append(list(argv))
@@ -227,13 +277,16 @@ class FakeHost:
                 self.active[args[-1]] = True
                 if args[-1] == self.d.UNITS[1]:
                     self.epoch += 1
-                    for identity in sorted(self.d.EXPECTED, key=lambda item: item[-1]):
+                    desired = json.loads((self.paths.state / "control/desired.json").read_text())
+                    for binding in self.d.symbol_bindings(desired["symbols"]):
                         self.committed.append({"local_batch_sequence": len(self.committed) + 1,
                             "epoch_id": f"synthetic-{self.epoch}", "delivery": "seed",
-                            "binding": dict(zip(("code", "market", "kind", "side", "page_id"), identity))})
+                            "binding": binding})
+                elif self.on_api_start: self.on_api_start()
             elif action in {"stop", "disable"}:
                 self.active[args[-1]] = False
                 if action == "stop" and args[-1] == self.d.UNITS[1] and self.on_stop: self.on_stop()
+                if action == "stop" and args[-1] == self.d.UNITS[0] and self.on_api_stop: self.on_api_stop()
         return ""
 
     def health(self) -> dict:
@@ -241,7 +294,8 @@ class FakeHost:
         return {"state": "blocked" if running and self.collector_error else "listening_candidate" if running else "unconfigured",
                 "error_code": "protocol_error" if running and self.collector_error else None,
                 "epoch_id": f"synthetic-{self.epoch}" if self.epoch else None,
-                "seed_queries": 6 if running else 0, "market_batch_count": 6 if running else 0,
+                "seed_queries": sum(row["epoch_id"] == f"synthetic-{self.epoch}" for row in self.committed) if running else 0,
+                "market_batch_count": len(self.committed),
                 "last_sequence": len(self.committed)}
 
     def batches(self, after: int) -> dict:
@@ -343,7 +397,7 @@ def next_release(tmp_path: Path, d, host: FakeHost, args) -> dict:
 def test_recorded_previous_rollback_restores_api_without_collector_start(tmp_path: Path) -> None:
     d, host, args, old_api = deployment(tmp_path); run_deploy(d, host, args, old_api)
     api = next_release(tmp_path, d, host, args); run_deploy(d, host, args, api)
-    assert host.batch_cursors == [0, 6]
+    assert host.batch_cursors[0] == 0 and 60 in host.batch_cursors
     args = d.parse_cli(["--rollback", "--target", TARGET]); host.commands.clear()
     assert run_deploy(d, host, args, old_api)["status"] == "rolled_back"
     assert host.paths.current.resolve() == host.paths.releases / TARGET
@@ -383,7 +437,8 @@ def test_second_preflight_refuses_new_writer_and_does_not_kill_it(tmp_path: Path
         with pytest.raises(d.DeployError): run_deploy(d, host, args, api)
         assert host.paths.current.resolve() == host.paths.releases / TARGET
         assert not host.active[d.UNITS[1]] and host.active[d.UNITS[0]]
-        assert len(host.mutations()) == 1 and "stop" in host.mutations()[0]
+        assert [(c[3], c[-1]) for c in host.mutations()] == [
+            ("stop", d.UNITS[0]), ("stop", d.UNITS[1]), ("start", d.UNITS[0])]
         assert held and not held[0].closed
     finally:
         for file in held: file.close()
@@ -431,8 +486,8 @@ def test_api_health_cannot_substitute_for_active_managed_service(tmp_path: Path)
 
 @pytest.mark.parametrize("seed_case", ["missing_with_push", "last_pending", "four_orders", "old_epoch", "complete", "paginated"])
 def test_persist_f1_requires_six_committed_seed_bindings(monkeypatch, seed_case: str) -> None:
-    d = deployer(); bindings = [dict(zip(("code", "market", "kind", "side", "page_id"), identity))
-                               for identity in sorted(d.EXPECTED, key=lambda item: item[-1])]
+    d = deployer(); bindings = d.symbol_bindings(["600000", "000001"])
+    expected = {d.identity(binding) for binding in bindings}
     rows = [{"local_batch_sequence": i + 1, "epoch_id": "new", "delivery": "seed", "binding": binding}
             for i, binding in enumerate(bindings)]
     if seed_case == "missing_with_push": rows[-1]["delivery"] = "candidate_push"
@@ -454,11 +509,11 @@ def test_persist_f1_requires_six_committed_seed_bindings(monkeypatch, seed_case:
                 "status": status}
     monkeypatch.setattr(d, "health_batches", batches, raising=False)
     if seed_case in {"complete", "paginated"}:
-        d.wait_health(lambda: status, lambda _: None, collector=True, old_epoch="old")
+        d.wait_health(lambda: status, lambda _: None, collector=True, old_epoch="old", expected=expected)
         assert cursors == ([0] if seed_case == "complete" else [0, 8])
     else:
         with pytest.raises(d.DeployError, match="collector_health_failed"):
-            d.wait_health(lambda: status, lambda _: None, collector=True, old_epoch="old")
+            d.wait_health(lambda: status, lambda _: None, collector=True, old_epoch="old", expected=expected)
 
 
 @pytest.mark.parametrize("peer,pid,rejected", [
@@ -478,3 +533,84 @@ def test_persist_f2_normalizes_upstream_peer(tmp_path: Path, peer: str, pid: int
             d.socket_writer_preflight(host.paths, views, command)
     else:
         d.socket_writer_preflight(host.paths, views, command)
+
+
+def use_proof(args, value: dict) -> None:
+    args.acceptance_proof.write_text(json.dumps(value))
+    args.acceptance_sha256 = hashlib.sha256(args.acceptance_proof.read_bytes()).hexdigest()
+
+
+def test_production_policy_initializes_twenty_verified_targets(tmp_path: Path) -> None:
+    d, host, args, api = deployment(tmp_path); use_proof(args, proof(40))
+    assert run_deploy(d, host, args, api)["status"] == "deployed"
+    assert json.loads((host.paths.state / "capacity.json").read_text()) == {
+        "max_symbols": 40, "source_tree": TREE, "acceptance_sha256": args.acceptance_sha256}
+    desired = json.loads((host.paths.state / "control/desired.json").read_text())
+    assert desired == {"revision": 1, "symbols": list(SYMBOLS[:20])}
+    assert host.health()["seed_queries"] == 60
+
+
+def test_upgrade_capacity_rechecks_last_accepted_union_after_api_stop(tmp_path: Path) -> None:
+    from rquant.l2.subscriptions import SubscriptionStore
+    d, host, args, api = deployment(tmp_path); use_proof(args, proof(40)); run_deploy(d, host, args, api)
+    api = next_release(tmp_path, d, host, args); use_proof(args, proof(20)); host.commands.clear()
+    host.on_api_stop = lambda: SubscriptionStore(host.paths.state / "control", max_symbols=40).add([SYMBOLS[20]])
+    with pytest.raises(d.DeployError): run_deploy(d, host, args, api)
+    assert len(json.loads((host.paths.state / "control/desired.json").read_text())["symbols"]) == 21
+    assert json.loads((host.paths.state / "capacity.json").read_text())["max_symbols"] == 40
+    assert all(host.active.values())
+    assert not [c for c in host.commands if "stop" in c and c[-1] == d.UNITS[1]]
+
+
+@pytest.mark.parametrize("old_capacity,new_capacity,blocked", [(20, 40, True), (40, 80, False)])
+def test_failed_upgrade_never_loses_accepted_union_or_expands_old_capacity(tmp_path: Path,
+        old_capacity: int, new_capacity: int, blocked: bool) -> None:
+    from rquant.l2.subscriptions import SubscriptionStore
+    d, host, args, api = deployment(tmp_path); use_proof(args, proof(old_capacity)); run_deploy(d, host, args, api)
+    api = next_release(tmp_path, d, host, args); use_proof(args, proof(new_capacity)); host.commands.clear()
+    def accepted() -> None:
+        SubscriptionStore(host.paths.state / "control", max_symbols=new_capacity).add([SYMBOLS[20]])
+    host.on_api_start = accepted; host.collector_error = True
+    with pytest.raises(d.DeployError): run_deploy(d, host, args, api)
+    desired = json.loads((host.paths.state / "control/desired.json").read_text())
+    assert desired == {"revision": 2, "symbols": list(SYMBOLS[:21])}
+    assert not host.active[d.UNITS[1]]
+    assert host.active[d.UNITS[0]] is (not blocked)
+    policy = json.loads((host.paths.state / "capacity.json").read_text())
+    assert policy["max_symbols"] == (new_capacity if blocked else old_capacity)
+    if blocked:
+        assert json.loads((host.paths.state / "deploy-intent.json").read_text())["phase"] == "blocked"
+
+
+@pytest.mark.parametrize("ready_at,accepted", [(310, True), (700, False)])
+def test_dynamic_health_budget_grows_with_union_without_resetting_origin(monkeypatch, ready_at: int, accepted: bool) -> None:
+    d = deployer(); ticks = [0.0]; rows = []
+    for index, binding in enumerate(d.symbol_bindings(list(SYMBOLS))):
+        rows.append({"local_batch_sequence": index + 1, "epoch_id": "new", "delivery": "seed", "binding": binding})
+    monkeypatch.setattr(d.time, "monotonic", lambda: ticks[0])
+    def status() -> dict:
+        return {"state": "listening_candidate", "epoch_id": "new", "error_code": None,
+                "seed_queries": 300 if ticks[0] >= ready_at else 0, "last_sequence": 300 if ticks[0] >= ready_at else 0}
+    def batches(after: int) -> dict:
+        selected = rows[after:after+128]
+        return {"batches": selected, "next_sequence": selected[-1]["local_batch_sequence"]}
+    def run() -> None:
+        d.wait_health(status, lambda second: ticks.__setitem__(0, ticks[0] + second), collector=True,
+            old_epoch="old", batches=batches, symbols=lambda: list(SYMBOLS[:20 if ticks[0] < 100 else 100]))
+    if accepted: run()
+    else:
+        with pytest.raises(d.DeployError): run()
+        assert ticks[0] <= 630
+
+
+def test_previous_without_dynamic_control_contract_is_rejected_before_stop(tmp_path: Path) -> None:
+    d, host, args, api = deployment(tmp_path); run_deploy(d, host, args, api)
+    api = next_release(tmp_path, d, host, args); run_deploy(d, host, args, api)
+    installed_file = host.paths.state / "installation.json"; installed = json.loads(installed_file.read_text())
+    manifest = host.paths.releases / TARGET / ".l2-deployment.json"
+    value = json.loads(manifest.read_text()); value.pop("control_schema"); manifest.write_text(json.dumps(value))
+    installed["previous"]["manifest_sha256"] = hashlib.sha256(manifest.read_bytes()).hexdigest()
+    installed_file.write_text(json.dumps(installed)); host.commands.clear()
+    args = d.parse_cli(["--rollback", "--target", TARGET])
+    with pytest.raises(d.DeployError): run_deploy(d, host, args, api)
+    assert host.mutations() == []

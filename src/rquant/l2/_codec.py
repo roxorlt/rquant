@@ -7,6 +7,7 @@ from ._request import (build_trade_query, encode_payload, parse_market_ini, pars
                        parse_trade_market_ini, parse_trade_request_body, decode_payload,
                        _parse_ini_route, _validate_order_parameters)
 from ._table import parse_table
+from .symbols import market_for_code
 
 ALLOWED_ENDPOINT = ("122.9.43.156", 9528)
 MAX_BYTES = 1 << 20
@@ -48,7 +49,7 @@ def build_common_order_frame(template_body: bytes, query: bytes, *, request_id: 
     legacy = build_experimental_order_frame(template_body, query, request_id=request_id)
     source = parse_request_body(legacy[13:])
     parameters = source['parameters']
-    if ({'603258': '17', '300006': '33'}.get(parameters['stockcode']) != parameters['marketcode']
+    if (str(market_for_code(parameters['stockcode'])) != parameters['marketcode']
             or any(int(p) > 65535 for p in source['frame']['pageList'].split(','))):
         raise ValueError('common order is outside validated symbol/page scope')
     plain = source['plaintext'].replace(b'[frame]\r\nid=2267\r\n', b'[frame]\r\nid=2357\r\n', 1)

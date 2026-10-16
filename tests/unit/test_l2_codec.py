@@ -121,6 +121,25 @@ def test_reviewed_request_codec_and_template_header_are_preserved() -> None:
         request.build_trade_query(code="603258", market=33, page_id=10117)
 
 
+@pytest.mark.parametrize('code,market', [('600000', 17), ('000001', 33), ('300001', 33)])
+def test_dynamic_symbol_wire_retains_header_and_exact_routes(code, market):
+    request, codec = module('_request'), module('_codec')
+    for trade in (True, False):
+        query = (request.build_trade_query(code=code, market=market, page_id=10137) if trade else
+                 request.build_order_query(code=code, market=market, page_id=10138, side='sell',
+                                           rowcount=20, endtime=0, orderid=0))
+        wire = (codec.build_trade_frame if trade else codec.build_common_order_frame)(template(trade), query, request_id=62)
+        raw = request._read_request_body(wire[13:], frame_id=2357)
+        route = request._parse_ini_route(raw['plaintext'], frame_id=2357)
+        assert route['parameters']['stockcode'] == code
+        assert route['parameters']['marketcode'] == str(market)
+        assert raw['header_extension'] == bytes(range(53))
+    with pytest.raises(ValueError):
+        bad = request.build_order_query(code=code, market=33 if market == 17 else 17, page_id=1, side='buy',
+                                        rowcount=20, endtime=0, orderid=0)
+        codec.build_common_order_frame(template(), bad, request_id=3)
+
+
 def test_reviewed_snappy_bounds_and_raw_table_fidelity() -> None:
     codec = module("_codec")
     assert codec.snappy_decompress(b"\x09\x00a\x11\x01") == b"a" * 9

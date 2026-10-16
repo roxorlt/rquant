@@ -49,7 +49,7 @@ def test_standalone_api_preserves_cache_cursor_concurrent_reads_and_errors(tmp_p
         assert client.get("/api/v1/l2/batches?after_sequence=3").json() == {
             "detail": {"code": "invalid_cursor"}}
         assert client.get("/api/v1/l2/batches?after_sequence=3").status_code == 400
-        for query in ("after_sequence=-1", "limit=0", "limit=9"):
+        for query in ("after_sequence=-1", "limit=0", "limit=129"):
             assert client.get("/api/v1/l2/batches?" + query).status_code == 422
         for path in ("/docs", "/redoc", "/openapi.json"):
             assert client.get(path).status_code == 404
@@ -183,7 +183,7 @@ def test_existing_app_opt_in_reads_cache_without_upstream(tmp_path: Path, monkey
         status = client.get("/api/v1/l2/status").json()
         assert status["subscription_state"] == "requested_unverified"
         assert status["last_market_received_at"] == "2026-10-15T07:00:00Z"
-        for params in ({"after_sequence": -1}, {"limit": 0}, {"limit": 9}):
+        for params in ({"after_sequence": -1}, {"limit": 0}, {"limit": 129}):
             assert client.get("/api/v1/l2/batches", params=params).status_code == 422
 
 

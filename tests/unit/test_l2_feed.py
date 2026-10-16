@@ -320,7 +320,7 @@ def collector(tmp_path: Path, provider: Provider, clock: Clock, **options):
 def test_explicit_resident_remains_passive_beyond_six_hours_and_stops(tmp_path: Path) -> None:
     class ResidentProvider(Provider):
         def recv(self, size):
-            if not self.chunks:
+            if not self.chunks and len(self.business) >= 6:
                 clock.sleep(21601)
                 obj.stop_event.set()
                 raise socket.timeout()
@@ -650,3 +650,147 @@ def test_producer_uses_one_common_frame_with_exact_cumulative_page_prefix(tmp_pa
         assert parsed['frame']['id'] == '2357'
         assert parsed['frame']['pageList'] == ','.join(pages)
     assert len(provider.sent) == 7 and status.market_batch_count == 12
+
+
+class ManyPushProvider(Provider):
+    def __init__(self, clock, *, count=40, missing=False):
+        super().__init__(clock)
+        self.count, self.missing = count, missing
+        self.first = None
+    def sendall(self, data):
+        insertion = len(self.chunks)
+        super().sendall(data)
+        if len(self.business) == 1: self.first = self.last
+        if len(self.business) == 2:
+            if self.missing: self.chunks[insertion:] = []
+            self.chunks[insertion:insertion] = [frame(sentinel_push(self.first))] * self.count
+    def recv(self, size):
+        if self.missing: self.clock.sleep(0.25)
+        return super().recv(size)
+
+
+def test_more_than_32_valid_pushes_do_not_abort_pending_seed(tmp_path):
+    clock = Clock(); provider = ManyPushProvider(clock)
+    obj, cache, calls = collector(tmp_path, provider, clock)
+    status = obj.run()
+    assert status.error_code == 'duration_limit'
+    assert len(provider.business) == 6 and status.market_batch_count == 46
+    assert len(calls) == 1 and provider.closed
+
+
+@pytest.mark.parametrize('size', [20, 40, 80, 100])
+def test_explicit_symbol_capacity_uses_one_socket_and_stable_three_stream_ids(tmp_path, size):
+    clock = Clock(); provider = Provider(clock)
+    codes = tuple(f'600{i:03}' for i in range(size))
+    obj, cache, calls = collector(tmp_path, provider, clock, symbols=codes, max_symbols=size,
+                                  duration_seconds=size * 4 + 10)
+    status = obj.run()
+    assert status.error_code == 'duration_limit' and len(calls) == 1 and provider.closed
+    assert len(provider.business) == 3 * size
+    for index, (_, parsed) in enumerate(provider.business):
+        assert parsed['request_id'] == index + 3
+        assert parsed['parameters']['stockcode'] == codes[index // 3]
+        assert int(parsed['page_id']) == 10117 + 10 * (index // 3) + index % 3
+    assert all(b[0] - a[0] >= 1 for a, b in zip(provider.business, provider.business[1:]))
+    receipt = cache.read_subscription_status()
+    assert len(receipt.streams) == 3 * size and receipt.collector_state == 'stopped'
+    assert all(s.seed_sequence is not None for s in receipt.streams)
+    assert (cache.root / 'subscription-status.json').stat().st_size < 256 * 1024
+
+
+def test_empty_control_waits_without_reading_private_inputs_or_connecting(tmp_path, monkeypatch):
+    clock = Clock(); provider = Provider(clock)
+    obj, cache, calls = collector(tmp_path, provider, clock, control_root=tmp_path / 'control', duration_seconds=3)
+    def forbidden(*args): pytest.fail('empty desired set read member inputs')
+    monkeypatch.setattr(module('feed'), '_private_input', forbidden)
+    status = obj.run()
+    assert status.error_code == 'duration_limit' and not calls and not provider.sent
+    with pytest.raises(ValueError):
+        collector(tmp_path, provider, clock, control_root=tmp_path / 'control', symbols=['600000'])
+
+
+def test_live_additions_and_duplicate_union_do_not_reseed_or_rebind(tmp_path):
+    from rquant.l2.subscriptions import SubscriptionStore
+    store = SubscriptionStore(tmp_path / 'control')
+    store.add(['600000'])
+    clock = Clock()
+    class AddProvider(Provider):
+        def sendall(self, data):
+            super().sendall(data)
+            if len(self.business) == 3:
+                store.add(['000001', '600000'])
+                self.chunks.extend([frame(sentinel_push(self.last))] * 50)
+    provider = AddProvider(clock)
+    obj, cache, calls = collector(tmp_path, provider, clock, control_root=store.root, duration_seconds=20)
+    writes = []
+    original = cache.write_subscription_status
+    def receipt_written(receipt):
+        writes.append(receipt)
+        original(receipt)
+    cache.write_subscription_status = receipt_written
+    status = obj.run()
+    assert status.error_code == 'duration_limit' and len(calls) == 1
+    assert len(provider.business) == 6
+    assert [p['parameters']['stockcode'] for _, p in provider.business] == ['600000'] * 3 + ['000001'] * 3
+    assert cache.read_subscription_status().desired_revision == 2
+    assert sum(s.first_push_sequence is not None for s in cache.read_subscription_status().streams) == 1
+    assert len(writes) < 25  # Repeated market frames do not rewrite the300-stream receipt.
+
+
+def test_old_stream_pushes_are_drained_before_next_paced_send(tmp_path):
+    clock = Clock()
+    counts = []
+    class PacingProvider(Provider):
+        def sendall(self, data):
+            if len(self.business) == 1: counts.append(cache._highwater)
+            super().sendall(data)
+            if len(self.business) == 1:
+                self.chunks.extend([frame(sentinel_push(self.last))] * 5)
+    provider = PacingProvider(clock)
+    obj, cache, _ = collector(tmp_path, provider, clock)
+    status = obj.run()
+    assert status.error_code == 'duration_limit' and counts == [6]
+
+
+def test_pending_deadline_and_total_local_resource_budgets_do_not_reset(tmp_path, monkeypatch):
+    clock = Clock(); provider = ManyPushProvider(clock, count=200, missing=True)
+    obj, cache, calls = collector(tmp_path, provider, clock, duration_seconds=100)
+    status = obj.run()
+    assert status.error_code == 'seed_timeout' and clock.now < 120
+    assert len(calls) == 1 and provider.closed
+    other = tmp_path / 'budget'; other.mkdir()
+    clock = Clock(); provider = ManyPushProvider(clock)
+    monkeypatch.setattr(module('feed'), 'MAX_PENDING_BYTES', 2000, raising=False)
+    obj, _, calls = collector(other, provider, clock)
+    assert obj.run().error_code == 'byte_limit' and provider.closed and len(calls) == 1
+
+
+def test_new_epoch_never_inherits_previous_stream_seed_or_push_receipt(tmp_path):
+    clock = Clock(); provider = Provider(clock)
+    first, cache, _ = collector(tmp_path, provider, clock, symbols=['600000'])
+    first.run()
+    previous = cache.read_subscription_status()
+    assert all(s.seed_sequence is not None for s in previous.streams)
+    next_clock = Clock(); broken = Provider(next_clock, fault='id')
+    second, cache, calls = collector(tmp_path, broken, next_clock, symbols=['600000'])
+    status = second.run()
+    current = cache.read_subscription_status()
+    assert status.error_code == 'association_mismatch' and len(calls) == 1
+    assert current.epoch_id != previous.epoch_id and current.collector_state == 'blocked'
+    assert all(s.seed_sequence is None and s.first_push_sequence is None for s in current.streams)
+    assert cache.read_status().last_sequence == 3
+
+
+def test_pending_frame_budget_and_stop_during_large_queue_are_finite(tmp_path, monkeypatch):
+    clock = Clock(); provider = ManyPushProvider(clock)
+    monkeypatch.setattr(module('feed'), 'MAX_PENDING_FRAMES', 5)
+    obj, _, calls = collector(tmp_path, provider, clock)
+    assert obj.run().error_code == 'frame_limit' and provider.closed and len(calls) == 1
+    other = tmp_path / 'stop'; other.mkdir()
+    clock = Clock(); provider = Provider(clock)
+    obj, cache, calls = collector(other, provider, clock, symbols=[f'600{i:03}' for i in range(100)],
+                                  max_symbols=100, duration_seconds=5)
+    status = obj.run()
+    assert status.error_code == 'duration_limit' and len(calls) == 1 and provider.closed
+    assert len(provider.business) <= 5
+    assert any(s.state == 'failed' for s in cache.read_subscription_status().streams)

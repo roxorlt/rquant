@@ -28,9 +28,6 @@ from urllib.request import Request, urlopen
 API = "https://api.github.com/repos/roxorlt/rquant"
 UNITS = ("rquant-l2-api.service", "rquant-l2-collector.service")
 JOBS = {"L2 raw feed (Python 3.11)", "L2 raw feed (Python 3.12)", "web"}
-EXPECTED = {(code, market, kind, side, base + offset)
-    for code, market, base in (("603258", 17, 10117), ("300006", 33, 10127))
-    for offset, (kind, side) in enumerate((("vendor4013", None), ("vendor4027", "buy"), ("vendor4027", "sell")))}
 
 
 class DeployError(Exception):
@@ -88,42 +85,98 @@ def utc(value: Any) -> datetime:
         raise DeployError("invalid_receipt_time") from None
 
 
+def symbol_bindings(symbols: list[str]) -> list[dict[str, Any]]:
+    if (not isinstance(symbols, list) or not 1 <= len(symbols) <= 100 or len(set(symbols)) != len(symbols)
+            or any(not isinstance(code, str) or re.fullmatch(r"[036][0-9]{5}", code) is None for code in symbols)):
+        raise DeployError("invalid_symbols")
+    return [{"code": code, "market": 17 if code[0] == "6" else 33, "kind": kind, "side": side,
+             "page_id": 10117 + 10 * slot + offset}
+        for slot, code in enumerate(symbols)
+        for offset, (kind, side) in enumerate((("vendor4013", None), ("vendor4027", "buy"), ("vendor4027", "sell")))]
+
+
+def identity(binding: dict[str, Any]) -> tuple[Any, ...]:
+    return tuple(binding[k] for k in ("code", "market", "kind", "side", "page_id"))
+
+
+def numeric(value: Any) -> bool:
+    return type(value) in (int, float) and math.isfinite(value)
+
+
 def validate_acceptance(proof: dict[str, Any], target_tree: str) -> dict[str, Any]:
     try:
-        duration = proof["duration_seconds"]
+        verified, attempted = proof["verified_symbols"], proof["attempted_symbols"]
+        plan = symbol_bindings(attempted); expected = {identity(b) for b in symbol_bindings(verified)}
+        highest, maximum = proof["highest_verified_tier"], proof["max_symbols"]
+        duration, elapsed = proof["duration_seconds"], proof["run_elapsed_seconds"]
+        ledger, termination = proof["issued_requests"], proof["termination"]
         cache, http, cleanup = proof["cache"], proof["http"], proof["cleanup"]
-        spacing = proof["minimum_query_spacing_seconds"]
-        if (proof["schema"] != "rquant-l2-acceptance-v1" or not hex_value(proof["source_commit"], 40)
+        if (proof["schema"] != "rquant-l2-acceptance-v2" or not hex_value(proof["source_commit"], 40)
                 or proof["source_tree"] != target_tree or not hex_value(target_tree, 40)
-                or type(duration) is not int or duration not in (300, 1200)
-                or any(type(proof[k]) is not int or proof[k] != n for k, n in
-                       (("connections", 1), ("upstream_sends", 7), ("reconnect_attempts", 0)))
-                or type(spacing) not in (int, float) or not math.isfinite(spacing) or spacing < 1
-                or any(type(cache[k]) is not int for k in ("first_sequence", "last_sequence", "batch_count", "seed_batches"))
+                or type(highest) is not int or highest not in (20, 40, 80, 100) or len(verified) != highest
+                or attempted[:highest] != verified or type(maximum) is not int or not 20 <= maximum <= highest
+                or type(duration) is not int or duration != 1200 or not numeric(elapsed) or not 0 < elapsed <= duration
+                or proof["connections"] != 1 or type(proof["connections"]) is not int
+                or proof["reconnect_attempts"] != 0 or type(proof["reconnect_attempts"]) is not int
+                or termination["blocking_error"] is not None or type(termination["partial_send"]) is not bool
+                or termination["classification"] not in {"completed", "insufficient_events", "local_capacity_limit", "local_resource_limit"}
+                or termination["partial_send"] and termination["classification"] not in {"local_capacity_limit", "local_resource_limit"}
+                or not 3 * highest <= len(ledger) <= len(plan)
+                or type(proof["upstream_sends"]) is not int or proof["upstream_sends"] != 1 + len(ledger)
+                or type(proof["send_attempts"]) is not int or proof["send_attempts"] != proof["upstream_sends"] + int(termination["partial_send"])
+                or proof["send_attempts"] > 1 + len(plan)
+                or termination["classification"] == "completed" and (len(ledger) != len(plan) or highest != len(attempted) or termination["partial_send"])
+                or not numeric(proof["minimum_query_spacing_seconds"]) or proof["minimum_query_spacing_seconds"] < 1):
+            raise DeployError("acceptance_gate")
+        previous_complete = None
+        for index, send in enumerate(ledger):
+            start, complete = send["sent_started_elapsed_seconds"], send["sent_completed_elapsed_seconds"]
+            if (send["binding"] != plan[index] or type(send["request_id"]) is not int or send["request_id"] != index + 3
+                    or not numeric(start) or not numeric(complete) or not 0 <= start <= complete <= elapsed
+                    or previous_complete is not None and start - previous_complete < 1 - 1e-6):
+                raise DeployError("acceptance_send_ledger")
+            previous_complete = complete
+        if (any(type(cache[k]) is not int for k in ("first_sequence", "last_sequence", "batch_count", "seed_batches"))
                 or cache["first_sequence"] != 1 or cache["last_sequence"] != cache["batch_count"]
-                or cache["batch_count"] < 6 or cache["seed_batches"] != 6
+                or not 3 * highest <= cache["seed_batches"] <= len(ledger) or cache["batch_count"] < cache["seed_batches"]
                 or type(http["successful_requests"]) is not int or http["successful_requests"] < 6
                 or type(http["failed_requests"]) is not int or http["failed_requests"] != 0
                 or type(http["extra_upstream_sends"]) is not int or http["extra_upstream_sends"] != 0
                 or any(type(http["windows"][w]) is not int or http["windows"][w] < 2 for w in ("early", "mid", "late"))
                 or cleanup["worker_alive"] is not False or cleanup["http_worker_alive"] is not False
                 or cleanup["all_upstream_sockets_closed"] is not True
-                or not all(hex_value(v) for v in (cache["export_sha256"], cache["integrity_proof_sha256"],
-                                                http["proof_sha256"], cleanup["proof_sha256"]))):
-            raise DeployError("acceptance_gate")
+                or not all(hex_value(v) for v in (cache["export_sha256"], cache["integrity_proof_sha256"], http["proof_sha256"], cleanup["proof_sha256"]))):
+            raise DeployError("acceptance_cache_http")
+        consumers = http["consumer_sequences"]
+        if len(consumers) != 2 or any(c["first_sequence"] != 1 or c["last_sequence"] != cache["last_sequence"]
+                or c["batch_count"] != cache["batch_count"] or not hex_value(c["sha256"]) for c in consumers):
+            raise DeployError("acceptance_consumers")
+        resource = proof["resources"]
+        limits = {"http_p95_seconds": 1, "http_p99_seconds": 2, "max_http_seconds": 5,
+            "max_consumer_lag_seconds": 5, "max_combined_rss_bytes": 1024**3,
+            "max_cpu_core_fraction": .8, "max_cache_bytes": 4 * 1024**3}
+        if (any(type(resource[k]) is not int or resource[k] != value for k, value in
+                (("sample_interval_seconds", 1), ("startup_settle_seconds", 10), ("cpu_window_seconds", 30)))
+                or not hex_value(resource["proof_sha256"])
+                or any(not numeric(resource[k]) or not 0 <= resource[k] <= limit for k, limit in limits.items())
+                or resource["max_cache_bytes"] >= 4 * 1024**3
+                or not numeric(resource["min_host_available_fraction"]) or not .2 <= resource["min_host_available_fraction"] <= 1
+                or not numeric(resource["min_disk_free_bytes"]) or resource["min_disk_free_bytes"] < 5 * 1024**3):
+            raise DeployError("acceptance_resources")
         origin = utc(proof["collector_started_at"])
+        window_start, window_end = (utc(proof["certification_window"][k]) for k in ("started_at", "ended_at"))
+        if window_start < origin or (window_end-window_start).total_seconds() < 90 or (window_end-origin).total_seconds() > elapsed:
+            raise DeployError("acceptance_common_window")
         streams, identities, epochs, sequences = proof["streams"], set(), set(), set()
-        if len(streams) != 6:
-            raise DeployError("acceptance_six_streams")
+        if len(streams) != len(expected): raise DeployError("acceptance_streams")
         for stream in streams:
-            binding = stream["binding"]
-            identity = tuple(binding[k] for k in ("code", "market", "kind", "side", "page_id"))
-            if identity not in EXPECTED or identity in identities:
-                raise DeployError("acceptance_binding")
-            identities.add(identity)
-            if not isinstance(stream["epoch_id"], str) or not stream["epoch_id"]:
-                raise DeployError("acceptance_epoch")
+            key = identity(stream["binding"])
+            if key not in expected or key in identities: raise DeployError("acceptance_binding")
+            identities.add(key)
+            if not isinstance(stream["epoch_id"], str) or not stream["epoch_id"]: raise DeployError("acceptance_epoch")
             epochs.add(stream["epoch_id"])
+            seeded = utc(stream["seed_received_at"])
+            if not origin <= seeded <= window_start: raise DeployError("acceptance_seed_time")
             seen = set(stream["seed_ids"])
             if not seen or len(seen) != len(stream["seed_ids"]) or any(type(n) is not int or n < 0 for n in seen):
                 raise DeployError("acceptance_seed")
@@ -139,18 +192,18 @@ def validate_acceptance(proof: dict[str, Any], target_tree: str) -> dict[str, An
                         or any(type(n) is not int or n <= high or n in seen for n in ids)):
                     raise DeployError("acceptance_forward")
                 previous = sequence; sequences.add(sequence); seen.update(ids); high = max(ids)
-                at = utc(batch["received_at"]); elapsed = (at - origin).total_seconds()
-                if not 0 <= elapsed <= duration:
-                    raise DeployError("acceptance_time")
-                arrivals.append(at); windows.add(int(at.timestamp()) // 30)
-                if duration - 60 <= elapsed <= duration:
-                    late.add(sequence)
-            if not arrivals or (max(arrivals) - min(arrivals)).total_seconds() < 60 or len(windows) < 3 or len(late) < 2:
+                at = utc(batch["received_at"])
+                if at < seeded or (at-origin).total_seconds() > elapsed: raise DeployError("acceptance_time")
+                if window_start <= at <= window_end:
+                    arrivals.append(at); windows.add(int(at.timestamp()) // 30)
+                    if (window_end-at).total_seconds() <= 60: late.add(sequence)
+            if not arrivals or (max(arrivals)-min(arrivals)).total_seconds() < 60 or len(windows) < 3 or len(late) < 2:
                 raise DeployError("acceptance_sustained")
-        if identities != EXPECTED or len(epochs) != 1:
-            raise DeployError("acceptance_binding")
-        return {"streams": 6, "source_tree": target_tree, "duration_seconds": duration,
-                "late_window_seconds": [duration - 60, duration], "cache_batches": cache["batch_count"]}
+        if identities != expected or len(epochs) != 1: raise DeployError("acceptance_binding")
+        return {"streams": len(expected), "source_tree": target_tree, "duration_seconds": duration,
+                "max_symbols": maximum, "highest_verified_tier": highest, "verified_symbols": verified,
+                "initial_symbols": verified[:20], "late_window_seconds": [(window_end-origin).total_seconds()-60,
+                    (window_end-origin).total_seconds()], "cache_batches": cache["batch_count"]}
     except (KeyError, TypeError, ValueError, OverflowError):
         raise DeployError("invalid_acceptance") from None
 
@@ -281,6 +334,14 @@ class Paths:
     def cache(self) -> Path:
         return self.state / "cache"
 
+    @property
+    def control(self) -> Path:
+        return self.state / "control"
+
+    @property
+    def capacity(self) -> Path:
+        return self.state / "capacity.json"
+
 
 Command = Callable[..., str]
 UV = "/home/lighthouse/.local/bin/uv"
@@ -373,7 +434,7 @@ def load_release(paths: Paths, record: dict[str, Any]) -> dict[str, Any]:
         raise DeployError("release_manifest_changed")
     manifest = json_object(encoded)
     try:
-        if manifest["target"] != target or not hex_value(manifest["tree"], 40):
+        if manifest["target"] != target or not hex_value(manifest["tree"], 40) or manifest.get("control_schema") != 1:
             raise DeployError("invalid_release_record")
         for name, digest in manifest["file_sha256"].items():
             if not hex_value(digest) or not safe_relative(name) or sha256(file_bytes(release / name)) != digest:
@@ -463,12 +524,51 @@ def python_digest(release: Path) -> str:
     return sha256(python.read_bytes())
 
 
+def read_desired(paths: Paths) -> dict[str, Any]:
+    if not paths.control.exists() and not paths.control.is_symlink():
+        return {"revision": 0, "symbols": []}
+    directory(paths.control)
+    file = paths.control / "desired.json"
+    if not file.exists() and not file.is_symlink(): return {"revision": 0, "symbols": []}
+    value = json_object(file_bytes(file, private=True, limit=65536))
+    if (set(value) != {"revision", "symbols"} or type(value["revision"]) is not int or value["revision"] < 0
+            or not isinstance(value["symbols"], list)):
+        raise DeployError("invalid_control")
+    if value["symbols"]: symbol_bindings(value["symbols"])
+    return value
+
+
+def read_policy(paths: Paths) -> dict[str, Any]:
+    value = json_object(file_bytes(paths.capacity, private=True, limit=4096))
+    if (set(value) != {"max_symbols", "source_tree", "acceptance_sha256"}
+            or type(value["max_symbols"]) is not int or not 1 <= value["max_symbols"] <= 100
+            or not hex_value(value["source_tree"], 40) or not hex_value(value["acceptance_sha256"])):
+        raise DeployError("invalid_capacity_policy")
+    return value
+
+
+def configure_control(paths: Paths, policy: dict[str, Any], initial: list[str]) -> dict[str, Any]:
+    directory(paths.control, create=True)
+    with exclusive(paths.control / ".subscriptions.lock"):
+        desired = read_desired(paths)
+        if not desired["symbols"] and initial:
+            desired = {"revision": desired["revision"] + 1, "symbols": initial}
+        if len(desired["symbols"]) > policy["max_symbols"]:
+            raise DeployError("capacity_union_conflict")
+        save_json(paths.capacity, policy)
+        if desired["symbols"] or (paths.control / "desired.json").exists():
+            save_json(paths.control / "desired.json", desired)
+        return desired
+
+
 def stage_release(paths: Paths, origin: dict[str, Any], archive: dict[str, Any], artifact: Path,
                   proof: dict[str, Any], proof_hash: str, command: Command) -> dict[str, Any]:
     release = paths.releases / origin["target"]
     if release.exists() or release.is_symlink():
         raise DeployError("release_already_exists")
     release.mkdir(mode=0o700)
+    if not {"src/rquant/l2/symbols.py", "src/rquant/l2/subscriptions.py"} <= set(archive["files"]):
+        raise DeployError("dynamic_control_source_required")
     for name, data in archive["files"].items():
         file = release / name
         file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -478,13 +578,15 @@ def stage_release(paths: Paths, origin: dict[str, Any], archive: dict[str, Any],
     command([UV, "--no-config", "sync", "--frozen", "--no-dev", "--python", PYTHON], cwd=release)
     digest = python_digest(release)
     command([str(release / ".venv/bin/python"), "-I", "-c",
-        "import pathlib,rquant.l2.api,rquant.l2.feed; p=pathlib.Path.cwd()/'src'; "
-        "assert all(pathlib.Path(m.__file__).resolve().is_relative_to(p) for m in (rquant.l2.api,rquant.l2.feed))"], cwd=release)
+        "import inspect,pathlib,rquant.l2.api,rquant.l2.feed,rquant.l2.symbols,rquant.l2.subscriptions; p=pathlib.Path.cwd()/'src'; "
+        "assert all(pathlib.Path(m.__file__).resolve().is_relative_to(p) for m in (rquant.l2.api,rquant.l2.feed,rquant.l2.symbols,rquant.l2.subscriptions)); "
+        "assert {'control_root','max_symbols'} <= set(inspect.signature(rquant.l2.api.create_app).parameters)"], cwd=release)
     file_hashes = {name: sha256(data) for name, data in archive["files"].items()}
     if any(sha256(file_bytes(release / name)) != digest for name, digest in file_hashes.items()):
         raise DeployError("release_changed_during_build")
     command(["/usr/bin/systemd-analyze", "verify", *[str(release / "deploy/systemd" / u) for u in UNITS]])
-    manifest = {"target": origin["target"], "tree": origin["tree"], "artifact_sha256": origin["artifact_sha256"],
+    manifest = {"target": origin["target"], "tree": origin["tree"], "artifact_sha256": origin["artifact_sha256"], "control_schema": 1,
+        "capacity_policy": {"max_symbols": proof["max_symbols"], "source_tree": origin["tree"], "acceptance_sha256": proof_hash},
         "unit_sha256": archive["unit_sha256"], "file_sha256": file_hashes, "python_sha256": digest,
         "acceptance": proof, "acceptance_sha256": proof_hash,
         "ci_run_id": origin["ci_run_id"], "release_id": origin["release_id"], "asset_id": origin["asset_id"]}
@@ -530,15 +632,24 @@ def health_status() -> dict[str, Any]:
 
 
 def health_batches(after_sequence: int) -> dict[str, Any]:
-    return read_cache_api(f"batches?after_sequence={after_sequence}&limit=8", 16 << 20)
+    return read_cache_api(f"batches?after_sequence={after_sequence}&limit=128", 16 << 20)
 
 
 def wait_health(health: Callable[[], dict[str, Any]], sleep: Callable[[float], None], *, collector: bool,
                 old_epoch: str | None = None, after_sequence: int = 0,
-                batches: Callable[[int], dict[str, Any]] | None = None) -> None:
+                batches: Callable[[int], dict[str, Any]] | None = None, expected: set[tuple[Any, ...]] | None = None,
+                symbols: Callable[[], list[str]] | None = None) -> None:
+    if symbols is not None: expected = {identity(b) for b in symbol_bindings(symbols())}
+    if collector and not expected: raise DeployError("expected_bindings_required")
     cursor, epoch, seeds = after_sequence, None, set()
-    deadline = time.monotonic() + 20
-    for _ in range(20 if collector else 5):
+    seconds = 2 * len(expected) + 30 if collector and expected else 5
+    started = time.monotonic(); deadline = started + seconds
+    for _ in range(630 if collector else 5):
+        if symbols is not None:
+            current = {identity(b) for b in symbol_bindings(symbols())}
+            if not expected <= current: raise DeployError("collector_health_failed")
+            expected = current; deadline = started + 2 * len(expected) + 30
+        if time.monotonic() >= deadline: break
         try:
             value = health()
             if not isinstance(value.get("state"), str) or type(value.get("last_sequence")) is not int:
@@ -555,7 +666,7 @@ def wait_health(health: Callable[[], dict[str, Any]], sleep: Callable[[float], N
                 while cursor < value["last_sequence"] and time.monotonic() < deadline:
                     page = (batches or health_batches)(cursor)
                     rows = page.get("batches")
-                    if not isinstance(rows, list) or not 1 <= len(rows) <= 8:
+                    if not isinstance(rows, list) or not 1 <= len(rows) <= 128:
                         raise DeployError("api_health_failed")
                     if (type(page.get("next_sequence")) is not int or page["next_sequence"] != cursor + len(rows)
                             or any(type(row.get("local_batch_sequence")) is not int
@@ -566,10 +677,10 @@ def wait_health(health: Callable[[], dict[str, Any]], sleep: Callable[[float], N
                         cursor += 1
                         if row.get("epoch_id") == epoch and row.get("delivery") == "seed":
                             binding = row.get("binding", {})
-                            identity = tuple(binding.get(key) for key in ("code", "market", "kind", "side", "page_id"))
-                            if identity in EXPECTED: seeds.add(identity)
+                            key = identity(binding)
+                            if key in expected: seeds.add(key)
                 if (value.get("state") in {"seeded_waiting", "listening_candidate"}
-                        and value.get("seed_queries") == 6 and seeds == EXPECTED):
+                        and value.get("seed_queries", 0) >= len(expected) and expected <= seeds):
                     return
         except DeployError as error:
             if str(error) != "api_health_failed": raise
@@ -622,6 +733,9 @@ def deploy(args: argparse.Namespace, *, paths: Paths = Paths(), api: Callable[[s
         installed = json_object(file_bytes(installed_path, private=True)) if installed_path.exists() else None
         current_record = installed.get("current") if installed else None
         old = load_release(paths, current_record) if current_record else None
+        old_policy = read_policy(paths) if old else None
+        if old and (old_policy != old["capacity_policy"] or not read_desired(paths)["symbols"]):
+            raise DeployError("capacity_policy_changed")
         if (paths.current.is_symlink() and (not old or paths.current.resolve() != paths.releases / old["target"])) or (
                 not paths.current.is_symlink() and (paths.current.exists() or old)):
             raise DeployError("foreign_current")
@@ -645,6 +759,10 @@ def deploy(args: argparse.Namespace, *, paths: Paths = Paths(), api: Callable[[s
                 comparison = api(f"/compare/{old['target']}...{args.target}")
                 if comparison.get("merge_base_commit", {}).get("sha") != old["target"] or comparison.get("status") not in {"ahead", "identical"}:
                     raise DeployError("upgrade_not_fast_forward")
+        policy = {"max_symbols": acceptance["max_symbols"], "source_tree": origin["tree"],
+                  "acceptance_sha256": (candidate["acceptance_sha256"] if args.rollback else args.acceptance_sha256)}
+        if len(read_desired(paths)["symbols"]) > policy["max_symbols"]:
+            raise DeployError("capacity_union_conflict")
         at = now()
         if old and restart_window(at):
             raise DeployError("restart_window")
@@ -659,7 +777,7 @@ def deploy(args: argparse.Namespace, *, paths: Paths = Paths(), api: Callable[[s
         audit(paths, {**intent, "result": "prepared", "artifact_sha256": origin["artifact_sha256"],
             "source_tree": origin["tree"], "ci_run_id": origin["ci_run_id"], "unit_sha256": archive["unit_sha256"],
             "previous_state": {unit: {k: views[unit][k] for k in ("ActiveState", "MainPID")} for unit in UNITS}})
-        touched, switched, collector_started, old_stop_attempted = [], False, False, False
+        touched, switched, collector_started, old_stop_attempted, api_stop_attempted = [], False, False, False, False
 
         def run(argv: list[str], cwd: Path | None = None) -> str:
             audit(paths, {"at": now().isoformat(), "command": argv})
@@ -683,10 +801,21 @@ def deploy(args: argparse.Namespace, *, paths: Paths = Paths(), api: Callable[[s
             socket_writer_preflight(paths, views, command)
             if old:
                 if restart_window(now()): raise DeployError("restart_window")
+                api_stop_attempted = True
+                action(["sudo", "-n", SYSTEMCTL, "stop", UNITS[0]])
+                views = managed_units(paths, old, command)
+                if int(views[UNITS[0]]["MainPID"]) or views[UNITS[0]]["ActiveState"] not in {"inactive", "failed"}:
+                    raise DeployError("api_not_stopped")
+                socket_writer_preflight(paths, views, command)
+                if len(read_desired(paths)["symbols"]) > policy["max_symbols"]:
+                    raise DeployError("capacity_union_conflict")
                 old_stop_attempted = True
                 action(["sudo", "-n", SYSTEMCTL, "stop", UNITS[1]])
                 views = managed_units(paths, old, command)
             socket_writer_preflight(paths, views, command, stopped=True)
+            desired = configure_control(paths, policy, acceptance["initial_symbols"] if not old else [])
+            audit(paths, {"at": now().isoformat(), "capacity_policy_sha256": sha256(file_bytes(paths.capacity, private=True)),
+                "desired_revision": desired["revision"], "desired_symbols": desired["symbols"]})
             change_current(paths, args.target); switched = True
             intent["phase"] = "activating"; save_json(intent_path, intent)
             install_units(args.target)
@@ -701,7 +830,7 @@ def deploy(args: argparse.Namespace, *, paths: Paths = Paths(), api: Callable[[s
                 collector_started = True
                 action(["sudo", "-n", SYSTEMCTL, "start" if old else "enable", *([] if old else ["--now"]), UNITS[1]])
                 wait_health(health, sleep, collector=True, old_epoch=baseline_epoch,
-                            after_sequence=baseline_cursor, batches=batches)
+                            after_sequence=baseline_cursor, batches=batches, symbols=lambda: read_desired(paths)["symbols"])
             active = managed_units(paths, candidate, command)
             if any(active[u]["ActiveState"] != "active" or int(active[u]["MainPID"]) <= 0
                    for u in (UNITS[:1] if args.rollback else UNITS)):
@@ -717,7 +846,14 @@ def deploy(args: argparse.Namespace, *, paths: Paths = Paths(), api: Callable[[s
                 if touched or switched:
                     if collector_started or old:
                         action(["sudo", "-n", SYSTEMCTL, "stop", UNITS[1]])
+                    if touched:
+                        action(["sudo", "-n", SYSTEMCTL, "stop", UNITS[0]])
                     if old:
+                        if len(read_desired(paths)["symbols"]) > old_policy["max_symbols"]:
+                            intent["phase"] = "blocked"; intent["result"] = "rollback_capacity_conflict"
+                            save_json(intent_path, intent); audit(paths, intent)
+                            raise DeployError("rollback_capacity_conflict")
+                        configure_control(paths, old_policy, [])
                         change_current(paths, old["target"])
                         install_units(old["target"])
                         action(["sudo", "-n", SYSTEMCTL, "restart", UNITS[0]])
@@ -737,8 +873,12 @@ def deploy(args: argparse.Namespace, *, paths: Paths = Paths(), api: Callable[[s
                             paths.current.unlink()
                         action(["sudo", "-n", SYSTEMCTL, "daemon-reload"])
                 elif old_stop_attempted:
+                    if api_stop_attempted:
+                        action(["sudo", "-n", SYSTEMCTL, "start", UNITS[0]])
                     views = managed_units(paths, old, command)
                     socket_writer_preflight(paths, views, command, stopped=True)
+                elif api_stop_attempted:
+                    action(["sudo", "-n", SYSTEMCTL, "start", UNITS[0]])
                 intent["phase"] = "complete"
                 intent["result"] = ("failed_collector_stopped" if old_stop_attempted else "failed_removed" if touched
                                     else "failed_before_activation")

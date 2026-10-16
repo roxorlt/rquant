@@ -439,7 +439,7 @@ def test_failed_directory_commit_exposes_no_torn_batch(tmp_path: Path, monkeypat
     assert cache.read_batches().batches == ()
 
 
-@pytest.mark.parametrize("after,limit", [(-1, 1), (True, 1), (0, 0), (0, 9)])
+@pytest.mark.parametrize("after,limit", [(-1, 1), (True, 1), (0, 0), (0, 129)])
 def test_local_cursor_validation(tmp_path: Path, after, limit):
     from rquant.l2.cache import RawL2Cache
 
@@ -511,3 +511,80 @@ def test_reader_snapshot_does_not_report_gap_when_writer_commits_during_scan(tmp
         page = RawL2Cache(cache.root).read_batches()
         assert len(page.batches) == 1
         assert page.next_sequence == 1
+
+
+def test_larger_page_amortizes_full_prefix_io_without_dropping_checks(tmp_path: Path, monkeypatch):
+    from rquant.l2.cache import RawL2Cache
+    cache = RawL2Cache(tmp_path / 'cache')
+    with cache.writer():
+        for _ in range(129): cache.append(observation())
+    original = Path.iterdir
+    scans = []
+    def counted(path):
+        if path == cache.root / 'batches': scans.append(path)
+        return original(path)
+    monkeypatch.setattr(Path, 'iterdir', counted)
+    page = RawL2Cache(cache.root).read_batches(limit=128)
+    assert len(page.batches) == 128 and page.next_sequence == 128
+    assert len(scans) == 1
+    assert len(RawL2Cache(cache.root).read_batches(after_sequence=128, limit=128).batches) == 1
+    # The bigger page must still reject a missing old batch, even after its cursor.
+    import shutil
+    shutil.rmtree(cache.root / 'batches' / f'{1:020d}')
+    with pytest.raises(Exception, match='sequence_gap'):
+        RawL2Cache(cache.root).read_batches(after_sequence=128, limit=128)
+
+
+def test_page_payload_byte_budget_returns_contiguous_prefix(tmp_path: Path, monkeypatch):
+    from rquant.l2 import cache as module
+    cache = module.RawL2Cache(tmp_path / 'cache')
+    with cache.writer():
+        for _ in range(4): cache.append(observation())
+    size = (cache.root / 'batches' / f'{1:020d}' / 'batch.json').stat().st_size
+    monkeypatch.setattr(module, 'MAX_BATCH_PAGE_BYTES', size * 2 + 2, raising=False)
+    first = cache.read_batches(limit=8)
+    assert len(first.batches) == 2 and first.next_sequence == 2
+    second = cache.read_batches(after_sequence=2, limit=8)
+    assert [b.local_batch_sequence for b in second.batches] == [3, 4]
+
+
+def test_subscription_runtime_receipt_and_age_are_bounded_reads_without_history_scan(tmp_path, monkeypatch):
+    from rquant.l2.cache import RawL2Cache
+    from rquant.l2.models import Binding, FeedStatus, SubscriptionReceipt, SubscriptionStream
+    cache = RawL2Cache(tmp_path / 'cache')
+    assert hasattr(cache, 'read_runtime_status'), 'bounded runtime status reader is missing'
+    assert cache.read_subscription_status() is None
+    received = datetime.now(UTC) - timedelta(seconds=120)
+    with cache.writer():
+        batch = cache.append(observation().model_copy(update={'received_at': received}))
+        cache.write_status(FeedStatus(state='connected', epoch_id='new_epoch'))
+        receipt = SubscriptionReceipt(epoch_id='old_epoch', desired_revision=1, collector_state='stopped',
+            streams=(SubscriptionStream(binding=Binding(page_id=10117, kind='vendor4013', code='600000', market=17),
+                                        state='seeded', request_id=3, seed_sequence=batch.local_batch_sequence,
+                                        seed_received_at=received),))
+        cache.write_subscription_status(receipt)
+    def forbidden(*args): pytest.fail('control GET scanned historical market batches')
+    monkeypatch.setattr(cache, '_directories', forbidden)
+    status = cache.read_runtime_status()
+    assert status.cache_stale and status.cache_age_seconds >= 120
+    assert status.epoch_id == 'new_epoch' and cache.read_subscription_status() == receipt
+    assert cache.read_subscription_status().epoch_id != status.epoch_id
+    runtime = cache.root / 'subscription-status.json'
+    assert runtime.stat().st_size <= 256 * 1024
+    runtime.write_bytes(b'x' * (256 * 1024 + 1))
+    with pytest.raises(Exception): cache.read_subscription_status()
+
+
+def test_actual_twelve_mib_page_budget_keeps_whole_batches_below_envelope_limit(tmp_path):
+    from rquant.l2.cache import MAX_BATCH_PAGE_BYTES, RawL2Cache
+    obs = observation()
+    obs = obs.model_copy(update={'table': obs.table.model_copy(update={'interpretation_limits': 'x' * (1024 * 1024)})})
+    cache = RawL2Cache(tmp_path / 'cache')
+    with cache.writer():
+        for _ in range(13): cache.append(obs)
+    page = cache.read_batches(limit=128)
+    committed_bytes = sum((cache.root / 'batches' / f'{b.local_batch_sequence:020d}' / 'batch.json').stat().st_size for b in page.batches)
+    assert 0 < len(page.batches) < 13 and committed_bytes <= MAX_BATCH_PAGE_BYTES
+    assert len(page.model_dump_json().encode()) < 16 * 1024 * 1024
+    assert page.next_sequence == len(page.batches)
+    assert cache.read_batches(after_sequence=page.next_sequence, limit=128).batches[0].local_batch_sequence == page.next_sequence + 1

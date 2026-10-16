@@ -14,6 +14,7 @@ import re
 import struct
 from typing import Any
 
+from .symbols import market_for_code
 
 IPHONE64_ALPHABET = b"aCcMeTKhxnwzmoPbsG4EvU8gyd02B3q6fIVWXYZjApRrDtuHkiLlN1O9F5S7JQ+/"
 _STANDARD64 = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
@@ -23,7 +24,6 @@ _FRAME_KEYS = {"id", "pageList", "reqPage", "reqPageCount"}
 _ORDER_KEYS = {"id", "marketcode", "rowcount", "stockcode", "reqtype", "endtime", "orderid"}
 _DETAIL_KEYS = {"id", "nopush", "isVolumeFloat", "stockcode", "rowcount", "marketcode", "endtime", "unixtime"}
 _TRADE_KEYS = {"id", "ispush", "isVolumeFloat", "rowcount", "stockcode", "bishu", "marketcode", "currentpage", "endtime"}
-_TRADE_MARKETS = {"603258": "17", "300006": "33"}
 
 
 def encode_payload(plaintext: bytes) -> bytes:
@@ -69,8 +69,8 @@ def _validate_order_parameters(parameters: dict[str, str]) -> None:
         raise ValueError("unsupported order query fields or command")
     if re.fullmatch(r"[0-9]{6}", parameters["stockcode"]) is None:
         raise ValueError("stockcode must contain six ASCII digits")
-    if parameters["marketcode"] not in {"17", "33"}:
-        raise ValueError("only the observed markets 17 and 33 are supported")
+    if parameters["marketcode"] != str(market_for_code(parameters["stockcode"])):
+        raise ValueError("stock and market mismatch")
     if parameters["reqtype"] not in {"buy", "sell"}:
         raise ValueError("reqtype must be buy or sell")
     if not 1 <= _decimal(parameters["rowcount"], "rowcount") <= 20:
@@ -198,8 +198,8 @@ def _validate_trade_parameters(parameters: dict[str, str]) -> None:
                        ("rowcount", "500"), ("bishu", "2500"), ("endtime", "0")):
         if parameters[key] != value:
             raise ValueError("unobserved initial4013 query options")
-    if _TRADE_MARKETS.get(parameters["stockcode"]) != parameters["marketcode"]:
-        raise ValueError("symbol outside initial trade validation scope")
+    if str(market_for_code(parameters["stockcode"])) != parameters["marketcode"]:
+        raise ValueError("stock and market mismatch")
     if not 1 <= _decimal(parameters["currentpage"], "currentpage") <= 3:
         raise ValueError("experimental currentpage must be in1..3")
 

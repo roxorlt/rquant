@@ -53,6 +53,8 @@ jobs:
           tests/unit/test_l2_codec.py tests/unit/test_l2_feed.py
           tests/unit/test_l2_cache.py tests/unit/test_l2_web.py
           tests/unit/test_l2_component_deploy.py
+          tests/unit/test_l2_symbols.py tests/unit/test_l2_subscriptions.py
+          tests/unit/test_l2_subscription_api.py
 
   web:
     runs-on: ubuntu-24.04

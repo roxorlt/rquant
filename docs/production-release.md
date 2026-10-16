@@ -8,25 +8,33 @@
 
 ## L2 独立组件
 
-本组件使用同一受控入口的 `--component l2` 分支，独立于默认平台发布链。当前仍待该版本云端六流验收与正式启用，服务器内 `127.0.0.1:8771` 不是已上线地址。
+本组件仅使用同一入口的 `--component l2` 分支，默认平台发布链及 R07 门禁保持原样。当前批量候选实际认证股票数为 0，尚未上线；`127.0.0.1:8771` 是固定目标回环地址，不是当前已启用服务的声明。
 
 ```sh
 bash scripts/deploy-production.sh --component l2 \
   --target <main上的完整40位commit> \
   --artifact /absolute/path/public-release.tar.gz \
-  --acceptance-proof /absolute/private/six-stream-acceptance.json \
+  --acceptance-proof /absolute/private/batch-capacity-acceptance.json \
   --acceptance-sha256 <验收文件的64位SHA256> --dry-run
 ```
 
-正式执行沿用相同参数去掉 `--dry-run`，由 Codex 在既有授权与门禁内完成。目标必须属于 main；公共发布制品的 SHA256、`RELEASE.commit`、精确目标的 Web MVP push CI 三个 job 成功记录和 source binding 都须匹配。缺失 GitHub 制品 digest、CI 或验收证据会拒绝执行，不接受浮动引用或跳过门禁。
+正式执行使用相同参数去掉 `--dry-run`。门禁验证 main 祖先关系、精确目标的 Web MVP push CI 三个 job 全部成功、正式 release asset SHA256、`RELEASE.commit` 与整棵源码树；`uv sync --frozen --no-dev` 后核实际解释器、导入路径和 unit 内容。网络、digest 或源树证据缺失即拒绝，不接受浮动引用、布尔自证或隔离测试制品冒充正式发布。所有门禁完成前不会停已受管采集器。
 
-验收文件须绑定同一候选代码与六个唯一数据流：两只股票各成交、买委托、卖委托；每流需要种子后向前 ID、至少 60 秒跨度、三个 30 秒窗口，以及相对采集器启动时间的最后 60 秒至少两批向前数据。必须同时证明单连接、七次发送、发送完成后至少一秒间隔、GET 不触发上游、完整缓存与 HTTP 游标覆盖、全部 worker/socket 已关闭。未通过六流验收前不启用服务。
+容量验收使用 `rquant-l2-acceptance-v2`，绑定同一源树、股票清单与每股成交/买委托/卖委托 3N 流。阶梯仅为 20→40→80→100；100 是本轮预算上限，不能宣称数据源极限。`verified_symbols` / `highest_verified_tier` 与 `attempted_symbols` 分开，生产策略不超过最高完整认证阶梯，首次 desired 只初始化已验证列表前 20 股，不自动启动全部已测股票。
 
-组件代码位于 `/home/lighthouse/rquant-l2-rel/<完整SHA>`，current 只指向已验证的该组件版本；缓存位于 `/home/lighthouse/rquant-l2-state/cache`，私有输入位于 `/home/lighthouse/rquant-l2-private`，部署锁与审计位于独立 state 目录。组件不接管 `/home/lighthouse/rquant` 工作区或既有 Web current，不读取 `.env`，不写生产数据库。
+每个认证阶梯在最后一个种子之后具有共同 90 秒窗口。全部 3N 流各自必须有实际种子、向前新 ID、至少 60 秒跨度、三个 30 秒桶及窗口最后 60 秒至少两批向前数据。种子、心跳、同 ID 值变化不能替代新事件。完整 run 最多 1200 秒、单连接、零重连，最多一次会话发送加 300 次业务发送；actual completed send ledger 保留每个绑定、请求 ID 与发送起止时间，并核下一次发送距上次完成至少一秒，部分发送必须明确诊断。
 
-本次组件授权仅允许安装、解析校验和管理 `rquant-l2-collector.service`、`rquant-l2-api.service` 两个精确名称。现有同名 unit 或 drop-in 不属于已记录的 L2 安装时拒绝覆盖。API 先启动并核验只读缓存，随后采集器只启动一次；采集器使用 `--resident --max-reconnects 0` 与 `Restart=no`，没有自动会话续期或失败重登录。API 固定绑定 `127.0.0.1:8771`，不增加公网代理。
+验收还包括真实回环 HTTP 动态追加/并发重复、重复零额外发送、双独立消费者在采集结束后完整 drain 到最终缓存序号、全缓存连续性与哈希、worker/socket/HTTP 全关闭。固定每秒资源采样、启动 settle 10 秒、CPU 30 秒窗口；认证窗口要求 HTTP p95≤1 秒、p99≤2 秒、单次≤5 秒、接收至消费 lag≤5 秒、合计 RSS≤1 GiB、主机可用内存≥20%、CPU≤主机核数的 80%、缓存低于 4 GiB、剩余磁盘≥5 GiB，完整 run 的资源越界原因不得丢弃。未知、鉴权、协议或完整性阻断不得用早先已通过的小阶梯掩盖；后续明确事件不足或可诊断本地容量/资源限制才可单独保留先前完整阶梯的实测下界。
 
-工作日上海时间 09:15–15:10 不重启服务。首次安装仅在两个 unit 都不存在且所有门禁通过时允许初次启动；升级或回滚涉及重启时延期。首次失败只停止、禁用并移除本次记录且内容匹配的两个新 unit，保留缓存、私有输入和证据。升级回滚仅接受已记录的 previous 完整 SHA，恢复已验证代码/API；鉴权或协议失败后采集器保持停止，不自动登录旧版本，缓存不回滚。
+组件代码为 `/home/lighthouse/rquant-l2-rel/<完整SHA>`；current 仅指向已验证组件。独立 state 包含 `cache`、`control/desired.json`、只读 `capacity.json`、部署锁和审计。策略由验收门禁生成 `max_symbols`、`source_tree`、`acceptance_sha256`。目录 0700、私有文件 0600；API 仅写 control、读缓存和策略，不能读取 `/home/lighthouse/rquant-l2-private` 会员输入。组件不接管现有生产工作区、Web current 或数据库。
+
+仅允许管理 `rquant-l2-collector.service`、`rquant-l2-api.service` 两个精确 unit。未知同名 fragment/drop-in、监听者、socket 或缓存写者均阻断，不 kill 未知进程。API 固定回环 8771、无公网代理；仅 standalone 显式 control 模式启用 POST，平台 Web 保持缓存 GET。采集器 `--resident --max-reconnects 0`、`Restart=no`，没有自动会话续期或失败重登录。
+
+升级完成候选 staging 后，先停受管控制 API，再重读最新持久并集并校验目标容量，然后停采集器、确认单 writer 释放，再更新策略与 current。短控制锁不跨网络或环境准备。新 API 启动后仅启动一次采集器；健康检查从启动前本地游标开始，核新 epoch 中当前 durable union 的全部 3N 个实际 `delivery=seed` 市场批次，不能用发送计数、旧 epoch 或推送补数替代。等待上界随实际列表有界增长。
+
+工作日上海时间 09:15–15:10 不重启现有服务；首次安装仅在两个 unit 均不存在且全部门禁通过时允许初次启动。初装失败仅移除本次记录且哈希匹配的 unit/link，保留输入、控制列表、缓存与证据。升级或显式回滚只恢复已记录且控制 schema 兼容的 previous，重新验证公开来源；采集器保持停止，不自动重新认证，缓存不回滚。
+
+任何回滚都保留客户端已经收到 202 的并集，不能恢复旧 desired 快照。若新 API 已受理的列表超过旧认证容量，保留新 desired/policy/cache，控制 API 与采集器均停止，记录 `rollback_capacity_conflict` / 回滚未完成；不能临时扩大旧容量或声称恢复成功。接口字段、消费者游标与运行示例见 [L2 接口](l2-interface.md)，静态契约见 [OpenAPI](l2-openapi.json)。
 
 ## 发布链路
 

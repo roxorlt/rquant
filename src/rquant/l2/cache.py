@@ -14,11 +14,14 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-from rquant.l2.models import BatchPage, FeedStatus, MarketObservation, RawL2Batch
+from rquant.l2.models import BatchPage, FeedStatus, MarketObservation, RawL2Batch, SubscriptionReceipt
 
 _ACTIVE = {"starting", "connected", "seeded_waiting", "listening_candidate"}
 _STALE_SECONDS = 60
 _MAX_BATCH_BYTES = 8 * 1024 * 1024
+MAX_BATCH_PAGE = 128
+MAX_BATCH_PAGE_BYTES = 12 * 1024 * 1024
+_MAX_RUNTIME_BYTES = 256 * 1024
 
 
 class CacheError(RuntimeError):
@@ -58,6 +61,27 @@ def _write_new(path: Path, data: bytes) -> None:
         stream.write(data)
         stream.flush()
         os.fsync(stream.fileno())
+
+
+def _replace_snapshot(root: Path, name: str, payload: bytes) -> None:
+    temporary = None
+    try:
+        if (root / name).is_symlink():
+            raise CacheError('unsafe_path')
+        fd, value = tempfile.mkstemp(prefix='.status-', dir=root)
+        temporary = Path(value)
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, root / name)
+        temporary = None
+        _fsync_dir(root)
+    except OSError:
+        raise CacheError('cache_io') from None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 class RawL2Cache:
@@ -141,9 +165,9 @@ class RawL2Cache:
             raise CacheError("cache_io") from None
 
     @staticmethod
-    def _read_batch(directory: Path, expected: int) -> RawL2Batch:
+    def _read_batch(directory: Path, expected: int, *, maximum: int = _MAX_BATCH_BYTES) -> RawL2Batch:
         try:
-            payload = _read(directory / "batch.json", _MAX_BATCH_BYTES)
+            payload = _read(directory / "batch.json", min(maximum, _MAX_BATCH_BYTES))
             digest = _read(directory / "sha256", 65)
             if digest != hashlib.sha256(payload).hexdigest().encode() + b"\n":
                 raise CacheError("invalid_batch")
@@ -227,22 +251,41 @@ class RawL2Cache:
         previous = self._stored_status()
         status = status.model_copy(update={"gap": status.gap or previous.gap})
         status = self._with_committed_receipt(status, *self._position(), datetime.now(UTC))
-        temporary: Path | None = None
+        _replace_snapshot(self.root, 'status.json', status.model_dump_json().encode() + b'\n')
+
+    def read_runtime_status(self) -> FeedStatus:
+        """Bounded writer snapshot for control routes; does not audit the batch prefix."""
+        status = self._stored_status()
+        last = status.last_market_received_at
+        age = max(0.0, (datetime.now(UTC) - last).total_seconds()) if last else None
+        return status.model_copy(update={
+            'cache_age_seconds': age,
+            'cache_stale': (age is None or age > _STALE_SECONDS or status.state in {
+                'unconfigured', 'disconnected', 'blocked', 'stopped'}),
+        })
+
+    def write_subscription_status(self, receipt: SubscriptionReceipt) -> None:
+        self._require_writer()
+        if not isinstance(receipt, SubscriptionReceipt):
+            raise ValueError('typed subscription receipt required')
+        payload = receipt.model_dump_json().encode() + b'\n'
+        if len(payload) > _MAX_RUNTIME_BYTES:
+            raise CacheError('invalid_status')
+        _replace_snapshot(self.root, 'subscription-status.json', payload)
+
+    def read_subscription_status(self) -> SubscriptionReceipt | None:
+        path = self.root / 'subscription-status.json'
+        if self.root.is_symlink() or path.is_symlink():
+            raise CacheError('unsafe_path')
+        if not path.exists():
+            return None
         try:
-            fd, name = tempfile.mkstemp(prefix=".status-", dir=self.root)
-            temporary = Path(name)
-            with os.fdopen(fd, "wb") as stream:
-                stream.write(status.model_dump_json().encode() + b"\n")
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, self.root / "status.json")
-            temporary = None
-            _fsync_dir(self.root)
-        except OSError:
-            raise CacheError("cache_io") from None
-        finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
+            info = path.lstat()
+            if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600:
+                raise CacheError('unsafe_path')
+            return SubscriptionReceipt.model_validate_json(_read(path, _MAX_RUNTIME_BYTES))
+        except (OSError, ValueError):
+            raise CacheError('invalid_status') from None
 
     def read_status(self, *, now: datetime | None = None) -> FeedStatus:
         clock = now if now is not None else datetime.now(UTC)
@@ -252,14 +295,33 @@ class RawL2Cache:
 
     def read_batches(self, *, after_sequence: int = 0, limit: int = 1) -> BatchPage:
         if (type(after_sequence) is not int or after_sequence < 0 or type(limit) is not int
-                or not 1 <= limit <= 8):
+                or not 1 <= limit <= MAX_BATCH_PAGE):
             raise ValueError("invalid local batch cursor")
         directories = self._directories()
         count = len(directories)
         if after_sequence > count:
             raise ValueError("invalid local batch cursor")
-        selected = tuple(self._read_batch(path, after_sequence + index + 1)
-                         for index, path in enumerate(directories[after_sequence:after_sequence + limit]))
+        selected_list = []
+        payload_bytes = 0
+        for index, path in enumerate(directories[after_sequence:after_sequence + limit]):
+            try:
+                size = (path / 'batch.json').lstat().st_size
+            except OSError:
+                raise CacheError('invalid_batch') from None
+            if size > _MAX_BATCH_BYTES:
+                raise CacheError('invalid_batch')
+            if payload_bytes + size > MAX_BATCH_PAGE_BYTES:
+                break
+            batch = self._read_batch(path, after_sequence + index + 1,
+                                     maximum=MAX_BATCH_PAGE_BYTES - payload_bytes)
+            # Include canonical model bytes as well as committed payload bytes in
+            # the budget, including noncanonical older JSON that expands on output.
+            size = max(size, len(batch.model_dump_json().encode()) + 1)
+            if payload_bytes + size > MAX_BATCH_PAGE_BYTES:
+                break
+            selected_list.append(batch)
+            payload_bytes += size
+        selected = tuple(selected_list)
         if selected and selected[-1].local_batch_sequence == count:
             last = selected[-1]
         else:

@@ -1,0 +1,1020 @@
+{
+  "components": {
+    "schemas": {
+      "BatchPage": {
+        "additionalProperties": false,
+        "properties": {
+          "batches": {
+            "items": {
+              "$ref": "#/components/schemas/RawL2Batch"
+            },
+            "title": "Batches",
+            "type": "array"
+          },
+          "next_sequence": {
+            "minimum": 0.0,
+            "title": "Next Sequence",
+            "type": "integer"
+          },
+          "status": {
+            "$ref": "#/components/schemas/FeedStatus"
+          }
+        },
+        "required": [
+          "batches",
+          "next_sequence",
+          "status"
+        ],
+        "title": "BatchPage",
+        "type": "object"
+      },
+      "Binding": {
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "vendor4013",
+              "vendor4027"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "market": {
+            "enum": [
+              17,
+              33
+            ],
+            "title": "Market",
+            "type": "integer"
+          },
+          "page_id": {
+            "maximum": 65535.0,
+            "minimum": 1.0,
+            "title": "Page Id",
+            "type": "integer"
+          },
+          "side": {
+            "anyOf": [
+              {
+                "enum": [
+                  "buy",
+                  "sell"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Side"
+          }
+        },
+        "required": [
+          "page_id",
+          "kind",
+          "code",
+          "market"
+        ],
+        "title": "Binding",
+        "type": "object"
+      },
+      "FeedStatus": {
+        "additionalProperties": false,
+        "properties": {
+          "cache_age_seconds": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cache Age Seconds"
+          },
+          "cache_stale": {
+            "default": true,
+            "title": "Cache Stale",
+            "type": "boolean"
+          },
+          "control_count": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Control Count",
+            "type": "integer"
+          },
+          "epoch_id": {
+            "anyOf": [
+              {
+                "pattern": "^[a-zA-Z0-9_-]{1,64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Epoch Id"
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "enum": [
+                  "transport_error",
+                  "peer_closed",
+                  "invalid_framing",
+                  "frame_length_limit",
+                  "frame_timeout",
+                  "byte_limit",
+                  "frame_limit",
+                  "decode_error",
+                  "association_mismatch",
+                  "order_side_mismatch",
+                  "seed_timeout",
+                  "protocol_error",
+                  "cache_error",
+                  "writer_busy",
+                  "restart_gap",
+                  "input_error",
+                  "duration_limit",
+                  "signal_stop",
+                  "unknown_market",
+                  "invalid_status"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code"
+          },
+          "gap": {
+            "default": false,
+            "title": "Gap",
+            "type": "boolean"
+          },
+          "heartbeat_count": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Heartbeat Count",
+            "type": "integer"
+          },
+          "last_market_received_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Market Received At"
+          },
+          "last_sequence": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Last Sequence",
+            "type": "integer"
+          },
+          "last_transport_received_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Transport Received At"
+          },
+          "market_batch_count": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Market Batch Count",
+            "type": "integer"
+          },
+          "mode": {
+            "const": "seed_then_passive_listen_candidate",
+            "default": "seed_then_passive_listen_candidate",
+            "title": "Mode",
+            "type": "string"
+          },
+          "reconnect_attempts": {
+            "default": 0,
+            "maximum": 2.0,
+            "minimum": 0.0,
+            "title": "Reconnect Attempts",
+            "type": "integer"
+          },
+          "seed_queries": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Seed Queries",
+            "type": "integer"
+          },
+          "source_freshness": {
+            "const": "unknown",
+            "default": "unknown",
+            "title": "Source Freshness",
+            "type": "string"
+          },
+          "state": {
+            "default": "unconfigured",
+            "enum": [
+              "unconfigured",
+              "starting",
+              "connected",
+              "seeded_waiting",
+              "listening_candidate",
+              "disconnected",
+              "blocked",
+              "stopped"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "subscription_state": {
+            "default": "requested_unverified",
+            "enum": [
+              "requested_unverified",
+              "candidate_push_observed"
+            ],
+            "title": "Subscription State",
+            "type": "string"
+          },
+          "unknown_push_count": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Unknown Push Count",
+            "type": "integer"
+          }
+        },
+        "title": "FeedStatus",
+        "type": "object"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "RawCell": {
+        "additionalProperties": false,
+        "properties": {
+          "raw_hex": {
+            "maxLength": 2097152,
+            "pattern": "^(?:[0-9a-f]{2})*$",
+            "title": "Raw Hex",
+            "type": "string"
+          },
+          "style": {
+            "maximum": 255.0,
+            "minimum": 0.0,
+            "title": "Style",
+            "type": "integer"
+          },
+          "value": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Value"
+          }
+        },
+        "required": [
+          "value",
+          "raw_hex",
+          "style"
+        ],
+        "title": "RawCell",
+        "type": "object"
+      },
+      "RawColumn": {
+        "additionalProperties": false,
+        "properties": {
+          "encoding": {
+            "enum": [
+              "unsigned-le",
+              "packed32-le",
+              "utf-16le",
+              "raw-hex"
+            ],
+            "title": "Encoding",
+            "type": "string"
+          },
+          "extra": {
+            "maximum": 255.0,
+            "minimum": 0.0,
+            "title": "Extra",
+            "type": "integer"
+          },
+          "field_id": {
+            "minimum": 0.0,
+            "title": "Field Id",
+            "type": "integer"
+          },
+          "flags": {
+            "maximum": 65535.0,
+            "minimum": 0.0,
+            "title": "Flags",
+            "type": "integer"
+          },
+          "flags_hex": {
+            "pattern": "^0x[0-9a-f]{1,4}$",
+            "title": "Flags Hex",
+            "type": "string"
+          },
+          "width": {
+            "maximum": 255.0,
+            "minimum": 1.0,
+            "title": "Width",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "field_id",
+          "flags",
+          "flags_hex",
+          "width",
+          "extra",
+          "encoding"
+        ],
+        "title": "RawColumn",
+        "type": "object"
+      },
+      "RawL2Batch": {
+        "additionalProperties": false,
+        "properties": {
+          "binding": {
+            "$ref": "#/components/schemas/Binding"
+          },
+          "cached_at": {
+            "format": "date-time",
+            "title": "Cached At",
+            "type": "string"
+          },
+          "coverage": {
+            "const": "unknown_day_coverage",
+            "default": "unknown_day_coverage",
+            "title": "Coverage",
+            "type": "string"
+          },
+          "delivery": {
+            "enum": [
+              "seed",
+              "backfill",
+              "candidate_push"
+            ],
+            "title": "Delivery",
+            "type": "string"
+          },
+          "epoch_id": {
+            "pattern": "^[a-zA-Z0-9_-]{1,64}$",
+            "title": "Epoch Id",
+            "type": "string"
+          },
+          "granularity": {
+            "const": "granularity_unverified",
+            "default": "granularity_unverified",
+            "title": "Granularity",
+            "type": "string"
+          },
+          "local_batch_sequence": {
+            "minimum": 1.0,
+            "title": "Local Batch Sequence",
+            "type": "integer"
+          },
+          "raw_table_hex": {
+            "maxLength": 2097152,
+            "pattern": "^(?:[0-9a-f]{2})*$",
+            "title": "Raw Table Hex",
+            "type": "string"
+          },
+          "received_at": {
+            "format": "date-time",
+            "title": "Received At",
+            "type": "string"
+          },
+          "request_id": {
+            "maximum": 4294967295.0,
+            "minimum": 1.0,
+            "title": "Request Id",
+            "type": "integer"
+          },
+          "response_body_hex": {
+            "maxLength": 2097152,
+            "pattern": "^(?:[0-9a-f]{2})*$",
+            "title": "Response Body Hex",
+            "type": "string"
+          },
+          "response_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Response Sha256",
+            "type": "string"
+          },
+          "source_fd_ordinal": {
+            "minimum": 1.0,
+            "title": "Source Fd Ordinal",
+            "type": "integer"
+          },
+          "table": {
+            "$ref": "#/components/schemas/RawTable"
+          }
+        },
+        "required": [
+          "epoch_id",
+          "binding",
+          "received_at",
+          "request_id",
+          "source_fd_ordinal",
+          "delivery",
+          "response_body_hex",
+          "raw_table_hex",
+          "table",
+          "response_sha256",
+          "local_batch_sequence",
+          "cached_at"
+        ],
+        "title": "RawL2Batch",
+        "type": "object"
+      },
+      "RawTable": {
+        "additionalProperties": false,
+        "properties": {
+          "col_count": {
+            "maximum": 32.0,
+            "minimum": 1.0,
+            "title": "Col Count",
+            "type": "integer"
+          },
+          "columns": {
+            "items": {
+              "$ref": "#/components/schemas/RawColumn"
+            },
+            "title": "Columns",
+            "type": "array"
+          },
+          "extended_header_length": {
+            "maximum": 65535.0,
+            "minimum": 24.0,
+            "title": "Extended Header Length",
+            "type": "integer"
+          },
+          "header_unknown_10": {
+            "title": "Header Unknown 10",
+            "type": "integer"
+          },
+          "header_unknown_14": {
+            "title": "Header Unknown 14",
+            "type": "integer"
+          },
+          "interpretation_limits": {
+            "title": "Interpretation Limits",
+            "type": "string"
+          },
+          "rle_algorithm_reference": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rle Algorithm Reference"
+          },
+          "row_count": {
+            "maximum": 500.0,
+            "minimum": 0.0,
+            "title": "Row Count",
+            "type": "integer"
+          },
+          "row_data_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Row Data Sha256",
+            "type": "string"
+          },
+          "row_width": {
+            "minimum": 1.0,
+            "title": "Row Width",
+            "type": "integer"
+          },
+          "rows": {
+            "items": {
+              "additionalProperties": {
+                "$ref": "#/components/schemas/RawCell"
+              },
+              "type": "object"
+            },
+            "title": "Rows",
+            "type": "array"
+          },
+          "source_codec": {
+            "const": "snappy",
+            "title": "Source Codec",
+            "type": "string"
+          },
+          "source_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Source Sha256",
+            "type": "string"
+          },
+          "table_version": {
+            "enum": [
+              "tb1.0",
+              "tb3.0"
+            ],
+            "title": "Table Version",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "title",
+          "table_version",
+          "source_codec",
+          "source_sha256",
+          "row_data_sha256",
+          "row_count",
+          "row_width",
+          "col_count",
+          "extended_header_length",
+          "header_unknown_10",
+          "header_unknown_14",
+          "columns",
+          "rows",
+          "interpretation_limits"
+        ],
+        "title": "RawTable",
+        "type": "object"
+      },
+      "SubscriptionReceipt": {
+        "additionalProperties": false,
+        "properties": {
+          "collector_state": {
+            "enum": [
+              "unconfigured",
+              "starting",
+              "connected",
+              "seeded_waiting",
+              "listening_candidate",
+              "disconnected",
+              "blocked",
+              "stopped"
+            ],
+            "title": "Collector State",
+            "type": "string"
+          },
+          "desired_revision": {
+            "minimum": 0.0,
+            "title": "Desired Revision",
+            "type": "integer"
+          },
+          "epoch_id": {
+            "pattern": "^[a-zA-Z0-9_-]{1,64}$",
+            "title": "Epoch Id",
+            "type": "string"
+          },
+          "streams": {
+            "items": {
+              "$ref": "#/components/schemas/SubscriptionStream"
+            },
+            "maxItems": 300,
+            "title": "Streams",
+            "type": "array"
+          }
+        },
+        "required": [
+          "epoch_id",
+          "desired_revision",
+          "collector_state",
+          "streams"
+        ],
+        "title": "SubscriptionReceipt",
+        "type": "object"
+      },
+      "SubscriptionRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "symbols": {
+            "description": "Six ASCII digits starting with 0, 3 or 6; additions form a durable union.",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 100,
+            "minItems": 1,
+            "title": "Symbols",
+            "type": "array"
+          }
+        },
+        "required": [
+          "symbols"
+        ],
+        "title": "SubscriptionRequest",
+        "type": "object"
+      },
+      "SubscriptionStream": {
+        "additionalProperties": false,
+        "properties": {
+          "binding": {
+            "$ref": "#/components/schemas/Binding"
+          },
+          "first_push_sequence": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Push Sequence"
+          },
+          "request_id": {
+            "anyOf": [
+              {
+                "maximum": 902.0,
+                "minimum": 3.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Request Id"
+          },
+          "seed_received_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Seed Received At"
+          },
+          "seed_sequence": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Seed Sequence"
+          },
+          "state": {
+            "enum": [
+              "queued",
+              "sent",
+              "seeded",
+              "no_data",
+              "first_push_observed",
+              "failed"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "binding",
+          "state"
+        ],
+        "title": "SubscriptionStream",
+        "type": "object"
+      },
+      "SubscriptionTargets": {
+        "additionalProperties": false,
+        "properties": {
+          "max_symbols": {
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Max Symbols",
+            "type": "integer"
+          },
+          "revision": {
+            "minimum": 0.0,
+            "title": "Revision",
+            "type": "integer"
+          },
+          "symbols": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Symbols",
+            "type": "array"
+          }
+        },
+        "required": [
+          "revision",
+          "symbols",
+          "max_symbols"
+        ],
+        "title": "SubscriptionTargets",
+        "type": "object"
+      },
+      "SubscriptionUpdate": {
+        "additionalProperties": false,
+        "properties": {
+          "added": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Added",
+            "type": "array"
+          },
+          "max_symbols": {
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Max Symbols",
+            "type": "integer"
+          },
+          "revision": {
+            "minimum": 0.0,
+            "title": "Revision",
+            "type": "integer"
+          },
+          "symbols": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Symbols",
+            "type": "array"
+          }
+        },
+        "required": [
+          "revision",
+          "symbols",
+          "max_symbols",
+          "added"
+        ],
+        "title": "SubscriptionUpdate",
+        "type": "object"
+      },
+      "SubscriptionView": {
+        "properties": {
+          "desired": {
+            "$ref": "#/components/schemas/SubscriptionTargets"
+          },
+          "runtime": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SubscriptionReceipt"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "runtime_current_epoch": {
+            "title": "Runtime Current Epoch",
+            "type": "boolean"
+          },
+          "status": {
+            "$ref": "#/components/schemas/FeedStatus"
+          }
+        },
+        "required": [
+          "desired",
+          "runtime",
+          "runtime_current_epoch",
+          "status"
+        ],
+        "title": "SubscriptionView",
+        "type": "object"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "title": "rQuant raw L2 cache",
+    "version": "0.1.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/v1/l2/batches": {
+      "get": {
+        "operationId": "batches_api_v1_l2_batches_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "after_sequence",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "minimum": 0,
+              "title": "After Sequence",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 1,
+              "maximum": 128,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Batches",
+        "tags": [
+          "l2 raw cache"
+        ]
+      }
+    },
+    "/api/v1/l2/status": {
+      "get": {
+        "operationId": "status_api_v1_l2_status_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FeedStatus"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Status",
+        "tags": [
+          "l2 raw cache"
+        ]
+      }
+    },
+    "/api/v1/l2/subscriptions": {
+      "get": {
+        "operationId": "subscriptions_api_v1_l2_subscriptions_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SubscriptionView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "503": {
+            "description": "A control or runtime snapshot is unavailable; only a fixed error code is returned."
+          }
+        },
+        "summary": "Subscriptions",
+        "tags": [
+          "local L2 subscriptions"
+        ]
+      },
+      "post": {
+        "operationId": "add_subscriptions_api_v1_l2_subscriptions_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SubscriptionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SubscriptionUpdate"
+                }
+              }
+            },
+            "description": "All symbols already admitted; revision is unchanged."
+          },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SubscriptionUpdate"
+                }
+              }
+            },
+            "description": "New symbols durably queued; market readiness is separate."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "429": {
+            "description": "The entire union would exceed the administrator's capacity."
+          },
+          "503": {
+            "description": "Control state is unavailable; only a fixed error code is returned."
+          }
+        },
+        "summary": "Add Subscriptions",
+        "tags": [
+          "local L2 subscriptions"
+        ]
+      }
+    }
+  }
+}

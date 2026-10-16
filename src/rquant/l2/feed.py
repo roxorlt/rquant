@@ -12,6 +12,7 @@ import struct
 import threading
 import uuid
 from collections.abc import Callable
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from ipaddress import IPv4Address
 from pathlib import Path
@@ -23,7 +24,15 @@ from ._codec import (ALLOWED_ENDPOINT, MAX_BYTES, MAX_SECONDS, _validate_bootstr
 from ._request import (build_order_query, build_trade_query, decode_payload,
                        parse_request_body, parse_trade_request_body)
 from .cache import CacheError, RawL2Cache
-from .models import Binding, FeedStatus, MarketObservation
+from .models import Binding, FeedStatus, MarketObservation, SubscriptionReceipt, SubscriptionStream
+from .subscriptions import SubscriptionError, SubscriptionStore
+from .symbols import MAX_SYMBOLS, market_for_code, normalize_symbols
+
+MAX_PENDING_FRAMES = 65536
+MAX_PENDING_BYTES = 64 * 1024 * 1024
+_QUANTUM_FRAMES = 32
+_QUANTUM_BYTES = 4 * 1024 * 1024
+_QUANTUM_SECONDS = 0.1
 
 
 class FeedError(RuntimeError):
@@ -178,6 +187,8 @@ class FeedCollector:
                  order_template_path: Path, trade_template_path: Path,
                  duration_seconds: float | None = 3600, trade_pages: int = 1, order_pages: int = 1,
                  max_reconnects: int = 0, reconnect_delay_seconds: float = 60,
+                 control_root: Path | None = None, max_symbols: int = 20,
+                 symbols: Sequence[str] | None = None,
                  connection_factory: Callable[..., Any] = socket.create_connection,
                  clock: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], None] = time.sleep,
@@ -192,6 +203,16 @@ class FeedCollector:
         if (type(reconnect_delay_seconds) not in (int, float)
                 or not math.isfinite(reconnect_delay_seconds) or reconnect_delay_seconds < 60):
             raise ValueError("reconnect delay must be at least60 seconds")
+        if control_root is not None and symbols is not None:
+            raise ValueError('control-root and explicit symbols are mutually exclusive')
+        if type(max_symbols) is not int or not 1 <= max_symbols <= MAX_SYMBOLS:
+            raise ValueError('invalid symbol capacity')
+        self.targets = SubscriptionStore(control_root, max_symbols=max_symbols) if control_root is not None else None
+        self._configured_symbols = (normalize_symbols(symbols) if symbols is not None else
+                                    () if self.targets is not None else ('603258', '300006'))
+        if len(self._configured_symbols) > max_symbols:
+            raise ValueError('symbol capacity exceeded')
+        self.max_symbols = max_symbols
         self.cache = cache
         self.bootstrap_path, self.order_template_path, self.trade_template_path = (
             Path(bootstrap_path), Path(order_template_path), Path(trade_template_path))
@@ -206,6 +227,61 @@ class FeedCollector:
         self.validated_seed = False
         self._inputs = (b"", b"", b"")
         self._last_send: float | None = None
+        self._symbols: tuple[str, ...] = ()
+        self._desired_revision = 0
+        self._stream_receipts: dict[int, SubscriptionStream] = {}
+        self._next_control_check = 0.0
+
+    def _write_receipt(self) -> None:
+        if self.status.epoch_id is None:
+            return
+        try:
+            self.cache.write_subscription_status(SubscriptionReceipt(
+                epoch_id=self.status.epoch_id, desired_revision=self._desired_revision,
+                collector_state=self.status.state, streams=tuple(self._stream_receipts.values())))
+        except Exception:
+            raise FeedError('cache_error') from None
+
+    def _transition(self, binding: Binding, **changes: Any) -> None:
+        current = self._stream_receipts.get(binding.page_id)
+        if current is None:
+            return
+        updated = SubscriptionStream.model_validate({**current.model_dump(mode='python'), **changes})
+        if updated != current:
+            self._stream_receipts[binding.page_id] = updated
+            self._write_receipt()
+
+    def _refresh_targets(self, *, force: bool = False) -> None:
+        if not force and self.clock() < self._next_control_check:
+            return
+        self._next_control_check = self.clock() + _QUANTUM_SECONDS
+        if self.targets is not None:
+            try:
+                targets = self.targets.read()
+            except SubscriptionError:
+                raise FeedError('input_error') from None
+            symbols, revision = targets.symbols, targets.revision
+            if (symbols[:len(self._symbols)] != self._symbols or revision < self._desired_revision
+                    or revision == self._desired_revision and symbols != self._symbols):
+                raise FeedError('input_error')
+        else:
+            symbols, revision = self._configured_symbols, 0
+        changed = symbols != self._symbols or revision != self._desired_revision
+        for index in range(len(self._symbols), len(symbols)):
+            code, base = symbols[index], 10117 + 10 * index
+            for offset, kind, side in ((0, 'vendor4013', None), (1, 'vendor4027', 'buy'), (2, 'vendor4027', 'sell')):
+                binding = Binding(page_id=base + offset, kind=kind, code=code,
+                                  market=market_for_code(code), side=side)
+                self._stream_receipts[binding.page_id] = SubscriptionStream(binding=binding, state='queued')
+        self._symbols, self._desired_revision = symbols, revision
+        if changed:
+            self._write_receipt()
+
+    def _finish_receipt(self) -> None:
+        for page, stream in tuple(self._stream_receipts.items()):
+            if stream.state in {'queued', 'sent'}:
+                self._stream_receipts[page] = stream.model_copy(update={'state': 'failed'})
+        self._write_receipt()
 
     def _update(self, **changes: Any) -> None:
         self.status = self.status.model_copy(update=changes)
@@ -271,6 +347,8 @@ class FeedCollector:
                 and int.from_bytes(body[6:10], "little") == 0x111
                 and int.from_bytes(body[12:16], "little") == 26 and body[32:] == no_data):
             self._update(control_count=self.status.control_count + 1)
+            if request == pending and delivery == 'seed':
+                self._transition(binding, state='no_data')
             return None
         try:
             if binding.kind == "vendor4013":
@@ -299,7 +377,7 @@ class FeedCollector:
         except Exception:
             raise FeedError("decode_error") from None
         try:
-            self.cache.append(observation)
+            batch = self.cache.append(observation)
         except Exception:
             raise FeedError("cache_error") from None
         changes: dict[str, Any] = {"last_market_received_at": received_at,
@@ -308,23 +386,44 @@ class FeedCollector:
             changes["subscription_state"] = "candidate_push_observed"
             changes["state"] = "listening_candidate"
         self._update(**changes)
+        receipt = self._stream_receipts.get(binding.page_id)
+        if receipt is not None:
+            if actual_delivery == 'seed' and receipt.seed_sequence is None:
+                self._transition(binding, seed_sequence=batch.local_batch_sequence, seed_received_at=received_at,
+                                 state='first_push_observed' if receipt.first_push_sequence else 'seeded')
+            elif actual_delivery == 'candidate_push' and receipt.first_push_sequence is None:
+                self._transition(binding, first_push_sequence=batch.local_batch_sequence, state='first_push_observed')
         return result
 
     def _receive(self, deadline: float, *, pending: int | None = None,
                  delivery: str = "seed", await_ack: bool = False) -> dict[str, Any] | None:
-        frames = 0
+        frames = payload_bytes = quantum_frames = quantum_bytes = 0
+        quantum_started = self.clock()
         while True:
             self._check_end(self._deadline)
             if self.clock() >= deadline:
-                raise FeedError("seed_timeout")
+                if pending is not None or await_ack:
+                    raise FeedError("seed_timeout")
+                return None
             body = self.reader.read(deadline=deadline)
             if body is None:
                 if pending is None and not await_ack:
                     return None
                 continue
             frames += 1
-            if frames > 32 and (pending is not None or await_ack):
+            payload_bytes += len(body) + 13
+            if (await_ack and frames > 32) or pending is not None and frames > MAX_PENDING_FRAMES:
                 raise FeedError("frame_limit")
+            if pending is not None and payload_bytes > MAX_PENDING_BYTES:
+                raise FeedError('byte_limit')
+            quantum_frames += 1
+            quantum_bytes += len(body) + 13
+            if (quantum_frames >= _QUANTUM_FRAMES or quantum_bytes >= _QUANTUM_BYTES
+                    or self.clock() - quantum_started >= _QUANTUM_SECONDS):
+                if not await_ack:
+                    self._refresh_targets(force=True)
+                quantum_frames = quantum_bytes = 0
+                quantum_started = self.clock()
             received_at = datetime.now(UTC)
             self._update(last_transport_received_at=received_at)
             control_kind = _control_kind(body)
@@ -377,11 +476,57 @@ class FeedCollector:
         except Exception:
             raise FeedError("protocol_error") from None
 
+    def _issue_stream(self, binding: Binding) -> None:
+        self._register(binding)
+        previous = None
+        pages = self.trade_pages if binding.kind == 'vendor4013' else self.order_pages
+        for page in range(1, pages + 1):
+            if self._last_send is not None:
+                until = self._last_send + 1
+                while self.clock() < until:
+                    self._check_end(self._deadline)
+                    self._refresh_targets()
+                    self._receive(min(self._deadline, until))
+            self._check_end(self._deadline)
+            request_id = 3 + len(self.issued)
+            maximum = 2 + self.max_symbols * (self.trade_pages + 2 * self.order_pages)
+            if request_id > maximum or request_id > 902:
+                raise FeedError('protocol_error')
+            cursor = self._order_cursor(previous) if previous is not None and binding.kind == 'vendor4027' else (0, 0)
+            if binding.kind == 'vendor4013':
+                query = build_trade_query(code=binding.code, market=binding.market,
+                                          page_id=binding.page_id, currentpage=page)
+                builder, template = build_trade_frame, self._inputs[2]
+            else:
+                query = build_order_query(code=binding.code, market=binding.market, side=binding.side,
+                    page_id=binding.page_id, rowcount=20, endtime=cursor[0], orderid=cursor[1])
+                builder, template = build_common_order_frame, self._inputs[1]
+            active = ','.join(str(p) for p in self.registered)
+            query = query.replace(f'pageList={binding.page_id}\r\n'.encode(), f'pageList={active}\r\n'.encode(), 1)
+            wire = builder(template, query, request_id=request_id)
+            self.issued[request_id] = binding
+            self._update(seed_queries=self.status.seed_queries + 1)
+            self._send(wire, self._deadline)
+            self._last_send = self.clock()
+            if page == 1:
+                self._transition(binding, state='sent', request_id=request_id)
+            result = self._receive(min(self._deadline, self.clock() + MAX_SECONDS), pending=request_id,
+                                   delivery='seed' if page == 1 else 'backfill')
+            if result is None:
+                break
+            self.validated_seed = True
+            if previous is not None:
+                self._older(binding, previous, result)
+            previous = result
+
     def _epoch(self) -> None:
         self.registered, self.issued = {}, {}
         self.validated_seed = False
         self._last_send = None
-        self._update(state="starting", epoch_id=uuid.uuid4().hex, error_code=None)
+        self._symbols, self._desired_revision, self._stream_receipts = (), 0, {}
+        self._update(state="starting", epoch_id=uuid.uuid4().hex, error_code=None,
+                     subscription_state='requested_unverified')
+        self._refresh_targets(force=True)
         try:
             self._check_end(self._deadline)
             try:
@@ -393,53 +538,19 @@ class FeedCollector:
             self._send(_wrap_frame(self._inputs[0]), self._deadline)
             self._receive(min(self._deadline, self.clock() + MAX_SECONDS), await_ack=True)
             self._update(state="connected")
-            bindings = [Binding(page_id=10117 + offset, kind="vendor4013", code=code, market=market)
-                        for code, market, offset in (("603258", 17, 0), ("300006", 33, 10))]
-            schedule = []
-            for trade in bindings:
-                schedule.extend([trade, Binding(page_id=trade.page_id + 1, kind="vendor4027",
-                                 code=trade.code, market=trade.market, side="buy"),
-                                 Binding(page_id=trade.page_id + 2, kind="vendor4027",
-                                 code=trade.code, market=trade.market, side="sell")])
-            for binding in schedule:
-                self._register(binding)
-                previous = None
-                pages = self.trade_pages if binding.kind == "vendor4013" else self.order_pages
-                for page in range(1, pages + 1):
-                    if self._last_send is not None:
-                        self._pause(max(0, self._last_send + 1 - self.clock()), self._deadline)
-                    self._check_end(self._deadline)
-                    request_id = 3 + len(self.issued)
-                    if request_id > 20:
-                        raise FeedError("protocol_error")
-                    cursor = self._order_cursor(previous) if previous is not None and binding.kind == "vendor4027" else (0, 0)
-                    if binding.kind == "vendor4013":
-                        query = build_trade_query(code=binding.code, market=binding.market,
-                                                 page_id=binding.page_id, currentpage=page)
-                        builder, template = build_trade_frame, self._inputs[2]
-                    else:
-                        query = build_order_query(code=binding.code, market=binding.market, side=binding.side,
-                            page_id=binding.page_id, rowcount=20, endtime=cursor[0], orderid=cursor[1])
-                        builder, template = build_common_order_frame, self._inputs[1]
-                    active = ",".join(str(p) for p in self.registered)
-                    query = query.replace(f"pageList={binding.page_id}\r\n".encode(), f"pageList={active}\r\n".encode(), 1)
-                    wire = builder(template, query, request_id=request_id)
-                    self.issued[request_id] = binding
-                    self._update(seed_queries=self.status.seed_queries + 1)
-                    self._send(wire, self._deadline)
-                    self._last_send = self.clock()
-                    result = self._receive(min(self._deadline, self.clock() + MAX_SECONDS), pending=request_id,
-                                           delivery="seed" if page == 1 else "backfill")
-                    if result is None:
-                        break  # Explicit no-data notice; do not invent an older cursor.
-                    self.validated_seed = True
-                    if previous is not None:
-                        self._older(binding, previous, result)
-                    previous = result
-            waiting = "seeded_waiting" if self.validated_seed else "connected"
-            self._update(state="listening_candidate" if self.status.subscription_state == "candidate_push_observed" else waiting)
+            self._write_receipt()
             while True:
                 self._check_end(self._deadline)
+                self._refresh_targets()
+                queued = next((s.binding for s in self._stream_receipts.values() if s.state == 'queued'), None)
+                if queued is not None:
+                    self._issue_stream(queued)
+                    continue
+                waiting = 'seeded_waiting' if self.validated_seed else 'connected'
+                state = 'listening_candidate' if self.status.subscription_state == 'candidate_push_observed' else waiting
+                if self.status.state != state:
+                    self._update(state=state)
+                    self._write_receipt()
                 self._receive(self._deadline)
         finally:
             if self.connection is not None:
@@ -458,6 +569,9 @@ class FeedCollector:
                 self._update()
                 try:
                     self._check_end(self._deadline)
+                    if self.targets is not None:
+                        while not self.targets.read().symbols:
+                            self._pause(1, self._deadline)
                     self._inputs = tuple(_private_input(p) for p in (
                         self.bootstrap_path, self.order_template_path, self.trade_template_path))
                     _validate_bootstrap(self._inputs[0])
@@ -480,6 +594,7 @@ class FeedCollector:
                         stopped = error.code in {"signal_stop", "duration_limit"}
                         state = "stopped" if stopped else "disconnected" if error.retryable else "blocked"
                         self._update(state=state, gap=True, error_code=error.code)
+                        self._finish_receipt()
                         if (error.retryable and self.validated_seed
                                 and self.status.reconnect_attempts < self.max_reconnects):
                             try:
@@ -492,9 +607,11 @@ class FeedCollector:
                         break
                     except KeyboardInterrupt:
                         self._update(state="stopped", gap=True, error_code="signal_stop")
+                        self._finish_receipt()
                         break
                     except Exception:
                         self._update(state="blocked", gap=True, error_code="protocol_error")
+                        self._finish_receipt()
                         break
                 return self.cache.read_status()
         except (CacheError, FeedError) as error:

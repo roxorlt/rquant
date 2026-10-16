@@ -9,6 +9,8 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, field_validator, model_validator
 
+from .symbols import MAX_SYMBOLS, market_for_code, normalize_symbols
+
 PositiveInt = Annotated[StrictInt, Field(ge=1)]
 Count = Annotated[StrictInt, Field(ge=0)]
 Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
@@ -31,6 +33,7 @@ class Model(BaseModel):
     def reject_numeric_datetime(cls, value: object, info: object) -> object:
         if isinstance(value, (int, float)) and getattr(info, "field_name", "") in {
             "received_at", "cached_at", "last_transport_received_at", "last_market_received_at",
+            "seed_received_at",
         }:
             raise ValueError("UTC timestamps require an explicit datetime")
         return value
@@ -46,16 +49,88 @@ class Model(BaseModel):
 class Binding(Model):
     page_id: Annotated[StrictInt, Field(ge=1, le=65535)]
     kind: Literal["vendor4013", "vendor4027"]
-    code: Literal["603258", "300006"]
+    code: StrictStr
     market: Literal[17, 33]
     side: Literal["buy", "sell"] | None = None
 
     @model_validator(mode="after")
     def validate_binding(self) -> Binding:
-        if self.market != {"603258": 17, "300006": 33}[self.code]:
+        if self.market != market_for_code(self.code):
             raise ValueError("stock and market mismatch")
         if (self.kind == "vendor4013") != (self.side is None):
             raise ValueError("side must be present only for vendor4027")
+        return self
+
+
+class SubscriptionTargets(Model):
+    revision: Count
+    symbols: tuple[StrictStr, ...]
+    max_symbols: Annotated[StrictInt, Field(ge=1, le=MAX_SYMBOLS)]
+
+    @model_validator(mode='after')
+    def validate_targets(self) -> SubscriptionTargets:
+        if normalize_symbols(self.symbols) != self.symbols or len(self.symbols) > self.max_symbols:
+            raise ValueError('invalid desired symbol set')
+        if (self.revision == 0) != (not self.symbols):
+            raise ValueError('desired revision and membership disagree')
+        return self
+
+
+class SubscriptionUpdate(SubscriptionTargets):
+    added: tuple[StrictStr, ...]
+
+    @model_validator(mode='after')
+    def validate_added(self) -> SubscriptionUpdate:
+        if normalize_symbols(self.added) != self.added or any(s not in self.symbols for s in self.added):
+            raise ValueError('invalid added symbols')
+        return self
+
+
+class CapacityPolicy(Model):
+    max_symbols: Annotated[StrictInt, Field(ge=1, le=MAX_SYMBOLS)]
+    source_tree: Annotated[StrictStr, Field(pattern=r'^[0-9a-f]{40}$')]
+    acceptance_sha256: Sha256
+
+
+class SubscriptionStream(Model):
+    binding: Binding
+    state: Literal['queued', 'sent', 'seeded', 'no_data', 'first_push_observed', 'failed']
+    request_id: Annotated[StrictInt, Field(ge=3, le=902)] | None = None
+    seed_sequence: PositiveInt | None = None
+    seed_received_at: datetime | None = None
+    first_push_sequence: PositiveInt | None = None
+
+    @model_validator(mode='after')
+    def validate_transition_receipt(self) -> SubscriptionStream:
+        if (self.seed_sequence is None) != (self.seed_received_at is None):
+            raise ValueError('seed receipt is incomplete')
+        if self.state == 'queued' and any(v is not None for v in (
+                self.request_id, self.seed_sequence, self.first_push_sequence)):
+            raise ValueError('queued flow cannot have sent or market receipts')
+        if self.state in {'sent', 'seeded', 'no_data', 'first_push_observed'} and self.request_id is None:
+            raise ValueError('issued flow requires its request identity')
+        if self.state == 'seeded' and self.seed_sequence is None:
+            raise ValueError('seeded flow requires a market receipt')
+        if self.state == 'no_data' and self.seed_sequence is not None:
+            raise ValueError('no-data is not a seed')
+        if self.state == 'first_push_observed' and self.first_push_sequence is None:
+            raise ValueError('push transition requires a market receipt')
+        return self
+
+
+class SubscriptionReceipt(Model):
+    epoch_id: EpochId
+    desired_revision: Count
+    collector_state: Literal['unconfigured', 'starting', 'connected', 'seeded_waiting',
+                             'listening_candidate', 'disconnected', 'blocked', 'stopped']
+    streams: tuple[SubscriptionStream, ...] = Field(max_length=3 * MAX_SYMBOLS)
+
+    @model_validator(mode='after')
+    def validate_bindings(self) -> SubscriptionReceipt:
+        pages = [s.binding.page_id for s in self.streams]
+        identities = [(s.binding.code, s.binding.kind, s.binding.side) for s in self.streams]
+        if len(set(pages)) != len(pages) or len(set(identities)) != len(identities):
+            raise ValueError('duplicate subscription binding')
         return self
 
 
