@@ -15,9 +15,11 @@ hand (one function in report_factors.py); everything else is automatic.
 
 from __future__ import annotations
 
+import inspect
 import json
 import re
 import shutil
+import time
 import urllib.request
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -46,12 +48,36 @@ def classify(title: str) -> str:
     return "unclassified"
 
 
-def _search(keyword: str, size: int = 20) -> list[dict]:
-    body = json.dumps({"keywords": keyword, "pageSize": size, "pageNum": 1, "order": 2}).encode()
+# fxbaogao ``order``: 1 = newest first; 2 (what we used before) is relevance-weighted and returned
+# mostly 1-4-month-old hits, so with a 14-day cutoff every hit was dropped -> new_reports: [].
+ORDER_NEWEST = 1
+PAGES = 3
+
+
+def _search(keyword: str, size: int = 20, page: int = 1) -> list[dict]:
+    body = json.dumps({"keywords": keyword, "pageSize": size, "pageNum": page,
+                       "order": ORDER_NEWEST}).encode()
     req = urllib.request.Request(SEARCH_URL, data=body, headers={
         "Content-Type": "application/json", "User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=20) as r:  # noqa: S310 - fixed https URL
         return json.loads(r.read())["data"]["dataList"] or []
+
+
+def _hits(search, kw: str, cutoff: datetime) -> list[dict]:  # noqa: ANN001
+    """Newest-first pages until one reaches past the cutoff (max PAGES pages).
+
+    Injected test searches that take only ``kw`` get a single call."""
+    if "page" not in inspect.signature(search).parameters:
+        return search(kw)
+    out: list[dict] = []
+    for page in range(1, PAGES + 1):
+        if page > 1:
+            time.sleep(1)  # fxbaogao: keep >=1s between requests
+        hits = search(kw, page=page)
+        out += hits
+        if len(hits) < 20 or min(int(h.get("pubTime") or 0) for h in hits) < cutoff.timestamp():
+            break
+    return out
 
 
 def discover(known: list[dict], days: int = 14,
@@ -62,7 +88,7 @@ def discover(known: list[dict], days: int = 14,
     found: dict[str, dict] = {}
     for kw in KEYWORDS:
         try:
-            hits = search(kw)
+            hits = _hits(search, kw, cutoff)
         except Exception as e:  # noqa: BLE001 - one bad keyword must not stop the run
             print("search failed", kw, e)
             continue
