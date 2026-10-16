@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useIntraday } from "@/api/endpoints";
 import { deltas, profile, stitch } from "@/charts/orderflow";
+import { useTouchScrub } from "@/charts/useTouchScrub";
 import { DatePicker, Panel } from "@/ui";
 
 const P = { left: 56, right: 56, top: 8 };
@@ -44,6 +45,9 @@ export function IntradayPanel({ code, span = 1 }: { code: string; span?: 1 | 5 }
       });
   }, [sessions, mode]);
   const multi = sessions.length > 1;
+  const [svgEl, setSvgEl] = useState<SVGSVGElement | null>(null);
+  const scrubRef = useRef<(clientX: number) => void>(() => {});
+  useTouchScrub(svgEl, (clientX) => scrubRef.current(clientX));
   if (!d || bars.length === 0) {
     return (
       <Panel title={span === 5 ? "5日分时" : "分时"}>
@@ -115,6 +119,7 @@ export function IntradayPanel({ code, span = 1 }: { code: string; span?: 1 | 5 }
     });
     setHover(xm >= P.left && xm <= plotR ? best : null);
   };
+  scrubRef.current = (x) => scrub(svgEl as Element, x, true);
   const hb = bars[at];
   const hv = vw[at];
   const pct = (v: number) => `${v >= pc ? "+" : ""}${(((v - pc) / pc) * 100).toFixed(2)}%`;
@@ -198,11 +203,12 @@ export function IntradayPanel({ code, span = 1 }: { code: string; span?: 1 | 5 }
           aria-label="分时图"
           onMouseLeave={() => setHover(null)}
           className="touch-scrub"
+          ref={setSvgEl}
           onPointerDown={(e) => {
-            if (e.pointerType !== "mouse") scrub(e.currentTarget, e.clientX, true);
+            if (e.pointerType === "pen") scrub(e.currentTarget, e.clientX, true);
           }}
           onPointerMove={(e) => {
-            if (e.pointerType !== "mouse") scrub(e.currentTarget, e.clientX, true);
+            if (e.pointerType === "pen") scrub(e.currentTarget, e.clientX, true);
           }}
           onMouseMove={(e) => scrub(e.currentTarget, e.clientX, false)}
         >

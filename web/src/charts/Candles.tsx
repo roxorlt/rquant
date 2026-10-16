@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { useTouchScrub } from "./useTouchScrub";
 
 export interface Candle {
   date: string;
@@ -96,6 +97,9 @@ export function Candles({
   const [s0, e0] = view ?? [0, all.length];
   const bars = all.slice(s0, e0);
   const svgRef = useRef<SVGSVGElement>(null);
+  const [svgEl, setSvgEl] = useState<SVGSVGElement | null>(null);
+  const touchScrub = useRef<(clientX: number, clientY: number) => void>(() => {});
+  useTouchScrub(svgEl, (x, y) => touchScrub.current(x, y));
   const drag = useRef<{ x: number; view: [number, number]; moved: boolean } | null>(null);
   const live = useRef({ s0, e0, n: all.length, w, onView });
   live.current = { s0, e0, n: all.length, w, onView };
@@ -174,6 +178,9 @@ export function Candles({
     setHover(next);
     onHover?.(next == null ? null : next + s0);
   };
+  touchScrub.current = (clientX, clientY) => {
+    if (svgEl) scrub({ currentTarget: svgEl, clientX, clientY, pointerType: "touch" });
+  };
   return (
     <div className="candles" ref={ref}>
       {h ? (
@@ -188,7 +195,10 @@ export function Candles({
       ) : null}
       {/* biome-ignore lint/a11y/useKeyWithClickEvents: picking an anchor is a pointer shortcut; a default anchor is always set */}
       <svg
-        ref={svgRef}
+        ref={(n) => {
+          svgRef.current = n;
+          setSvgEl(n);
+        }}
         className={onView ? "pannable touch-scrub" : "touch-scrub"}
         width={w}
         height={height}
@@ -205,8 +215,9 @@ export function Candles({
           if (hover != null) onPick?.(hover + s0);
         }}
         onPointerDown={(e) => {
+          if (e.pointerType === "touch") return; // fingers: useTouchScrub
           if (e.pointerType !== "mouse") {
-            // touch / pen: drag scrubs the crosshair (pan-y keeps vertical page scroll)
+            // pen: drag scrubs the crosshair
             drag.current = null;
             scrub(e);
             return;
@@ -214,7 +225,7 @@ export function Candles({
           drag.current = { x: e.clientX, view: [s0, e0], moved: false };
         }}
         onPointerMove={(e) => {
-          if (e.pointerType !== "mouse") scrub(e);
+          if (e.pointerType === "pen") scrub(e);
         }}
         onPointerUp={() => {
           setTimeout(() => {
