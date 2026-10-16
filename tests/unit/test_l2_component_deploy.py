@@ -68,7 +68,7 @@ def proof(count: int = 20, *, attempted: int | None = None) -> dict:
         "http": {"successful_requests": 9, "failed_requests": 0, "extra_upstream_sends": 0,
                  "windows": {"early": 3, "mid": 3, "late": 3}, "proof_sha256": "f" * 64,
                  "consumer_sequences": [{"first_sequence": 1, "last_sequence": batch_count,
-                     "batch_count": batch_count, "sha256": str(i) * 64} for i in (2, 3)]},
+                     "batch_count": batch_count, "sha256": "d" * 64} for _ in range(2)]},
         "cleanup": {"worker_alive": False, "http_worker_alive": False,
                     "all_upstream_sockets_closed": True, "proof_sha256": "1" * 64}, "streams": streams,
         "resources": {"sample_interval_seconds": 1, "startup_settle_seconds": 10, "cpu_window_seconds": 30,
@@ -129,6 +129,15 @@ def test_acceptance_recomputes_six_streams_and_dynamic_late_window() -> None:
     assert result["streams"] == 60 and result["max_symbols"] == 20
     assert result["late_window_seconds"][1] - result["late_window_seconds"][0] == 60
     assert d.validate_acceptance(proof(20, attempted=40), TREE)["max_symbols"] == 20
+
+
+@pytest.mark.parametrize("digests", [("0" * 64, "d" * 64), ("0" * 64, "0" * 64)])
+def test_acceptance_requires_each_consumer_to_match_cache_chain(digests: tuple[str, str]) -> None:
+    d = deployer(); value = proof()
+    for consumer, digest in zip(value["http"]["consumer_sequences"], digests):
+        consumer["sha256"] = digest
+    with pytest.raises(d.DeployError, match="acceptance_consumers"):
+        d.validate_acceptance(value, TREE)
 
 
 @pytest.mark.parametrize("bad", ["legacy", "missing_stream", "capacity", "wrong_symbol", "missing_send", "short_window",

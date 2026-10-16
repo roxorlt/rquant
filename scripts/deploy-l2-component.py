@@ -149,7 +149,8 @@ def validate_acceptance(proof: dict[str, Any], target_tree: str) -> dict[str, An
             raise DeployError("acceptance_cache_http")
         consumers = http["consumer_sequences"]
         if len(consumers) != 2 or any(c["first_sequence"] != 1 or c["last_sequence"] != cache["last_sequence"]
-                or c["batch_count"] != cache["batch_count"] or not hex_value(c["sha256"]) for c in consumers):
+                or c["batch_count"] != cache["batch_count"] or not hex_value(c["sha256"])
+                or c["sha256"] != cache["export_sha256"] for c in consumers):
             raise DeployError("acceptance_consumers")
         resource = proof["resources"]
         limits = {"http_p95_seconds": 1, "http_p99_seconds": 2, "max_http_seconds": 5,

@@ -20,7 +20,7 @@ class SubscriptionError(RuntimeError):
         super().__init__(code)
 
 
-def _unique_object(pairs):
+def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     result = {}
     for key, value in pairs:
         if key in result:
