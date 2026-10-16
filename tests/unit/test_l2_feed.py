@@ -113,7 +113,7 @@ def session_fields(client_ip: str = "192.0.2.123") -> dict:
 
 
 def session_control(*, size: int = 379, fields: dict | None = None,
-                    text: bytes | None = None) -> bytes:
+                    text: bytes | None = None, carrier: int = 0x61) -> bytes:
     """Entirely synthetic session metadata; never derived from private input."""
     if text is None:
         data = session_fields("192.168.100.123" if size == 383 else "192.0.2.123") if fields is None else fields
@@ -121,7 +121,7 @@ def session_control(*, size: int = 379, fields: dict | None = None,
     decoded_size = 263 if size == 379 else 267
     assert len(text) <= decoded_size
     encoded = module("_request").encode_payload(text.ljust(decoded_size, b" "))
-    payload = encoded + b"a"  # Observed opaque carrier shape, no semantic interpretation.
+    payload = encoded + bytes([carrier])  # Opaque carrier outside the encoded JSON.
     assert len(payload) == size - 26
     return struct.pack("<HIIHIII", 26, 0xFFFFFFFD, 0x1000B, 0, len(payload), 0, 0) + b"xx" + payload
 
@@ -134,8 +134,15 @@ def test_exact_session_metadata_is_control_only(size: int) -> None:
     assert feed._control_kind(control(auth=True)[13:]) == "ack"
 
 
+@pytest.mark.parametrize("size", [379, 383])
+def test_session_metadata_accepts_every_opaque_carrier_value(size: int) -> None:
+    feed = module("feed")
+    for carrier in range(256):
+        assert feed._control_kind(session_control(size=size, carrier=carrier)) == "control"
+
+
 @pytest.mark.parametrize("fault", [
-    "header", "request", "flags", "page", "command", "declared", "size", "carrier",
+    "header", "request", "flags", "page", "command", "declared", "size",
     "base64", "padbits", "json", "utf8", "duplicate", "extra", "error", "missing",
     "object", "type", "bool", "ip", "port", "md5", "version", "version_bound",
     "release", "session", "time_bound",
@@ -173,7 +180,6 @@ def test_session_metadata_rejects_unknown_or_malformed_profiles(fault: str) -> N
     if fault == "size":
         body.extend(b"aaaa")
         struct.pack_into("<I", body, 12, len(body) - 26)
-    if fault == "carrier": body[-1] = 0
     if fault == "base64": body[26] = ord("!")
     if fault == "padbits":
         body = bytearray(session_control())  # 263 bytes has one '=' padding byte.
@@ -312,12 +318,13 @@ def collector(tmp_path: Path, provider: Provider, clock: Clock, **options):
 
 
 def test_session_metadata_does_not_complete_pending_or_refresh_market_or_leak(tmp_path: Path, monkeypatch) -> None:
+    control_bodies = [session_control(carrier=0), session_control(size=383, carrier=255)]
     class SessionProvider(Provider):
         def sendall(self, data):
             insertion = len(self.chunks)
             super().sendall(data)
             if len(self.sent) == 2:
-                self.chunks[insertion:insertion] = [frame(session_control()), frame(session_control(size=383))]
+                self.chunks[insertion:insertion] = [frame(body) for body in control_bodies]
     clock = Clock(); provider = SessionProvider(clock)
     obj, cache, calls = collector(tmp_path, provider, clock)
     statuses = []
@@ -339,8 +346,7 @@ def test_session_metadata_does_not_complete_pending_or_refresh_market_or_leak(tm
             data = path.read_bytes()
             assert b"SYNTHETIC_CONTROL_ONLY_" not in data
             assert b"AuthCountryCodeMd5" not in data
-            assert session_control().hex().encode() not in data
-            assert session_control(size=383).hex().encode() not in data
+            assert all(body.hex().encode() not in data for body in control_bodies)
 
 
 @pytest.mark.parametrize("before_ack", [False, True])
@@ -349,7 +355,7 @@ def test_session_metadata_is_neither_ack_nor_validated_seed_for_retry(tmp_path: 
         def sendall(self, data):
             super().sendall(data)
             if len(self.sent) == (1 if before_ack else 2):
-                self.chunks[:] = [frame(session_control()), b""]
+                self.chunks[:] = [frame(session_control(carrier=0x1f)), b""]
     clock = Clock(); provider = SessionOnlyProvider(clock)
     obj, cache, calls = collector(tmp_path, provider, clock, max_reconnects=2)
     status = obj.run()

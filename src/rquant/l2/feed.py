@@ -20,7 +20,7 @@ from typing import Any
 from ._codec import (ALLOWED_ENDPOINT, MAX_BYTES, MAX_SECONDS, _validate_bootstrap,
                      _wrap_frame, build_common_order_frame, build_trade_frame,
                      decode_order_response, decode_trade_response)
-from ._request import (IPHONE64_ALPHABET, build_order_query, build_trade_query, decode_payload,
+from ._request import (build_order_query, build_trade_query, decode_payload,
                        parse_request_body, parse_trade_request_body)
 from .cache import CacheError, RawL2Cache
 from .models import Binding, FeedStatus, MarketObservation
@@ -138,7 +138,7 @@ def _control_kind(body: bytes) -> str | None:
         return None
     if flags == 11 and len(body) in {147, 131}:
         return "control"
-    if flags != 0x1000B or len(body) not in {379, 383} or body[-1] not in IPHONE64_ALPHABET:
+    if flags != 0x1000B or len(body) not in {379, 383}:
         return None
     try:
         # The final carrier byte is opaque. Only this independently observed
