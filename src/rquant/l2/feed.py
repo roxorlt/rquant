@@ -6,19 +6,22 @@ import time
 import math
 import os
 import re
+import json
 import stat
 import struct
 import threading
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
+from ipaddress import IPv4Address
 from pathlib import Path
 from typing import Any
 
 from ._codec import (ALLOWED_ENDPOINT, MAX_BYTES, MAX_SECONDS, _validate_bootstrap,
                      _wrap_frame, build_common_order_frame, build_trade_frame,
                      decode_order_response, decode_trade_response)
-from ._request import build_order_query, build_trade_query, parse_request_body, parse_trade_request_body
+from ._request import (IPHONE64_ALPHABET, build_order_query, build_trade_query, decode_payload,
+                       parse_request_body, parse_trade_request_body)
 from .cache import CacheError, RawL2Cache
 from .models import Binding, FeedStatus, MarketObservation
 
@@ -131,11 +134,36 @@ def _control_kind(body: bytes) -> str | None:
         return None
     if (request, flags, command, len(body)) == (0, 6, 2201, 887):
         return "ack"
-    if request == 0xFFFFFFFD and command == 0 and (flags, len(body)) in {
-        (0x1000B, 383), (11, 147), (11, 131),
-    }:
+    if request != 0xFFFFFFFD or command != 0:
+        return None
+    if flags == 11 and len(body) in {147, 131}:
         return "control"
-    return None
+    if flags != 0x1000B or len(body) not in {379, 383} or body[-1] not in IPHONE64_ALPHABET:
+        return None
+    try:
+        # The final carrier byte is opaque. Only this independently observed
+        # JSON schema is classified; no session values leave this function.
+        fields = json.loads(decode_payload(body[26:-1]).decode("utf-8"),
+                            object_pairs_hook=lambda pairs: dict(pairs) if len(dict(pairs)) == len(pairs) else None)
+        keys = {"AuthCountryCodeMd5", "AuthPubRSAVer", "clientIp", "clientPort",
+                "releaseName", "serverIp", "sessionId", "srvTime"}
+        if type(fields) is not dict or set(fields) != keys:
+            return None
+        if any(type(fields[k]) is not str or not fields[k]
+               or any(not 0x21 <= ord(c) <= 0x7e for c in fields[k]) for k in keys - {"srvTime"}):
+            return None
+        if (re.fullmatch(r"[0-9a-fA-F]{32}", fields["AuthCountryCodeMd5"]) is None
+                or len(fields["AuthPubRSAVer"]) > 32 or len(fields["releaseName"]) > 64
+                or len(fields["sessionId"]) != 36
+                or re.fullmatch(r"[1-9][0-9]{0,4}", fields["clientPort"]) is None
+                or int(fields["clientPort"]) > 65535
+                or type(fields["srvTime"]) is not int or not 0 <= fields["srvTime"] <= 0xFFFFFFFF):
+            return None
+        IPv4Address(fields["clientIp"])
+        IPv4Address(fields["serverIp"])
+    except (ValueError, TypeError):
+        return None
+    return "control"
 
 
 class FeedCollector:

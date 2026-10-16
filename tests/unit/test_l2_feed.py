@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import socket
 import struct
+import json
 from pathlib import Path
 
 import pytest
@@ -102,6 +103,83 @@ def control(auth: bool = False) -> bytes:
     body = struct.pack("<HIIHIII", 26, 0 if auth else 0xFFFFFFFD, 6 if auth else 11,
                        0, size - 26, 2201 if auth else 0, 0) + b"xx"
     return frame(body + (b"SYNTHETIC_PRIVATE_SENTINEL" + b"x" * size)[:size - 26])
+
+
+def session_fields(client_ip: str = "192.0.2.123") -> dict:
+    return {"AuthCountryCodeMd5": "a" * 32, "AuthPubRSAVer": "1.2.3.456",
+            "clientIp": client_ip, "clientPort": "54321", "releaseName": "SYNTHETIC-TEST",
+            "serverIp": "198.51.100.9", "sessionId": "SYNTHETIC_CONTROL_ONLY_".ljust(36, "X"),
+            "srvTime": 1700000000}
+
+
+def session_control(*, size: int = 379, fields: dict | None = None,
+                    text: bytes | None = None) -> bytes:
+    """Entirely synthetic session metadata; never derived from private input."""
+    if text is None:
+        data = session_fields("192.168.100.123" if size == 383 else "192.0.2.123") if fields is None else fields
+        text = json.dumps(data, separators=(",", ":")).encode()
+    decoded_size = 263 if size == 379 else 267
+    assert len(text) <= decoded_size
+    encoded = module("_request").encode_payload(text.ljust(decoded_size, b" "))
+    payload = encoded + b"a"  # Observed opaque carrier shape, no semantic interpretation.
+    assert len(payload) == size - 26
+    return struct.pack("<HIIHIII", 26, 0xFFFFFFFD, 0x1000B, 0, len(payload), 0, 0) + b"xx" + payload
+
+
+@pytest.mark.parametrize("size", [379, 383])
+def test_exact_session_metadata_is_control_only(size: int) -> None:
+    feed = module("feed")
+    assert feed._control_kind(session_control(size=size)) == "control"
+    assert feed._control_kind(control()[13:]) == "control"
+    assert feed._control_kind(control(auth=True)[13:]) == "ack"
+
+
+@pytest.mark.parametrize("fault", [
+    "header", "request", "flags", "page", "command", "declared", "size", "carrier",
+    "base64", "padbits", "json", "utf8", "duplicate", "extra", "error", "missing",
+    "object", "type", "bool", "ip", "port", "md5", "version", "version_bound",
+    "release", "session", "time_bound",
+])
+def test_session_metadata_rejects_unknown_or_malformed_profiles(fault: str) -> None:
+    fields = session_fields()
+    fields.update(AuthPubRSAVer="1", clientIp="1.1.1.1", clientPort="1",
+                  releaseName="r", serverIp="2.2.2.2", srvTime=0)
+    text = None
+    if fault == "duplicate":
+        text = json.dumps(fields, separators=(",", ":")).encode()[:-1] + b',"clientPort":"1"}'
+    if fault == "extra": fields["unknown"] = 1
+    if fault == "error": fields["error"] = "refused"
+    if fault == "missing": del fields["AuthPubRSAVer"]
+    if fault == "object": text = b'[]'
+    if fault == "type": fields["clientPort"] = 1
+    if fault == "bool": fields["srvTime"] = True
+    if fault == "ip": fields["clientIp"] = "999.1.1.1"
+    if fault == "port": fields["clientPort"] = "00001"
+    if fault == "md5": fields["AuthCountryCodeMd5"] = "z" * 32
+    if fault == "version": fields["AuthPubRSAVer"] = "\n"
+    if fault == "version_bound": fields["AuthPubRSAVer"] = "v" * 33
+    if fault == "release": fields["releaseName"] = ""
+    if fault == "session": fields["sessionId"] = "x" * 35
+    if fault == "time_bound": fields["srvTime"] = 0x100000000
+    if fault == "json": text = b'{broken'
+    if fault == "utf8": text = b'\xff'
+    body = bytearray(session_control(size=383, fields=fields, text=text))
+    mutations = {"header": (0, "<H", 27), "request": (2, "<I", 0),
+                 "flags": (6, "<I", 0x1000C), "page": (10, "<H", 1),
+                 "command": (16, "<I", 2357), "declared": (12, "<I", 356)}
+    if fault in mutations:
+        offset, fmt, value = mutations[fault]
+        struct.pack_into(fmt, body, offset, value)
+    if fault == "size":
+        body.extend(b"aaaa")
+        struct.pack_into("<I", body, 12, len(body) - 26)
+    if fault == "carrier": body[-1] = 0
+    if fault == "base64": body[26] = ord("!")
+    if fault == "padbits":
+        body = bytearray(session_control())  # 263 bytes has one '=' padding byte.
+        alphabet = module("_request").IPHONE64_ALPHABET
+        body[-3] = alphabet[alphabet.index(body[-3]) | 1]
+    assert module("feed")._control_kind(bytes(body)) is None
 
 
 class Provider(Socket):
@@ -231,6 +309,79 @@ def collector(tmp_path: Path, provider: Provider, clock: Clock, **options):
                              duration_seconds=20, clock=clock, sleep=clock.sleep,
                              connection_factory=connect, **options)
     return obj, cache, calls
+
+
+def test_session_metadata_does_not_complete_pending_or_refresh_market_or_leak(tmp_path: Path, monkeypatch) -> None:
+    class SessionProvider(Provider):
+        def sendall(self, data):
+            insertion = len(self.chunks)
+            super().sendall(data)
+            if len(self.sent) == 2:
+                self.chunks[insertion:insertion] = [frame(session_control()), frame(session_control(size=383))]
+    clock = Clock(); provider = SessionProvider(clock)
+    obj, cache, calls = collector(tmp_path, provider, clock)
+    statuses = []
+    write_status = cache.write_status
+    def observe(status):
+        statuses.append(status)
+        write_status(status)
+    monkeypatch.setattr(cache, "write_status", observe)
+    status = obj.run()
+    assert len(calls) == 1 and len(provider.sent) == 7 and provider.closed
+    assert status.market_batch_count == 6 and status.control_count == 4
+    assert status.error_code == "duration_limit" and status.source_freshness == "unknown"
+    metadata_status = next(s for s in statuses if s.control_count == 3)
+    assert metadata_status.market_batch_count == 0 and metadata_status.last_market_received_at is None
+    assert metadata_status.subscription_state == "requested_unverified"
+    assert cache.read_status().last_sequence == 6
+    for path in cache.root.rglob("*"):
+        if path.is_file():
+            data = path.read_bytes()
+            assert b"SYNTHETIC_CONTROL_ONLY_" not in data
+            assert b"AuthCountryCodeMd5" not in data
+            assert session_control().hex().encode() not in data
+            assert session_control(size=383).hex().encode() not in data
+
+
+@pytest.mark.parametrize("before_ack", [False, True])
+def test_session_metadata_is_neither_ack_nor_validated_seed_for_retry(tmp_path: Path, before_ack: bool) -> None:
+    class SessionOnlyProvider(Provider):
+        def sendall(self, data):
+            super().sendall(data)
+            if len(self.sent) == (1 if before_ack else 2):
+                self.chunks[:] = [frame(session_control()), b""]
+    clock = Clock(); provider = SessionOnlyProvider(clock)
+    obj, cache, calls = collector(tmp_path, provider, clock, max_reconnects=2)
+    status = obj.run()
+    assert len(calls) == 1 and len(provider.sent) == (1 if before_ack else 2) and provider.closed
+    assert not obj.validated_seed and status.reconnect_attempts == 0
+    assert status.error_code == "peer_closed" and status.market_batch_count == 0
+    assert status.last_market_received_at is None and status.source_freshness == "unknown"
+    assert cache.read_status().last_sequence == 0 and status.cache_stale
+
+
+@pytest.mark.parametrize("fault", ["duplicate", "extra", "error", "malformed"])
+def test_invalid_session_metadata_stops_without_cache_or_replay(tmp_path: Path, fault: str) -> None:
+    fields = session_fields()
+    fields.update(AuthPubRSAVer="1", releaseName="r")
+    text = None
+    if fault == "duplicate":
+        text = json.dumps(fields, separators=(",", ":")).encode()[:-1] + b',"clientPort":"1"}'
+    if fault == "extra": fields["unknown"] = 1
+    if fault == "error": fields["error"] = "refused"
+    if fault == "malformed": text = b'{broken'
+    body = session_control(size=383, fields=fields, text=text)
+    class InvalidSessionProvider(Provider):
+        def sendall(self, data):
+            insertion = len(self.chunks)
+            super().sendall(data)
+            if len(self.sent) == 2: self.chunks[insertion:insertion] = [frame(body)]
+    clock = Clock(); provider = InvalidSessionProvider(clock)
+    obj, cache, calls = collector(tmp_path, provider, clock, max_reconnects=2)
+    status = obj.run()
+    assert status.error_code == "association_mismatch" and status.market_batch_count == 0
+    assert len(calls) == 1 and provider.closed and not obj.validated_seed
+    assert status.last_market_received_at is None and cache.read_status().last_sequence == 0
 
 
 def test_six_seeds_then_passive_immutable_binding_and_late_rows_retained(tmp_path: Path) -> None:
