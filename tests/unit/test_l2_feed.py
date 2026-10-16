@@ -312,9 +312,39 @@ def collector(tmp_path: Path, provider: Provider, clock: Clock, **options):
         return provider
     obj = feed.FeedCollector(cache, bootstrap_path=tmp_path / "bootstrap",
                              order_template_path=tmp_path / "order", trade_template_path=tmp_path / "trade",
-                             duration_seconds=20, clock=clock, sleep=clock.sleep,
+                             duration_seconds=options.pop("duration_seconds", 20), clock=clock, sleep=clock.sleep,
                              connection_factory=connect, **options)
     return obj, cache, calls
+
+
+def test_explicit_resident_remains_passive_beyond_six_hours_and_stops(tmp_path: Path) -> None:
+    class ResidentProvider(Provider):
+        def recv(self, size):
+            if not self.chunks:
+                clock.sleep(21601)
+                obj.stop_event.set()
+                raise socket.timeout()
+            return super().recv(size)
+    clock = Clock(); provider = ResidentProvider(clock)
+    obj, cache, calls = collector(tmp_path, provider, clock, duration_seconds=None)
+    status = obj.run()
+    assert clock() > 100 + 21600 and obj._deadline == float("inf")
+    assert len(calls) == 1 and len(provider.sent) == 7 and len(provider.business) == 6
+    assert status.state == "stopped" and status.error_code == "signal_stop"
+    assert status.market_batch_count == 6 and status.reconnect_attempts == 0
+    assert provider.closed and obj._inputs == (b"", b"", b"")
+    assert cache.read_status().gap
+
+
+@pytest.mark.parametrize("duration", [float("nan"), float("inf"), -float("inf"), 0, -1, True])
+def test_collector_still_rejects_invalid_numeric_duration(tmp_path: Path, duration) -> None:
+    feed = module("feed")
+    from rquant.l2.cache import RawL2Cache
+    with pytest.raises(ValueError, match="invalid duration"):
+        feed.FeedCollector(RawL2Cache(tmp_path / "cache"), bootstrap_path=tmp_path / "bootstrap",
+                           order_template_path=tmp_path / "order", trade_template_path=tmp_path / "trade",
+                           duration_seconds=duration)
+    assert not (tmp_path / "cache").exists()
 
 
 def test_session_metadata_does_not_complete_pending_or_refresh_market_or_leak(tmp_path: Path, monkeypatch) -> None:

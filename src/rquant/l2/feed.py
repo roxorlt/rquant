@@ -176,14 +176,14 @@ class FeedCollector:
 
     def __init__(self, cache: RawL2Cache, *, bootstrap_path: Path,
                  order_template_path: Path, trade_template_path: Path,
-                 duration_seconds: float = 3600, trade_pages: int = 1, order_pages: int = 1,
+                 duration_seconds: float | None = 3600, trade_pages: int = 1, order_pages: int = 1,
                  max_reconnects: int = 0, reconnect_delay_seconds: float = 60,
                  connection_factory: Callable[..., Any] = socket.create_connection,
                  clock: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], None] = time.sleep,
                  stop_event: threading.Event | None = None) -> None:
-        if (type(duration_seconds) not in (int, float) or not math.isfinite(duration_seconds)
-                or duration_seconds <= 0):
+        if duration_seconds is not None and (type(duration_seconds) not in (int, float)
+                or not math.isfinite(duration_seconds) or duration_seconds <= 0):
             raise ValueError("invalid duration")
         if any(type(n) is not int or not 1 <= n <= 3 for n in (trade_pages, order_pages)):
             raise ValueError("history pages must be in1..3")
@@ -450,7 +450,7 @@ class FeedCollector:
                 self.connection = None
 
     def run(self) -> FeedStatus:
-        self._deadline = self.clock() + self.duration_seconds
+        self._deadline = math.inf if self.duration_seconds is None else self.clock() + self.duration_seconds
         try:
             with self.cache.writer():
                 previous = self.cache.read_status()

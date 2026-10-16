@@ -3,8 +3,30 @@
 ## 目标
 
 日常代码发布由 Codex 完成 PR 合并、版本 tag、腾讯云部署和验证，用户不需要登录服务器。
-自动化不是任意生产权限：部署器只能部署 `origin/main` 中的精确 SemVer tag 或完整 commit，
+自动化不是任意生产权限：平台部署器只能部署 `origin/main` 中的精确 SemVer tag 或完整 commit，
 只能重启固定的 rQuant 服务，不能修改 systemd/nginx、写生产数据库或执行任意 sudo。
+
+## L2 独立组件
+
+本组件使用同一受控入口的 `--component l2` 分支，独立于默认平台发布链。当前仍待该版本云端六流验收与正式启用，服务器内 `127.0.0.1:8771` 不是已上线地址。
+
+```sh
+bash scripts/deploy-production.sh --component l2 \
+  --target <main上的完整40位commit> \
+  --artifact /absolute/path/public-release.tar.gz \
+  --acceptance-proof /absolute/private/six-stream-acceptance.json \
+  --acceptance-sha256 <验收文件的64位SHA256> --dry-run
+```
+
+正式执行沿用相同参数去掉 `--dry-run`，由 Codex 在既有授权与门禁内完成。目标必须属于 main；公共发布制品的 SHA256、`RELEASE.commit`、精确目标的 Web MVP push CI 三个 job 成功记录和 source binding 都须匹配。缺失 GitHub 制品 digest、CI 或验收证据会拒绝执行，不接受浮动引用或跳过门禁。
+
+验收文件须绑定同一候选代码与六个唯一数据流：两只股票各成交、买委托、卖委托；每流需要种子后向前 ID、至少 60 秒跨度、三个 30 秒窗口，以及相对采集器启动时间的最后 60 秒至少两批向前数据。必须同时证明单连接、七次发送、发送完成后至少一秒间隔、GET 不触发上游、完整缓存与 HTTP 游标覆盖、全部 worker/socket 已关闭。未通过六流验收前不启用服务。
+
+组件代码位于 `/home/lighthouse/rquant-l2-rel/<完整SHA>`，current 只指向已验证的该组件版本；缓存位于 `/home/lighthouse/rquant-l2-state/cache`，私有输入位于 `/home/lighthouse/rquant-l2-private`，部署锁与审计位于独立 state 目录。组件不接管 `/home/lighthouse/rquant` 工作区或既有 Web current，不读取 `.env`，不写生产数据库。
+
+本次组件授权仅允许安装、解析校验和管理 `rquant-l2-collector.service`、`rquant-l2-api.service` 两个精确名称。现有同名 unit 或 drop-in 不属于已记录的 L2 安装时拒绝覆盖。API 先启动并核验只读缓存，随后采集器只启动一次；采集器使用 `--resident --max-reconnects 0` 与 `Restart=no`，没有自动会话续期或失败重登录。API 固定绑定 `127.0.0.1:8771`，不增加公网代理。
+
+工作日上海时间 09:15–15:10 不重启服务。首次安装仅在两个 unit 都不存在且所有门禁通过时允许初次启动；升级或回滚涉及重启时延期。首次失败只停止、禁用并移除本次记录且内容匹配的两个新 unit，保留缓存、私有输入和证据。升级回滚仅接受已记录的 previous 完整 SHA，恢复已验证代码/API；鉴权或协议失败后采集器保持停止，不自动登录旧版本，缓存不回滚。
 
 ## 发布链路
 

@@ -20,7 +20,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--bootstrap-file", type=Path, required=True)
     parser.add_argument("--order-template", type=Path, required=True)
     parser.add_argument("--trade-template", type=Path, required=True)
-    parser.add_argument("--duration-seconds", type=float, default=3600)
+    runtime = parser.add_mutually_exclusive_group()
+    runtime.add_argument("--duration-seconds", type=float, default=3600)
+    runtime.add_argument("--resident", action="store_true")
     parser.add_argument("--trade-pages", type=int, choices=(1, 2, 3), default=1)
     parser.add_argument("--order-pages", type=int, choices=(1, 2, 3), default=1)
     parser.add_argument("--max-reconnects", type=int, choices=(0, 1, 2), default=0)
@@ -43,7 +45,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         collector = FeedCollector(
             RawL2Cache(args.cache_root), bootstrap_path=args.bootstrap_file,
             order_template_path=args.order_template, trade_template_path=args.trade_template,
-            duration_seconds=args.duration_seconds, trade_pages=args.trade_pages,
+            duration_seconds=None if args.resident else args.duration_seconds, trade_pages=args.trade_pages,
             order_pages=args.order_pages, max_reconnects=args.max_reconnects,
             reconnect_delay_seconds=args.reconnect_delay_seconds, stop_event=stop,
         )

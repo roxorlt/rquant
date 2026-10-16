@@ -6,6 +6,8 @@
 
 ### Added
 
+- **L2 原始批次接口**：两股六流单连接种子后被动接收，新增显式常驻模式、`127.0.0.1:8771` 缓存只读 API 和独立受控组件部署入口；待该版本云端六流验收与正式启用。
+
 - **板块资金流真 3 秒更新**：采集器每轮（~3s）把去重后的行情写成 `snapshots/<day>/stream/d-<run>-<seq>.parquet`
   （原子写），30 秒正式分片仍是唯一真相并在 parquet 元数据里记下所含最后一轮 `seq`；web 只把 seq 大于已折叠分片的
   delta 叠在官方状态的临时副本上计算，分片落盘即按 seq 丢弃对应 delta，不会重复计数。采集器在分片落盘后删对应 delta、
@@ -217,6 +219,9 @@
   **`deploy/systemd/` 改动，部署前必须在云端 `systemd-analyze verify` 通过。**
 
 ### Fixed
+
+- **Web CI 离线研究测试**：使用合成风险源并保留真实风险落表与幂等断言，避免假 token 触发外部请求退避耗尽 CI。
+- **L2 控制消息载体尾字节**：与 canonical JSON 编码分离处理，保留完整头部与八字段 schema 校验，控制消息不计入行情或触发重试。
 
 - **健康看板 `dashboard/app.py` 遇到新运行时的空值 / 过期日期直接崩溃，往下所有 section 都不渲染**：`dashboard_summary`
   汇总行由新 runtime_health 权威产出，旧库计数（`daily_bar_rows`、`monitor_event_rows`、`latest_daily_bar`、

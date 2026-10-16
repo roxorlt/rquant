@@ -52,6 +52,7 @@ jobs:
           uv run pytest -q --basetemp="$RQUANT_CI_ROOT/pytest"
           tests/unit/test_l2_codec.py tests/unit/test_l2_feed.py
           tests/unit/test_l2_cache.py tests/unit/test_l2_web.py
+          tests/unit/test_l2_component_deploy.py
 
   web:
     runs-on: ubuntu-24.04
