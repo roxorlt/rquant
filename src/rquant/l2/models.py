@@ -28,7 +28,8 @@ ErrorCode = Literal[
 class Model(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    @field_validator("*", mode="before")
+    @field_validator("received_at", "cached_at", "last_transport_received_at", "last_market_received_at",
+                     "seed_received_at", mode="before", check_fields=False)
     @classmethod
     def reject_numeric_datetime(cls, value: object, info: object) -> object:
         if isinstance(value, (int, float)) and getattr(info, "field_name", "") in {
@@ -38,7 +39,8 @@ class Model(BaseModel):
             raise ValueError("UTC timestamps require an explicit datetime")
         return value
 
-    @field_validator("*", mode="after")
+    @field_validator("received_at", "cached_at", "last_transport_received_at", "last_market_received_at",
+                     "seed_received_at", mode="after", check_fields=False)
     @classmethod
     def require_utc(cls, value: object) -> object:
         if isinstance(value, datetime) and (value.tzinfo is None or value.utcoffset() != timedelta(0)):
