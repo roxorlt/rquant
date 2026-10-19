@@ -585,6 +585,60 @@ def test_standalone_probe_no_dev_dependency_and_synthetic_cannot_claim_real_r2(
     assert "pytest" not in script.read_text()
 
 
+def test_byte_envelope_standalone_probe_streams_all_four_large_records(tmp_path: Path, monkeypatch) -> None:
+    import importlib.util
+    entry = Path(__file__).resolve().parents[2] / "scripts/validate-l2-archive.py"
+    spec = importlib.util.spec_from_file_location("archive_large_probe", entry)
+    probe = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(probe)
+    original = probe._observation
+
+    def factory(index):
+        obs = original(index)
+        return obs.model_copy(update={"table": obs.table.model_copy(update={
+            "interpretation_limits": "x" * (13 << 20)})}) if index % 2 == 0 else obs
+
+    monkeypatch.setattr(probe, "_observation", factory)
+    client = FakeR2()
+    result = probe.run_probe(entry.parents[1], "a" * 40, tmp_path / "large-probe", PREFIX, client=client)
+    assert result["roundtrip"]["source_count"] == result["roundtrip"]["restored_count"] == 4
+    assert result["roundtrip"]["source_sha256"] == result["roundtrip"]["restored_sha256"]
+    assert result["idempotence_puts"] == 0 and result["requests"]["precondition_failed"] == 1
+    assert result["closed"] is True and all(result["cases"].values())
+    # Real byte-limited cache reads return fewer than four records, which the
+    # standalone proof must never confuse with the complete fixed H=4 source.
+    cache = RawL2Cache(tmp_path / "large-probe/synthetic-cache")
+    assert cache.read_batches(limit=4).next_sequence < 4
+
+
+def test_byte_envelope_archive_retains_whole_large_lines_and_fixed_sequence(tmp_path: Path):
+    a, client = archive(), FakeR2()
+    cache = RawL2Cache(tmp_path / "large-source")
+    obs = observation()
+    obs = obs.model_copy(update={"table": obs.table.model_copy(update={
+        "interpretation_limits": "x" * (13 << 20)})})
+    with cache.writer():
+        for _ in range(3): cache.append(obs)
+        cache.write_status(FeedStatus(state="stopped", gap=True, epoch_id=obs.epoch_id))
+    state = tmp_path / "large-state"
+    a.initialize(cache, state, client=client, prefix=PREFIX)
+    a.run_archive(cache, state, client=client, prefix=PREFIX, now=NOW)
+    catalog = a.Catalog.model_validate_json(client.objects[PREFIX + "/catalog.json"])
+    day = next(iter(catalog.days))
+    manifest = a.DayManifest.model_validate_json(client.objects[catalog.days[day].key])
+    assert len(manifest.chunks) == 2
+    assert [chunk.records for chunk in manifest.chunks] == [2, 1]
+    assert all(chunk.expanded_bytes <= 32 << 20 for chunk in manifest.chunks)
+    destination = tmp_path / "large-restored"
+    receipt = a.fetch_archive(day, destination, client=client, prefix=PREFIX)
+    assert receipt.records == receipt.last_sequence == 3 and catalog.source_observation.gap is True
+    with (destination / "batches.jsonl").open("rb") as stream:
+        for sequence in range(1, 4):
+            line = stream.readline(a.MAX_LINE + 1)
+            assert line == a._bytes(a._batch(cache, sequence))
+        assert stream.read(1) == b""
+
+
 @pytest.mark.parametrize("target", ["catalog", "day"])
 @pytest.mark.parametrize("variant", ["missing", "internal_alias", "unknown"])
 def test_remote_wire_schema_is_required_before_restore(
