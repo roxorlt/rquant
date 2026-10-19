@@ -586,19 +586,50 @@ def test_subscription_runtime_receipt_and_age_are_bounded_reads_without_history_
     with pytest.raises(Exception): cache.read_subscription_status()
 
 
-def test_actual_twelve_mib_page_budget_keeps_whole_batches_below_envelope_limit(tmp_path):
+def test_actual_page_byte_budget_keeps_whole_batches_below_envelope_limit(tmp_path):
     from rquant.l2.cache import MAX_BATCH_PAGE_BYTES, RawL2Cache
     obs = observation()
     obs = obs.model_copy(update={'table': obs.table.model_copy(update={'interpretation_limits': 'x' * (1024 * 1024)})})
     cache = RawL2Cache(tmp_path / 'cache')
     with cache.writer():
-        for _ in range(13): cache.append(obs)
+        for _ in range(27): cache.append(obs)
     page = cache.read_batches(limit=128)
     committed_bytes = sum((cache.root / 'batches' / f'{b.local_batch_sequence:020d}' / 'batch.json').stat().st_size for b in page.batches)
-    assert 0 < len(page.batches) < 13 and committed_bytes <= MAX_BATCH_PAGE_BYTES
-    assert len(page.model_dump_json().encode()) < 16 * 1024 * 1024
+    assert 0 < len(page.batches) < 27 and committed_bytes <= MAX_BATCH_PAGE_BYTES
+    assert len(page.model_dump_json().encode()) < 32 * 1024 * 1024
     assert page.next_sequence == len(page.batches)
     assert cache.read_batches(after_sequence=page.next_sequence, limit=128).batches[0].local_batch_sequence == page.next_sequence + 1
+
+
+def test_byte_envelope_single_large_batch_progress_and_exact_resource_boundary(tmp_path, monkeypatch):
+    from datetime import UTC, datetime
+    from rquant.l2 import cache as module
+    from rquant.l2.models import RawL2Batch
+    fixed = datetime(2026, 10, 19, tzinfo=UTC)
+    monkeypatch.setattr(module, "datetime", type("FixedClock", (), {"now": staticmethod(lambda tz: fixed)}))
+    original = observation()
+    initial = RawL2Batch.model_validate({**original.model_dump(mode="python"),
+        "local_batch_sequence": 1, "cached_at": fixed})
+    padding = (20 << 20) - len(initial.model_dump_json().encode()) - 1
+    large = original.model_copy(update={"table": original.table.model_copy(update={
+        "interpretation_limits": original.table.interpretation_limits + "x" * padding})})
+    source = module.RawL2Cache(tmp_path / "large")
+    with source.writer():
+        batch = source.append(large)
+        assert len(batch.model_dump_json().encode()) + 1 == 20 << 20
+        too_large = large.model_copy(update={"table": large.table.model_copy(update={
+            "interpretation_limits": large.table.interpretation_limits + "x"})})
+        with pytest.raises(module.CacheError, match="invalid_batch"):
+            source.append(too_large)
+        assert not list((source.root / "batches").glob(".pending-*"))
+    reader = module.RawL2Cache(source.root)
+    page = reader.read_batches(limit=1)
+    assert page.next_sequence == 1 and len(page.batches) == 1
+    assert page.batches[0] == batch
+    assert len(page.model_dump_json().encode()) < 32 << 20
+    assert reader.read_batches(after_sequence=1).batches == ()
+    with reader.writer():
+        assert reader._highwater == 1 and reader._last_batch == batch
 
 
 def test_published_head_is_same_inode_and_append_keeps_four_fsyncs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
