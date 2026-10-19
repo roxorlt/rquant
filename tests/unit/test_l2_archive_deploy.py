@@ -187,9 +187,10 @@ class FakeHost:
                 fragment = str(file) if loaded else ""
                 if self.bad_fragment and file.exists(): fragment = "/usr/lib/systemd/system/foreign.service"
                 active = self.service_active if unit == self.d.UNITS[0] else self.active[unit]
-                return "\n".join([f"LoadState={'loaded' if loaded else 'not-found'}", f"FragmentPath={fragment}",
-                    f"DropInPaths={self.dropins if file.exists() else ''}", "MainPID=0",
-                    f"ActiveState={'active' if active else 'inactive'}"])
+                fields = [f"LoadState={'loaded' if loaded else 'not-found'}", f"FragmentPath={fragment}",
+                    f"DropInPaths={self.dropins if file.exists() else ''}"]
+                if unit == self.d.UNITS[0]: fields.append("MainPID=0")
+                return "\n".join([*fields, f"ActiveState={'active' if active else 'inactive'}"])
             if action in {"stop", "disable"}:
                 assert args[-1] in self.d.UNITS
                 if self.strict_missing_unit and args[-1] not in self.loaded_units:
@@ -238,6 +239,74 @@ def deployment(tmp_path: Path):
 
 def run(d, host: FakeHost, args, api: dict) -> dict:
     return d.deploy(args, paths=host.paths, api=api.__getitem__, command=host.command, health=host.ch.health)
+
+
+def test_r2_f5_real_timer_view_has_no_pid(tmp_path: Path) -> None:
+    d, host, _, _ = deployment(tmp_path)
+    views = d.archive_units(host.paths, None, host.command)
+    assert views[d.UNITS[1]] == {"LoadState": "not-found", "FragmentPath": "",
+        "DropInPaths": "", "ActiveState": "inactive"}
+    timer_command = next(argv for argv in host.commands if argv[:3] == [d.SYSTEMCTL, "show", d.UNITS[1]])
+    assert timer_command[-1] == "--property=LoadState,FragmentPath,DropInPaths,ActiveState"
+    assert not host.mutations()
+
+
+@pytest.mark.parametrize("fault", ["missing", "extra", "duplicate", "malformed", "empty_state"])
+def test_r2_f5_malformed_timer_schema_is_rejected(tmp_path: Path, fault: str) -> None:
+    d, host, _, _ = deployment(tmp_path)
+
+    def command(argv: list[str], cwd: Path | None = None) -> str:
+        value = host.command(argv, cwd=cwd)
+        if argv[:3] == [d.SYSTEMCTL, "show", d.UNITS[1]]:
+            if fault == "missing": value = value.replace("DropInPaths=\n", "")
+            elif fault == "extra": value += "\nMainPID=0"
+            elif fault == "duplicate": value += "\nActiveState=inactive"
+            elif fault == "malformed": value += "\nnot-a-property"
+            else: value = value.replace("ActiveState=inactive", "ActiveState=")
+        return value
+
+    with pytest.raises(d.DeployError, match="^unit_inspection_failed$"):
+        d.archive_units(host.paths, None, command)
+    assert not host.mutations()
+
+
+@pytest.mark.parametrize("pid", [None, "not-a-number"])
+def test_r2_f5_archive_service_still_requires_numeric_pid(tmp_path: Path, pid: str | None) -> None:
+    d, host, _, _ = deployment(tmp_path)
+
+    def command(argv: list[str], cwd: Path | None = None) -> str:
+        value = host.command(argv, cwd=cwd)
+        if argv[:3] == [d.SYSTEMCTL, "show", d.UNITS[0]]:
+            value = value.replace("MainPID=0\n", "" if pid is None else f"MainPID={pid}\n")
+        return value
+
+    with pytest.raises(d.DeployError, match="^unit_inspection_failed$"):
+        d.archive_units(host.paths, None, command)
+    assert not host.mutations()
+
+
+@pytest.mark.parametrize("foreign", ["fragment", "dropin"])
+def test_r2_f5_foreign_timer_is_not_taken_over(tmp_path: Path, foreign: str) -> None:
+    d, host, args, api = deployment(tmp_path)
+    run(d, host, args, api)
+    newer = next_release(tmp_path, d, args, api)
+    original = host.command
+
+    def command(argv: list[str], cwd: Path | None = None) -> str:
+        value = original(argv, cwd=cwd)
+        if argv[:3] == [d.SYSTEMCTL, "show", d.UNITS[1]]:
+            if foreign == "fragment":
+                value = value.replace(f"FragmentPath={host.paths.core.units / d.UNITS[1]}",
+                    "FragmentPath=/usr/lib/systemd/system/foreign.timer")
+            else:
+                value = value.replace("DropInPaths=", "DropInPaths=/etc/systemd/system/foreign.conf")
+        return value
+
+    host.commands.clear()
+    host.command = command
+    with pytest.raises(d.DeployError, match="^foreign_archive_unit$"):
+        run(d, host, newer, api)
+    assert not host.mutations() and host.enabled and host.active[d.UNITS[1]]
 
 
 @pytest.mark.parametrize("bad", ["proof_hash", "tree", "ci", "core_missing", "core_inactive"])
