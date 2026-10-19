@@ -19,9 +19,9 @@ from rquant.l2.models import BatchPage, FeedStatus, MarketObservation, RawL2Batc
 
 _ACTIVE = {"starting", "connected", "seeded_waiting", "listening_candidate"}
 _STALE_SECONDS = 60
-_MAX_BATCH_BYTES = 8 * 1024 * 1024
+_MAX_BATCH_BYTES = 20 * 1024 * 1024
 MAX_BATCH_PAGE = 128
-MAX_BATCH_PAGE_BYTES = 12 * 1024 * 1024
+MAX_BATCH_PAGE_BYTES = 24 * 1024 * 1024
 _MAX_RUNTIME_BYTES = 256 * 1024
 
 

@@ -177,19 +177,30 @@ def run_probe(
         for index in range(4):
             cache.append(_observation(index))
         cache.write_status(FeedStatus(state="stopped", gap=True, epoch_id="synthetic_1"))
-    source = b"".join(archive._bytes(batch) for batch in cache.read_batches(limit=4).batches)
+    highwater = cache.read_status().last_sequence
+    if highwater != 4:
+        raise ValueError("source count mismatch")
+    source = hashlib.sha256()
+    for sequence in range(1, highwater + 1):
+        source.update(archive._bytes(archive._batch(cache, sequence)))
     state = output_dir / "state"
     archive.initialize(cache, state, client=counted, prefix=prefix)
     now = datetime(2026, 10, 16, 9, 20, tzinfo=UTC)
     archive.run_archive(cache, state, client=counted, prefix=prefix, now=now)
     (state / "last-run.json").unlink()
     listing = archive.list_archive(client=counted, prefix=prefix)
-    restored = bytearray()
+    restored, restored_count = hashlib.sha256(), 0
     for day in listing.days:
         archive.fetch_archive(day, output_dir / day, client=counted, prefix=prefix)
-        restored.extend((output_dir / day / "batches.jsonl").read_bytes())
-    rows = [json.loads(line) for line in restored.splitlines()]
-    if bytes(restored) != source or [row["local_batch_sequence"] for row in rows] != [1, 2, 3, 4]:
+        with (output_dir / day / "batches.jsonl").open("rb") as stream:
+            while line := stream.readline(archive.MAX_LINE + 1):
+                restored_count += 1
+                if (restored_count > highwater or len(line) > archive.MAX_LINE
+                        or not line.endswith(b"\n")
+                        or line != archive._bytes(archive._batch(cache, restored_count))):
+                    raise ValueError("roundtrip mismatch")
+                restored.update(line)
+    if restored_count != 4 or restored.hexdigest() != source.hexdigest():
         raise ValueError("roundtrip mismatch")
     # No local receipt or checkpoint may be necessary to discover remote progress.
     before = counted.counts["put"]
@@ -245,10 +256,10 @@ def run_probe(
         },
         "roundtrip": {
             "source_count": 4,
-            "restored_count": len(rows),
+            "restored_count": restored_count,
             "received_dates": list(listing.days),
-            "source_sha256": hashlib.sha256(source).hexdigest(),
-            "restored_sha256": hashlib.sha256(restored).hexdigest(),
+            "source_sha256": source.hexdigest(),
+            "restored_sha256": restored.hexdigest(),
             "catalog_last_sequence": listing.last_sequence,
         },
         "idempotence_puts": idempotence_puts,
