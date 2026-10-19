@@ -643,6 +643,64 @@ def test_dynamic_health_budget_grows_with_union_without_resetting_origin(monkeyp
         assert ticks[0] <= 630
 
 
+@pytest.mark.parametrize("case", ["old_blocked_then_new", "old_blocked_only", "new_blocked", "new_none_blocked",
+    "new_then_old", "new_then_none", "different_blocked_epoch", "empty_old_blocked", "none_old_blocked", "old_then_new_blocked"])
+def test_start_health_rejects_only_current_epoch_failure(monkeypatch: pytest.MonkeyPatch, case: str) -> None:
+    d = deployer()
+    bindings = d.symbol_bindings(["600000"])
+    expected = {d.identity(binding) for binding in bindings}
+    baseline = 45130
+    old = {"state": "blocked", "epoch_id": "old", "error_code": "decode_error",
+        "seed_queries": 3, "last_sequence": baseline}
+    starting = {**old, "state": "starting", "epoch_id": None, "error_code": None, "seed_queries": 0}
+    fresh_start = {**starting, "epoch_id": "new"}
+    ready = {**old, "state": "listening_candidate", "epoch_id": "new", "error_code": None, "last_sequence": baseline + 3}
+    new_blocked = {**ready, "state": "blocked", "error_code": "decode_error"}
+    sequence = {
+        "old_blocked_then_new": [old, starting, ready],
+        "old_blocked_only": [old],
+        "new_blocked": [new_blocked],
+        "new_none_blocked": [{**old, "epoch_id": None, "error_code": "input_error"}],
+        "new_then_old": [fresh_start, {**ready, "epoch_id": "old"}, ready],
+        "new_then_none": [fresh_start, starting, ready],
+        "different_blocked_epoch": [{**old, "epoch_id": "other"}],
+        "empty_old_blocked": [{**old, "epoch_id": ""}],
+        "none_old_blocked": [{**old, "epoch_id": None, "error_code": "input_error"}],
+        "old_then_new_blocked": [old, new_blocked],
+    }[case]
+    old_epoch = "" if case == "empty_old_blocked" else None if case == "none_old_blocked" else "old"
+    ticks, polls, cursors = [0.0], [], []
+    rows = [{"local_batch_sequence": baseline + index + 1, "epoch_id": "new", "delivery": "seed", "binding": binding}
+            for index, binding in enumerate(bindings)]
+    monkeypatch.setattr(d.time, "monotonic", lambda: ticks[0])
+
+    def health() -> dict:
+        value = sequence[min(len(polls), len(sequence) - 1)]
+        polls.append(value)
+        return value
+
+    def batches(after: int) -> dict:
+        cursors.append(after)
+        selected = [row for row in rows if row["local_batch_sequence"] > after]
+        return {"batches": selected, "next_sequence": selected[-1]["local_batch_sequence"] if selected else after}
+
+    def wait() -> None:
+        d.wait_health(health, lambda second: ticks.__setitem__(0, ticks[0] + second), collector=True,
+            old_epoch=old_epoch, after_sequence=baseline, expected=expected, batches=batches)
+
+    if case == "old_blocked_then_new":
+        wait()
+        assert len(polls) == 3 and ticks[0] == 2 and cursors == [baseline]
+    else:
+        with pytest.raises(d.DeployError, match="^collector_health_failed$"):
+            wait()
+        if case == "old_blocked_only":
+            assert ticks[0] == 2 * len(expected) + 30 and len(polls) == ticks[0]
+        else:
+            assert len(polls) == (2 if case in {"new_then_old", "new_then_none", "old_then_new_blocked"} else 1)
+        assert cursors == []
+
+
 def test_previous_without_dynamic_control_contract_is_rejected_before_stop(tmp_path: Path) -> None:
     d, host, args, api = deployment(tmp_path); run_deploy(d, host, args, api)
     api = next_release(tmp_path, d, host, args); run_deploy(d, host, args, api)
