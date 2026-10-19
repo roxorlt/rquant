@@ -672,14 +672,17 @@ def wait_health(health: Callable[[], dict[str, Any]], sleep: Callable[[float], N
             value = health()
             if not isinstance(value.get("state"), str) or type(value.get("last_sequence")) is not int:
                 raise DeployError("api_health_failed")
-            if collector and (value.get("state") == "blocked" or value.get("error_code") not in {None, "restart_gap", "signal_stop", "duration_limit"}):
-                raise DeployError("collector_health_failed")
             if not collector:
                 return
             observed_epoch = value.get("epoch_id")
+            if epoch is not None and observed_epoch != epoch:
+                raise DeployError("collector_health_failed")
+            waiting_on_old_epoch = (epoch is None and isinstance(old_epoch, str) and bool(old_epoch)
+                                    and observed_epoch == old_epoch)
+            if not waiting_on_old_epoch and (value.get("state") == "blocked"
+                    or value.get("error_code") not in {None, "restart_gap", "signal_stop", "duration_limit"}):
+                raise DeployError("collector_health_failed")
             if isinstance(observed_epoch, str) and observed_epoch and observed_epoch != old_epoch:
-                if epoch is not None and observed_epoch != epoch:
-                    raise DeployError("collector_health_failed")
                 epoch = observed_epoch
                 while cursor < value["last_sequence"] and time.monotonic() < deadline:
                     page = (batches or health_batches)(cursor)
