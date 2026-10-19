@@ -484,7 +484,7 @@ def test_explicit_history_is_bounded_and_nonprogress_stops_honestly(tmp_path: Pa
     obj, cache, _ = collector(tmp_path, provider, clock, trade_pages=3, order_pages=3)
     obj.run()
     assert len(provider.business) == 18
-    assert len(list((tmp_path / "cache" / "batches").iterdir())) == 18
+    assert len(cache._directories()) == 18
     other = tmp_path / "repeat";other.mkdir()
     clock = Clock(); provider = Provider(clock, repeat_history=True)
     obj, cache, _ = collector(other, provider, clock, trade_pages=3)

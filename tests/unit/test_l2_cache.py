@@ -3,7 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import struct
-from datetime import UTC, datetime, timedelta
+from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
 
 import pytest
@@ -406,7 +407,7 @@ def test_pending_batch_ignored_and_corrupt_derived_value_rejected(tmp_path: Path
         cache.read_batches()
 
 
-def test_missing_prefix_fails_even_when_cursor_is_after_the_gap(tmp_path: Path):
+def test_unrequested_missing_prefix_is_rejected_on_replay_and_full_audit(tmp_path: Path):
     from rquant.l2.cache import CacheError, RawL2Cache
 
     cache = RawL2Cache(tmp_path / "cache")
@@ -417,8 +418,15 @@ def test_missing_prefix_fails_even_when_cursor_is_after_the_gap(tmp_path: Path):
     for path in first.iterdir():
         path.unlink()
     first.rmdir()
+    # A tail read certifies its selected range and head, not unrequested history.
+    assert cache.read_batches(after_sequence=2).batches == ()
+    with pytest.raises(CacheError):
+        cache.read_batches(after_sequence=0)
     with pytest.raises(CacheError, match="sequence_gap"):
-        cache.read_batches(after_sequence=1)
+        cache._directories()
+    with pytest.raises(CacheError, match="sequence_gap"):
+        with RawL2Cache(cache.root).writer():
+            pytest.fail('recovery accepted a missing historical batch')
 
 
 def test_failed_directory_commit_exposes_no_torn_batch(tmp_path: Path, monkeypatch):
@@ -497,6 +505,7 @@ def test_reader_snapshot_does_not_report_gap_when_writer_commits_during_scan(tmp
     with cache.writer():
         cache.append(observation())
         cache.write_status(FeedStatus(state="connected"))
+        (cache.root / 'batches' / '.head').unlink()  # Exercise legacy audit snapshot.
 
         def interleaved(path):
             nonlocal fired
@@ -509,11 +518,12 @@ def test_reader_snapshot_does_not_report_gap_when_writer_commits_during_scan(tmp
 
         monkeypatch.setattr(Path, "iterdir", interleaved)
         page = RawL2Cache(cache.root).read_batches()
+        assert fired
         assert len(page.batches) == 1
         assert page.next_sequence == 1
 
 
-def test_larger_page_amortizes_full_prefix_io_without_dropping_checks(tmp_path: Path, monkeypatch):
+def test_larger_published_page_is_bounded_and_history_audit_is_explicit(tmp_path: Path, monkeypatch):
     from rquant.l2.cache import RawL2Cache
     cache = RawL2Cache(tmp_path / 'cache')
     with cache.writer():
@@ -526,13 +536,14 @@ def test_larger_page_amortizes_full_prefix_io_without_dropping_checks(tmp_path: 
     monkeypatch.setattr(Path, 'iterdir', counted)
     page = RawL2Cache(cache.root).read_batches(limit=128)
     assert len(page.batches) == 128 and page.next_sequence == 128
-    assert len(scans) == 1
+    assert len(scans) == 0  # Published pages do not enumerate all history.
     assert len(RawL2Cache(cache.root).read_batches(after_sequence=128, limit=128).batches) == 1
-    # The bigger page must still reject a missing old batch, even after its cursor.
+    # Unrequested history is checked on replay or a complete audit/recovery.
     import shutil
     shutil.rmtree(cache.root / 'batches' / f'{1:020d}')
+    assert len(RawL2Cache(cache.root).read_batches(after_sequence=128, limit=128).batches) == 1
     with pytest.raises(Exception, match='sequence_gap'):
-        RawL2Cache(cache.root).read_batches(after_sequence=128, limit=128)
+        RawL2Cache(cache.root)._directories()
 
 
 def test_page_payload_byte_budget_returns_contiguous_prefix(tmp_path: Path, monkeypatch):
@@ -588,3 +599,262 @@ def test_actual_twelve_mib_page_budget_keeps_whole_batches_below_envelope_limit(
     assert len(page.model_dump_json().encode()) < 16 * 1024 * 1024
     assert page.next_sequence == len(page.batches)
     assert cache.read_batches(after_sequence=page.next_sequence, limit=128).batches[0].local_batch_sequence == page.next_sequence + 1
+
+
+def test_published_head_is_same_inode_and_append_keeps_four_fsyncs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import os
+    from rquant.l2 import cache as module
+    cache = module.RawL2Cache(tmp_path / 'cache')
+    calls = []
+    original = module.os.fsync
+    def counted(fd: int) -> None:
+        calls.append(fd)
+        return original(fd)
+    with cache.writer():
+        monkeypatch.setattr(module.os, 'fsync', counted)
+        cache.append(observation())
+        assert len(calls) == 4
+    parent = cache.root / 'batches'
+    assert os.path.samefile(parent / '.head', parent / f'{1:020d}' / 'batch.json')
+    assert list(parent.glob('.pending-head-*')) == []
+
+
+def test_published_cursor_work_does_not_scan_history(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from rquant.l2.cache import RawL2Cache
+    cache = RawL2Cache(tmp_path / 'cache')
+    with cache.writer():
+        for _ in range(65): cache.append(observation())
+    def forbidden(*args: object) -> None:
+        pytest.fail('published cursor enumerated historical prefix')
+    monkeypatch.setattr(RawL2Cache, '_directories', forbidden)
+    reader = RawL2Cache(cache.root)
+    page = reader.read_batches(after_sequence=31, limit=2)
+    assert [b.local_batch_sequence for b in page.batches] == [32, 33]
+    assert page.status.last_sequence == 65 and reader.read_status().last_sequence == 65
+
+
+def test_published_head_fd_remains_one_snapshot_across_replacement(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import os
+    from rquant.l2 import cache as module
+    from rquant.l2.models import FeedStatus
+    cache = module.RawL2Cache(tmp_path / 'cache')
+    original = module.os.open
+    fired = False
+    with cache.writer():
+        cache.append(observation())
+        cache.write_status(FeedStatus(state='connected'))
+        def interleaved(path: str | Path, flags: int, *args: int, **kwargs: int) -> int:
+            nonlocal fired
+            fd = original(path, flags, *args, **kwargs)
+            if Path(path).name == '.head' and not fired:
+                fired = True
+                cache.append(observation())
+                cache.write_status(FeedStatus(state='connected'))
+            return fd
+        monkeypatch.setattr(module.os, 'open', interleaved)
+        page = module.RawL2Cache(cache.root).read_batches(limit=8)
+        assert fired and page.status.last_sequence == page.next_sequence == 1
+        assert [b.local_batch_sequence for b in page.batches] == [1]
+        assert module.RawL2Cache(cache.root).read_status().last_sequence == 2
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+def test_published_writer_repairs_only_fully_audited_stale_or_legacy_head(tmp_path: Path, legacy: bool) -> None:
+    import os
+    from rquant.l2.cache import RawL2Cache
+    cache = RawL2Cache(tmp_path / 'cache')
+    with cache.writer():
+        cache.append(observation()); cache.append(observation())
+    parent = cache.root / 'batches'; head = parent / '.head'
+    head.unlink()
+    if not legacy: os.link(parent / f'{1:020d}' / 'batch.json', head)
+    if legacy: assert RawL2Cache(cache.root).read_batches(limit=8).next_sequence == 2
+    with RawL2Cache(cache.root).writer() as restored:
+        assert restored.read_status().gap
+        assert os.path.samefile(head, parent / f'{2:020d}' / 'batch.json')
+    assert len(RawL2Cache(cache.root)._directories()) == 2
+
+
+@pytest.mark.parametrize('fault', ['symlink', 'directory', 'fifo', 'oversize', 'copy', 'corrupt',
+                                  'missing_target', 'bad_sha', 'ahead_status'])
+def test_published_bad_head_never_falls_back_or_is_silently_repaired(tmp_path: Path, fault: str) -> None:
+    import os
+    from rquant.l2.cache import CacheError, RawL2Cache
+    from rquant.l2.models import FeedStatus
+    cache = RawL2Cache(tmp_path / 'cache')
+    with cache.writer(): cache.append(observation())
+    parent = cache.root / 'batches'; target = parent / f'{1:020d}' / 'batch.json'; head = parent / '.head'
+    if fault in {'symlink', 'directory', 'fifo', 'oversize', 'copy'}:
+        head.unlink()
+        if fault == 'symlink': head.symlink_to(target)
+        elif fault == 'directory': head.mkdir()
+        elif fault == 'fifo': os.mkfifo(head, 0o600)
+        elif fault == 'oversize':
+            with head.open('wb') as stream: stream.truncate(8 * 1024 * 1024 + 1)
+        else:
+            head.write_bytes(target.read_bytes())
+            head.chmod(0o600)
+    elif fault == 'corrupt': target.write_bytes(b'bad head')
+    elif fault == 'missing_target': target.unlink()
+    elif fault == 'bad_sha': (target.parent / 'sha256').write_bytes(b'0' * 64 + b'\n')
+    else:
+        (cache.root / 'status.json').write_text(FeedStatus(last_sequence=2).model_dump_json())
+    with pytest.raises(CacheError): RawL2Cache(cache.root).read_batches(after_sequence=1)
+    with pytest.raises(CacheError):
+        with RawL2Cache(cache.root).writer(): pytest.fail('unsafe head was repaired')
+
+
+@pytest.mark.parametrize('fault', ['link', 'replace', 'parent_fsync'])
+def test_published_failure_does_not_acknowledge_or_remove_raw_batch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str) -> None:
+    import os
+    from rquant.l2 import cache as module
+    cache = module.RawL2Cache(tmp_path / 'cache'); parent = cache.root / 'batches'
+    with cache.writer():
+        original_link = module.os.link; original_replace = module.os.replace; original_fsync = module._fsync_dir
+        def failed_link(*args: object, **kwargs: object) -> None: raise OSError('synthetic link failure')
+        def failed_replace(src: Path, dst: Path) -> None:
+            if Path(dst).name == '.head': raise OSError('synthetic publication failure')
+            return original_replace(src, dst)
+        def failed_fsync(path: Path) -> None:
+            if path == parent: raise OSError('synthetic parent durability failure')
+            return original_fsync(path)
+        with monkeypatch.context() as patch:
+            patch.setattr(module.os, 'link', failed_link if fault == 'link' else original_link)
+            patch.setattr(module.os, 'replace', failed_replace if fault == 'replace' else original_replace)
+            patch.setattr(module, '_fsync_dir', failed_fsync if fault == 'parent_fsync' else original_fsync)
+            with pytest.raises(module.CacheError): cache.append(observation())
+        assert (parent / f'{1:020d}' / 'batch.json').is_file()
+        assert list(parent.glob('.pending-head-*')) == []
+    with module.RawL2Cache(cache.root).writer() as recovered:
+        assert recovered.read_status().gap
+        assert os.path.samefile(parent / '.head', parent / f'{1:020d}' / 'batch.json')
+
+
+def test_published_legacy_fallback_audits_payloads_before_old_cursor(tmp_path: Path) -> None:
+    from rquant.l2.cache import CacheError, RawL2Cache
+    cache = RawL2Cache(tmp_path / 'cache')
+    with cache.writer():
+        cache.append(observation()); cache.append(observation())
+    parent = cache.root / 'batches'; (parent / '.head').unlink()
+    (parent / f'{1:020d}' / 'batch.json').write_bytes(b'corrupt unrequested legacy payload')
+    with pytest.raises(CacheError): RawL2Cache(cache.root).read_batches(after_sequence=2)
+    with pytest.raises(CacheError):
+        with RawL2Cache(cache.root).writer(): pytest.fail('legacy corruption was repaired')
+
+
+def test_published_full_audit_does_not_mistake_readdir_omission_for_a_gap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from rquant.l2.cache import RawL2Cache
+    cache = RawL2Cache(tmp_path / 'cache')
+    with cache.writer():
+        cache.append(observation()); cache.append(observation())
+    original = Path.iterdir
+    def omitted(path: Path) -> Iterator[Path]:
+        return (p for p in original(path) if not (path == cache.root / 'batches' and p.name == f'{1:020d}'))
+    monkeypatch.setattr(Path, 'iterdir', omitted)
+    assert len(RawL2Cache(cache.root)._directories()) == 2
+
+
+@pytest.mark.parametrize('fault', ['low', 'zero_block', 'negative_blocks', 'wrong_type', 'absent', 'error'])
+def test_published_disk_guard_rejects_before_new_allocations(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str) -> None:
+    from types import SimpleNamespace
+    from rquant.l2 import cache as module
+    cache = module.RawL2Cache(tmp_path / 'cache')
+    with cache.writer():
+        cache.append(observation())
+        before = {str(p.relative_to(cache.root)): p.read_bytes() for p in cache.root.rglob('*') if p.is_file()}
+        def unavailable(path: Path) -> SimpleNamespace:
+            if fault == 'error': raise OSError('synthetic unavailable disk stats')
+            if fault == 'absent': return SimpleNamespace()
+            return SimpleNamespace(f_bavail=-1 if fault == 'negative_blocks' else 'invalid' if fault == 'wrong_type' else 1,
+                                   f_frsize=0 if fault == 'zero_block' else 4096)
+        with monkeypatch.context() as patch:
+            patch.setattr(module.os, 'statvfs', unavailable)
+            with pytest.raises(module.CacheError, match='^cache_io$'): cache.append(observation())
+        after = {str(p.relative_to(cache.root)): p.read_bytes() for p in cache.root.rglob('*') if p.is_file()}
+        assert after == before
+        assert len(cache._directories()) == 1
+
+
+def test_published_disk_guard_exact_budget_and_one_byte_below(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+    from rquant.l2 import cache as module
+    from rquant.l2.models import RawL2Batch
+    cache = module.RawL2Cache(tmp_path / 'cache')
+    fixed = datetime(2026, 10, 19, 3, tzinfo=UTC)
+    class FixedClock(datetime):
+        @classmethod
+        def now(cls, tz: tzinfo | None = None) -> datetime: return fixed
+    monkeypatch.setattr(module, 'datetime', FixedClock)
+    data = observation()
+    payload = RawL2Batch.model_validate({**data.model_dump(mode='python'),
+        'local_batch_sequence': 1, 'cached_at': fixed}).model_dump_json().encode() + b'\n'
+    minimum = 5 * 1024**3 + len(payload) + 65 + 1024**2
+    with cache.writer():
+        monkeypatch.setattr(module.os, 'statvfs', lambda path: SimpleNamespace(f_frsize=1, f_bavail=minimum - 1))
+        with pytest.raises(module.CacheError, match='^cache_io$'): cache.append(data)
+        assert list((cache.root / 'batches').iterdir()) == []
+        monkeypatch.setattr(module.os, 'statvfs', lambda path: SimpleNamespace(f_frsize=1, f_bavail=minimum))
+        assert cache.append(data).local_batch_sequence == 1
+
+
+@pytest.mark.parametrize('fault', ['directory_symlink', 'batch_symlink', 'sha_directory'])
+def test_published_tail_defers_unrequested_unsafe_history_to_replay_or_audit(
+        tmp_path: Path, fault: str) -> None:
+    from rquant.l2.cache import CacheError, RawL2Cache
+    cache = RawL2Cache(tmp_path / 'cache')
+    with cache.writer():
+        cache.append(observation()); cache.append(observation())
+    first = cache.root / 'batches' / f'{1:020d}'
+    if fault == 'directory_symlink':
+        held = cache.root / 'held'; first.rename(held); first.symlink_to(held, target_is_directory=True)
+    elif fault == 'batch_symlink':
+        held = first / 'held.json'; (first / 'batch.json').rename(held); (first / 'batch.json').symlink_to(held)
+    else:
+        (first / 'sha256').unlink(); (first / 'sha256').mkdir()
+    assert RawL2Cache(cache.root).read_batches(after_sequence=2).next_sequence == 2
+    with pytest.raises(CacheError): RawL2Cache(cache.root).read_batches(after_sequence=0)
+    with pytest.raises(CacheError): RawL2Cache(cache.root)._directories()
+    with pytest.raises(CacheError):
+        with RawL2Cache(cache.root).writer(): pytest.fail('unsafe old prefix passed recovery')
+
+
+def test_published_full_audit_ignores_only_exact_head_name(tmp_path: Path) -> None:
+    from rquant.l2.cache import CacheError, RawL2Cache
+    cache = RawL2Cache(tmp_path / 'cache')
+    with cache.writer(): cache.append(observation())
+    (cache.root / 'batches' / '.head-copy').write_bytes(b'unknown entry')
+    with pytest.raises(CacheError, match='invalid_cache'): cache._directories()
+
+
+@pytest.mark.parametrize('name', ['status.json', 'subscription-status.json'])
+def test_mutable_snapshot_replacement_between_lstat_and_open_is_valid(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str) -> None:
+    from rquant.l2 import cache as module
+    from rquant.l2.models import FeedStatus, SubscriptionReceipt
+    cache = module.RawL2Cache(tmp_path / 'cache')
+    original = module.os.open
+    fired = False
+    with cache.writer():
+        if name == 'status.json':
+            cache.write_status(FeedStatus(state='connected', heartbeat_count=1))
+            updated = FeedStatus(state='connected', heartbeat_count=2)
+        else:
+            cache.write_subscription_status(SubscriptionReceipt(
+                epoch_id='snapshot_race', desired_revision=1, collector_state='connected', streams=()))
+            updated = SubscriptionReceipt(epoch_id='snapshot_race', desired_revision=2,
+                                          collector_state='connected', streams=())
+
+        def interleaved(path: str | Path, flags: int, *args: int, **kwargs: int) -> int:
+            nonlocal fired
+            if Path(path) == cache.root / name and not fired:
+                fired = True
+                module._replace_snapshot(cache.root, name, updated.model_dump_json().encode() + b'\n')
+            return original(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(module.os, 'open', interleaved)
+        reader = module.RawL2Cache(cache.root)
+        if name == 'status.json':
+            assert reader.read_runtime_status().heartbeat_count == 2
+        else:
+            assert reader.read_subscription_status().desired_revision == 2
+        assert fired
