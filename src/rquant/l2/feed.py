@@ -425,7 +425,9 @@ class FeedCollector:
                 quantum_frames = quantum_bytes = 0
                 quantum_started = self.clock()
             received_at = datetime.now(UTC)
-            self._update(last_transport_received_at=received_at)
+            # Commit transport with the frame's outcome; a separate status fsync
+            # delays pending seeds while already registered streams are active.
+            self.status = self.status.model_copy(update={"last_transport_received_at": received_at})
             control_kind = _control_kind(body)
             if control_kind is not None:
                 if control_kind == "heartbeat":

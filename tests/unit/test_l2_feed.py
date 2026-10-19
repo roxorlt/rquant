@@ -4,9 +4,12 @@ from __future__ import annotations
 import socket
 import struct
 import json
+from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
 
 import pytest
+
+from rquant.l2.models import FeedStatus, MarketObservation
 
 from tests.unit.test_l2_codec import bootstrap, frame, module, response, template
 
@@ -676,6 +679,108 @@ def test_more_than_32_valid_pushes_do_not_abort_pending_seed(tmp_path):
     assert status.error_code == 'duration_limit'
     assert len(provider.business) == 6 and status.market_batch_count == 46
     assert len(calls) == 1 and provider.closed
+
+
+def test_status_io_does_not_starve_an_already_queued_pending_seed(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = Clock(); provider = ManyPushProvider(clock, count=200)
+    obj, cache, calls = collector(tmp_path, provider, clock, duration_seconds=100)
+    write_status = cache.write_status
+
+    def delayed_status(status: FeedStatus) -> None:
+        write_status(status)
+        clock.sleep(.04)
+
+    monkeypatch.setattr(cache, 'write_status', delayed_status)
+    status = obj.run()
+    assert status.error_code == 'duration_limit'
+    assert len(provider.business) == 6 and status.market_batch_count == 206
+    assert len(calls) == 1 and provider.closed
+    assert all(b[0] - a[0] >= 1 for a, b in zip(provider.business, provider.business[1:]))
+
+
+@pytest.mark.parametrize('kind', ['market', 'heartbeat', 'ack', 'control', 'no_data'])
+def test_one_frame_persists_transport_with_its_market_or_control_status(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str) -> None:
+    feed = module('feed')
+    from rquant.l2.models import Binding
+
+    clock = Clock(); provider = Provider(clock)
+    obj, cache, _ = collector(tmp_path, provider, clock)
+    binding = Binding(page_id=10117, kind='vendor4013', code='603258', market=17)
+    bodies = {'market': response(trade=True, request_id=3, page_id=10117, code='603258'),
+              'heartbeat': b'', 'ack': control(auth=True)[13:], 'control': control()[13:],
+              'no_data': NO_DATA_4013}
+    obj.status = FeedStatus(state='connected', epoch_id='one_frame')
+    obj.registered[binding.page_id] = obj.issued[3] = binding
+    obj._deadline = clock() + 30
+    obj.reader = feed.FrameReader(Socket([frame(bodies[kind])], clock), clock=clock)
+    snapshots = []
+    write_status = cache.write_status
+
+    def recorded_status(status: FeedStatus) -> None:
+        snapshots.append(status)
+        write_status(status)
+
+    with cache.writer():
+        monkeypatch.setattr(cache, 'write_status', recorded_status)
+        obj._receive(clock() + feed.MAX_SECONDS,
+                     pending=3 if kind in {'market', 'no_data'} else None,
+                     await_ack=kind == 'ack')
+        stored = cache.read_status()
+    assert len(snapshots) == 1
+    assert stored.last_transport_received_at is not None
+    assert stored.last_sequence == (1 if kind == 'market' else 0)
+    assert stored.control_count == (1 if kind in {'ack', 'control', 'no_data'} else 0)
+    assert stored.heartbeat_count == (1 if kind == 'heartbeat' else 0)
+    assert (stored.last_market_received_at == stored.last_transport_received_at) == (kind == 'market')
+
+
+@pytest.mark.parametrize('fault,error', [('id', 'association_mismatch'), ('flags', 'decode_error'),
+                                        ('side', 'order_side_mismatch'), ('cache', 'cache_error')])
+def test_rejected_frame_persists_latest_transport_and_gap(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str, error: str) -> None:
+    feed = module('feed')
+    clock = Clock(); provider = Provider(clock, fault='' if fault == 'cache' else fault)
+    obj, cache, calls = collector(tmp_path, provider, clock, max_reconnects=2)
+    received = []
+
+    class ReceiptClock(datetime):
+        @classmethod
+        def now(cls, tz: tzinfo | None = None) -> datetime:
+            value = datetime(2026, 10, 19, 1, 30, tzinfo=UTC) + timedelta(seconds=len(received))
+            received.append(value)
+            return value
+
+    monkeypatch.setattr(feed, 'datetime', ReceiptClock)
+    if fault == 'cache':
+        def rejected_append(observation: MarketObservation) -> None:
+            raise OSError('synthetic cache commit failure')
+        monkeypatch.setattr(cache, 'append', rejected_append)
+    status = obj.run()
+    persisted = cache.read_status()
+    assert status.state == persisted.state == 'blocked' and persisted.gap
+    assert status.error_code == persisted.error_code == error
+    assert len(received) >= 2 and persisted.last_transport_received_at == received[-1]
+    assert len(calls) == 1 and provider.closed and status.reconnect_attempts == 0
+
+
+def test_status_write_failure_still_closes_without_claiming_a_durable_snapshot(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = Clock(); provider = Provider(clock)
+    obj, cache, calls = collector(tmp_path, provider, clock)
+    write_status = cache.write_status
+
+    def rejected_market_status(status: FeedStatus) -> None:
+        if status.last_transport_received_at is not None:
+            raise OSError('synthetic status storage failure')
+        write_status(status)
+
+    monkeypatch.setattr(cache, 'write_status', rejected_market_status)
+    status = obj.run()
+    assert status.state == 'blocked' and status.gap and status.error_code == 'cache_error'
+    assert len(calls) == 1 and provider.closed and status.reconnect_attempts == 0
+    assert cache.read_status().last_transport_received_at is None
 
 
 @pytest.mark.parametrize('size', [20, 40, 80, 100])
