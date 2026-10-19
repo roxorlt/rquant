@@ -87,6 +87,7 @@ class _Day:
         self.last_time: str | None = None
         self.max_slot = -1
         self.landed: dict[str, int] = {}  # collector run -> max delta seq inside folded shards
+        self.late_dropped = 0  # rows not newer than the code's carry row (see fold)
 
     def clone(self) -> _Day:
         """A copy for folding provisional deltas (the official state is never touched)."""
@@ -99,6 +100,7 @@ class _Day:
         c.sector_names, c.sec_ix, c.sectors = self.sector_names, self.sec_ix, self.sectors
         c.carry, c.last_time, c.max_slot = self.carry, self.last_time, self.max_slot
         c.landed = dict(self.landed)
+        c.late_dropped = self.late_dropped
         return c
 
     def _ensure(self, codes: np.ndarray, names: np.ndarray) -> np.ndarray:
@@ -127,9 +129,23 @@ class _Day:
             return
         df = df.assign(_new=True)
         if self.carry is not None:
+            # Late rows (flowfix 2026-10-19): the collector's sources (ts_k/sina/ts_tick) can put a
+            # row for a code into a LATER chunk than a newer row already folded (e.g. sina 11:29:59
+            # after ts_k 11:30:00). Sorted ahead of the carry row it used to become the code's
+            # "first row of the day" and re-count all turnover to date. amount is cumulative, so a
+            # row not newer than the carry adds nothing: drop it.
+            last_t = dict(zip(self.carry["ts_code"], self.carry["time"], strict=True))
+            ct = df["ts_code"].map(last_t)
+            df = df[~(ct.notna() & (df["time"] <= ct)).to_numpy()]
+            self.late_dropped += int(len(ct) - len(df))
+            if df.empty:
+                return
             df = pd.concat([self.carry.assign(_new=False), df], ignore_index=True)
         df = df.sort_values(["ts_code", "time"], kind="stable").reset_index(drop=True)
         same = df["ts_code"].eq(df["ts_code"].shift())
+        # cumulative turnover never goes back: a stale source within a chunk must not make the
+        # next row re-count the difference
+        df["amount"] = df.groupby("ts_code", sort=False)["amount"].cummax()
         p_amt = df["amount"].shift().where(same)
         p_px = df["price"].shift().where(same)
         p_a1 = df["a1_p"].shift().where(same)
