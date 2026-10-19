@@ -145,13 +145,26 @@ def core_deployed(paths: Paths, command: Command, health: Callable[[], dict[str,
         raise DeployError("core_not_deployed") from None
 
 
+def archive_unit_view(unit: str, command: Command) -> dict[str, str]:
+    if unit != UNITS[1]:
+        return core.system_view(unit, command)
+    result = command([SYSTEMCTL, "show", unit,
+        "--property=LoadState,FragmentPath,DropInPaths,ActiveState"])
+    lines = result.splitlines()
+    values = dict(line.split("=", 1) for line in lines if "=" in line)
+    if (len(lines) != 4 or set(values) != {"LoadState", "FragmentPath", "DropInPaths", "ActiveState"}
+            or not values["LoadState"] or not values["ActiveState"]):
+        raise DeployError("unit_inspection_failed")
+    return values
+
+
 def archive_units(paths: Paths, manifest: dict[str, Any] | None, command: Command, *, idle: bool = True) -> dict[str, dict[str, str]]:
-    views = {unit: core.system_view(unit, command) for unit in UNITS}
+    views = {unit: archive_unit_view(unit, command) for unit in UNITS}
     for unit, view in views.items():
         file = paths.core.units / unit
         if manifest is None:
             if (view["LoadState"] != "not-found" or view["FragmentPath"] or view["DropInPaths"]
-                    or file.exists() or file.is_symlink() or view["MainPID"] != "0"):
+                    or file.exists() or file.is_symlink() or (unit == UNITS[0] and view["MainPID"] != "0")):
                 raise DeployError("foreign_archive_unit")
         else:
             info = file.lstat()
@@ -346,9 +359,9 @@ def deploy(args: argparse.Namespace, *, paths: Paths = Paths(), api: Callable[[s
                     else:
                         for unit in reversed(UNITS):
                             file = paths.core.units / unit
-                            view = core.system_view(unit, command)
+                            view = archive_unit_view(unit, command)
                             absent = (view["LoadState"] == "not-found" and not view["FragmentPath"]
-                                and not view["DropInPaths"] and view["MainPID"] == "0"
+                                and not view["DropInPaths"] and (unit == UNITS[1] or view["MainPID"] == "0")
                                 and view["ActiveState"] in {"inactive", "failed"})
                             if not file.exists() and not file.is_symlink():
                                 if not absent: raise DeployError("archive_cleanup_changed")
