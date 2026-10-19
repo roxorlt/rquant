@@ -30,7 +30,7 @@ def _version() -> str:
 
 
 def create_app(source: Source | None = None, dist: Path | None = DIST,
-               research_root: Path | None = None) -> FastAPI:
+               research_root: Path | None = None, l2_cache_root: Path | None = None) -> FastAPI:
     app = FastAPI(title="rQuant web API", version=_version())
     #: portfolio backtest results (files); None → $RQUANT_RESEARCH_ROOT or data/research
     app.state.research_root = research_root
@@ -58,9 +58,19 @@ def create_app(source: Source | None = None, dist: Path | None = DIST,
         return JSONResponse({"detail": f"数据暂不可用：{exc}"}, status_code=503)
 
     app.include_router(router)
+    l2_router = None
+    raw_root = l2_cache_root or os.environ.get("RQUANT_L2_RAW_ROOT")
+    if raw_root:
+        from rquant.l2.cache import RawL2Cache
+        from rquant.web.l2 import router as l2_router
+
+        app.state.l2_cache = RawL2Cache(Path(raw_root))
+        app.include_router(l2_router)
     if dist is not None and (dist / "index.html").is_file():
         # The page calls <page dir>/api/v1/... (nginx maps /app/api/ -> /api/ in production).
         app.include_router(router, prefix="/app", include_in_schema=False)
+        if l2_router is not None:
+            app.include_router(l2_router, prefix="/app", include_in_schema=False)
         app.mount("/app", StaticFiles(directory=dist, html=True), name="app")
 
         @app.get("/", include_in_schema=False)

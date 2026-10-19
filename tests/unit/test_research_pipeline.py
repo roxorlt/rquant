@@ -39,6 +39,20 @@ def _seed(root, days=420, n=40):
 
 def test_screens_and_daily_job_populate_research_root(tmp_path, monkeypatch):
     monkeypatch.setenv("RQUANT_RESEARCH_ROOT", str(tmp_path))
+    monkeypatch.setenv("TUSHARE_TOKEN_MAIN", "0" * 32)
+    risk_calls = []
+
+    class SyntheticPro:
+        def __init__(self, token: str) -> None:
+            assert token == "0" * 32
+
+        def __call__(self, api: str, **kwargs: object) -> pd.DataFrame:
+            risk_calls.append(api)
+            if api == "stock_st":
+                return pd.DataFrame({"ts_code": ["600000.SH"], "type_name": ["ST"]})
+            return pd.DataFrame()
+
+    monkeypatch.setattr(ingest, "Pro", SyntheticPro)
     idx = _seed(tmp_path)
     con = ingest.connect(tmp_path)
     assert screens.build(con, idx[150].date(), idx[-1].date()) > 0
@@ -49,8 +63,16 @@ def test_screens_and_daily_job_populate_research_root(tmp_path, monkeypatch):
     assert "mom20-top10" in {getattr(s, "slug", s) for s in list_strategies(tmp_path)}
     assert len(list_factors(tmp_path)) == len(daily.FACTORS)
     assert (tmp_path / "data_audit" / "latest.json").exists()
+    risk_query = "SELECT trade_date, ts_code, flag FROM risk_flags_daily WHERE flag = 'st'"
+    expected_risk = [(idx[-1].date(), "600000.SH", "st")]
+    with ingest.connect(tmp_path, read_only=True) as con:
+        assert con.execute(risk_query).fetchall() == expected_risk
+    assert risk_calls.count("stock_st") == 1
     daily.run(ingest=False)  # idempotent
     assert len(list_factors(tmp_path)) == len(daily.FACTORS)
+    with ingest.connect(tmp_path, read_only=True) as con:
+        assert con.execute(risk_query).fetchall() == expected_risk
+    assert risk_calls.count("stock_st") == 2
     from rquant.factor.condition import list_conditions
     from rquant.research import paper
 

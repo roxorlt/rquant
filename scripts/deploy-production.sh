@@ -5,6 +5,14 @@ PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON_BIN="${RQUANT_DEPLOY_PYTHON:-${PROJECT_DIR}/.venv/bin/python}"
 UV_BIN="${RQUANT_DEPLOY_UV:-}"
 
+if [[ "${1:-}" == "--component" ]]; then
+    if [[ "${2:-}" != "l2" ]]; then
+        printf 'Unsupported deployment component\n' >&2
+        exit 2
+    fi
+    shift 2
+    exec /usr/bin/python3.11 -I -S "${PROJECT_DIR}/scripts/deploy-l2-component.py" "$@"
+fi
 if [[ ! -x "${PYTHON_BIN}" ]]; then
     printf 'Deployment Python is not executable: %s\n' "${PYTHON_BIN}" >&2
     exit 2
