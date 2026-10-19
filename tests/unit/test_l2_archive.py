@@ -1,4 +1,4 @@
-"""Synthetic archive integrity tests. No remote or member-session access."""
+"""Offline archive integrity tests. No remote or member-session access."""
 
 from __future__ import annotations
 
@@ -151,6 +151,63 @@ def test_roundtrip_multidate_without_local_progress_and_zero_put_retry(
     assert len(client.puts) == before
     assert all(none == "*" for key, match, none in client.puts if key != PREFIX + "/catalog.json")
     assert client.puts[0][2] == "*" and client.puts[-1][1] is not None
+
+
+def test_actual_763_row_trade_push_archive_restore_preserves_old_batch_and_full_hashes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.l2._codec import decode_trade_response
+    from rquant.l2.models import Binding, MarketObservation, RawL2Batch
+
+    body = (Path(__file__).parents[1] / "fixtures" / "l2_trade_push_763.bin").read_bytes()
+    body_sha = "f7c0734e1de817820745374ca311dab9ca936a52706179b89a9dd85d5f78024b"
+    table_sha = "43be6a8dc34261bafa8e546c09b76ec590b021aff34687c2d6092869b59d4ffb"
+    row_sha = "5b967e2cdd8a92581e0be872c9971b28955bab09dbc86bd5b8f6dd785b7f59c6"
+    assert hashlib.sha256(body).hexdigest() == body_sha
+    decoded = decode_trade_response(body, request_id=0xFFFFFFFF, page_id=10237,
+                                    code="601899", market=17, source_fd_ordinal=4953)
+    observed = MarketObservation(
+        epoch_id="epoch_0",
+        binding=Binding(page_id=10237, kind="vendor4013", code="601899", market=17),
+        received_at=dt.datetime(2026, 10, 14, 7, 0, 1, tzinfo=dt.UTC),
+        request_id=0xFFFFFFFF, source_fd_ordinal=4953, delivery="candidate_push",
+        response_body_hex=body.hex(), raw_table_hex=decoded["raw_table"].hex(),
+        table=decoded["table"], response_sha256=decoded["response_sha256"],
+    )
+    a, client, cache = archive(), FakeR2(), source(tmp_path, 1)
+    with cache.writer():
+        cache.append(observed)
+        cache.write_status(FeedStatus(state="stopped", gap=True, epoch_id="epoch_0"))
+    expected = b"".join(b.model_dump_json().encode() + b"\n"
+                        for b in cache.read_batches(limit=2).batches)
+    before = {p.relative_to(cache.root): hashlib.sha256(p.read_bytes()).hexdigest()
+              for p in cache.root.rglob("*") if p.is_file()}
+
+    def deny_writer(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("archive attempted to acquire the source cache writer")
+
+    monkeypatch.setattr(cache, "writer", deny_writer)
+    state = tmp_path / "archive-state"
+    a.initialize(cache, state, client=client, prefix=PREFIX)
+    archived = a.run_archive(cache, state, client=client, prefix=PREFIX, now=NOW)
+    assert archived.status == "archived" and archived.last_sequence == 2
+    destination = tmp_path / "restored"
+    fetched = a.fetch_archive("2026-10-14", destination, client=client, prefix=PREFIX)
+    assert fetched.status == "fetched" and fetched.records == 2
+    restored = (destination / "batches.jsonl").read_bytes()
+    assert hashlib.sha256(restored).hexdigest() == hashlib.sha256(expected).hexdigest()
+    batches = [RawL2Batch.model_validate_json(line) for line in restored.splitlines()]
+    assert [b.local_batch_sequence for b in batches] == [1, 2]
+    assert batches[0].table.row_count == 1
+    assert batches[1].table.row_count == len(batches[1].table.rows) == 763
+    assert batches[1].response_sha256 == body_sha
+    assert batches[1].table.source_sha256 == table_sha
+    assert batches[1].table.row_data_sha256 == row_sha
+    puts = len(client.puts)
+    assert a.run_archive(cache, state, client=client, prefix=PREFIX, now=NOW).status == "unchanged"
+    assert len(client.puts) == puts
+    assert before == {p.relative_to(cache.root): hashlib.sha256(p.read_bytes()).hexdigest()
+                      for p in cache.root.rglob("*") if p.is_file()}
 
 
 @pytest.mark.parametrize("fault", ["missing", "sha", "type"])

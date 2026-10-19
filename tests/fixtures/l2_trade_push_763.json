@@ -1,0 +1,15 @@
+{
+  "schema": "market-only-trade-push-fixture-v1",
+  "received_date": "2026-10-19",
+  "body_bytes": 4543,
+  "body_sha256": "f7c0734e1de817820745374ca311dab9ca936a52706179b89a9dd85d5f78024b",
+  "binding": {"kind": "vendor4013", "code": "601899", "market": 17, "page_id": 10237},
+  "request_id": 4294967295,
+  "command": 2357,
+  "table_version": "tb3.0",
+  "row_count": 763,
+  "row_width": 66,
+  "table_sha256": "43be6a8dc34261bafa8e546c09b76ec590b021aff34687c2d6092869b59d4ffb",
+  "row_data_sha256": "5b967e2cdd8a92581e0be872c9971b28955bab09dbc86bd5b8f6dd785b7f59c6",
+  "provenance": "Root extracted one complete market response after strict TCP/frame reconstruction and immutable registered-request/page binding checks. No authentication, bootstrap, control frame or full packet capture is included."
+}
