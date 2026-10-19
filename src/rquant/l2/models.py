@@ -161,7 +161,8 @@ class RawTable(Model):
     source_codec: Literal["snappy"]
     source_sha256: Sha256
     row_data_sha256: Sha256
-    row_count: Annotated[StrictInt, Field(ge=0, le=500)]
+    row_count: Annotated[StrictInt, Field(ge=0, le=4096,
+        description="Above 500 rows only for a recognized trade sentinel candidate push.")]
     row_width: PositiveInt
     col_count: Annotated[StrictInt, Field(ge=1, le=32)]
     extended_header_length: Annotated[StrictInt, Field(ge=24, le=65535)]
@@ -226,6 +227,13 @@ class MarketObservation(Model):
                 or request != self.request_id or page != self.binding.page_id
                 or command not in allowed_commands or flags not in allowed_flags or size != len(body) - h):
             raise ValueError("market record association mismatch")
+        if self.table.row_count > 500:
+            if not (trade and push_envelope and self.delivery == "candidate_push"):
+                raise ValueError("market row count exceeds profile limit")
+            expected_columns = ((0x2001, 4, 165), (0x38, 30, 165), (0x100A, 4, 165), (0x100D, 4, 165),
+                                (0x104A, 4, 165), (0x104B, 4, 165), (0xA610, 4, 165), (0x1012, 4, 165))
+            if tuple((c.flags, c.width, c.extra) for c in self.table.columns) != expected_columns:
+                raise ValueError("unsupported expanded trade table schema")
         layout = (self.table.col_count, self.table.row_width, self.table.title)
         if trade:
             valid_table = (layout == (8, 66, "") and (self.table.table_version == "tb3.0"

@@ -223,7 +223,7 @@ def decode_trade_response(body: bytes, *, request_id: int, page_id: int, code: s
     data = _response_payload(body, request_id=request_id, page_id=page_id,
                              command=2357, allowed_flags=(0x1110, 0x1100, 0x1130))
     version = "tb1.0" if request_id == 0xFFFFFFFF and data[:6] == b"tb1.0\0" else "tb3.0"
-    metadata = _table_metadata(data, version=version, max_rows=500)
+    metadata = _table_metadata(data, version=version, max_rows=4096 if request_id == 0xFFFFFFFF else 500)
     expected_columns = [(0x2001, 4), (0x38, 30), (0x100A, 4), (0x100D, 4),
                         (0x104A, 4), (0x104B, 4), (0xA610, 4), (0x1012, 4)]
     actual_columns = [(int(c["flags_hex"], 16), c["width"]) for c in metadata["columns"]]
