@@ -8,6 +8,7 @@ import hashlib
 import importlib
 import json
 import re
+import shutil
 import socket
 import urllib.error
 from pathlib import Path
@@ -16,7 +17,7 @@ from typing import Any
 
 import pytest
 
-from rquant.l2.cache import RawL2Cache
+from rquant.l2.cache import CacheError, RawL2Cache
 from rquant.l2.models import FeedStatus
 from tests.unit.test_l2_cache import observation
 
@@ -116,8 +117,18 @@ def setup_archive(tmp_path: Path, count: int = 4) -> tuple[ModuleType, FakeR2, R
     return a, client, cache, state
 
 
-def test_roundtrip_multidate_without_local_progress_and_zero_put_retry(tmp_path: Path) -> None:
+def test_roundtrip_multidate_without_local_progress_and_zero_put_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     a, client, cache, state = setup_archive(tmp_path)
+    head = cache.root / "batches" / ".head"
+    assert head.stat().st_ino == (cache.root / "batches" / f"{4:020d}" / "batch.json").stat().st_ino
+
+    def deny_cache_mutation_or_scan(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("published-head archive must read only its fixed batch range")
+
+    monkeypatch.setattr(cache, "writer", deny_cache_mutation_or_scan)
+    monkeypatch.setattr(cache, "_directories", deny_cache_mutation_or_scan)
     receipt = a.run_archive(cache, state, client=client, prefix=PREFIX, now=NOW)
     assert receipt.status == "archived" and receipt.last_sequence == 4
     assert a.check_archive(client=client, prefix=PREFIX).last_sequence == 4
@@ -140,6 +151,73 @@ def test_roundtrip_multidate_without_local_progress_and_zero_put_retry(tmp_path:
     assert len(client.puts) == before
     assert all(none == "*" for key, match, none in client.puts if key != PREFIX + "/catalog.json")
     assert client.puts[0][2] == "*" and client.puts[-1][1] is not None
+
+
+@pytest.mark.parametrize("fault", ["missing", "sha", "type"])
+def test_published_head_new_interval_fault_never_advances_catalog(
+    tmp_path: Path, fault: str
+) -> None:
+    a, client, cache, state = setup_archive(tmp_path)
+    catalog_key = PREFIX + "/catalog.json"
+    before = client.objects[catalog_key]
+    directory = cache.root / "batches" / f"{2:020d}"
+    if fault == "missing":
+        shutil.rmtree(directory)
+    elif fault == "sha":
+        (directory / "sha256").write_text("0" * 64 + "\n")
+    else:
+        (directory / "batch.json").unlink()
+        (directory / "batch.json").mkdir(mode=0o700)
+    # H is valid and does not inspect the unselected middle batch. The archive
+    # must still validate every newly included record before publishing progress.
+    assert cache.read_status().last_sequence == 4
+    before_puts = len(client.puts)
+    with pytest.raises(CacheError):
+        a.run_archive(cache, state, client=client, prefix=PREFIX, now=NOW)
+    assert client.objects[catalog_key] == before
+    assert all(key != catalog_key for key, _, _ in client.puts[before_puts:])
+
+
+@pytest.mark.parametrize("fault", ["symlink", "copied_inode", "sha"])
+def test_invalid_published_head_fails_before_archive_upload(tmp_path: Path, fault: str) -> None:
+    a, client, cache, state = setup_archive(tmp_path)
+    head = cache.root / "batches" / ".head"
+    last = cache.root / "batches" / f"{4:020d}"
+    if fault == "sha":
+        (last / "sha256").write_text("0" * 64 + "\n")
+    else:
+        payload = head.read_bytes()
+        head.unlink()
+        if fault == "symlink":
+            head.symlink_to(last / "batch.json")
+        else:
+            head.write_bytes(payload)
+            head.chmod(0o600)
+    before_objects, before_puts = dict(client.objects), len(client.puts)
+    with pytest.raises(CacheError):
+        a.run_archive(cache, state, client=client, prefix=PREFIX, now=NOW)
+    assert client.objects == before_objects and len(client.puts) == before_puts
+
+
+def test_legacy_headless_archive_is_read_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    a, client, cache = archive(), FakeR2(), source(tmp_path)
+    head = cache.root / "batches" / ".head"
+    head.unlink()
+    before = {p.relative_to(cache.root): p.read_bytes() for p in cache.root.rglob("*") if p.is_file()}
+
+    def deny_writer(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("legacy archive must not acquire a cache writer")
+
+    monkeypatch.setattr(RawL2Cache, "writer", deny_writer)
+    state = tmp_path / "archive-state"
+    a.initialize(cache, state, client=client, prefix=PREFIX)
+    assert a.run_archive(cache, state, client=client, prefix=PREFIX, now=NOW).last_sequence == 4
+    fetched = a.fetch_archive("2026-10-14", tmp_path / "restored", client=client, prefix=PREFIX)
+    assert fetched.records == 2
+    assert not head.exists()
+    assert before == {p.relative_to(cache.root): p.read_bytes() for p in cache.root.rglob("*") if p.is_file()}
 
 
 def test_fixed_highwater_does_not_decode_later_append(
