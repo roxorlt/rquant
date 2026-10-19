@@ -4,7 +4,7 @@ import hashlib
 import json
 import struct
 from collections.abc import Iterator
-from datetime import UTC, datetime, timedelta, tzinfo
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 
 import pytest
@@ -41,6 +41,62 @@ def observed_trade_push_data(body=OBSERVED_TRADE_PUSH):
         "response_body_hex": body.hex(), "raw_table_hex": raw_table.hex(),
         "response_sha256": hashlib.sha256(body).hexdigest(), "table": table,
     }
+
+
+def test_date_validators_do_not_run_on_raw_cell_fields():
+    import sys
+    from rquant.l2.models import Model, RawCell
+
+    date_callbacks = {Model.reject_numeric_datetime.__func__.__code__, Model.require_utc.__func__.__code__}
+    calls = []
+    previous = sys.getprofile()
+    def record(frame, event, arg):
+        if event == "call" and frame.f_code in date_callbacks:
+            calls.append(frame.f_code.co_name)
+    try:
+        sys.setprofile(record)
+        cell = RawCell.model_validate({"value": "123", "raw_hex": "7b000000", "style": 255})
+    finally:
+        sys.setprofile(previous)
+    assert cell.value == "123" and cell.raw_hex == "7b000000" and cell.style == 255
+    assert calls == []
+    for invalid in ({"value": True}, {"raw_hex": "xyz"}, {"style": 256}):
+        with pytest.raises(ValueError):
+            RawCell.model_validate({"value": "123", "raw_hex": "7b000000", "style": 255, **invalid})
+
+
+@pytest.mark.parametrize("field", ["received_at", "cached_at", "last_transport_received_at",
+                                   "last_market_received_at", "seed_received_at"])
+@pytest.mark.parametrize("value,valid", [
+    (datetime(2026, 10, 19, tzinfo=UTC), True),
+    ("2026-10-19T00:00:00Z", True),
+    (0, False), (0.0, False),
+    (datetime(2026, 10, 19), False),
+    (datetime(2026, 10, 19, tzinfo=timezone(timedelta(hours=8))), False),
+    (None, True),
+])
+def test_date_validators_preserve_all_current_datetime_fields(field, value, valid):
+    from rquant.l2.models import FeedStatus, MarketObservation, RawL2Batch, SubscriptionStream
+
+    if field in {"received_at", "cached_at"}:
+        data = observed_trade_push_data()
+        model = MarketObservation if field == "received_at" else RawL2Batch
+        if field == "cached_at":
+            data.update(local_batch_sequence=1, cached_at=datetime(2026, 10, 19, tzinfo=UTC))
+        data[field] = value
+        valid = valid and value is not None
+    elif field == "seed_received_at":
+        model = SubscriptionStream
+        data = {"binding": {"page_id": 10117, "kind": "vendor4013", "code": "603258", "market": 17},
+                "state": "sent" if value is None else "seeded", "request_id": 3,
+                "seed_sequence": None if value is None else 1, field: value}
+    else:
+        model, data = FeedStatus, {field: value}
+    if valid:
+        assert getattr(model.model_validate(data), field) == (None if value is None else datetime(2026, 10, 19, tzinfo=UTC))
+    else:
+        with pytest.raises(ValueError):
+            model.model_validate(data)
 
 
 def test_market_model_observed_h26_push_retains_bytes_and_cache_roundtrip(tmp_path: Path):
