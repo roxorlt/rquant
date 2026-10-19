@@ -1835,7 +1835,12 @@ export interface components {
             /** Spark */
             spark: (number | null)[];
         };
-        /** FlowSummary */
+        /**
+         * FlowSummary
+         * @description Top cards. No market-wide net (2026-10-20, roxor): the sum of the tick-rule estimate over all
+         *     stocks is "active buy - active sell since the open", not a market net inflow, so it is no longer
+         *     served. See docs/数据口径核实-20261019.md §6.
+         */
         FlowSummary: {
             /** Amount */
             amount: number;
@@ -1845,8 +1850,18 @@ export interface components {
             limit_down: number;
             /** Limit Up */
             limit_up: number;
-            /** Net */
-            net: number;
+            /** Prev Date */
+            prev_date?: string | null;
+            /** Prev Turnover */
+            prev_turnover?: number | null;
+            /** Turnover */
+            turnover?: number | null;
+            /** Turnover Chg */
+            turnover_chg?: number | null;
+            /** Turnover Chg Pct */
+            turnover_chg_pct?: number | null;
+            /** Turnover Source */
+            turnover_source?: string | null;
             /** Up */
             up: number;
         };

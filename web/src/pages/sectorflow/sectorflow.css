@@ -19,7 +19,7 @@
 }
 .sf-stats {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(3, 1fr);
   gap: 10px;
   margin: 4px 0 12px;
 }
@@ -43,6 +43,10 @@
 .sf-stat .sl {
   color: var(--sf-mute);
   font-weight: 400;
+}
+.sf-chg {
+  font-size: 12px;
+  font-weight: 600;
 }
 .sf-ud {
   display: flex;
@@ -566,6 +570,9 @@
 }
 .sf-phone .sf-stat .v {
   font-size: 16px;
+}
+.sf-phone .sf-turn {
+  grid-column: 1 / -1;
 }
 .sf-phone .sf-grid {
   display: flex;

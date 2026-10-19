@@ -15,6 +15,7 @@ import {
   defaultSelection,
   fmtAmountYi,
   fmtPct,
+  fmtTurnoverChg,
   fmtValue,
   fmtYi,
   type Mode,
@@ -111,14 +112,7 @@ function Body({
     <>
       {sm ? (
         <div className="sf-stats">
-          <div className="sf-stat">
-            <span className="k">两市成交额</span>
-            <span className="v">{fmtAmountYi(sm.amount)}</span>
-          </div>
-          <div className="sf-stat">
-            <span className="k">全市场估算净流入</span>
-            <span className={`v ${tone(sm.net)}`}>{fmtYi(sm.net / 1e8)}</span>
-          </div>
+          <TurnoverCard sm={sm} />
           <div className="sf-stat">
             <span className="k">上涨 / 下跌</span>
             <span className="v">
@@ -274,6 +268,29 @@ function Body({
         {data.t.length} 个时点
       </p>
     </>
+  );
+}
+
+/** 两市成交额 (沪深京全 A, 含北交所) + change vs the previous open day; replaces the old
+ *  "全市场估算净流入" card (the summed tick-rule estimate is not a market net inflow). */
+function TurnoverCard({ sm }: { sm: NonNullable<SectorFlowData["summary"]> }) {
+  const yi = sm.turnover ?? sm.amount / 1e8;
+  const chg = fmtTurnoverChg(sm.turnover_chg, sm.turnover_chg_pct);
+  const snap = sm.turnover_source === "snapshot_last";
+  const src = snap ? "快照末笔累计（Tushare 日线未入库）" : "Tushare 日线合计";
+  const prev =
+    sm.prev_turnover != null
+      ? `；上一交易日 ${sm.prev_date ?? ""} ${sm.prev_turnover.toFixed(1)}亿`
+      : "";
+  return (
+    <div
+      className="sf-stat sf-turn"
+      title={`沪深京全 A 成交额（含北交所）${yi.toFixed(1)}亿，来源：${src}${prev}`}
+    >
+      <span className="k">两市成交额{snap ? " · 快照" : ""}</span>
+      <span className="v">{fmtAmountYi(yi * 1e8)}</span>
+      {chg ? <span className={`sf-chg ${tone(sm.turnover_chg)}`}>{chg}</span> : null}
+    </div>
   );
 }
 

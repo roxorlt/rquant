@@ -51,6 +51,17 @@ export function fmtAmountYi(cny: number): string {
   return yi >= 10000 ? `${(yi / 10000).toFixed(2)}万亿` : `${yi.toFixed(0)}亿`;
 }
 
+/** 两市成交额 card sub-line: "较昨 +X亿（+Y%）" (change vs the previous open day, 亿 CNY / %). */
+export function fmtTurnoverChg(
+  chg: number | null | undefined,
+  pct: number | null | undefined,
+): string | null {
+  if (chg == null) return null;
+  const sign = (v: number) => (v > 0 ? "+" : "");
+  const p = pct == null ? "" : `（${sign(pct)}${pct.toFixed(1)}%）`;
+  return `较昨 ${sign(chg)}${chg.toFixed(1)}亿${p}`;
+}
+
 /** Default lines: top-k inflow + top-k outflow by net now. */
 export function defaultSelection(sectors: Sector[], k: number): string[] {
   const ins = sectors.filter((s) => s.net > 0).slice(0, k);

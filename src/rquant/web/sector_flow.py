@@ -219,12 +219,22 @@ class FlowLeader(BaseModel):
 
 
 class FlowSummary(BaseModel):
-    amount: float
-    net: float
+    """Top cards. No market-wide net (2026-10-20, roxor): the sum of the tick-rule estimate over all
+    stocks is "active buy - active sell since the open", not a market net inflow, so it is no longer
+    served. See docs/数据口径核实-20261019.md §6."""
+
+    amount: float  # CNY, Σ snapshot cumulative turnover (last row per code)
     up: int
     down: int
     limit_up: int
     limit_down: int
+    # 两市成交额 (沪深京全 A, 含北交所, same as docs/flowfix/turnover_daily.csv), 亿 CNY
+    turnover: float | None = None
+    turnover_source: str | None = None  # "tushare_daily" | "snapshot_last" | None
+    prev_date: str | None = None  # previous open day per trade_calendar
+    prev_turnover: float | None = None  # 亿 CNY, Tushare daily (daily_bar) of prev_date
+    turnover_chg: float | None = None  # 亿 CNY, turnover - prev_turnover
+    turnover_chg_pct: float | None = None  # %, turnover_chg / prev_turnover * 100
 
 
 class SectorFlowData(BaseModel):
@@ -352,6 +362,74 @@ def _update(root: Path, day: str) -> _Day | None:
     return st
 
 
+_TURN: dict[tuple[str, str], tuple[float, float | None]] = {}  # (root, day) -> (checked, Σ亿)
+_PREV: dict[tuple[str, str], str | None] = {}  # (root, day) -> previous open day
+TURN_RETRY = 300.0  # s: re-check daily_bar for a day not ingested yet at most this often
+
+
+def _db_turnover(root: Path, day: str) -> float | None:
+    """Tushare daily Σamount for the day, 亿 CNY (daily_bar.amount is 千元). All A shares in
+    daily_bar: 沪 + 深 + 北交所 (the same total as docs/flowfix/turnover_daily.csv
+    tushare_daily_yi). None when the day is not ingested yet."""
+    key = (str(root), day)
+    hit = _TURN.get(key)
+    if hit and (hit[1] is not None or time.time() - hit[0] < TURN_RETRY):
+        return hit[1]
+    try:
+        con = duckdb.connect(str(root / "market.duckdb"), read_only=True)
+        try:
+            n, s = con.execute("SELECT count(*), sum(amount) FROM daily_bar WHERE trade_date = ?",
+                               [_date.fromisoformat(day)]).fetchone()
+        finally:
+            con.close()
+    except duckdb.Error:
+        n, s = 0, None
+    v = round(float(s) * 1e3 / 1e8, 3) if n and s else None
+    if len(_TURN) > 64:
+        _TURN.clear()
+    _TURN[key] = (time.time(), v)
+    return v
+
+
+def _prev_open(root: Path, day: str) -> str | None:
+    """Previous trading day from trade_calendar (the authoritative exchange calendar)."""
+    key = (str(root), day)
+    if key in _PREV:
+        return _PREV[key]
+    try:
+        con = duckdb.connect(str(root / "market.duckdb"), read_only=True)
+        try:
+            row = con.execute("SELECT max(cal_date) FROM trade_calendar WHERE is_open AND cal_date < ?",
+                              [_date.fromisoformat(day)]).fetchone()
+        finally:
+            con.close()
+    except duckdb.Error:
+        return None  # not cached: retry next call
+    out = row[0].isoformat() if row and row[0] else None
+    if len(_PREV) > 64:
+        _PREV.clear()
+    _PREV[key] = out
+    return out
+
+
+def turnover_fields(root: Path, day: str, snapshot_amount: float) -> dict:
+    """两市成交额 card. turnover: Tushare daily total once ingested, else the snapshot total
+    (Σ last cumulative amount per code; intraday = turnover so far); prev_turnover: Tushare daily
+    total of the previous open day (trade_calendar). All 亿 CNY; missing -> None."""
+    tu = _db_turnover(root, day)
+    src = "tushare_daily"
+    if tu is None and snapshot_amount > 0:
+        tu, src = round(snapshot_amount / 1e8, 3), "snapshot_last"
+    elif tu is None:
+        src = None
+    prev = _prev_open(root, day)
+    pt = _db_turnover(root, prev) if prev else None
+    chg = round(tu - pt, 3) if tu is not None and pt else None
+    pct = round(chg / pt * 100, 2) if chg is not None and pt else None
+    return dict(turnover=tu, turnover_source=src, prev_date=prev, prev_turnover=pt,
+                turnover_chg=chg, turnover_chg_pct=pct)
+
+
 MIN_CIRC = 30e8  # leader floor: float cap >= 30亿
 MIN_AMT = 1e8  # and turnover >= 1亿
 
@@ -386,9 +464,10 @@ def _compute(st: _Day, root: Path, day: str, version: str | None = None) -> Sect
     floored = np.isfinite(last) & (last <= dpx + 1e-6) & (st.pre > 0)
     lu_sec = np.bincount(st.sec_of, weights=sealed, minlength=nsec + 1)
     nowp = pctm[:, -1]
-    summary = FlowSummary(amount=float(st.amt.sum()), net=float(cum[:nsec, -1].sum()),
+    summary = FlowSummary(amount=float(st.amt.sum()),
                           up=int((nowp > 0).sum()), down=int((nowp < 0).sum()),
-                          limit_up=int(sealed.sum()), limit_down=int(floored.sum()))
+                          limit_up=int(sealed.sum()), limit_down=int(floored.sum()),
+                          **turnover_fields(root, day, float(st.amt.sum())))
 
     def r(v: float) -> float | None:
         return None if not np.isfinite(v) else round(float(v), 2)
@@ -515,7 +594,10 @@ def _refresh(root: Path, day: str) -> SectorFlowData | None:
             return None
         pend = _pending(st, found)
         extra = (pend[-1][0], pend[-1][1], len(pend)) if pend else None
-        sig = (len(st.keys), st.last_time, extra)
+        # the Tushare daily total lands in the evening: a new sig/version swaps the turnover card
+        # from the snapshot total to it without a restart (lookup is cached, see TURN_RETRY)
+        td = _db_turnover(root, day) is not None
+        sig = (len(st.keys), st.last_time, extra, td)
         hit = _RESULT.get(day)
         if hit and hit[0] == sig:
             return hit[1]
@@ -526,15 +608,17 @@ def _refresh(root: Path, day: str) -> SectorFlowData | None:
         break
     else:
         pend, extra, df = [], None, None
-        sig = (len(st.keys), st.last_time, None)
-    version = f"{len(st.keys)}-{st.last_time}"
+        td = _db_turnover(root, day) is not None
+        sig = (len(st.keys), st.last_time, None, td)
+    tv = "-td" if td else ""
+    version = f"{len(st.keys)}-{st.last_time}{tv}"
     if pend and df is not None:
         with st.lock:
             view = st.clone()
         view.fold(df)
         if view.max_slot < 0:
             return None
-        version = f"{len(st.keys)}+{extra[0]}.{extra[1]}-{view.last_time}"
+        version = f"{len(st.keys)}+{extra[0]}.{extra[1]}-{view.last_time}{tv}"
         out = _compute(view, root, day, version)
     else:
         if st.max_slot < 0:

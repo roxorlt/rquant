@@ -68,7 +68,7 @@ def _clear() -> None:
     for t in threading.enumerate():  # background refreshes started by load_sector_flow
         if t.name.startswith("sector-flow-2"):
             t.join(10)
-    for c in (sf._DAYS, sf._RESULT, sf._FOOTER, sf._SECT, sf._CIRC):
+    for c in (sf._DAYS, sf._RESULT, sf._FOOTER, sf._SECT, sf._CIRC, sf._TURN, sf._PREV):
         c.clear()
 
 
@@ -237,7 +237,7 @@ def test_late_snapshot_in_later_chunk_is_not_recounted(tmp_path: Path) -> None:
     s = {x.name: x for x in out.sectors}["银行"]
     assert s.net == 1e8 + 4e8 - 1e8
     assert s.amount == 6e8  # Σ increments == final cumulative turnover
-    assert out.summary is not None and out.summary.amount == 6e8 and out.summary.net == 4e8
+    assert out.summary is not None and out.summary.amount == 6e8
     assert sf._DAYS["2026-10-14"].late_dropped == 2
 
 
@@ -274,3 +274,79 @@ def test_late_rows_in_delta_overlay_are_ignored(tmp_path: Path) -> None:
     view.fold(pd.DataFrame([_row("000001.SZ", "09:59:58", 10.3, 2.9e8, 10.2, 10.3)]))
     assert float(view.net.sum()) == float(st.net.sum()) == 1e8 + 2e8
     assert view.late_dropped == 1 and st.late_dropped == 0
+
+
+# ------------------------------------------- 2026-10-20: 两市成交额 card replaces the market net
+TDAY = "2026-10-19"  # Monday; previous open day is Friday 10-16 (calendar, not "yesterday")
+
+
+def _turnover_root(tmp_path: Path, *, today: bool, calendar: bool = True) -> Path:
+    _db(tmp_path)
+    con = duckdb.connect(str(tmp_path / "market.duckdb"))
+    if calendar:
+        con.execute("CREATE TABLE trade_calendar (cal_date DATE, is_open BOOLEAN)")
+        con.execute("INSERT INTO trade_calendar VALUES (DATE '2026-10-15', true),"
+                    "(DATE '2026-10-16', true), (DATE '2026-10-17', false),"
+                    "(DATE '2026-10-18', false), (DATE '2026-10-19', true)")
+    con.execute("CREATE TABLE daily_bar (ts_code VARCHAR, trade_date DATE, amount DOUBLE)")
+    # amount in 千元 like Tushare daily; 北交所 counted (same total as turnover_daily.csv)
+    con.execute("INSERT INTO daily_bar VALUES ('000001.SZ', DATE '2026-10-16', 1.5e9),"
+                "('920001.BJ', DATE '2026-10-16', 6.9066e7), ('000001.SZ', DATE '2026-10-15', 9e9)")
+    if today:
+        con.execute("INSERT INTO daily_bar VALUES ('000001.SZ', DATE '2026-10-19', 1.4e9),"
+                    "('920001.BJ', DATE '2026-10-19', 4.8791854e7)")
+    con.close()
+    q = tmp_path / "snapshots" / TDAY / "quotes"
+    q.mkdir(parents=True)
+    pd.DataFrame([
+        _row("000001.SZ", "09:25:03", 10.1, 1e8, 10.1, 10.1),
+        _row("000001.SZ", "10:00:00", 10.2, 3e8, 10.1, 10.2),
+    ]).to_parquet(q / "part-1.parquet")
+    return tmp_path
+
+
+def test_turnover_from_tushare_daily_vs_previous_open_day(tmp_path: Path) -> None:
+    root = _turnover_root(tmp_path, today=True)
+    sm = sf.load_sector_flow(root, TDAY, [], wait=True).summary
+    assert sm is not None
+    assert sm.turnover_source == "tushare_daily"
+    assert sm.turnover == 14487.919  # (1.4e9 + 4.8791854e7) 千元 -> 亿
+    assert sm.prev_date == "2026-10-16"  # skips the weekend via trade_calendar
+    assert sm.prev_turnover == 15690.66
+    assert sm.turnover_chg == -1202.741
+    assert sm.turnover_chg_pct == -7.67
+    d = sm.model_dump()
+    assert "net" not in d  # the market-wide estimated net inflow is no longer served
+
+
+def test_turnover_falls_back_to_snapshot_until_ingested(tmp_path: Path, monkeypatch) -> None:
+    root = _turnover_root(tmp_path, today=False)
+    out = sf.load_sector_flow(root, TDAY, [], wait=True)
+    sm = out.summary
+    assert sm is not None
+    assert sm.turnover_source == "snapshot_last" and sm.turnover == 3.0  # last cum amount 3e8
+    assert sm.prev_turnover == 15690.66 and sm.turnover_chg == round(3.0 - 15690.66, 3)
+    # Tushare lands later: next refresh swaps the source and the version, no restart needed
+    con = duckdb.connect(str(root / "market.duckdb"))
+    con.execute("INSERT INTO daily_bar VALUES ('000001.SZ', DATE '2026-10-19', 1.4e9)")
+    con.close()
+    monkeypatch.setattr(sf, "TURN_RETRY", 0.0)
+    again = sf._refresh(root, TDAY)
+    assert again is not None and again.version != out.version and again.version.endswith("-td")
+    assert again.summary is not None and again.summary.turnover_source == "tushare_daily"
+    assert again.summary.turnover == 14000.0
+
+
+def test_turnover_without_calendar_has_no_change(tmp_path: Path) -> None:
+    root = _turnover_root(tmp_path, today=True, calendar=False)
+    sm = sf.load_sector_flow(root, TDAY, [], wait=True).summary
+    assert sm is not None and sm.turnover == 14487.919
+    assert sm.prev_date is None and sm.prev_turnover is None
+    assert sm.turnover_chg is None and sm.turnover_chg_pct is None
+
+
+def test_turnover_fields_empty_day(tmp_path: Path) -> None:
+    _db(tmp_path)
+    f = sf.turnover_fields(tmp_path, TDAY, 0.0)
+    assert f == dict(turnover=None, turnover_source=None, prev_date=None, prev_turnover=None,
+                     turnover_chg=None, turnover_chg_pct=None)
