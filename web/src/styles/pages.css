@@ -58,8 +58,9 @@ input:focus {
   }
 }
 .tbl td.best {
-  color: var(--accent-t);
+  color: var(--ink);
   font-weight: 600;
+  background: var(--surface-2);
 }
 .weight-bars {
   margin: 0;
@@ -725,12 +726,16 @@ input:focus {
   background: var(--surface-2);
 }
 .bd-pct.up {
-  color: #fff;
-  background: var(--up);
+  color: var(--up-t);
+  background: transparent;
 }
 .bd-pct.down {
-  color: #fff;
-  background: var(--down);
+  color: var(--down-t);
+  background: transparent;
+}
+.bd-pct.flat {
+  color: var(--ink-2);
+  background: transparent;
 }
 .bd-chev {
   color: var(--faint);

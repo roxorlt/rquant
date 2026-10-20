@@ -8,7 +8,7 @@ import {
   useReactTable,
 } from "@tanstack/react-table";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { type KeyboardEvent, type ReactNode, useMemo, useRef, useState } from "react";
+import { type KeyboardEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { readPreference, writePreference } from "@/theme/storage";
 import { DropdownMenu } from "@/ui/DropdownMenu";
 
@@ -27,6 +27,8 @@ export interface DataColumn<T> {
   sortable?: boolean;
   /** Secondary columns are hidden on phones (≤ 599 px) to keep rows one-hand readable. */
   secondary?: boolean;
+  /** Hidden until the viewer turns the column on. Ignored once a preference is saved. */
+  hiddenByDefault?: boolean;
 }
 
 export interface DataTableProps<T> {
@@ -52,6 +54,8 @@ export interface DataTableProps<T> {
    * export of the visible columns in the current sort order. A string names the file.
    */
   tools?: boolean | string;
+  /** Keep the first and last columns in view while the rest scroll sideways. */
+  pinEnds?: boolean;
 }
 
 /** CSV text (with BOM so Excel reads UTF-8) of the given columns and rows. */
@@ -112,11 +116,16 @@ export function DataTable<T>({
   virtualizeFrom = 200,
   estimatedRowHeight = 37,
   tools,
+  pinEnds = false,
 }: DataTableProps<T>) {
   const prefKey = `cols.${label}`;
-  const [hidden, setHidden] = useState<Set<string>>(
-    () => new Set((tools ? (readPreference(prefKey) ?? "") : "").split(",").filter(Boolean)),
-  );
+  const [hidden, setHidden] = useState<Set<string>>(() => {
+    const saved = tools ? readPreference(prefKey) : null;
+    if (saved !== null) return new Set(saved.split(",").filter(Boolean));
+    return new Set(
+      allColumns.filter((column) => column.hiddenByDefault).map((column) => column.id),
+    );
+  });
   const toggleColumn = (id: string) =>
     setHidden((prev) => {
       const next = new Set(prev);
@@ -128,6 +137,22 @@ export function DataTable<T>({
   const columns = useMemo(() => allColumns.filter((c) => !hidden.has(c.id)), [allColumns, hidden]);
   const [sorting, setSorting] = useState<SortingState>(initialSort ? [initialSort] : []);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const [overflowing, setOverflowing] = useState(false);
+  // Column count changes scrollWidth without resizing the wrap, so it is a dependency.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: remeasure when columns or rows change
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el || !pinEnds) return;
+    const measure = () => {
+      const first = el.querySelector("tbody td");
+      if (first) el.style.setProperty("--pin-1", `${first.getBoundingClientRect().width}px`);
+      setOverflowing(el.scrollWidth > el.clientWidth + 1);
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [pinEnds, rows.length, columns.length]);
   const bodyRef = useRef<HTMLTableSectionElement>(null);
 
   const columnDefs = useMemo<ColumnDef<T>[]>(
@@ -259,7 +284,7 @@ export function DataTable<T>({
       {toolbar}
       <div
         ref={scrollRef}
-        className={height === undefined ? "tbl-wrap" : "tbl-wrap scroll"}
+        className={`tbl-wrap${height === undefined ? "" : " scroll"}${pinEnds ? " pin-cols" : ""}`}
         style={height === undefined ? undefined : { maxHeight: height }}
       >
         <table className="tbl" aria-label={label} aria-rowcount={sortedRows.length + 1}>
@@ -316,7 +341,15 @@ export function DataTable<T>({
                 className={selectable ? "click" : undefined}
                 aria-selected={selectable ? row.id === selectedKey : undefined}
                 tabIndex={selectable ? 0 : undefined}
-                onClick={selectable ? () => onSelect(row.original) : undefined}
+                data-row-key={row.id}
+                onClick={
+                  selectable
+                    ? (event) => {
+                        event.currentTarget.focus();
+                        onSelect(row.original);
+                      }
+                    : undefined
+                }
                 onKeyDown={
                   selectable ? (event) => onRowKeyDown(event, index, row.original) : undefined
                 }
@@ -336,6 +369,7 @@ export function DataTable<T>({
           </tbody>
         </table>
       </div>
+      {pinEnds && overflowing ? <p className="tbl-scroll-hint">左右滑动查看全部列</p> : null}
     </>
   );
 }

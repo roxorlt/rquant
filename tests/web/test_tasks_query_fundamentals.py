@@ -50,11 +50,12 @@ def test_api_tasks_query_fundamentals(client):
     assert doc["rows"][0]["code"] == "600519.SH"
 
 
-def test_viewer_cannot_query(client, monkeypatch):
+def test_viewer_can_run_readonly_query(client, monkeypatch):
     monkeypatch.setenv("RQUANT_WEB_ADMINS", "roxor")
-    r = client.post("/api/v1/query", json={"sql": "select 1"},
-                    headers={"X-Remote-User": "guest"})
-    assert r.status_code == 403
+    guest = {"X-Remote-User": "guest"}
+    r = client.post("/api/v1/query", json={"sql": "select 1"}, headers=guest)
+    assert r.status_code == 200
+    assert client.post("/api/v1/alerts/ack", json={"alert_id": "b" * 64}, headers=guest).status_code == 403
 
 
 def test_fetch_latest_period(tmp_path):

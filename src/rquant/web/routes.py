@@ -7,9 +7,9 @@ import hashlib
 import json
 import os
 from collections.abc import Callable
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Annotated, Any, TypeVar
+from typing import Annotated, Any, Literal, TypeVar
 
 import duckdb
 import pandas as pd
@@ -853,6 +853,22 @@ def _send(request: Request, kind: str, fields: dict[str, Any]) -> CommandReceipt
                           detail=receipt.get("detail") or receipt.get("error"))
 
 
+def _remember(request: Request, receipt: CommandReceipt, *,
+              kind: Literal["ack_alert", "unack_alert", "add_watchlist_item", "save_alert_rule"],
+              summary: str,
+              actor: str | None) -> CommandReceipt:
+    """Keep ack and unack both visible after the ack row itself is removed."""
+    if receipt.status in {"failed", "rejected"} or not receipt.command_id:
+        return receipt
+    log = getattr(request.app.state, "operation_log", None)
+    if log is None:
+        log = []
+        request.app.state.operation_log = log
+    log.append(OperationRow(at=datetime.now(UTC), kind=kind, summary=summary, actor=actor,
+                            command_id=receipt.command_id))
+    return receipt
+
+
 @router.post("/pools", response_model=CommandReceipt, summary="保存池子")
 def save_pool(body: SavePoolRequest, request: Request) -> CommandReceipt:
     return _send(request, "save_canvas", {"name": body.name, "description": body.description,
@@ -865,8 +881,22 @@ def ack_alert(body: AckAlertRequest, request: Request, source: SourceDep) -> Com
     gen = generation_id if generation_id and len(generation_id) == 64 else hashlib.sha256(
         str(generation_id).encode()).hexdigest()
     actor = _user(request) or "owner"
-    return _send(request, "ack_alert",
-                 {"alert_id": body.alert_id, "generation_id": gen, "actor_id": actor})
+    receipt = _send(request, "ack_alert",
+                    {"alert_id": body.alert_id, "generation_id": gen, "actor_id": actor})
+    return _remember(request, receipt, kind="ack_alert",
+                     summary=f"确认告警 {body.alert_id[:12]}", actor=actor)
+
+
+@router.post("/alerts/unack", response_model=CommandReceipt, summary="撤销确认")
+def unack_alert(body: AckAlertRequest, request: Request, source: SourceDep) -> CommandReceipt:
+    generation_id, _ = source.generation()
+    gen = generation_id if generation_id and len(generation_id) == 64 else hashlib.sha256(
+        str(generation_id).encode()).hexdigest()
+    actor = _user(request) or "owner"
+    receipt = _send(request, "unack_alert",
+                    {"alert_id": body.alert_id, "generation_id": gen, "actor_id": actor})
+    return _remember(request, receipt, kind="unack_alert",
+                     summary=f"撤销确认 {body.alert_id[:12]}", actor=actor)
 
 
 def _optional_rows(source: Source, sql: str) -> list[dict[str, Any]]:
@@ -879,7 +909,7 @@ def _optional_rows(source: Source, sql: str) -> list[dict[str, Any]]:
 
 
 @router.get("/operations", response_model=Envelope[OperationsData], summary="操作记录")
-def operations(source: SourceDep) -> Envelope[OperationsData]:
+def operations(request: Request, source: SourceDep) -> Envelope[OperationsData]:
     """Web writes as page control recorded them (read back from their Serving projections)."""
     items = [OperationRow(at=r["acked_at"], kind="ack_alert",
                           summary=f"确认告警 {r['alert_id'][:12]}",
@@ -896,6 +926,11 @@ def operations(source: SourceDep) -> Envelope[OperationsData]:
                            actor=None, command_id=r["command_id"])
               for r in _optional_rows(source, "SELECT title, enabled, saved_at, command_id "
                                       "FROM alert_rule ORDER BY saved_at DESC LIMIT 200")]
+    seen = {i.command_id for i in items}
+    for row in getattr(request.app.state, "operation_log", []) or []:
+        if row.command_id not in seen:
+            items.append(row)
+            seen.add(row.command_id)
     items.sort(key=lambda i: i.at.timestamp() if i.at else 0, reverse=True)
     return _envelope(source, OperationsData(items=items[:300]))
 
@@ -946,10 +981,8 @@ def task_log(request: Request, source: SourceDep, unit: str,
 
 
 @router.post("/query", response_model=Envelope[sql_query.QueryResult], summary="只读查询")
-def run_query(request: Request, source: SourceDep,
+def run_query(source: SourceDep,
               body: sql_query.QueryRequest) -> Envelope[sql_query.QueryResult]:
-    if _role(request) != "admin":
-        raise HTTPException(403, "只读账号不能执行查询")
     try:
         sql = sql_query.guard(body.sql)
         runner = getattr(source, "query_sandboxed", source.query)

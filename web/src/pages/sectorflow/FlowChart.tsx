@@ -89,10 +89,21 @@ export function FlowChart({ t, shown, colors, mode, upto, phone, focus, onFocus 
   };
 
   // end labels with collision avoidance
-  const gap = phone ? 12 : 15;
-  const labs = shown
-    .map((s, k) => ({ s, v: lastVal(vals[k] ?? []), y: Y(lastVal(vals[k] ?? [])) }))
-    .sort((a, b) => a.y - b.y);
+  const gap = 14;
+  const allLabs = shown.map((s, k) => ({
+    s,
+    v: lastVal(vals[k] ?? []),
+    y: Y(lastVal(vals[k] ?? [])),
+  }));
+  const keep = new Set(
+    phone && allLabs.length > 6
+      ? [
+          ...[...allLabs].sort((a, b) => b.v - a.v).slice(0, 3),
+          ...[...allLabs].sort((a, b) => a.v - b.v).slice(0, 3),
+        ].map((item) => item.s.name)
+      : allLabs.map((item) => item.s.name),
+  );
+  const labs = allLabs.filter((item) => keep.has(item.s.name)).sort((a, b) => a.y - b.y);
   const laid = layoutEndLabels(
     labs.map((l) => l.y),
     gap,
@@ -337,11 +348,11 @@ export function FlowChart({ t, shown, colors, mode, upto, phone, focus, onFocus 
                 x={x1 + 3}
                 y={y + 4}
                 fill={c}
-                fontSize={phone ? 10.5 : 11.5}
+                fontSize={phone ? 12 : 11}
                 fontWeight={focus === s.name ? 800 : 600}
               >
                 {phone && s.name.length > 4 ? s.name.slice(0, 4) : s.name}{" "}
-                <tspan className={v >= 0 ? "up" : "down"}>{fmtValue(v, mode, phone)}</tspan>
+                <tspan className={v >= 0 ? "up" : "down"}>{fmtValue(v, mode)}</tspan>
               </text>
             </g>
           );

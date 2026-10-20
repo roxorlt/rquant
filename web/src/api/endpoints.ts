@@ -253,7 +253,26 @@ export function useAckAlert() {
       });
       return unwrap(data, response);
     },
-    onSuccess: () => client.invalidateQueries({ queryKey: ["alerts"] }),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ["alerts"] });
+      void client.invalidateQueries({ queryKey: ["operations"] });
+    },
+  });
+}
+
+export function useUnackAlert() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async (alertId: string) => {
+      const { data, response } = await apiClient().POST("/api/v1/alerts/unack", {
+        body: { alert_id: alertId },
+      });
+      return unwrap(data, response);
+    },
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ["alerts"] });
+      void client.invalidateQueries({ queryKey: ["operations"] });
+    },
   });
 }
 

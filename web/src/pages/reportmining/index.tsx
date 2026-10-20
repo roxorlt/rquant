@@ -196,7 +196,7 @@ function Detail({ r, hold }: { r: FactorResult; hold: number }) {
           />
         </div>
         <div>
-          <h3 className="sub">五分组超额（未扣费，Q5=预期最好）</h3>
+          <h3 className="sub">五分组超额</h3>
           <TimeChart
             label="五分组"
             dates={s.dates}
@@ -415,7 +415,7 @@ export default function ReportMiningPage() {
           ) : (
             <Panel>
               <p className="hint">
-                还没有研报因子结果（服务器上运行 python -m rquant.research.report_factors run）。
+                还没有研报因子结果。
               </p>
             </Panel>
           )

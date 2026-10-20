@@ -3,7 +3,7 @@ import { inTradingHours, useAuctionPoolLive, usePools } from "@/api/endpoints";
 import { useUrlState } from "@/app/useUrlState";
 import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
-import { EmptyState, FlowSteps, PageHeader, Panel, Segmented } from "@/ui";
+import { EmptyState, FlowSteps, PageHeader, Panel, ReadOnlyBanner, Segmented } from "@/ui";
 import { ChangeText } from "@/ui/ChangeText";
 import { Sparkline } from "@/ui/Sparkline";
 import { StockLink } from "@/ui/StockLink";
@@ -35,6 +35,7 @@ export default function PoolsPage() {
   return (
     <>
       <PageHeader eyebrow="研究" title="池子" note={headerNote} actions={<FlowSteps />} />
+      <ReadOnlyBanner />
       <QueryView query={query}>
         {(data) => {
           if (!data.pools.length)
@@ -57,7 +58,10 @@ export default function PoolsPage() {
                 label="池子"
                 value={pool.name}
                 onChange={setSelected}
-                options={data.pools.map((p) => ({ value: p.name, label: p.name }))}
+                options={data.pools.map((p) => ({
+                  value: p.name,
+                  label: p.name.replace("（同花顺原条件，非买入信号）", ""),
+                }))}
               />
               <Panel
                 title={
@@ -76,18 +80,18 @@ export default function PoolsPage() {
                       </span>
                     </>
                   ) : (
-                    `${pool.name} · ${pool.members.length} 只`
+                    `${pool.name} · ${pool.members?.length ?? 0} 只`
                   )
                 }
                 sub={[
                   pool.description,
-                  pool.pool_refs.join(" + "),
+                  (pool.pool_refs ?? []).join(" + "),
                   pool.updated_at ? `更新于 ${formatShanghaiDateTime(pool.updated_at)}` : "",
                 ]
                   .filter(Boolean)
                   .join(" · ")}
                 actions={
-                  pool.pool_refs.length ? (
+                  (pool.pool_refs ?? []).length ? (
                     <Link
                       className="btn sm"
                       to={`/experiments?preset=${encodeURIComponent(pool.pool_refs[0] ?? "")}`}
@@ -101,7 +105,7 @@ export default function PoolsPage() {
                 <DataTable
                   label="池子成员"
                   tools="池子成员"
-                  rows={pool.members}
+                  rows={pool.members ?? []}
                   rowKey={(row) => `${row.preset}:${row.code}`}
                   emptyText="今天没有成员：去「选股器」筛选后点「保存为池子」。"
                   columns={[

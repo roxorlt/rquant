@@ -199,6 +199,11 @@ class FixtureSource:
         )
         return {"command_id": payload["command_id"], "status": "succeeded"}
 
+    def record_unack(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Drop the ack row so the alert reads as unconfirmed again."""
+        self.con.execute("DELETE FROM alert_ack WHERE alert_id = ?", [payload["alert_id"]])
+        return {"command_id": payload["command_id"], "status": "succeeded"}
+
     def record_rule(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Fixture stand-in for ``save_alert_rule`` + Serving republish (latest wins)."""
         rule = payload["rule"]

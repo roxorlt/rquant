@@ -502,7 +502,7 @@ class BandData(BaseModel):
 
 class OperationRow(BaseModel):
     at: datetime | None
-    kind: Literal["ack_alert", "add_watchlist_item", "save_alert_rule"]
+    kind: Literal["ack_alert", "unack_alert", "add_watchlist_item", "save_alert_rule"]
     summary: str
     actor: str | None
     command_id: str

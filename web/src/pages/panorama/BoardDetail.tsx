@@ -3,8 +3,7 @@ import { Link } from "react-router";
 import { useMarketLive } from "@/api/endpoints";
 import type { components } from "@/api/schema";
 import { formatAmount } from "@/format/number";
-import { ChangeText, SideDrawer, SkeletonRows } from "@/ui";
-import { PhoneSheet } from "./PhoneSheet";
+import { AppDrawer, ChangeText, SkeletonRows } from "@/ui";
 
 type LiveBoard = components["schemas"]["LiveBoard"];
 type Sort = "pct" | "amount";
@@ -17,13 +16,12 @@ const tone = (v: number | null | undefined) =>
 export function BoardDetail({
   board,
   boards,
-  phone,
   onClose,
 }: {
   board: string | null;
   /** Board summaries already on the page, so the header renders before members load. */
   boards: readonly LiveBoard[];
-  phone: boolean;
+  phone?: boolean;
   onClose: () => void;
 }) {
   const [sort, setSort] = useState<Sort>("pct");
@@ -44,7 +42,7 @@ export function BoardDetail({
         上涨 <b className="num">{ur == null ? "—" : `${Math.round(ur * 100)}%`}</b>
       </span>
       <span>
-        涨停 <b className="num up">{info?.limit_up ?? "—"}</b>
+        涨停 <b className={info?.limit_up ? "num up" : "num"}>{info?.limit_up ?? "—"}</b>
       </span>
       {info?.broken ? (
         <span>
@@ -113,33 +111,11 @@ export function BoardDetail({
     </ol>
   );
 
-  if (phone) {
-    return (
-      <PhoneSheet
-        open={board != null}
-        onClose={onClose}
-        label={`${board ?? ""} 成分股`}
-        header={
-          <>
-            <div className="bd-titlerow">
-              <h2 className="bd-title">{board}</h2>
-              <span className={`bd-chip num ${tone(info?.pct_median)}`}>
-                {pctText(info?.pct_median)}
-              </span>
-            </div>
-            {summary}
-            {sorter}
-          </>
-        }
-      >
-        {list}
-      </PhoneSheet>
-    );
-  }
   return (
-    <SideDrawer
+    <AppDrawer
       open={board != null}
       onClose={onClose}
+      label={`${board ?? ""} 成分股`}
       title={
         <span className="bd-titlerow">
           {board} <ChangeText value={info?.pct_median ?? null} />
@@ -151,6 +127,6 @@ export function BoardDetail({
         {sorter}
         {list}
       </div>
-    </SideDrawer>
+    </AppDrawer>
   );
 }

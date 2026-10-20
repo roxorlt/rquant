@@ -27,7 +27,7 @@ export function CorrelationPanel() {
           value={kind}
           onChange={setKind}
           options={[
-            { value: "value", label: "截面值（最新日）" },
+            { value: "value", label: "截面值" },
             { value: "ic", label: "IC 序列" },
           ]}
         />

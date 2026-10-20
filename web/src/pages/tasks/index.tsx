@@ -1,23 +1,22 @@
+import { useNavigate } from "react-router";
 import { useTaskLog, useTasks } from "@/api/endpoints";
 import { useUrlState } from "@/app/useUrlState";
 import { DataTable } from "@/table/DataTable";
-import { PageHeader, Panel, Pill } from "@/ui";
+import { AppDrawer, PageHeader, Panel, Pill } from "@/ui";
 import { QueryView } from "../shared";
 
 function Log({ unit }: { unit: string }) {
   const log = useTaskLog(unit);
   return (
-    <Panel title={`日志 · ${unit}`} sub="journalctl 最近 200 行">
-      <QueryView query={log}>
-        {(data) =>
-          data.error ? (
-            <p className="hint">{data.error}</p>
-          ) : (
-            <pre className="log-view">{data.lines.join("\n") || "（没有日志）"}</pre>
-          )
-        }
-      </QueryView>
-    </Panel>
+    <QueryView query={log}>
+      {(data) =>
+        data.error ? (
+          <p className="hint">{data.error}</p>
+        ) : (
+          <pre className="logview">{data.lines.join("\n") || "没有日志"}</pre>
+        )
+      }
+    </QueryView>
   );
 }
 
@@ -40,13 +39,10 @@ function shortRun(value: string | null | undefined): string {
 export default function TasksPage() {
   const query = useTasks();
   const [unit, setUnit] = useUrlState("unit");
+  const navigate = useNavigate();
   return (
     <>
-      <PageHeader
-        eyebrow="运维"
-        title="任务与调度"
-        note="只读：systemd 中 rquant* 服务与定时器；立即运行需要服务器授权，暂不提供"
-      />
+      <PageHeader eyebrow="运维" title="任务与调度" note="只读：服务和定时器的运行时间" />
       <QueryView query={query}>
         {(rows) => (
           <Panel title={`任务 · ${rows.length}`} sub="点一行看日志" flush>
@@ -101,7 +97,14 @@ export default function TasksPage() {
           </Panel>
         )}
       </QueryView>
-      {unit ? <Log unit={unit} /> : null}
+      <AppDrawer
+        open={unit !== null}
+        onClose={() => navigate(-1)}
+        title={unit?.replace(/\.(service|timer)$/, "") ?? ""}
+        label={unit ? `${unit} 日志` : "日志"}
+      >
+        {unit ? <Log unit={unit} /> : null}
+      </AppDrawer>
     </>
   );
 }

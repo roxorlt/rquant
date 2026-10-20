@@ -5,6 +5,7 @@ import "dayjs/locale/zh-cn";
 import { type ReactNode, useMemo } from "react";
 import { useTheme } from "@/theme/ThemeProvider";
 import { antdThemeFor } from "./theme";
+import { ToastHost } from "./Toast";
 
 dayjs.locale("zh-cn");
 
@@ -19,7 +20,10 @@ export function UiProvider({ children }: { children: ReactNode }) {
   const themeConfig = useMemo(() => antdThemeFor(resolved), [mode, resolved]);
   return (
     <ConfigProvider locale={zhCN} theme={themeConfig}>
-      <AntApp component={false}>{children}</AntApp>
+      <AntApp component={false}>
+        {children}
+        <ToastHost />
+      </AntApp>
     </ConfigProvider>
   );
 }

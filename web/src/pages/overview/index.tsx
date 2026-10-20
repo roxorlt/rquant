@@ -35,7 +35,10 @@ function Pipeline() {
             <li key={layer.key}>
               <span className="pn">{layer.title}</span>
               <Pill kind={kind}>{text}</Pill>
-              <span className="pd">{layer.detail.slice(0, 2).join("；") || "—"}</span>
+              <span className="pd">
+                {layer.detail.filter((line) => !line.includes("python -m")).slice(0, 2).join("；") ||
+                  "—"}
+              </span>
             </li>
           );
         })}
@@ -97,7 +100,10 @@ function Attention() {
         </ul>
       ) : (
         <p className="hint" style={{ padding: "12px 16px" }}>
-          一切正常
+          {(health.data?.layers ?? []).length > 0 &&
+          (health.data?.layers ?? []).every((layer) => layer.state === "unknown")
+            ? "还不知道服务是否正常"
+            : "一切正常"}
         </p>
       )}
     </Panel>
@@ -106,7 +112,13 @@ function Attention() {
 
 function LatestAlerts() {
   const alerts = useAlerts();
+  const health = useHealth();
   const rows = (alerts.data?.items ?? []).slice(0, 6);
+  const monitor = (health.data?.layers ?? []).find((layer) => /盯盘|通知/.test(layer.title));
+  const empty =
+    !monitor || monitor.state === "unknown"
+      ? "今天还没有告警。还没有识别到盯盘服务。"
+      : "今天还没有告警。盯盘服务在运行，还没有触发规则。";
   return (
     <Panel
       title="最新告警"
@@ -121,7 +133,7 @@ function LatestAlerts() {
         label="最新告警"
         rows={rows}
         rowKey={(row) => row.alert_id}
-        emptyText="今天还没有告警：盯盘服务运行中且未触发规则。规则在「盯盘与告警」页调整。"
+        emptyText={empty}
         columns={[
           {
             id: "at",
@@ -151,6 +163,7 @@ function LatestAlerts() {
 
 export default function OverviewPage() {
   const query = useOverview();
+  const health = useHealth();
   return (
     <>
       <PageHeader
@@ -172,7 +185,14 @@ export default function OverviewPage() {
           <>
             <KpiStrip
               label="关键数字"
-              items={data.kpis.map((kpi) => ({ ...kpi, tone: kpi.tone ?? undefined }))}
+              items={data.kpis.map((kpi) => {
+                const layers = health.data?.layers ?? [];
+                const unknown = layers.length > 0 && layers.every((layer) => layer.state === "unknown");
+                if (unknown && (kpi.key === "services" || kpi.label === "服务异常")) {
+                  return { ...kpi, label: "服务状态", value: "未知", tone: "warn" as const };
+                }
+                return { ...kpi, tone: kpi.tone ?? undefined };
+              })}
             />
             <div className="g2">
               <LatestAlerts />

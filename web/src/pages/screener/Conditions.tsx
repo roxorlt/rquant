@@ -14,7 +14,7 @@ function TdxImport() {
   const [text, setText] = useState("");
   const ai = useTextToCondition();
   return (
-    <Panel title="通达信公式导入" sub="只翻译与校验；执行用 python -m rquant.factor screen --tdx">
+    <Panel title="通达信公式导入" sub="只翻译和校验。">
       <div className="cond-row">
         <input
           aria-label="一句话条件"
@@ -74,7 +74,8 @@ export function Conditions() {
       <TdxImport />
       <QueryView query={query}>
         {(data) => {
-          const run = data.runs[picked];
+          const runs = data.runs ?? [];
+          const run = runs[picked];
           return (
             <Panel
               title="条件选股"
@@ -85,13 +86,13 @@ export function Conditions() {
               }
               flush
             >
-              {data.runs.length > 1 ? (
+              {runs.length > 1 ? (
                 <select
                   aria-label="选择条件"
                   value={picked}
                   onChange={(e) => setPicked(Number(e.target.value))}
                 >
-                  {data.runs.map((r, i) => (
+                  {runs.map((r, i) => (
                     <option key={r.run_id} value={i}>
                       {r.name}
                     </option>

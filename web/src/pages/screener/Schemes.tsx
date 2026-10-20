@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { readPreference, writePreference } from "@/theme/storage";
-import { Button } from "@/ui";
+import { Button, FailureNotice } from "@/ui";
+import type { FailureCopy } from "@/ui/failure";
 import type { Filter, Rank } from "./Builder";
 
 export interface Scheme {
@@ -20,8 +21,9 @@ export function loadSchemes(): Scheme[] {
   }
 }
 
-function store(list: Scheme[]) {
+function store(list: Scheme[]): boolean {
   writePreference(KEY, list.length ? JSON.stringify(list) : null);
+  return list.length === 0 || readPreference(KEY) != null;
 }
 
 /** Named condition schemes kept in this browser: save the current set, load or delete one. */
@@ -36,13 +38,22 @@ export function Schemes({
 }) {
   const [list, setList] = useState<Scheme[]>(loadSchemes);
   const [name, setName] = useState("");
+  const [fail, setFail] = useState<FailureCopy | null>(null);
   const save = () => {
     const n = name.trim();
     if (!n) return;
     const next = [...list.filter((s) => s.name !== n), { name: n, filters, ranks }];
-    store(next);
+    if (!store(next)) {
+      setFail({
+        text: `方案『${n}』没保存上：浏览器存不下这些条件。删掉几条旧方案后再试`,
+        retry: true,
+        health: false,
+      });
+      return;
+    }
     setList(next);
     setName("");
+    setFail(null);
   };
   const remove = (n: string) => {
     const next = list.filter((s) => s.name !== n);
@@ -72,9 +83,10 @@ export function Schemes({
           if (e.key === "Enter") save();
         }}
       />
-      <Button size="sm" onClick={save} disabledReason={name.trim() ? undefined : "先填方案名"}>
+      <Button size="sm" onClick={save} disabled={!name.trim()}>
         保存方案
       </Button>
+      {fail ? <FailureNotice copy={fail} onRetry={save} /> : null}
     </div>
   );
 }

@@ -1,9 +1,10 @@
+import { useNavigate } from "react-router";
 import { useDataCenter, useFundamentals } from "@/api/endpoints";
 import { useUrlState } from "@/app/useUrlState";
 import { toneClass, toneOf } from "@/format/color";
 import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
-import { PageHeader, Panel, Pill } from "@/ui";
+import { AppDrawer, PageHeader, Panel, Pill } from "@/ui";
 import { StockLink } from "@/ui/StockLink";
 import { QueryView } from "../shared";
 
@@ -12,8 +13,8 @@ function Fundamentals() {
   const doc = query.data;
   if (!doc) {
     return (
-      <Panel title="财务指标" sub="尚无数据：python -m rquant.fundamentals --codes 600519.SH,…">
-        <p className="hint">Tushare fina_indicator，每只股票取最近报告期</p>
+      <Panel title="财务指标" sub="还没有财务指标。">
+        <p className="hint">每只股票显示最近一个报告期。</p>
       </Panel>
     );
   }
@@ -62,6 +63,7 @@ function Fundamentals() {
 export default function DataCenterPage() {
   const query = useDataCenter();
   const [picked, setPicked] = useUrlState("dataset");
+  const navigate = useNavigate();
   return (
     <>
       <PageHeader eyebrow="数据" title="数据中心" />
@@ -76,7 +78,7 @@ export default function DataCenterPage() {
                 sub={
                   data.audit
                     ? `覆盖审计 ${formatShanghaiDateTime(data.audit.generated_at)}，窗口 ${data.audit.window_start} ~ ${data.audit.window_end}（${data.audit.open_days} 个交易日）`
-                    : "尚无覆盖审计：python -m rquant.data_catalog.audit"
+                    : "还没有覆盖审计。"
                 }
                 flush
               >
@@ -117,27 +119,31 @@ export default function DataCenterPage() {
                   ]}
                 />
               </Panel>
-              {dataset ? (
-                <Panel title={dataset.name} sub={dataset.purpose} flush>
-                  <DataTable
-                    label="字段"
-                    rows={dataset.fields}
-                    rowKey={(row) => row.key}
-                    columns={[
-                      { id: "key", header: "字段", value: (row) => row.key },
-                      { id: "name", header: "名称", value: (row) => row.name },
-                      { id: "type", header: "类型", value: (row) => row.data_type },
-                      { id: "unit", header: "单位", value: (row) => row.unit ?? "" },
-                      { id: "desc", header: "说明", value: (row) => row.description },
-                    ]}
-                  />
-                  {coverage.get(dataset.dataset_id)?.missing_open_days.length ? (
-                    <p className="sub">
-                      缺失：{coverage.get(dataset.dataset_id)?.missing_open_days.join("、")}
-                    </p>
-                  ) : null}
-                </Panel>
-              ) : null}
+              <AppDrawer
+                open={dataset !== undefined}
+                onClose={() => navigate(-1)}
+                title={dataset?.name ?? ""}
+                label={dataset ? `${dataset.name} 字段` : "字段"}
+                extra={<span className="mono">{dataset?.table_name}</span>}
+              >
+                {dataset ? (
+                  <>
+                    <p className="hint">{dataset.purpose}</p>
+                    <DataTable
+                      label="字段"
+                      rows={dataset.fields}
+                      rowKey={(row) => row.key}
+                      columns={[
+                        { id: "key", header: "字段", value: (row) => row.key },
+                        { id: "name", header: "名称", value: (row) => row.name },
+                        { id: "type", header: "类型", value: (row) => row.data_type },
+                        { id: "unit", header: "单位", value: (row) => row.unit ?? "" },
+                        { id: "desc", header: "说明", value: (row) => row.description },
+                      ]}
+                    />
+                  </>
+                ) : null}
+              </AppDrawer>
               <Panel title="研究库覆盖" sub="research market.duckdb 各表最近 30 天" flush>
                 <DataTable
                   label="研究库覆盖"

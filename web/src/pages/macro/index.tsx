@@ -550,7 +550,7 @@ export default function MacroPage() {
           ) : (
             <EmptyState
               title="宏观数据尚未生成"
-              hint="运行 python -m rquant.macro refresh 后刷新"
+              hint="刷新后会显示最新数据。"
             />
           )
         }

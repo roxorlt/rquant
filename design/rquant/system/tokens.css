@@ -1,0 +1,170 @@
+/* rQuant 设计变量 v1.2（2026-10-21）。与 tokens.json 同一份数据。v1.0 新增动效变量 --dur-* / --ease-*；v1.2 新增等宽字体 --font-mono（只给日志块 .logview）。 */
+:root {
+  --c-ground: #F3F5F7;
+  --c-surface: #FFFFFF;
+  --c-surface-2: #F8F9FA;
+  --c-sunken: #ECEFF2;
+  --c-ink: #161A21;
+  --c-ink-2: #3A4250;
+  --c-muted: #5E6776;
+  --c-faint: #8A92A0;
+  --c-rule: #E3E7EC;
+  --c-rule-strong: #CCD3DB;
+  --c-accent: #2448D0;
+  --c-accent-hover: #1D3BB0;
+  --c-accent-weak: #EAEFFC;
+  --c-on-accent: #FFFFFF;
+  --c-up: #C8232C;
+  --c-up-weak: #FCECEC;
+  --c-down: #07773F;
+  --c-down-weak: #E3F3EA;
+  --c-flat: #5E6776;
+  --c-warn: #8F5B00;
+  --c-warn-weak: #FBF1DC;
+  --c-crit: #B4232B;
+  --c-crit-weak: #FCECEC;
+  --c-ok: #07773F;
+  --c-ok-weak: #E3F3EA;
+  --c-focus: #2448D0;
+  --c-scrim: rgba(22,26,33,0.40);
+  --font-sans: "PingFang SC", "HarmonyOS Sans SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", system-ui, sans-serif;
+  --font-num: "IBM Plex Sans Condensed", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  --font-mono: "SF Mono", "JetBrains Mono", Menlo, Consolas, "PingFang SC", "Microsoft YaHei", monospace;
+  --num-features: "tnum" 1, "lnum" 1;
+  --t-hero: 600 32px/36px var(--font-sans);
+  --t-hero-size: 32px;
+  --t-title: 600 20px/28px var(--font-sans);
+  --t-title-size: 20px;
+  --t-section: 600 15px/22px var(--font-sans);
+  --t-section-size: 15px;
+  --t-metric: 600 18px/22px var(--font-sans);
+  --t-metric-size: 18px;
+  --t-body: 400 13px/20px var(--font-sans);
+  --t-body-size: 13px;
+  --t-label: 400 12px/16px var(--font-sans);
+  --t-label-size: 12px;
+  --t-caption: 400 11px/14px var(--font-sans);
+  --t-caption-size: 11px;
+  --s-0: 0px;
+  --s-1: 2px;
+  --s-2: 4px;
+  --s-3: 8px;
+  --s-4: 12px;
+  --s-5: 16px;
+  --s-6: 24px;
+  --s-7: 32px;
+  --s-8: 48px;
+  --h-row-dense: 28px;
+  --h-row: 36px;
+  --h-row-touch: 44px;
+  --h-control-pc: 32px;
+  --h-control-phone: 44px;
+  --h-header-pc: 52px;
+  --h-header-phone: 48px;
+  --h-metric-strip-pc: 56px;
+  --h-metric-cell-phone: 48px;
+  --h-tabbar-phone: 56px;
+  --r-xs: 4px;
+  --r-sm: 6px;
+  --r-md: 10px;
+  --r-pill: 999px;
+  --shadow-none: none;
+  --shadow-pop: 0 8px 24px rgba(22,26,33,0.14), 0 1px 3px rgba(22,26,33,0.08);
+  --m-fast: 120ms;
+  --m-base: 180ms;
+  --m-ease: cubic-bezier(0.2, 0, 0, 1);
+  --dur-instant: 80ms;
+  --dur-fast: 120ms;
+  --dur-base: 180ms;
+  --dur-slow: 280ms;
+  --dur-flash: 600ms;
+  --dur-flash-gap: 1000ms;
+  --delay-skeleton: 300ms;
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --ease-enter: cubic-bezier(0, 0, 0, 1);
+  --ease-exit: cubic-bezier(0.4, 0, 1, 1);
+  color-scheme: light;
+}
+@media (max-width: 599px) {
+  :root {
+    --t-hero: 600 28px/32px var(--font-sans);
+    --t-hero-size: 28px;
+    --t-title: 600 17px/24px var(--font-sans);
+    --t-title-size: 17px;
+    --t-section: 600 15px/22px var(--font-sans);
+    --t-section-size: 15px;
+    --t-metric: 600 18px/22px var(--font-sans);
+    --t-metric-size: 18px;
+    --t-body: 400 14px/21px var(--font-sans);
+    --t-body-size: 14px;
+    --t-label: 400 12px/16px var(--font-sans);
+    --t-label-size: 12px;
+    --t-caption: 400 12px/16px var(--font-sans);
+    --t-caption-size: 12px;
+  }
+}
+:root[data-theme="dark"] {
+  --c-ground: #101318;
+  --c-surface: #171B21;
+  --c-surface-2: #1C2129;
+  --c-sunken: #0C0F13;
+  --c-ink: #E8EBF0;
+  --c-ink-2: #C5CBD5;
+  --c-muted: #97A0AF;
+  --c-faint: #6F7887;
+  --c-rule: #272D36;
+  --c-rule-strong: #37404C;
+  --c-accent: #7C98FF;
+  --c-accent-hover: #97ADFF;
+  --c-accent-weak: #1C2645;
+  --c-on-accent: #0C0F13;
+  --c-up: #FF5C64;
+  --c-up-weak: #3A1B1F;
+  --c-down: #2FC27E;
+  --c-down-weak: #11291D;
+  --c-flat: #97A0AF;
+  --c-warn: #E6AE45;
+  --c-warn-weak: #30260F;
+  --c-crit: #FF7A80;
+  --c-crit-weak: #3A1B1F;
+  --c-ok: #2FC27E;
+  --c-ok-weak: #11291D;
+  --c-focus: #7C98FF;
+  --c-scrim: rgba(0,0,0,0.55);
+  color-scheme: dark;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --c-ground: #101318;
+    --c-surface: #171B21;
+    --c-surface-2: #1C2129;
+    --c-sunken: #0C0F13;
+    --c-ink: #E8EBF0;
+    --c-ink-2: #C5CBD5;
+    --c-muted: #97A0AF;
+    --c-faint: #6F7887;
+    --c-rule: #272D36;
+    --c-rule-strong: #37404C;
+    --c-accent: #7C98FF;
+    --c-accent-hover: #97ADFF;
+    --c-accent-weak: #1C2645;
+    --c-on-accent: #0C0F13;
+    --c-up: #FF5C64;
+    --c-up-weak: #3A1B1F;
+    --c-down: #2FC27E;
+    --c-down-weak: #11291D;
+    --c-flat: #97A0AF;
+    --c-warn: #E6AE45;
+    --c-warn-weak: #30260F;
+    --c-crit: #FF7A80;
+    --c-crit-weak: #3A1B1F;
+    --c-ok: #2FC27E;
+    --c-ok-weak: #11291D;
+    --c-focus: #7C98FF;
+    --c-scrim: rgba(0,0,0,0.55);
+    color-scheme: dark;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  :root { --m-fast: 0ms; --m-base: 0ms; --dur-instant: 0ms; --dur-fast: 0ms; --dur-base: 0ms; --dur-slow: 0ms; --dur-flash: 0ms; }
+}

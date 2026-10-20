@@ -40,10 +40,21 @@ export const fmtPct = (v: number | null | undefined, digits = 2) =>
 export const tone = (v: number | null | undefined) =>
   v == null || v === 0 ? "" : v > 0 ? "up" : "down";
 
-export function fmtValue(v: number | null | undefined, mode: Mode, short = false): string {
+export const LINE_COLORS = [
+  "#2448D0",
+  "#C47B12",
+  "#6B4C9A",
+  "#0E7490",
+  "#9A3412",
+  "#3F6212",
+  "#1D4E89",
+  "#A16207",
+];
+
+export function fmtValue(v: number | null | undefined, mode: Mode, _short = false): string {
   if (v == null) return "—";
-  if (mode === "net") return short ? `${v > 0 ? "+" : ""}${v.toFixed(0)}` : fmtYi(v);
-  return fmtPct(v, short ? 1 : 2);
+  if (mode === "net") return fmtYi(v);
+  return fmtPct(v, 2);
 }
 
 export function fmtAmountYi(cny: number): string {
@@ -73,16 +84,13 @@ export function defaultSelection(sectors: Sector[], k: number): string[] {
 }
 
 /** Stable colours: inflow names get warm hues, outflow cool, by rank among the shown lines. */
+/** Categorical hues, stable by name. Not the red/green up-down pair. */
 export function colorMap(shown: Sector[]): Map<string, string> {
   const m = new Map<string, string>();
-  let i = 0;
-  let o = 0;
-  for (const s of [...shown].sort((a, b) => b.net - a.net)) {
-    if (s.net >= 0) m.set(s.name, IN_COLORS[i++ % IN_COLORS.length] ?? "#ff4d4f");
-  }
-  for (const s of [...shown].sort((a, b) => a.net - b.net)) {
-    if (s.net < 0) m.set(s.name, OUT_COLORS[o++ % OUT_COLORS.length] ?? "#1fb46a");
-  }
+  const names = shown.map((s) => s.name).sort((a, b) => a.localeCompare(b, "zh"));
+  names.forEach((name, index) => {
+    m.set(name, LINE_COLORS[index % LINE_COLORS.length] ?? "#2448D0");
+  });
   return m;
 }
 

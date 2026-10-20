@@ -1,10 +1,22 @@
 import { useMemo, useState } from "react";
-import { useSearchParams } from "react-router";
+import { useNavigate, useSearchParams } from "react-router";
 import { type ScreenRow, useAddWatch, useSavePool, useScreen } from "@/api/endpoints";
 import { useReadOnlyReason } from "@/api/useMeta";
 import { formatPrice } from "@/format/number";
 import { DataTable } from "@/table/DataTable";
-import { Button, ChangeText, FlowSteps, PageHeader, Panel, Segmented, useToast } from "@/ui";
+import {
+  AppDrawer,
+  Button,
+  ChangeText,
+  FailureNotice,
+  FlowSteps,
+  PageHeader,
+  Panel,
+  ReadOnlyBanner,
+  Segmented,
+  useToast,
+} from "@/ui";
+import { type FailureCopy, failureCopy } from "@/ui/failure";
 import { StockLink } from "@/ui/StockLink";
 import { QueryView } from "../shared";
 import {
@@ -150,6 +162,12 @@ export default function ScreenerPage() {
   const savePool = useSavePool();
   const addWatch = useAddWatch();
   const toast = useToast();
+  const navigate = useNavigate();
+  const [saveOpen, setSaveOpen] = useState(false);
+  const [poolName, setPoolName] = useState("");
+  const [saveFail, setSaveFail] = useState<FailureCopy | null>(null);
+  const [watchFail, setWatchFail] = useState<{ code: string; copy: FailureCopy } | null>(null);
+  const [inPool, setInPool] = useState<Set<string>>(new Set());
   const presets = query.data?.presets ?? [];
   const [params] = useSearchParams();
   const q = (params.get("q") ?? "").trim();
@@ -169,22 +187,44 @@ export default function ScreenerPage() {
     .map((k) => k.slice(2));
   const scores = useMemo(() => score(filtered.rows, ranks), [filtered, ranks]);
 
+  const openSave = () => {
+    const day = query.data?.trade_date ?? "";
+    const [, month, date] = day.split("-");
+    setPoolName(month && date ? `选股 ${month}-${date}` : "选股结果");
+    setSaveFail(null);
+    setSaveOpen(true);
+  };
   const save = () => {
-    const name = window.prompt("池子名称", preset === ALL ? "选股结果" : preset);
+    const name = poolName.trim();
     if (!name) return;
     savePool.mutate(
       { name, description: "", pool_refs: preset === ALL ? presets : [preset] },
       {
-        onSuccess: (r) => toast(`已提交保存：${r.status}`),
-        onError: (e) => toast(`保存失败：${e.message}`),
+        onSuccess: () => {
+          setSaveOpen(false);
+          setSaveFail(null);
+          toast({
+            text: `已保存为池子『${name}』，共 ${filtered.rows.length} 只`,
+            action: { label: "去看看", onClick: () => navigate("/pools") },
+          });
+        },
+        onError: (error) => setSaveFail(failureCopy(`方案『${name}』`, "保存", error)),
       },
     );
   };
-  const watch = (row: ScreenRow) =>
+  const watch = (row: ScreenRow) => {
     addWatch.mutate(row.code, {
-      onSuccess: (r) => toast(`${row.code} 加入自选：${r.status}`),
-      onError: (e) => toast(`加入自选失败：${e.message}`),
+      onSuccess: () => {
+        setInPool((prev) => new Set(prev).add(row.code));
+        setWatchFail(null);
+        toast(`已加入池子`);
+      },
+      onError: (error) => {
+        const who = `${row.name ?? row.code}（${row.code}）`;
+        setWatchFail({ code: row.code, copy: failureCopy(who, "加进池子", error) });
+      },
     });
+  };
 
   return (
     <>
@@ -196,14 +236,16 @@ export default function ScreenerPage() {
           <>
             <FlowSteps />
             <Button
-              onClick={save}
-              disabledReason={readOnly ?? (presets.length ? undefined : "没有可保存的结果")}
+              onClick={openSave}
+              aria-describedby={readOnly ? "readonly-notice" : undefined}
+              disabled={!!readOnly || presets.length === 0}
             >
               保存为池子
             </Button>
           </>
         }
       />
+      <ReadOnlyBanner />
       <Segmented
         label="选股方案"
         value={preset}
@@ -244,9 +286,19 @@ export default function ScreenerPage() {
       <QueryView query={query}>
         {() => (
           <Panel title={`结果 · 命中 ${filtered.rows.length} 只`} flush>
+            {watchFail ? (
+              <FailureNotice
+                copy={watchFail.copy}
+                onRetry={() => {
+                  const row = filtered.rows.find((item) => item.code === watchFail.code);
+                  if (row) watch(row);
+                }}
+              />
+            ) : null}
             <DataTable
               label="选股结果"
               tools="选股结果"
+              pinEnds
               rows={filtered.rows}
               rowKey={(row) => `${row.preset}:${row.code}`}
               initialSort={{ id: "score", desc: true }}
@@ -320,6 +372,7 @@ export default function ScreenerPage() {
                   id: `f:${name}`,
                   header: `${name}分位`,
                   numeric: true,
+                  hiddenByDefault: true,
                   value: (row: ScreenRow) => row.factors?.[name] ?? null,
                   cell: (row: ScreenRow) => row.factors?.[name]?.toFixed(0) ?? "—",
                 })),
@@ -335,22 +388,55 @@ export default function ScreenerPage() {
                   header: "",
                   sortable: false,
                   value: () => null,
-                  cell: (row) => (
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      onClick={() => watch(row)}
-                      disabledReason={readOnly}
-                    >
-                      加自选
-                    </Button>
-                  ),
+                  cell: (row) =>
+                    inPool.has(row.code) ? (
+                      <Button size="sm" variant="ghost" disabled>
+                        已在池子
+                      </Button>
+                    ) : (
+                      <span className="ack-cell">
+                        {watchFail?.code === row.code ? (
+                          <span className="row-err">没加进池子</span>
+                        ) : null}
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          aria-describedby={readOnly ? "readonly-notice" : undefined}
+                          disabled={!!readOnly || addWatch.isPending}
+                          onClick={() => watch(row)}
+                        >
+                          {watchFail?.code === row.code ? "重试" : "加入池子"}
+                        </Button>
+                      </span>
+                    ),
                 },
               ]}
             />
           </Panel>
         )}
       </QueryView>
+      <AppDrawer
+        open={saveOpen}
+        onClose={() => setSaveOpen(false)}
+        title="保存为池子"
+        label="保存为池子"
+      >
+        <p className="hint">共 {filtered.rows.length} 只</p>
+        <label>
+          池子名称
+          <input
+            aria-label="池子名称"
+            value={poolName}
+            onChange={(event) => setPoolName(event.target.value)}
+          />
+        </label>
+        {saveFail ? (
+          <FailureNotice copy={saveFail} busy={savePool.isPending} onRetry={save} />
+        ) : null}
+        <Button variant="primary" aria-busy={savePool.isPending || undefined} onClick={save}>
+          保存
+        </Button>
+      </AppDrawer>
       <Conditions />
     </>
   );

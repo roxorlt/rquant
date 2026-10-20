@@ -285,6 +285,34 @@ def test_viewer_cannot_write_and_operations_list_web_writes(monkeypatch) -> None
     assert client.get("/api/v1/meta").json()["data"]["role"] == "admin"
 
 
+def test_unack_clears_the_ack_and_keeps_both_operation_lines() -> None:
+    from fastapi.testclient import TestClient
+
+    from rquant.web.app import create_app
+    from rquant.web.source import FixtureSource
+
+    fixture = FixtureSource()
+    app = create_app(fixture, dist=None)
+
+    def transport(payload: dict) -> dict:
+        if payload["kind"] == "unack_alert":
+            return fixture.record_unack(payload)
+        return fixture.record_ack(payload)
+
+    app.state.page_control_transport = transport
+    client = TestClient(app)
+    alert_id = client.get("/api/v1/alerts").json()["data"]["items"][0]["alert_id"]
+    assert client.post("/api/v1/alerts/ack", json={"alert_id": alert_id}).status_code == 200
+    acked = client.get("/api/v1/alerts").json()["data"]["items"]
+    assert next(row for row in acked if row["alert_id"] == alert_id)["acked_at"]
+    assert client.post("/api/v1/alerts/unack", json={"alert_id": alert_id}).status_code == 200
+    cleared = client.get("/api/v1/alerts").json()["data"]["items"]
+    assert next(row for row in cleared if row["alert_id"] == alert_id)["acked_at"] is None
+    summaries = [row["summary"] for row in client.get("/api/v1/operations").json()["data"]["items"]]
+    assert any(text.startswith("确认告警") for text in summaries)
+    assert any(text.startswith("撤销确认") for text in summaries)
+
+
 def test_stock_profile_reads_the_research_market(tmp_path) -> None:
     from fastapi.testclient import TestClient
 

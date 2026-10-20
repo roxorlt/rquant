@@ -43,3 +43,78 @@
   border-color: var(--accent);
   color: var(--accent-t);
 }
+
+/* Panels keep their own scroller so a wide table cannot widen the page. */
+.panel .tbl-wrap {
+  overflow-x: auto;
+  max-width: 100%;
+}
+.tbl-wrap.pin-cols {
+  position: relative;
+}
+.tbl-wrap.pin-cols th:first-child,
+.tbl-wrap.pin-cols td:first-child,
+.tbl-wrap.pin-cols th:last-child,
+.tbl-wrap.pin-cols td:last-child {
+  position: sticky;
+  background: var(--surface);
+  z-index: 1;
+}
+.tbl-wrap.pin-cols th:first-child,
+.tbl-wrap.pin-cols td:first-child {
+  left: 0;
+  z-index: 2;
+}
+.tbl-wrap.pin-cols th:nth-child(2),
+.tbl-wrap.pin-cols td:nth-child(2) {
+  position: sticky;
+  left: var(--pin-1, 7.5rem);
+  background: var(--surface);
+  z-index: 2;
+}
+.tbl-wrap.pin-cols th:last-child,
+.tbl-wrap.pin-cols td:last-child {
+  right: 0;
+}
+.tbl-wrap.pin-cols::after {
+  content: "";
+  position: sticky;
+  right: 0;
+  display: block;
+  height: 0;
+  box-shadow: -16px 0 16px -16px var(--ink);
+  pointer-events: none;
+}
+.tbl-scroll-hint {
+  margin: 0;
+  padding: 6px 12px 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.query-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.bd-pct.up,
+.bd-pct.down {
+  color: var(--ink-2);
+  background: transparent;
+}
+.bd-pct.up {
+  color: var(--up-t);
+}
+.bd-pct.down {
+  color: var(--down-t);
+}
+.bd-pct.flat {
+  color: var(--ink-2);
+}
+.psheet-close {
+  width: 44px;
+  height: 44px;
+}
+.psheet-title,
+.bd-title {
+  font: 600 15px / 22px var(--font-sans);
+}

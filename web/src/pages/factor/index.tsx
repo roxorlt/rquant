@@ -38,7 +38,7 @@ function Detail({ id }: { id: string }) {
           {tracking ? (
             <Panel
               title="近期跟踪"
-              sub={`${tracking.window_start} ~ ${tracking.latest_date ?? "—"}，python -m rquant.factor track 更新`}
+              sub={`${tracking.window_start} ~ ${tracking.latest_date ?? "—"}`}
             >
               <KpiStrip
                 label="跟踪指标"
@@ -178,7 +178,7 @@ function QuantilePanel({ result }: { result: TestResult }) {
         />
       ) : (
         <p className="hint">
-          这条检验结果产出较早，没有逐日分组数据；重跑 python -m rquant.factor 后显示。
+          这条检验结果产出较早，没有逐日分组数据。
         </p>
       )}
       <div className="risk-block">
@@ -229,7 +229,7 @@ export default function FactorPage() {
         {(data) => (
           <Panel
             title={`因子 · ${data.factors.length}`}
-            sub="python -m rquant.factor --name … --expr … 产出"
+            sub="检验结果出现在这里"
             flush
           >
             <DataTable
@@ -239,7 +239,7 @@ export default function FactorPage() {
               rowKey={(row) => row.factor_id}
               onSelect={(row) => setId(row.factor_id)}
               selectedKey={id}
-              emptyText="还没有因子检验结果：运行 python -m rquant.factor 产出 IC / 分组检验后显示。"
+              emptyText="还没有因子检验结果。"
               columns={[
                 { id: "name", header: "名称", value: (row) => row.name },
                 { id: "expr", header: "表达式", value: (row) => row.expression },
