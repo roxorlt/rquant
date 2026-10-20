@@ -274,7 +274,7 @@ class RawL2Cache:
         if not isinstance(observation, MarketObservation):
             raise ValueError("typed market observation required")
         batch = RawL2Batch.model_validate({
-            **observation.model_dump(mode="python"),
+            **observation.model_dump(mode="python", serialize_as_any=True),
             "local_batch_sequence": self._highwater + 1,
             "cached_at": datetime.now(UTC),
         })
