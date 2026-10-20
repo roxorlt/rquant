@@ -12,6 +12,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tarfile
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -30,6 +31,81 @@ def deployer():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+class CacheResponse(io.BytesIO):
+    def __init__(self, payload: bytes):
+        super().__init__(payload)
+        self.read_limits: list[int] = []
+
+    def read(self, size: int = -1) -> bytes:
+        self.read_limits.append(size)
+        return super().read(size)
+
+
+@pytest.mark.parametrize("response_bytes", [17_100_000, 25_232_061])
+def test_health_batches_reads_complete_large_json_envelope(monkeypatch, response_bytes: int) -> None:
+    d = deployer()
+    prefix, suffix = b'{"padding":"', b'","tail":"complete"}'
+    padding_size = response_bytes - len(prefix) - len(suffix)
+    response = CacheResponse(prefix + b"x" * padding_size + suffix)
+    calls = []
+
+    def open_response(url, *, timeout):
+        calls.append((url, timeout))
+        return response
+
+    monkeypatch.setattr(d, "urlopen", open_response)
+    result = d.health_batches(7)
+    assert len(result["padding"]) == padding_size and result["tail"] == "complete"
+    assert calls == [("http://127.0.0.1:8771/api/v1/l2/batches?after_sequence=7&limit=1", 5)]
+    assert response.read_limits == [(32 << 20) + 1] and response.closed
+
+
+def test_health_status_keeps_original_read_and_timeout_limits(monkeypatch) -> None:
+    d = deployer(); response = CacheResponse(b'{"state":"connected","last_sequence":1}')
+    calls = []
+
+    def open_response(url, *, timeout):
+        calls.append((url, timeout))
+        return response
+
+    monkeypatch.setattr(d, "urlopen", open_response)
+    assert d.health_status() == {"state": "connected", "last_sequence": 1}
+    assert calls == [("http://127.0.0.1:8771/api/v1/l2/status", 2)]
+    assert response.read_limits == [(2 << 20) + 1] and response.closed
+
+
+@pytest.mark.parametrize("failure", ["oversize", "invalid_json", "duplicate_key", "non_object", "read_error", "read_timeout"])
+def test_health_batches_closes_failed_response(monkeypatch, failure: str) -> None:
+    d = deployer()
+    payload = {"invalid_json": b"{", "duplicate_key": b'{"a":1,"a":2}', "non_object": b"[]"}.get(failure, b"{}")
+    if failure == "oversize": payload = b" " * ((32 << 20) + 2)
+    response = CacheResponse(payload)
+    monkeypatch.setattr(d, "urlopen", lambda *args, **kwargs: response)
+    if failure == "oversize":
+        monkeypatch.setattr(d, "json_object", lambda _: pytest.fail("oversized response parsed"))
+    elif failure in {"read_error", "read_timeout"}:
+        def fail_read(size):
+            response.read_limits.append(size)
+            raise (OSError("synthetic read failure") if failure == "read_error" else TimeoutError("synthetic timeout"))
+        monkeypatch.setattr(response, "read", fail_read)
+    with pytest.raises(d.DeployError, match="^api_health_failed$"):
+        d.health_batches(0)
+    assert response.read_limits == [(32 << 20) + 1] and response.closed
+
+
+def test_health_batches_open_timeout_keeps_fixed_error(monkeypatch) -> None:
+    d = deployer(); calls = []
+
+    def fail_open(url, *, timeout):
+        calls.append((url, timeout))
+        raise TimeoutError("synthetic open timeout")
+
+    monkeypatch.setattr(d, "urlopen", fail_open)
+    with pytest.raises(d.DeployError, match="^api_health_failed$"):
+        d.health_batches(0)
+    assert calls == [("http://127.0.0.1:8771/api/v1/l2/batches?after_sequence=0&limit=1", 5)]
 
 
 SYMBOLS = tuple(f"600{index:03d}" for index in range(100))
@@ -554,6 +630,34 @@ def test_persist_f1_requires_six_committed_seed_bindings(monkeypatch, seed_case:
     else:
         with pytest.raises(d.DeployError, match="collector_health_failed"):
             d.wait_health(lambda: status, lambda _: None, collector=True, old_epoch="old", expected=expected)
+
+
+def test_health_limit1_walks_every_batch_to_all_sixty_current_seed_bindings(monkeypatch) -> None:
+    d = deployer(); bindings = d.symbol_bindings(list(SYMBOLS[:20]))
+    expected = {d.identity(binding) for binding in bindings}
+    rows = [{"local_batch_sequence": index + 1, "epoch_id": epoch, "delivery": "seed", "binding": binding}
+            for index, (epoch, binding) in enumerate(
+                (epoch, binding) for epoch in ("old", "new") for binding in bindings)]
+    status = {"state": "listening_candidate", "epoch_id": "new", "error_code": None,
+              "seed_queries": 60, "last_sequence": len(rows)}
+    calls, responses = [], []
+
+    def open_response(url, *, timeout):
+        query = parse_qs(urlsplit(url).query)
+        after, limit = int(query["after_sequence"][0]), int(query["limit"][0])
+        selected = rows[after:after + limit]
+        calls.append((after, limit, timeout))
+        response = CacheResponse(json.dumps({"batches": selected,
+            "next_sequence": selected[-1]["local_batch_sequence"] if selected else after,
+            "status": status}).encode())
+        responses.append(response)
+        return response
+
+    monkeypatch.setattr(d, "urlopen", open_response)
+    d.wait_health(lambda: status, lambda _: pytest.fail("complete seeds should not retry"),
+        collector=True, old_epoch="old", expected=expected)
+    assert calls == [(cursor, 1, 5) for cursor in range(120)]
+    assert all(response.closed and response.read_limits == [(32 << 20) + 1] for response in responses)
 
 
 @pytest.mark.parametrize("peer,pid,rejected", [
