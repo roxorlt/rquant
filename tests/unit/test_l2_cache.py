@@ -735,19 +735,25 @@ def test_published_head_fd_remains_one_snapshot_across_replacement(tmp_path: Pat
     with cache.writer():
         cache.append(observation())
         cache.write_status(FeedStatus(state='connected'))
+        reader = module.RawL2Cache(cache.root)
+        assert reader.read_status().last_market_received_at == observation().received_at
         def interleaved(path: str | Path, flags: int, *args: int, **kwargs: int) -> int:
             nonlocal fired
             fd = original(path, flags, *args, **kwargs)
             if Path(path).name == '.head' and not fired:
                 fired = True
-                cache.append(observation())
+                cache.append(observation().model_copy(update={
+                    'received_at': observation().received_at + timedelta(seconds=1),
+                }))
                 cache.write_status(FeedStatus(state='connected'))
             return fd
         monkeypatch.setattr(module.os, 'open', interleaved)
-        page = module.RawL2Cache(cache.root).read_batches(limit=8)
+        page = reader.read_batches(limit=8)
         assert fired and page.status.last_sequence == page.next_sequence == 1
         assert [b.local_batch_sequence for b in page.batches] == [1]
-        assert module.RawL2Cache(cache.root).read_status().last_sequence == 2
+        latest = reader.read_status()
+        assert latest.last_sequence == 2
+        assert latest.last_market_received_at == observation().received_at + timedelta(seconds=1)
 
 
 @pytest.mark.parametrize('legacy', [False, True])
@@ -767,14 +773,20 @@ def test_published_writer_repairs_only_fully_audited_stale_or_legacy_head(tmp_pa
     assert len(RawL2Cache(cache.root)._directories()) == 2
 
 
+@pytest.mark.parametrize('warm', [False, True])
 @pytest.mark.parametrize('fault', ['symlink', 'directory', 'fifo', 'oversize', 'copy', 'corrupt',
-                                  'missing_target', 'bad_sha', 'ahead_status'])
-def test_published_bad_head_never_falls_back_or_is_silently_repaired(tmp_path: Path, fault: str) -> None:
+                                  'missing_target', 'bad_sha', 'ahead_status', 'mode', 'owner',
+                                  'same_size_invalid_model', 'unbounded_sequence'])
+def test_published_bad_head_never_falls_back_or_is_silently_repaired(
+        tmp_path: Path, monkeypatch, fault: str, warm: bool) -> None:
     import os
     from rquant.l2.cache import CacheError, RawL2Cache
     from rquant.l2.models import FeedStatus
     cache = RawL2Cache(tmp_path / 'cache')
     with cache.writer(): cache.append(observation())
+    reader = RawL2Cache(cache.root)
+    if warm:
+        assert reader.read_status().last_sequence == 1
     parent = cache.root / 'batches'; target = parent / f'{1:020d}' / 'batch.json'; head = parent / '.head'
     if fault in {'symlink', 'directory', 'fifo', 'oversize', 'copy'}:
         head.unlink()
@@ -782,16 +794,31 @@ def test_published_bad_head_never_falls_back_or_is_silently_repaired(tmp_path: P
         elif fault == 'directory': head.mkdir()
         elif fault == 'fifo': os.mkfifo(head, 0o600)
         elif fault == 'oversize':
-            with head.open('wb') as stream: stream.truncate(8 * 1024 * 1024 + 1)
+            with head.open('wb') as stream: stream.truncate(20 * 1024 * 1024 + 1)
         else:
             head.write_bytes(target.read_bytes())
             head.chmod(0o600)
     elif fault == 'corrupt': target.write_bytes(b'bad head')
     elif fault == 'missing_target': target.unlink()
     elif fault == 'bad_sha': (target.parent / 'sha256').write_bytes(b'0' * 64 + b'\n')
+    elif fault == 'mode': head.chmod(0o640)
+    elif fault == 'owner':
+        actual_owner = os.geteuid()
+        monkeypatch.setattr(os, 'geteuid', lambda: actual_owner + 1)
+    elif fault in {'same_size_invalid_model', 'unbounded_sequence'}:
+        payload = target.read_bytes()
+        if fault == 'same_size_invalid_model':
+            changed = payload.replace(b'"side":"buy"', b'"side":"bad"', 1)
+            assert changed != payload and len(changed) == len(payload)
+        else:
+            changed = payload.replace(b'"local_batch_sequence":1',
+                                      b'"local_batch_sequence":100000000000000000000', 1)
+            assert changed != payload
+        target.write_bytes(changed)
+        (target.parent / 'sha256').write_bytes(hashlib.sha256(changed).hexdigest().encode() + b'\n')
     else:
         (cache.root / 'status.json').write_text(FeedStatus(last_sequence=2).model_dump_json())
-    with pytest.raises(CacheError): RawL2Cache(cache.root).read_batches(after_sequence=1)
+    with pytest.raises(CacheError): reader.read_batches(after_sequence=1)
     with pytest.raises(CacheError):
         with RawL2Cache(cache.root).writer(): pytest.fail('unsafe head was repaired')
 
@@ -822,14 +849,18 @@ def test_published_failure_does_not_acknowledge_or_remove_raw_batch(tmp_path: Pa
         assert os.path.samefile(parent / '.head', parent / f'{1:020d}' / 'batch.json')
 
 
-def test_published_legacy_fallback_audits_payloads_before_old_cursor(tmp_path: Path) -> None:
+@pytest.mark.parametrize('warm', [False, True])
+def test_published_legacy_fallback_audits_payloads_before_old_cursor(tmp_path: Path, warm: bool) -> None:
     from rquant.l2.cache import CacheError, RawL2Cache
     cache = RawL2Cache(tmp_path / 'cache')
     with cache.writer():
         cache.append(observation()); cache.append(observation())
+    reader = RawL2Cache(cache.root)
+    if warm:
+        assert reader.read_status().last_sequence == 2
     parent = cache.root / 'batches'; (parent / '.head').unlink()
     (parent / f'{1:020d}' / 'batch.json').write_bytes(b'corrupt unrequested legacy payload')
-    with pytest.raises(CacheError): RawL2Cache(cache.root).read_batches(after_sequence=2)
+    with pytest.raises(CacheError): reader.read_batches(after_sequence=2)
     with pytest.raises(CacheError):
         with RawL2Cache(cache.root).writer(): pytest.fail('legacy corruption was repaired')
 
@@ -1026,3 +1057,157 @@ def test_order640_typed_mutation_is_rejected_before_commit(tmp_path, fault):
             cache.append(changed)
         assert cache.read_status().last_sequence == 1
         assert not list((cache.root / "batches").glob(".pending-*"))
+
+
+def test_head_receipt_repeated_status_and_caught_up_reads_keep_only_scalars(tmp_path, monkeypatch):
+    import weakref
+    from rquant.l2 import cache as module
+    from rquant.l2.models import RawL2Batch
+
+    cache = module.RawL2Cache(tmp_path / 'receipt')
+    with cache.writer(): cache.append(order640_observation())
+    fixed = datetime(2026, 10, 20, 8, tzinfo=UTC)
+    monkeypatch.setattr(module, 'datetime', type('Clock', (), {'now': staticmethod(lambda tz: fixed)}))
+    reader = module.RawL2Cache(cache.root)
+    original = RawL2Batch.model_validate_json
+    calls, models = [], []
+    def counted(payload, **kwargs):
+        result = original(payload, **kwargs)
+        calls.append(len(payload)); models.append(weakref.ref(result))
+        return result
+    monkeypatch.setattr(RawL2Batch, 'model_validate_json', counted)
+    first = reader.read_status(now=fixed)
+    for _ in range(3):
+        assert reader.read_status(now=fixed) == first
+        page = reader.read_batches(after_sequence=1)
+        assert page.batches == () and page.next_sequence == 1 and page.status == first
+    assert len(calls) == 1
+    assert all(reference() is None for reference in models)
+    def scalar(value):
+        return isinstance(value, (str, int, datetime)) or isinstance(value, tuple) and all(scalar(v) for v in value)
+    assert scalar(reader._head_receipt)
+    assert reader._last_batch is None
+
+
+def test_head_receipt_concurrent_cold_readers_validate_once(tmp_path, monkeypatch):
+    from threading import Barrier, Event, Lock, Thread
+    from rquant.l2.cache import RawL2Cache
+    from rquant.l2.models import RawL2Batch
+
+    cache = RawL2Cache(tmp_path / 'cold')
+    with cache.writer(): cache.append(observation())
+    reader = RawL2Cache(cache.root)
+    original = RawL2Batch.model_validate_json
+    entered, duplicate, release = Event(), Event(), Event()
+    begin, lock = Barrier(4), Lock()
+    calls, results, errors = [], [], []
+    def counted(payload, **kwargs):
+        with lock:
+            calls.append(len(payload))
+            if len(calls) > 1: duplicate.set()
+        entered.set()
+        assert release.wait(3)
+        return original(payload, **kwargs)
+    def read():
+        try:
+            begin.wait(3)
+            results.append(reader.read_status(now=datetime(2026, 10, 20, tzinfo=UTC)))
+        except BaseException as error:
+            errors.append(error)
+    monkeypatch.setattr(RawL2Batch, 'model_validate_json', counted)
+    threads = [Thread(target=read, daemon=True) for _ in range(4)]
+    try:
+        for thread in threads: thread.start()
+        assert entered.wait(3)
+        duplicate.wait(.25)
+    finally:
+        release.set()
+        for thread in threads: thread.join(3)
+    assert not any(thread.is_alive() for thread in threads) and not errors
+    assert len(results) == 4 and all(result == results[0] for result in results)
+    assert len(calls) == 1
+
+
+def test_head_receipt_selected_batches_are_revalidated_and_not_shared(tmp_path, monkeypatch):
+    from rquant.l2.cache import RawL2Cache
+    from rquant.l2.models import RawL2Batch
+
+    cache = RawL2Cache(tmp_path / 'selected')
+    with cache.writer(): committed = cache.append(observation())
+    expected = committed.model_dump_json()
+    reader = RawL2Cache(cache.root)
+    original = RawL2Batch.model_validate_json
+    calls = []
+    def counted(payload, **kwargs):
+        calls.append(len(payload))
+        return original(payload, **kwargs)
+    monkeypatch.setattr(RawL2Batch, 'model_validate_json', counted)
+    assert reader.read_status().last_sequence == 1
+    first = reader.read_batches(limit=1)
+    first.batches[0].table.rows[0]['1']['value'] = 'caller mutation'
+    second = reader.read_batches(limit=128)
+    assert second.batches[0].model_dump_json() == expected
+    assert first.batches[0] is not second.batches[0]
+    assert len(calls) == 3  # One cold head; each selected read independently validates.
+
+
+def test_head_receipt_checks_full_bytes_and_new_identity_then_revalidates(tmp_path, monkeypatch):
+    import os
+    from rquant.l2 import cache as module
+    from rquant.l2.models import RawL2Batch
+
+    cache = module.RawL2Cache(tmp_path / 'changed')
+    with cache.writer(): cache.append(observation())
+    parent = cache.root / 'batches'; target = parent / f'{1:020d}' / 'batch.json'
+    payload = target.read_bytes()
+    reader = module.RawL2Cache(cache.root)
+    validate = RawL2Batch.model_validate_json
+    digest = module.hashlib.sha256
+    model_calls, payload_hashes = [], []
+    def counted_model(raw, **kwargs):
+        model_calls.append(len(raw)); return validate(raw, **kwargs)
+    def counted_hash(raw=b'', *args, **kwargs):
+        if raw == payload: payload_hashes.append(len(raw))
+        return digest(raw, *args, **kwargs)
+    monkeypatch.setattr(RawL2Batch, 'model_validate_json', counted_model)
+    monkeypatch.setattr(module.hashlib, 'sha256', counted_hash)
+    original_time = reader.read_status().last_market_received_at
+    assert reader.read_status().last_market_received_at == original_time
+    assert len(model_calls) == 1 and len(payload_hashes) == 2
+    changed = payload.replace(b'2026-10-15T07:00:00Z', b'2026-10-15T07:00:01Z', 1)
+    assert changed != payload and len(changed) == len(payload)
+    target.write_bytes(changed)
+    (target.parent / 'sha256').write_bytes(digest(changed).hexdigest().encode() + b'\n')
+    assert reader.read_status().last_market_received_at == original_time + timedelta(seconds=1)
+    assert len(model_calls) == 2
+    replacement = target.parent / 'replacement'
+    replacement.write_bytes(changed); replacement.chmod(0o600)
+    os.replace(replacement, target)
+    (parent / '.head').unlink(); os.link(target, parent / '.head')
+    assert reader.read_status().last_market_received_at == original_time + timedelta(seconds=1)
+    assert len(model_calls) == 3
+
+
+def test_head_receipt_cold_exception_releases_lock_and_does_not_publish(tmp_path, monkeypatch):
+    from threading import Thread
+    from rquant.l2.cache import CacheError, RawL2Cache
+    from rquant.l2.models import RawL2Batch
+
+    cache = RawL2Cache(tmp_path / 'failure')
+    with cache.writer(): cache.append(observation())
+    reader = RawL2Cache(cache.root)
+    original = RawL2Batch.model_validate_json
+    calls, results, errors = [], [], []
+    def fail_once(payload, **kwargs):
+        calls.append(len(payload))
+        if len(calls) == 1: raise ValueError('cold validation failed')
+        return original(payload, **kwargs)
+    monkeypatch.setattr(RawL2Batch, 'model_validate_json', fail_once)
+    with pytest.raises(CacheError, match='invalid_batch'): reader.read_status()
+    def read():
+        try: results.append(reader.read_status())
+        except BaseException as error: errors.append(error)
+    thread = Thread(target=read, daemon=True)
+    thread.start(); thread.join(3)
+    assert not thread.is_alive() and not errors
+    assert len(results) == 1 and results[0].last_sequence == 1 and len(calls) == 2
