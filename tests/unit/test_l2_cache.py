@@ -45,6 +45,7 @@ def observed_trade_push_data(body=OBSERVED_TRADE_PUSH):
 
 def test_date_validators_do_not_run_on_raw_cell_fields():
     import sys
+    from pydantic import TypeAdapter
     from rquant.l2.models import Model, RawCell
 
     date_callbacks = {Model.reject_numeric_datetime.__func__.__code__, Model.require_utc.__func__.__code__}
@@ -55,14 +56,18 @@ def test_date_validators_do_not_run_on_raw_cell_fields():
             calls.append(frame.f_code.co_name)
     try:
         sys.setprofile(record)
-        cell = RawCell.model_validate({"value": "123", "raw_hex": "7b000000", "style": 255})
+        adapter = TypeAdapter(RawCell)
+        cell = adapter.validate_python({"value": "123", "raw_hex": "7b000000", "style": 255})
     finally:
         sys.setprofile(previous)
-    assert cell.value == "123" and cell.raw_hex == "7b000000" and cell.style == 255
+    assert adapter.dump_python(cell) == {"value": "123", "raw_hex": "7b000000", "style": 255}
     assert calls == []
-    for invalid in ({"value": True}, {"raw_hex": "xyz"}, {"style": 256}):
+    for valid in (None, 1, "1"):
+        assert adapter.dump_python(adapter.validate_python({"value": valid, "raw_hex": "00", "style": 0}))["value"] == valid
+    for invalid in ({"value": True}, {"value": False}, {"value": b"1"}, {"raw_hex": "xyz"},
+                    {"style": 256}, {"style": -1}, {"style": True}, {"extra": 1}):
         with pytest.raises(ValueError):
-            RawCell.model_validate({"value": "123", "raw_hex": "7b000000", "style": 255, **invalid})
+            adapter.validate_python({"value": "123", "raw_hex": "7b000000", "style": 255, **invalid})
 
 
 @pytest.mark.parametrize("field", ["received_at", "cached_at", "last_transport_received_at",
@@ -328,8 +333,8 @@ def test_market_model_retains_raw_cells_and_json_roundtrip():
     data = observation()
     restored = MarketObservation.model_validate_json(data.model_dump_json())
     assert restored == data
-    assert restored.table.rows[0]["13"].value == "2"
-    assert restored.table.rows[0]["13"].raw_hex == "02000000"
+    assert restored.table.rows[0]["13"]["value"] == "2"
+    assert restored.table.rows[0]["13"]["raw_hex"] == "02000000"
 
 
 def test_binding_rejects_mismatched_market_and_side():
@@ -945,3 +950,79 @@ def test_mutable_snapshot_replacement_between_lstat_and_open_is_valid(
         else:
             assert reader.read_subscription_status().desired_revision == 2
         assert fired
+
+
+def order640_observation():
+    from rquant.l2._codec import decode_order_response
+    from rquant.l2.models import MarketObservation
+
+    body = (Path(__file__).parents[1] / "fixtures/l2-order640.body").read_bytes()
+    assert hashlib.sha256(body).hexdigest() == "f5060e3f6c430aee2e199fcc026a4501f4d16177ca77f3e43e5e7a79969071a2"
+    result = decode_order_response(body, request_id=0xFFFFFFFF, page_id=10199,
+                                   code="600276", source_fd_ordinal=1)
+    return MarketObservation(epoch_id="append_segments_only",
+        binding={"page_id": 10199, "kind": "vendor4027", "code": "600276", "market": 17, "side": "sell"},
+        received_at=datetime(2026, 10, 20, 5, 1, 33, 123456, tzinfo=UTC), request_id=0xFFFFFFFF,
+        source_fd_ordinal=1, delivery="candidate_push", response_body_hex=body.hex(),
+        raw_table_hex=result["raw_table"].hex(), table=result["table"], response_sha256=result["response_sha256"])
+
+
+def test_order640_canonical_cache_roundtrip_and_receipt_overwrite(tmp_path, monkeypatch):
+    from rquant.l2 import cache as module
+
+    fixed = datetime(2026, 10, 20, 8, 0, 0, 123456, tzinfo=UTC)
+    monkeypatch.setattr(module, "datetime", type("Clock", (), {"now": staticmethod(lambda tz: fixed)}))
+    original = order640_observation()
+    cache = module.RawL2Cache(tmp_path / "order640")
+    with cache.writer():
+        first = cache.append(original)
+        payload = first.model_dump_json().encode() + b"\n"
+        assert hashlib.sha256(payload).hexdigest() == "eb2918f0abd92dbeb8156282139fe6f84595886eeeead6cee4407a6f2aee9306"
+        assert (cache.root / "batches/00000000000000000001/batch.json").read_bytes() == payload
+        assert first.table.row_count == len(first.table.rows) == 640
+        assert first.table.row_data_sha256 == "b4efcae2e9aabbf95c82cb37d20678580290807064b2b6e76cd367d3e37ae861"
+        second = cache.append(original.model_copy(update={"received_at": original.received_at.isoformat()}))
+        assert second.received_at == original.received_at
+        third = cache.append(first.model_copy(update={"local_batch_sequence": True, "cached_at": 0}))
+        assert third.local_batch_sequence == 3 and third.cached_at == fixed
+    page = module.RawL2Cache(cache.root).read_batches(limit=128)
+    assert page.next_sequence == 3 and page.batches[0].model_dump_json().encode() + b"\n" == payload
+
+
+@pytest.mark.parametrize("fault", ["value_true", "value_false", "value_bytes", "style_bool", "extra",
+    "row_key", "raw_hex", "numeric_time", "nonUTC", "geometry", "side", "delivery"])
+def test_order640_typed_mutation_is_rejected_before_commit(tmp_path, fault):
+    from pydantic import TypeAdapter
+    from rquant.l2.cache import RawL2Cache
+    from rquant.l2.models import RawCell
+
+    original = order640_observation()
+    if fault in {"numeric_time", "nonUTC"}:
+        value = 0 if fault == "numeric_time" else original.received_at.astimezone(timezone(timedelta(hours=1)))
+        changed = original.model_copy(update={"received_at": value})
+    elif fault == "geometry":
+        changed = original.model_copy(update={"table": original.table.model_copy(update={"row_width": 31})})
+    elif fault == "side":
+        changed = original.model_copy(update={"binding": original.binding.model_copy(update={"side": "buy"})})
+    elif fault == "delivery":
+        changed = original.model_copy(update={"delivery": "seed"})
+    else:
+        rows = list(original.table.rows)
+        row = dict(rows[0])
+        cell = TypeAdapter(RawCell).dump_python(row["1"])
+        if fault.startswith("value_"):
+            cell["value"] = {"value_true": True, "value_false": False, "value_bytes": b"1"}[fault]
+        elif fault == "style_bool": cell["style"] = True
+        elif fault == "extra": cell["extra"] = 1
+        elif fault == "raw_hex": cell["raw_hex"] = "xyz"
+        row["1"] = cell
+        if fault == "row_key": row[1] = row.pop("1")
+        rows[0] = row
+        changed = original.model_copy(update={"table": original.table.model_copy(update={"rows": tuple(rows)})})
+    cache = RawL2Cache(tmp_path / "mutation")
+    with cache.writer():
+        cache.append(original)
+        with pytest.raises(ValueError):
+            cache.append(changed)
+        assert cache.read_status().last_sequence == 1
+        assert not list((cache.root / "batches").glob(".pending-*"))

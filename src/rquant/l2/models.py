@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, field_validator, model_validator
+from typing_extensions import TypedDict
 
 from .symbols import MAX_SYMBOLS, market_for_code, normalize_symbols
 
@@ -136,7 +137,9 @@ class SubscriptionReceipt(Model):
         return self
 
 
-class RawCell(Model):
+class RawCell(TypedDict):
+    __pydantic_config__ = ConfigDict(extra="forbid")
+
     value: StrictStr | StrictInt | None
     raw_hex: HexBytes
     style: Annotated[StrictInt, Field(ge=0, le=255)]
@@ -239,11 +242,11 @@ class RawTable(Model):
                 raise ValueError("row vendor fields mismatch")
             for column in self.columns:
                 cell = row[str(column.field_id)]
-                data = bytes.fromhex(cell.raw_hex)
+                data = bytes.fromhex(cell["raw_hex"])
                 if len(data) != column.width:
                     raise ValueError("cell width mismatch")
                 raw.extend(data)
-                raw.append(cell.style)
+                raw.append(cell["style"])
         if hashlib.sha256(raw).hexdigest() != self.row_data_sha256:
             raise ValueError("row data hash mismatch")
         return self
@@ -330,7 +333,7 @@ class MarketObservation(Model):
             RawTable.preflight_shape(self.table)
             if not trade:
                 expected_side = 1 if self.binding.side == "buy" else 2
-                if any(type(row["12"].value) is not int or row["12"].value != expected_side for row in self.table.rows):
+                if any(type(row["12"]["value"]) is not int or row["12"]["value"] != expected_side for row in self.table.rows):
                     raise ValueError("expanded order side mismatch")
         layout = (self.table.col_count, self.table.row_width, self.table.title)
         if trade:

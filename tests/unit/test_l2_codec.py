@@ -662,6 +662,7 @@ def test_raw_table_keeps_logical_byte_budget_before_rows() -> None:
 @pytest.mark.parametrize("fault", ["flags", "widths", "extra"])
 def test_expanded_trade_rejects_unrecognized_descriptor(tmp_path: Path, rows: int, target: str, fault: str) -> None:
     from rquant.l2.cache import RawL2Cache
+    from pydantic import TypeAdapter
     from rquant.l2.models import Binding, MarketObservation, RawCell, RawColumn, RawTable
 
     codec = module("_codec")
@@ -687,9 +688,10 @@ def test_expanded_trade_rejects_unrecognized_descriptor(tmp_path: Path, rows: in
         else:
             # Exercise append's own RawL2Batch revalidation independently of
             # observation construction, with valid typed cells and raw hashes.
+            cell_adapter = TypeAdapter(RawCell)
             typed = RawTable.model_construct(**{**data["table"],
                 "columns": tuple(RawColumn.model_validate(c) for c in data["table"]["columns"]),
-                "rows": tuple({k: RawCell.model_validate(v) for k, v in row.items()}
+                "rows": tuple({k: cell_adapter.validate_python(v) for k, v in row.items()}
                               for row in data["table"]["rows"])})
             unchecked = MarketObservation.model_construct(**{**data,
                 "binding": Binding.model_validate(data["binding"]), "table": typed})
@@ -754,7 +756,7 @@ def test_byte_envelope_order_uses_known_profile_and_geometry(side):
     binding = {"kind": "vendor4027", "code": "603258", "market": 17, "side": side, "page_id": 10117}
     model = MarketObservation.model_validate(market_model_data(body, result, binding=binding))
     assert model.table.row_count == len(model.table.rows) == 501
-    assert {cell["12"].value for cell in model.table.rows} == {1 if side == "buy" else 2}
+    assert {cell["12"]["value"] for cell in model.table.rows} == {1 if side == "buy" else 2}
 
 
 def test_byte_envelope_compressed_logical_boundary_and_preallocation(monkeypatch):

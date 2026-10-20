@@ -639,3 +639,14 @@ def test_websocket_is_not_exposed_by_platform_cache_router(tmp_path: Path, webso
     app = FastAPI(); app.state.l2_cache = RawL2Cache(tmp_path / 'absent'); app.include_router(router)
     with TestClient(app) as client, pytest.raises(WebSocketDisconnect):
         with client.websocket_connect('/api/v1/l2/stream'): pytest.fail('platform exposed WS')
+
+
+def test_cell_and_containing_openapi_schema_is_unchanged(tmp_path):
+    import hashlib
+
+    app = module("api").create_app(tmp_path / "schema-only")
+    schemas = app.openapi()["components"]["schemas"]
+    selected = {name: schemas[name] for name in ("RawCell", "RawTable", "RawL2Batch", "BatchPage")}
+    payload = json.dumps(selected, sort_keys=True, separators=(",", ":")).encode()
+    assert hashlib.sha256(payload).hexdigest() == "addfe6ae3e09b81a538d8a4c8720930076344bf0ebc6bafeeb5518ba31499573"
+    assert not (tmp_path / "schema-only").exists()
