@@ -87,6 +87,9 @@ from rquant.web.models import (
     ReportFactorsSummaryData,
     SavePoolRequest,
     ScreenData,
+    ScreenerSchemeBody,
+    ScreenerSchemeRow,
+    ScreenerSchemesData,
     ScreenRow,
     ServiceItem,
     ServingMeta,
@@ -95,6 +98,7 @@ from rquant.web.models import (
     StrategyRow,
     SurgeData,
     SurgeEvent,
+    SurgeRules,
     TextToConditionData,
     TextToConditionRequest,
     TranslateData,
@@ -765,7 +769,26 @@ def surge_events(request: Request, source: SourceDep, day: date | None = None,
                 "at", "time", "name", "kind", "ratio", "acc1", "acc5", "pct", "price", "amount")}))
         except Exception:  # noqa: BLE001 - skip malformed lines
             continue
-    return _envelope(source, SurgeData(date=d, items=items))
+    from rquant.research.surge import (
+        ACC5_MIN,
+        ACC_RATIO_MIN,
+        AMOUNT_MIN,
+        COOLDOWN_S,
+        RATIO_MIN,
+        START_M,
+        WIN_AMOUNT_MIN,
+    )
+
+    rules = SurgeRules(
+        ratio_min=RATIO_MIN,
+        amount_min=AMOUNT_MIN,
+        acc5_min=ACC5_MIN,
+        win_amount_min=WIN_AMOUNT_MIN,
+        acc_ratio_min=ACC_RATIO_MIN,
+        start_m=START_M,
+        cooldown_s=COOLDOWN_S,
+    )
+    return _envelope(source, SurgeData(date=d, items=items, rules=rules))
 
 
 @router.get("/alerts", response_model=Envelope[AlertsData], summary="告警时间线")
@@ -840,9 +863,20 @@ def _role(request: Request) -> str:
     return "admin" if not admins or _user(request) in admins else "viewer"
 
 
+def _preview_fail(request: Request) -> bool:
+    """Fixture preview only. Production ignores ``?fail=1`` and the preview header."""
+    if not getattr(request.app.state, "preview_writes", False):
+        return False
+    if request.query_params.get("fail") == "1":
+        return True
+    return request.headers.get("x-rquant-preview-fail") == "1"
+
+
 def _send(request: Request, kind: str, fields: dict[str, Any]) -> CommandReceipt:
     if _role(request) != "admin":
         raise HTTPException(403, "只读账号不能执行写操作")
+    if _preview_fail(request):
+        raise HTTPException(503, "preview failure")
     transport: Callable | None = getattr(request.app.state, "page_control_transport", None)
     try:
         receipt = page_control.forward(kind, fields, transport)
@@ -960,6 +994,55 @@ def save_alert_rule(body: AlertRuleBody, request: Request) -> CommandReceipt:
 def add_watch(body: AddWatchRequest, request: Request) -> CommandReceipt:
     return _send(request, "add_watchlist_item", {"item": {"ts_code": body.code,
                                                            "note": body.note}})
+
+
+def _schemes(request: Request):
+    from rquant.web.screener_schemes import MemorySchemeStore, SqliteSchemeStore
+    from rquant.web.source import FixtureSource
+
+    store = getattr(request.app.state, "screener_schemes", None)
+    if store is not None:
+        return store
+    source = getattr(request.app.state, "source", None)
+    if isinstance(source, FixtureSource) or getattr(request.app.state, "preview_writes", False):
+        store = MemorySchemeStore()
+    else:
+        import os
+
+        from rquant.config import get_settings
+
+        raw = os.environ.get("RQUANT_SCREENER_SCHEMES_DB")
+        path = Path(raw) if raw else get_settings().data_dir / "screener_schemes.sqlite3"
+        store = SqliteSchemeStore(path)
+    request.app.state.screener_schemes = store
+    return store
+
+
+@router.get("/screener-schemes", response_model=Envelope[ScreenerSchemesData], summary="选股方案")
+def list_screener_schemes(request: Request, source: SourceDep) -> Envelope[ScreenerSchemesData]:
+    rows = [ScreenerSchemeRow(**row) for row in _schemes(request).list()]
+    return _envelope(source, ScreenerSchemesData(schemes=rows))
+
+
+@router.put("/screener-schemes", response_model=CommandReceipt, summary="保存选股方案")
+def save_screener_scheme(body: ScreenerSchemeBody, request: Request) -> CommandReceipt:
+    if _role(request) != "admin":
+        raise HTTPException(403, "只读账号不能执行写操作")
+    if _preview_fail(request):
+        raise HTTPException(503, "preview failure")
+    _schemes(request).save(body.name, body.filters, body.ranks)
+    return CommandReceipt(command_id=None, status="succeeded")
+
+
+@router.delete("/screener-schemes", response_model=CommandReceipt, summary="删除选股方案")
+def delete_screener_scheme(request: Request, name: str = Query(min_length=1, max_length=40),
+                           ) -> CommandReceipt:
+    if _role(request) != "admin":
+        raise HTTPException(403, "只读账号不能执行写操作")
+    if _preview_fail(request):
+        raise HTTPException(503, "preview failure")
+    _schemes(request).delete(name)
+    return CommandReceipt(command_id=None, status="succeeded")
 
 
 @router.get("/tasks", response_model=Envelope[list[task_view.TaskRow]],

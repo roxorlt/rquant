@@ -67,6 +67,16 @@
   --topbar-h: 52px;
   --rail-w: 212px;
   --rail-w-min: 60px;
+
+  /* Overlay stack, low to high: page < top bar & bottom nav < scrim < drawers & sheets < toasts.
+     Search and the command palette sit above that stack. */
+  --z-topbar: 40;
+  --z-nav: 40;
+  --z-scrim: 50;
+  --z-drawer: 60;
+  --z-toast: 70;
+  --z-search: 80;
+  --z-cmdk: 100;
   color-scheme: light;
 }
 

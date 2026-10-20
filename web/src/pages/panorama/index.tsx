@@ -23,7 +23,7 @@ export default function PanoramaPage() {
           return (
             <>
               <Panel
-                title={`东财板块热力图（Serving${asOf ? ` · ${formatShanghaiDateTime(asOf)}` : ""}）`}
+                title={`东财板块热力图${asOf ? ` · ${formatShanghaiDateTime(asOf)}` : ""}`}
                 sub="面积 = 成交额，颜色 = 成分股涨跌幅中位数（±3% 封顶）；取成交额前 80"
                 actions={
                   systems.length > 1 ? (
@@ -31,7 +31,10 @@ export default function PanoramaPage() {
                       label="板块体系"
                       value={system ?? systems[0] ?? ""}
                       onChange={setSystem}
-                      options={systems.map((s) => ({ value: s, label: s }))}
+                      options={systems.map((s) => ({
+                        value: s,
+                        label: s === "dc_industry" ? "行业" : s,
+                      }))}
                     />
                   ) : undefined
                 }

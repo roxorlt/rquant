@@ -38,7 +38,7 @@ export function LivePanorama() {
       {(data) => {
         const p = data.pulse;
         if (!p || !data.curve)
-          return <p className="hint pad">今天还没有快照（采集器 09:10 启动，开盘后出现）。</p>;
+          return <p className="hint pad">今天还没有快照。</p>;
         const c = data.curve;
         const live = inTradingHours();
         const boards = data.boards;

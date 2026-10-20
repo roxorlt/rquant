@@ -60,7 +60,9 @@ export default function PoolsPage() {
                 onChange={setSelected}
                 options={data.pools.map((p) => ({
                   value: p.name,
-                  label: p.name.replace("（同花顺原条件，非买入信号）", ""),
+                  label: p.name
+                    .replace("（同花顺原条件，非买入信号）", "")
+                    .replace(/（T-1=[^）]*）/g, ""),
                 }))}
               />
               <Panel

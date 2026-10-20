@@ -14,15 +14,33 @@ export interface AppDrawerProps {
   /** Accessible name when the title is not plain text. */
   label: string;
   extra?: ReactNode;
+  /** Fixed actions. Only the body scrolls. */
+  footer?: ReactNode;
   children: ReactNode;
 }
 
+function focusable(root: HTMLElement): HTMLElement[] {
+  return [
+    ...root.querySelectorAll<HTMLElement>(
+      'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+    ),
+  ].filter((el) => !el.hasAttribute("disabled") && el.getAttribute("aria-hidden") !== "true");
+}
+
 /**
- * Desktop right drawer (400px) / phone bottom sheet (max 85vh).
+ * Desktop right drawer (full viewport height) / phone bottom sheet (flush to the screen edge).
  * Closes from the button, the scrim, Esc, and a downward swipe on the grabber or header.
- * Focus returns to whatever opened it (the row, when that row took focus).
+ * Focus starts on the title, stays inside the dialog, and returns to the opener.
  */
-export function AppDrawer({ open, onClose, title, label, extra, children }: AppDrawerProps) {
+export function AppDrawer({
+  open,
+  onClose,
+  title,
+  label,
+  extra,
+  footer,
+  children,
+}: AppDrawerProps) {
   const titleId = useId();
   const panel = useRef<HTMLElement>(null);
   const opener = useRef<HTMLElement | null>(null);
@@ -33,6 +51,8 @@ export function AppDrawer({ open, onClose, title, label, extra, children }: AppD
   useEffect(() => {
     if (!open) return;
     opener.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const shell = document.querySelector(".shell");
+    if (shell instanceof HTMLElement) shell.inert = true;
     const html = document.documentElement;
     const prev = html.style.overflow;
     html.style.overflow = "hidden";
@@ -40,18 +60,42 @@ export function AppDrawer({ open, onClose, title, label, extra, children }: AppD
       if (event.key === "Escape") {
         event.preventDefault();
         onCloseRef.current();
+        return;
+      }
+      if (event.key !== "Tab" || !panel.current) return;
+      const items = focusable(panel.current);
+      if (items.length === 0) {
+        event.preventDefault();
+        return;
+      }
+      const first = items[0];
+      const last = items[items.length - 1];
+      const active = document.activeElement;
+      const onTitle = active instanceof HTMLElement && active.id === titleId;
+      if (onTitle || !panel.current.contains(active)) {
+        event.preventDefault();
+        (event.shiftKey ? last : first)?.focus();
+        return;
+      }
+      if (event.shiftKey && active === first) {
+        event.preventDefault();
+        last?.focus();
+      } else if (!event.shiftKey && active === last) {
+        event.preventDefault();
+        first?.focus();
       }
     };
     window.addEventListener("keydown", onKey);
-    panel.current?.querySelector<HTMLElement>(".drawer-h .x")?.focus();
+    panel.current?.querySelector<HTMLElement>(".drawer-h h2")?.focus();
     return () => {
+      if (shell instanceof HTMLElement) shell.inert = false;
       html.style.overflow = prev;
       window.removeEventListener("keydown", onKey);
       const back = opener.current;
       opener.current = null;
       back?.focus();
     };
-  }, [open]);
+  }, [open, titleId]);
 
   if (!open) return null;
 
@@ -86,13 +130,16 @@ export function AppDrawer({ open, onClose, title, label, extra, children }: AppD
       >
         <div className="drawer-grab" aria-hidden="true" onPointerDown={onDown} onPointerUp={onUp} />
         <div className="drawer-h" onPointerDown={onDown} onPointerUp={onUp}>
-          <h2 id={titleId}>{title}</h2>
+          <h2 id={titleId} tabIndex={-1}>
+            {title}
+          </h2>
           {extra}
           <button type="button" className="x" aria-label="关闭" onClick={onClose}>
             ×
           </button>
         </div>
         <div className="drawer-b">{children}</div>
+        {footer ? <div className="drawer-f">{footer}</div> : null}
       </aside>
     </>,
     document.body,

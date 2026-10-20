@@ -35,6 +35,23 @@ it("closes from the button, the mask, and Escape, then returns focus", () => {
   expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
 });
 
+it("starts on the title and keeps Tab inside the drawer", () => {
+  render(<Harness />);
+  const open = screen.getByRole("button", { name: "打开日志" });
+  open.focus();
+  fireEvent.click(open);
+  const title = screen.getByRole("heading", { name: "每日行情采集" });
+  expect(title).toHaveFocus();
+  const close = screen.getByRole("button", { name: "关闭" });
+  close.focus();
+  fireEvent.keyDown(window, { key: "Tab" });
+  expect(close).toHaveFocus();
+  expect(document.body).not.toHaveFocus();
+  fireEvent.keyDown(window, { key: "Escape" });
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  expect(open).toHaveFocus();
+});
+
 it("closes when the grabber is swiped down", () => {
   render(<Harness />);
   fireEvent.click(screen.getByRole("button", { name: "打开日志" }));

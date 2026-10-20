@@ -1,5 +1,30 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_TOP_N, fmtAmountYi, fmtTurnoverChg, layoutEndLabels, tone } from "./model";
+import {
+  colorMap,
+  DEFAULT_TOP_N,
+  fmtAmountYi,
+  fmtSectorNet,
+  fmtTurnoverChg,
+  fmtYi,
+  layoutEndLabels,
+  type Sector,
+  tone,
+} from "./model";
+
+describe("leader net is already 亿", () => {
+  it("does not divide a series value by 1e8", () => {
+    expect(fmtSectorNet(2.4)).toBe("+2.4亿");
+    expect(fmtYi(2.4 / 1e8)).toBe("+0.0亿");
+  });
+});
+
+describe("line colours", () => {
+  it("gives each drawn sector a different colour", () => {
+    const shown = Array.from({ length: 10 }, (_, i) => ({ name: `板块${i}` })) as Sector[];
+    const colors = [...colorMap(shown).values()];
+    expect(new Set(colors).size).toBe(colors.length);
+  });
+});
 
 describe("sectorflow defaults", () => {
   it("draws 5 inflow + 5 outflow lines by default (phone too)", () => {

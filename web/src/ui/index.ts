@@ -3,6 +3,8 @@
  * these wrappers (biome.json forbids importing it from pages and the shell),
  * so a component can be replaced in one place.
  */
+
+export { AppDrawer, type AppDrawerProps } from "./AppDrawer";
 export { Button, type ButtonProps } from "./Button";
 export { ChangeText } from "./ChangeText";
 export { ConfirmDialog, type ConfirmDialogProps, type ConfirmLevel } from "./ConfirmDialog";
@@ -10,7 +12,10 @@ export { DatePicker, type DatePickerProps } from "./DatePicker";
 export { BottomSheet, type BottomSheetProps, SideDrawer, type SideDrawerProps } from "./Drawer";
 export { DropdownMenu, type DropdownMenuItem } from "./DropdownMenu";
 export { EmptyState } from "./EmptyState";
+export { FailureNotice, ReadOnlyBanner } from "./FailureNotice";
 export { FlowSteps } from "./FlowSteps";
+export { type FailureCopy, failureCopy } from "./failure";
+export { HelpMark } from "./HelpMark";
 export { type Kpi, KpiStrip } from "./KpiStrip";
 export { PageHeader, type PageHeaderProps } from "./PageHeader";
 export { PagePlaceholder, type PagePlaceholderProps } from "./PagePlaceholder";
@@ -27,8 +32,5 @@ export { StockLink } from "./StockLink";
 export { Switch } from "./Switch";
 export { type TabItem, Tabs } from "./Tabs";
 export { Tip, type TipProps, useTouchOnly } from "./Tip";
-export { AppDrawer, type AppDrawerProps } from "./AppDrawer";
-export { FailureNotice, ReadOnlyBanner } from "./FailureNotice";
-export { failureCopy, type FailureCopy } from "./failure";
 export { showToast, useToast } from "./Toast";
 export { UiProvider } from "./UiProvider";

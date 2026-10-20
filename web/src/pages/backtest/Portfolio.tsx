@@ -67,6 +67,7 @@ function Compare({ ids, onRemove }: { ids: string[]; onRemove: (id: string) => v
   return (
     <Panel
       title={`对比 · ${runs.length} 条`}
+      titleId="compare-title"
       sub="净值叠在一起。加粗并标「最优」的是这一行更好的数；回撤越小越好。"
     >
       <div>
@@ -198,7 +199,7 @@ function Detail({ runId, onCompare }: { runId: string; onCompare: () => void }) 
             title="过拟合检查"
             sub={`同一预设已存 ${data.overfit?.trials ?? 0} 次回测，按试验数计 DSR（下限估计）`}
             actions={
-              <Button size="sm" variant="ghost" onClick={onCompare}>
+              <Button size="sm" variant="ghost" className="touch-44" onClick={onCompare}>
                 加入对比
               </Button>
             }
@@ -317,13 +318,15 @@ export function PortfolioRuns() {
               sub={preset ? `只看入场池 ${preset}` : "点一行看净值和委托"}
               actions={
                 <>
-                  <span className="hint">已选 {picked.length} / 5</span>
+                  <span className="hint cmp-count">已选 {picked.length} / 5</span>
                   {picked.length >= 2 ? (
                     <Button
                       size="sm"
-                      onClick={() =>
-                        document.getElementById("compare-panel")?.scrollIntoView({ block: "start" })
-                      }
+                      className="touch-44"
+                      onClick={() => {
+                        document.getElementById("compare-panel")?.scrollIntoView({ block: "start" });
+                        document.getElementById("compare-title")?.focus();
+                      }}
                     >
                       看对比
                     </Button>
@@ -357,6 +360,7 @@ export function PortfolioRuns() {
                         <Button
                           size="sm"
                           variant="ghost"
+                          className="touch-44"
                           disabled={full}
                           aria-pressed={on}
                           onClick={(event) => {

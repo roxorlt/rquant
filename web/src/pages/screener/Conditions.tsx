@@ -3,7 +3,7 @@ import { useConditions, useTextToCondition, useTranslateTdx } from "@/api/endpoi
 import { toneClass, toneOf } from "@/format/color";
 import { formatPrice } from "@/format/number";
 import { DataTable } from "@/table/DataTable";
-import { Button, failureCopy, Panel } from "@/ui";
+import { Button, FailureNotice, failureCopy, Panel } from "@/ui";
 import { StockLink } from "@/ui/StockLink";
 import { QueryView } from "../shared";
 
@@ -23,7 +23,7 @@ function TdxImport() {
   const passed = Boolean(result?.expression);
   const misses = unrecognizedCount(result?.error ?? null);
   return (
-    <Panel title="通达信公式导入" sub="只翻译和校验。">
+    <Panel title="通达信公式导入" sub="只翻译和校验">
       <div className="formula-ai">
         <input
           aria-label="一句话条件"
@@ -46,7 +46,12 @@ function TdxImport() {
           {ai.isPending ? "生成中…" : "一句话生成"}
         </Button>
       </div>
-      {ai.error ? <p className="row-err">{failureCopy("条件", "生成", ai.error).text}</p> : null}
+      {ai.error ? (
+        <FailureNotice
+          copy={failureCopy("条件", "生成", ai.error)}
+          onRetry={() => ai.mutate(text)}
+        />
+      ) : null}
       <textarea
         aria-label="通达信公式"
         rows={3}
@@ -58,7 +63,10 @@ function TdxImport() {
         <Button onClick={() => translate.mutate(tdx)}>翻译</Button>
       </div>
       {translate.error ? (
-        <p className="row-err">{failureCopy("公式", "翻译", translate.error).text}</p>
+        <FailureNotice
+          copy={failureCopy("公式", "翻译", translate.error)}
+          onRetry={() => translate.mutate(tdx)}
+        />
       ) : null}
       {result ? (
         <div className="formula-result">
@@ -96,7 +104,9 @@ export function Conditions() {
               flush
             >
               {runs.length > 1 ? (
+                <div className="cond-pick">
                 <select
+                  className="select"
                   aria-label="选择条件"
                   value={picked}
                   onChange={(e) => setPicked(Number(e.target.value))}
@@ -107,6 +117,7 @@ export function Conditions() {
                     </option>
                   ))}
                 </select>
+                </div>
               ) : null}
               {run ? (
                 <DataTable

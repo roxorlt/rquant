@@ -1,4 +1,4 @@
-import { type ReactNode, useEffect, useState, useSyncExternalStore } from "react";
+import { type ReactNode, useEffect, useRef, useState, useSyncExternalStore } from "react";
 
 export interface ToastAction {
   label: string;
@@ -9,6 +9,8 @@ export interface ToastNotice {
   text: string;
   action?: ToastAction;
   duration?: number;
+  /** Element to focus after Esc dismisses this toast. */
+  returnFocus?: () => HTMLElement | null;
 }
 
 interface Current {
@@ -16,6 +18,8 @@ interface Current {
   text: string;
   action?: ToastAction;
   duration: number;
+  returnFocus?: () => HTMLElement | null;
+  focusAction: boolean;
 }
 
 let current: Current | null = null;
@@ -50,7 +54,14 @@ function arm(ms: number): void {
 export function showToast(input: string | ToastNotice): void {
   const notice = typeof input === "string" ? { text: input } : input;
   const duration = notice.duration ?? (notice.action?.label === "撤销" ? 6000 : 4000);
-  current = { id: ++seq, text: notice.text, action: notice.action, duration };
+  current = {
+    id: ++seq,
+    text: notice.text,
+    action: notice.action,
+    duration,
+    returnFocus: notice.returnFocus,
+    focusAction: notice.action?.label === "撤销",
+  };
   arm(duration);
   emit();
 }
@@ -85,9 +96,33 @@ export function useToast(): (notice: string | ToastNotice) => void {
 
 /** One bottom toast. Hover or focus pauses the timer; a new toast replaces this one. */
 export function ToastHost(): ReactNode {
-  const snap = useSyncExternalStore(subscribe, () => current, () => null);
+  const snap = useSyncExternalStore(
+    subscribe,
+    () => current,
+    () => null,
+  );
   const [, setTick] = useState(0);
+  const skipPause = useRef(false);
   useEffect(() => subscribe(() => setTick((n) => n + 1)), []);
+  useEffect(() => {
+    if (!snap) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      if (document.querySelector('[role="dialog"]')) return;
+      event.preventDefault();
+      const back = snap.returnFocus?.() ?? null;
+      dismissToast();
+      back?.focus();
+    };
+    window.addEventListener("keydown", onKey);
+    if (snap.focusAction) {
+      // Moving focus for the keyboard does not count as the user pausing the timer.
+      skipPause.current = true;
+      document.querySelector<HTMLElement>(".toast .act")?.focus();
+      skipPause.current = false;
+    }
+    return () => window.removeEventListener("keydown", onKey);
+  }, [snap]);
   if (!snap) return null;
   return (
     <div
@@ -96,7 +131,10 @@ export function ToastHost(): ReactNode {
       role="status"
       onMouseEnter={pauseToast}
       onMouseLeave={resumeToast}
-      onFocus={pauseToast}
+      onFocus={() => {
+        if (skipPause.current) return;
+        pauseToast();
+      }}
       onBlur={resumeToast}
     >
       <span>{snap.text}</span>

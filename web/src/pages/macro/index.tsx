@@ -92,7 +92,7 @@ function Holders({ data }: { data: MacroData }) {
   return (
     <Panel
       title="社保基金 / 中央汇金 持仓变动"
-      sub="来源：前十大流通股东（top10_floatholders）。按公告季度归集=信息真正可见的时间，避免前视；按报告期=实际调仓时间（滞后1-4个月才可知）。流入=Σ股数变动×期末价"
+      sub="来源：前十大流通股东。按公告季度归集=信息真正可见的时间；按报告期=实际调仓时间。流入=Σ股数变动×期末价"
       actions={
         <>
           <Segmented
@@ -237,7 +237,7 @@ function Options({ data }: { data: MacroData }) {
   return (
     <Panel
       title="ETF 期权情绪（日频）"
-      sub="PCR=认沽/认购；放量=当日成交量÷前20日均量；ATM IV=近月（≥7天）平值认购认沽 IV 均值（BS 反推，r=1.5%）"
+      sub="PCR=认沽/认购；放量=当日成交量÷前20日均量；ATM IV=近月（≥7天）平值认购认沽 IV 均值"
       actions={
         <Segmented
           label="标的"
@@ -418,7 +418,7 @@ function MacroBody({ data }: { data: MacroData }) {
           <>
             <Banded
               title="股债利差（沪深300）"
-              sub="1/PE_TTM − 中国10年国债收益率（AKShare）。虚线=全样本20/80分位"
+              sub="1/PE_TTM − 中国10年国债收益率。虚线=全样本20/80分位"
               c={daily}
               k="erp"
               name="股债利差%"
@@ -491,7 +491,7 @@ function MacroBody({ data }: { data: MacroData }) {
         <Holders data={data} />
         {etf && etf.dates.length > 1 ? (
           <Panel
-            title="宽基 ETF 份额与申赎（国家队代理）"
+            title="宽基 ETF 份额与申赎"
             sub="510300/159919/510310/510330 份额合计（亿份）。汇金托底常以买入宽基ETF进行，份额陡增可作日频线索"
           >
             <TimeChart
@@ -644,8 +644,8 @@ function HkSystem({ data }: { data: MacroData }) {
   const sig = col(c, "signal").map((v, i) => (v ? (col(c, "csi300")[i] ?? null) : null));
   return (
     <Panel
-      title="定价权系统C（近似复刻）"
-      sub="恒生科技指数 × 恒生科技ETF成交量 构造 SMARTMONEY；信号=SM>MA20 且 上证50/沪深300/创业板 同日收涨。博主原公式未公开，此为近似"
+      title="定价权系统C"
+      sub="恒生科技指数 × 恒生科技ETF成交量 构造 SMARTMONEY；信号=SM>MA20 且 上证50/沪深300/创业板 同日收涨"
     >
       <TimeChart
         label="沪深300与信号"

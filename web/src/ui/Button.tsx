@@ -9,6 +9,11 @@ export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
    * tooltip and as its accessible description (v2: no silent grey buttons).
    */
   disabledReason?: string;
+  /**
+   * Stays in the tab order (read-only writes). The click is ignored.
+   * Native `disabled` is for a control that is busy or has nothing to do.
+   */
+  ariaDisabled?: boolean;
   children: ReactNode;
 }
 
@@ -17,10 +22,12 @@ export function Button({
   size = "md",
   disabledReason,
   disabled,
+  ariaDisabled,
   type = "button",
   title,
   className,
   children,
+  onClick,
   ...rest
 }: ButtonProps) {
   const classes = [
@@ -31,14 +38,23 @@ export function Button({
   ]
     .filter(Boolean)
     .join(" ");
+  const soft = ariaDisabled === true && !disabled && disabledReason === undefined;
   const button = (
     <button
       {...rest}
       type={type}
       className={classes}
       disabled={disabled || disabledReason !== undefined}
+      aria-disabled={soft ? true : undefined}
       title={disabledReason === undefined ? title : undefined}
       aria-description={disabledReason}
+      onClick={(event) => {
+        if (soft) {
+          event.preventDefault();
+          return;
+        }
+        onClick?.(event);
+      }}
     >
       {children}
     </button>

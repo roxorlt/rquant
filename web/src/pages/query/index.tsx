@@ -128,7 +128,11 @@ export default function QueryPage() {
     });
   };
   useEffect(() => {
-    if (run.isSuccess || run.isError) resultRef.current?.scrollIntoView({ block: "start" });
+    if (run.isError) {
+      document.getElementById("query-error-title")?.focus();
+      return;
+    }
+    if (run.isSuccess) resultRef.current?.scrollIntoView({ block: "start" });
   }, [run.isSuccess, run.isError]);
   const insert = (text: string, replaceWord = false) => {
     const from = replaceWord ? start : cursor;
@@ -153,6 +157,8 @@ export default function QueryPage() {
       <div className="query-grid">
         <div className="query-schema">
           <Panel title="表与字段" sub="点表名插入" flush>
+            <details className="query-fold">
+            <summary>表与字段</summary>
             <nav className="schema-tree" aria-label="可查询的表">
               {Object.entries(tables).map(([t, cols]) => (
                 <div key={t}>
@@ -193,6 +199,7 @@ export default function QueryPage() {
                 </div>
               ))}
             </nav>
+            </details>
             {schema.error ? (
               <div className="error-block" role="alert">
                 <b>表列表没有读到</b>
@@ -246,8 +253,12 @@ export default function QueryPage() {
               ))}
             </div>
           </Panel>
-          {history.length ? (
+        </div>
+        {history.length ? (
+          <div className="query-history">
             <Panel title="历史与收藏" sub="收藏的语句会留在这里" flush>
+              <details className="query-fold">
+              <summary>历史与收藏</summary>
               <ul className="sql-history">
                 {history.map((h) => (
                   <li key={h.sql}>
@@ -271,14 +282,16 @@ export default function QueryPage() {
                   </li>
                 ))}
               </ul>
+              </details>
             </Panel>
-          ) : null}
-        </div>
-      </div>
-      <div ref={resultRef}>
+          </div>
+        ) : null}
+        <div className="query-results" ref={resultRef}>
         {run.error ? (
-          <div className="error-block" role="alert" tabIndex={-1}>
-            <b>查询没有运行</b>
+          <div className="error-block" role="alert">
+            <b id="query-error-title" tabIndex={-1}>
+              查询没有运行
+            </b>
             <p>
               {run.error instanceof ApiError &&
               run.error.status === 400 &&
@@ -289,7 +302,7 @@ export default function QueryPage() {
             {run.error instanceof ApiError && run.error.status === 400 ? (
               <Button onClick={() => ref.current?.focus()}>改 SQL</Button>
             ) : (
-              <Button aria-busy={run.isPending || undefined} onClick={() => exec(sql)}>
+              <Button className="touch-44" aria-busy={run.isPending || undefined} onClick={() => exec(sql)}>
                 重试
               </Button>
             )}
@@ -333,6 +346,7 @@ export default function QueryPage() {
             />
           </>
         ) : null}
+        </div>
       </div>
     </>
   );

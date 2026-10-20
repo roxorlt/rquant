@@ -1,19 +1,51 @@
-import { useQueryClient } from "@tanstack/react-query";
 import { useRef, useState } from "react";
-import { type AlertItem, useAckAlert, useAlerts, useUnackAlert } from "@/api/endpoints";
+import {
+  type AlertItem,
+  useAckAlert,
+  useAlerts,
+  useAlertsCache,
+  useUnackAlert,
+} from "@/api/endpoints";
 import { useReadOnlyReason } from "@/api/useMeta";
 import { formatPrice } from "@/format/number";
 import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
-import { Button, FailureNotice, PageHeader, Panel, Pill, ReadOnlyBanner, useToast } from "@/ui";
-import { failureCopy, type FailureCopy } from "@/ui/failure";
+import {
+  Button,
+  FailureNotice,
+  PageHeader,
+  Panel,
+  Pill,
+  ReadOnlyBanner,
+  Segmented,
+  useToast,
+} from "@/ui";
+import { type FailureCopy, failureCopy } from "@/ui/failure";
 import { StockLink } from "@/ui/StockLink";
 import { QueryView } from "../shared";
 import { AlertRules } from "./Rules";
 import { SurgePanel } from "./Surge";
 
+const TRIGGER_LABEL: Record<string, string> = {
+  gap_up: "跳空高开",
+  volume_surge: "放量",
+  take_profit: "止盈",
+  breakout: "突破",
+};
+const POOL_LABEL: Record<string, string> = { pool1: "一号池", pool2: "二号池", manual: "自选" };
+
+function triggerLabel(value: string | null | undefined): string {
+  if (!value) return "—";
+  return TRIGGER_LABEL[value] ?? value;
+}
+
+function poolLabel(value: string | null | undefined): string {
+  if (!value) return "—";
+  return POOL_LABEL[value] ?? value;
+}
+
 interface RowFailure {
-  id: string;
+  ids: string[];
   copy: FailureCopy;
   attempt: number;
 }
@@ -24,60 +56,51 @@ export default function MonitorPage() {
   const unack = useUnackAlert();
   const toast = useToast();
   const readOnly = useReadOnlyReason();
-  const client = useQueryClient();
+  const alertsCache = useAlertsCache();
   const inflight = useRef(new Set<string>());
   const [busyId, setBusyId] = useState<string | null>(null);
   const [show, setShow] = useState<"all" | "open">("all");
   const [fail, setFail] = useState<RowFailure | null>(null);
 
-  const patchAck = (alertId: string, acked: boolean) => {
-    client.setQueryData(
-      ["alerts"],
-      (old: { data?: { items?: AlertItem[] } } | undefined) => {
-        const items = old?.data?.items;
-        if (!items) return old;
-        return {
-          ...old,
-          data: {
-            ...old.data,
-            items: items.map((item) =>
-              item.alert_id === alertId
-                ? {
-                    ...item,
-                    acked_at: acked ? new Date().toISOString() : null,
-                    acked_by: acked ? "我" : null,
-                  }
-                : item,
-            ),
-          },
-        };
-      },
-    );
-  };
-
   const acknowledge = async (row: AlertItem) => {
-    if (inflight.current.has(row.alert_id) || row.acked_at) return;
+    if (readOnly || inflight.current.has(row.alert_id) || row.acked_at) return;
     inflight.current.add(row.alert_id);
     setBusyId(row.alert_id);
-    const previous = client.getQueryData(["alerts"]);
-    patchAck(row.alert_id, true);
+    const previous = alertsCache.snapshot();
+    alertsCache.patchAck(row.alert_id, true);
     try {
       await ack.mutateAsync(row.alert_id);
-      await client.invalidateQueries({ queryKey: ["alerts"] });
-      setFail(null);
+      await alertsCache.refresh();
+      setFail((prev) => {
+        if (!prev) return null;
+        const ids = prev.ids.filter((id) => id !== row.alert_id);
+        return ids.length ? { ...prev, ids } : null;
+      });
       toast({
         text: "已确认 1 条告警",
         duration: 6000,
         action: { label: "撤销", onClick: () => void undo(row) },
+        returnFocus: () =>
+          document.querySelector<HTMLElement>(`[data-alert-focus="${row.alert_id}"]`),
       });
     } catch (error) {
-      client.setQueryData(["alerts"], previous);
-      const attempt = fail?.id === row.alert_id ? fail.attempt + 1 : 1;
+      alertsCache.restore(previous);
+      const attempt = fail?.ids.includes(row.alert_id) ? fail.attempt + 1 : 1;
       const who = `${row.code} ${row.name ?? ""}`.trim();
-      setFail({
-        id: row.alert_id,
-        attempt,
-        copy: failureCopy(`告警『${who}』`, "确认", error, attempt),
+      const one = failureCopy(`告警『${who}』`, "确认", error, attempt);
+      setFail((prev) => {
+        const ids = [...new Set([...(prev?.ids ?? []), row.alert_id])];
+        if (ids.length < 2) return { ids, attempt, copy: one };
+        const reason = one.text.split("：")[1]?.replace(/。.*$/, "") ?? "服务没有响应";
+        return {
+          ids,
+          attempt,
+          copy: {
+            text: `${ids.length} 条告警没确认上：${reason}。`,
+            retry: one.retry,
+            health: one.health,
+          },
+        };
       });
     } finally {
       inflight.current.delete(row.alert_id);
@@ -91,12 +114,16 @@ export default function MonitorPage() {
     setBusyId(row.alert_id);
     try {
       await unack.mutateAsync(row.alert_id);
-      await client.invalidateQueries({ queryKey: ["alerts"] });
-      patchAck(row.alert_id, false);
+      await alertsCache.refresh();
+      alertsCache.patchAck(row.alert_id, false);
       toast({ text: "已撤销确认", duration: 4000 });
     } catch (error) {
       const who = `${row.code} ${row.name ?? ""}`.trim();
-      setFail({ id: row.alert_id, attempt: 1, copy: failureCopy(`告警『${who}』`, "撤销", error) });
+      setFail({
+        ids: [row.alert_id],
+        attempt: 1,
+        copy: failureCopy(`告警『${who}』`, "撤销", error),
+      });
     } finally {
       inflight.current.delete(row.alert_id);
       setBusyId(null);
@@ -112,28 +139,38 @@ export default function MonitorPage() {
         {(data) => {
           const open = data.items.filter((r) => !r.acked_at).length;
           const rows = show === "open" ? data.items.filter((r) => !r.acked_at) : data.items;
-          const failed = rows.find((row) => row.alert_id === fail?.id);
+          const failed = rows.find((row) => fail?.ids.includes(row.alert_id));
           return (
             <Panel
               title={`告警时间线 · 未确认 ${open} / 共 ${data.items.length}`}
               sub="最新在上"
               actions={
-                <div className="seg" role="group" aria-label="显示">
-                  <button type="button" aria-pressed={show === "all"} onClick={() => setShow("all")}>
-                    全部
-                  </button>
-                  <button type="button" aria-pressed={show === "open"} onClick={() => setShow("open")}>
-                    未确认 {open}
-                  </button>
-                </div>
+                <Segmented
+                  label="显示"
+                  value={show}
+                  onChange={setShow}
+                  options={[
+                    { value: "all", label: "全部" },
+                    { value: "open", label: `未确认 ${open}` },
+                  ]}
+                />
               }
               flush
             >
               {fail ? (
                 <FailureNotice
                   copy={fail.copy}
-                  busy={busyId === fail.id}
-                  onRetry={failed ? () => void acknowledge(failed) : undefined}
+                  busy={busyId != null && fail.ids.includes(busyId)}
+                  onRetry={
+                    failed
+                      ? () => {
+                          for (const id of fail?.ids ?? []) {
+                            const row = rows.find((item) => item.alert_id === id);
+                            if (row) void acknowledge(row);
+                          }
+                        }
+                      : undefined
+                  }
                 />
               ) : null}
               <DataTable
@@ -143,9 +180,7 @@ export default function MonitorPage() {
                 initialSort={{ id: "at", desc: true }}
                 rowKey={(row) => row.alert_id}
                 height={600}
-                emptyText={
-                  show === "open" ? "告警都已确认。" : "今天还没有告警。规则在下方调整。"
-                }
+                emptyText={show === "open" ? "告警都已确认。" : "今天还没有告警。规则在下方调整。"}
                 columns={[
                   {
                     id: "at",
@@ -169,7 +204,12 @@ export default function MonitorPage() {
                     value: (row) => row.level,
                     cell: (row) => <Pill kind={row.acked_at ? "idle" : "warn"}>{row.level}</Pill>,
                   },
-                  { id: "type", header: "类型", value: (row) => row.trigger_type ?? null },
+                  {
+                    id: "type",
+                    header: "类型",
+                    value: (row) => row.trigger_type ?? null,
+                    cell: (row) => triggerLabel(row.trigger_type),
+                  },
                   {
                     id: "price",
                     header: "触发价",
@@ -177,7 +217,13 @@ export default function MonitorPage() {
                     value: (row) => row.trigger_price ?? null,
                     cell: (row) => formatPrice(row.trigger_price),
                   },
-                  { id: "pool", header: "池", value: (row) => row.pool ?? null, secondary: true },
+                  {
+                    id: "pool",
+                    header: "池",
+                    value: (row) => row.pool ?? null,
+                    secondary: true,
+                    cell: (row) => poolLabel(row.pool),
+                  },
                   {
                     id: "ack",
                     header: "状态",
@@ -185,21 +231,24 @@ export default function MonitorPage() {
                     value: () => null,
                     cell: (row) =>
                       row.acked_at ? (
-                        <span className="st" tabIndex={-1}>
-                          已确认{row.acked_by ? ` · ${row.acked_by}` : ""}
+                        <span className="st" tabIndex={-1} data-alert-focus={row.alert_id}>
+                          已确认
                         </span>
                       ) : (
                         <span className="ack-cell">
-                          {fail?.id === row.alert_id ? <span className="row-err">没确认上</span> : null}
+                          <span className="st warn" data-alert-focus={row.alert_id} tabIndex={-1}>
+                            未确认
+                          </span>
                           <Button
                             size="sm"
                             variant="ghost"
                             aria-busy={busyId === row.alert_id || undefined}
                             aria-describedby={readOnly ? "readonly-notice" : undefined}
-                            disabled={!!readOnly || busyId === row.alert_id}
+                            ariaDisabled={!!readOnly}
+                            disabled={busyId === row.alert_id}
                             onClick={() => void acknowledge(row)}
                           >
-                            {fail?.id === row.alert_id ? "重试" : "确认"}
+                            {fail?.ids.includes(row.alert_id) ? "重试" : "确认"}
                           </Button>
                         </span>
                       ),

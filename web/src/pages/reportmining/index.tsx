@@ -403,7 +403,6 @@ export default function ReportMiningPage() {
       <PageHeader
         eyebrow="研究"
         title="研报挖掘"
-        note="复现券商金工因子：5 分钟 / 日线数据可做的已回测；3s 快照类登记待数据积累"
       />
       <QueryView query={query}>
         {(data) =>

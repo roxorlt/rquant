@@ -4,7 +4,7 @@
 .topbar {
   position: sticky;
   top: 0;
-  z-index: 40;
+  z-index: var(--z-topbar);
   display: flex;
   align-items: center;
   gap: 12px;
@@ -401,7 +401,7 @@
 .search-screen {
   position: fixed;
   inset: 0;
-  z-index: 80;
+  z-index: var(--z-search);
   display: flex;
   flex-direction: column;
   gap: 12px;
@@ -627,7 +627,7 @@
   .tabbar {
     position: fixed;
     inset: auto 0 0;
-    z-index: 45;
+    z-index: var(--z-nav);
     display: grid;
     grid-template-columns: repeat(4, minmax(0, 1fr));
     height: calc(56px + env(safe-area-inset-bottom, 0px));
@@ -687,12 +687,13 @@
   .cmdk-input {
     font-size: 16px;
   }
-  /* Sheet sits above the tab bar so 全景 / 资金流 / 池子 / 更多 stay reachable. */
+  /* Sheets cover the tab bar and sit on the screen edge; only the home indicator is padded. */
   .rq-sheet.ant-drawer {
-    bottom: calc(56px + env(safe-area-inset-bottom, 0px));
+    bottom: 0;
   }
   .rq-sheet .ant-drawer-section {
-    max-height: calc(100dvh - var(--topbar-h) - 56px - 12px);
+    max-height: 85dvh;
+    padding-bottom: env(safe-area-inset-bottom, 0px);
   }
 }
 .tb-date {
@@ -739,7 +740,7 @@
 .cmdk-backdrop {
   position: fixed;
   inset: 0;
-  z-index: 1000;
+  z-index: var(--z-cmdk);
   display: flex;
   justify-content: center;
   align-items: flex-start;

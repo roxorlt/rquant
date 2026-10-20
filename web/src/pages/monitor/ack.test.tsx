@@ -121,7 +121,7 @@ it("does not show 已确认 when the write fails, and offers 重试 on the row",
   fireEvent.click(
     await screen.findAllByRole("button", { name: "确认" }).then((n) => n[0] as HTMLElement),
   );
-  expect(await screen.findByText("没确认上")).toBeInTheDocument();
+  expect(await screen.findByText(/没确认上/)).toBeInTheDocument();
   expect(screen.getAllByRole("button", { name: "重试" }).length).toBeGreaterThan(0);
   expect(screen.queryByText("已确认 1 条告警")).not.toBeInTheDocument();
   expect(screen.queryByText(/HTTP/)).not.toBeInTheDocument();

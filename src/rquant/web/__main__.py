@@ -49,6 +49,7 @@ def main(argv: list[str] | None = None) -> None:
             return {"command_id": payload["command_id"], "status": "succeeded"}
 
         app.state.page_control_transport = transport
+        app.state.preview_writes = True
 
         def demo_llm(messages: list[dict]) -> str:  # no network in demo mode
             if "通达信" in messages[0]["content"]:

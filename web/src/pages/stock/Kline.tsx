@@ -222,7 +222,7 @@ export function KlinePanel({
   return (
     <Panel
       title="日K线 · 筹码"
-      sub="前复权；筹码 = 换手率衰减模型（近似）"
+      sub="前复权"
       actions={
         <span className="qc-ctl">
           <label>

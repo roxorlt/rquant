@@ -43,7 +43,7 @@ export function FlowChart({ t, shown, colors, mode, upto, phone, focus, onFocus 
   }, []);
 
   const h = phone ? 300 : 440;
-  const m = { l: phone ? 34 : 46, r: phone ? 86 : 124, t: 22, b: 24 };
+  const m = { l: phone ? 34 : 46, r: phone ? 108 : 124, t: 22, b: 24 };
   const iw = Math.max(50, w - m.l - m.r);
   const ih = h - m.t - m.b;
   const X = (slot: number) => m.l + (slotX(slot) / X_MAX) * iw;
@@ -328,6 +328,10 @@ export function FlowChart({ t, shown, colors, mode, upto, phone, focus, onFocus 
           const x0 = X(upto) + 5;
           const x1 = X(upto) + 14;
           const dim = focus != null && focus !== s.name;
+          const labelName = phone && s.name.length > 4 ? s.name.slice(0, 4) : s.name;
+          const label = `${labelName} ${fmtValue(v, mode)}`;
+          const est = label.length * (phone ? 12 : 11);
+          const flip = x1 + 3 + est > w - 4;
           return (
             <g
               key={s.name}
@@ -345,13 +349,14 @@ export function FlowChart({ t, shown, colors, mode, upto, phone, focus, onFocus 
                 opacity={0.6}
               />
               <text
-                x={x1 + 3}
+                x={flip ? x0 - 6 : x1 + 3}
                 y={y + 4}
+                textAnchor={flip ? "end" : "start"}
                 fill={c}
                 fontSize={phone ? 12 : 11}
                 fontWeight={focus === s.name ? 800 : 600}
               >
-                {phone && s.name.length > 4 ? s.name.slice(0, 4) : s.name}{" "}
+                {labelName}{" "}
                 <tspan className={v >= 0 ? "up" : "down"}>{fmtValue(v, mode)}</tspan>
               </text>
             </g>

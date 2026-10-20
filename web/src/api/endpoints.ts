@@ -21,7 +21,7 @@ type SectorFlowEnvelope = Schemas["Envelope_SectorFlowData_"];
 
 function unwrap<T>(data: T | undefined, response: Response): T {
   if (data === undefined) {
-    throw new ApiError(response.status, `网页 API 返回 HTTP ${response.status}`);
+    throw new ApiError(response.status, "暂时读不到数据");
   }
   return data;
 }
@@ -260,6 +260,39 @@ export function useAckAlert() {
   });
 }
 
+/** Optimistic ack updates stay next to the alerts query, not in the page. */
+export function useAlertsCache() {
+  const client = useQueryClient();
+  return {
+    snapshot: () => client.getQueryData(["alerts"]),
+    restore: (previous: unknown) => {
+      client.setQueryData(["alerts"], previous);
+    },
+    refresh: () => client.invalidateQueries({ queryKey: ["alerts"] }),
+    patchAck: (alertId: string, acked: boolean) => {
+      client.setQueryData(["alerts"], (old: { data?: { items?: AlertItem[] } } | undefined) => {
+        const items = old?.data?.items;
+        if (!items) return old;
+        return {
+          ...old,
+          data: {
+            ...old.data,
+            items: items.map((item) =>
+              item.alert_id === alertId
+                ? {
+                    ...item,
+                    acked_at: acked ? new Date().toISOString() : null,
+                    acked_by: acked ? "我" : null,
+                  }
+                : item,
+            ),
+          },
+        };
+      });
+    },
+  };
+}
+
 export function useUnackAlert() {
   const client = useQueryClient();
   return useMutation({
@@ -325,6 +358,37 @@ export function useAlertRules(): ServingQueryResult<Schemas["AlertRulesData"]> {
   return useServingQuery(["alert-rules"], async () => {
     const { data, response } = await apiClient().GET("/api/v1/alert-rules");
     return unwrap(data, response);
+  });
+}
+
+export function useScreenerSchemes(): ServingQueryResult<Schemas["ScreenerSchemesData"]> {
+  return useServingQuery(["screener-schemes"], async () => {
+    const { data, response } = await apiClient().GET("/api/v1/screener-schemes");
+    return unwrap(data, response);
+  });
+}
+
+export function useSaveScreenerScheme() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async (body: Schemas["ScreenerSchemeBody"]) => {
+      const { data, response } = await apiClient().PUT("/api/v1/screener-schemes", { body });
+      return unwrap(data, response);
+    },
+    onSuccess: () => client.invalidateQueries({ queryKey: ["screener-schemes"] }),
+  });
+}
+
+export function useDeleteScreenerScheme() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async (name: string) => {
+      const { data, response } = await apiClient().DELETE("/api/v1/screener-schemes", {
+        params: { query: { name } },
+      });
+      return unwrap(data, response);
+    },
+    onSuccess: () => client.invalidateQueries({ queryKey: ["screener-schemes"] }),
   });
 }
 

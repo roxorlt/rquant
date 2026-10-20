@@ -452,10 +452,10 @@
 .sf-sh .rank {
   width: 20px;
   height: 20px;
-  border-radius: 6px;
-  background: var(--up-weak);
-  color: var(--up-t);
-  font-weight: 800;
+  border-radius: var(--r-sm);
+  background: var(--c-sunken);
+  color: var(--c-muted);
+  font-weight: 600;
   font-size: 12px;
   display: flex;
   align-items: center;
@@ -685,6 +685,15 @@
   grid-template-columns: minmax(0, 1fr) 56px 76px;
 }
 .sf-pill.replay {
-  color: var(--accent);
-  border-color: var(--accent);
+  background: var(--c-warn-weak);
+  color: var(--c-warn);
+  border-color: transparent;
+  font-size: 12px;
+}
+.sf-hint {
+  font-size: 12px;
+  color: var(--c-muted);
+  border: 0;
+  background: none;
+  padding: 0;
 }

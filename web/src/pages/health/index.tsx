@@ -5,6 +5,22 @@ import { KpiStrip, PageHeader, Panel, StatusBadge } from "@/ui";
 import { QueryView } from "../shared";
 
 /** Large counts get thousands separators; dates and text pass through. */
+const STATUS_LABEL: Record<string, string> = {
+  running: "运行中",
+  idle: "空闲",
+  failed: "失败",
+  error: "出错",
+};
+
+function statusLabel(status: string, stale: boolean): string {
+  const text = STATUS_LABEL[status] ?? status;
+  return stale ? `${text}（过期）` : text;
+}
+
+function publicLines(lines: string[]): string[] {
+  return lines.filter((line) => !/python -m|HTTP|rquant-|API \d/.test(line));
+}
+
 function formatFresh(value: string | number): string {
   const n = typeof value === "number" ? value : /^\d+$/.test(value) ? Number(value) : null;
   return n === null ? String(value) : n.toLocaleString("zh-CN");
@@ -30,9 +46,9 @@ export default function HealthPage() {
                             : (layer.state as "ok" | "warn" | "crit")
                         }
                         label={`${layer.title}${layer.state === "unknown" ? "（未知）" : ""}`}
-                        reason={layer.detail.join("；")}
+                        reason={publicLines(layer.detail).join("；")}
                       />
-                      <span className="sub">{layer.detail[0]}</span>
+                      <span className="sub">{publicLines(layer.detail)[0] ?? "—"}</span>
                     </li>
                   ))}
                 </ul>
@@ -55,7 +71,7 @@ export default function HealthPage() {
                       return (
                         <StatusBadge
                           state={bad ? "crit" : "ok"}
-                          label={row.stale ? `${row.status}（过期）` : row.status}
+                          label={statusLabel(row.status, row.stale)}
                           reason={row.last_error}
                         />
                       );

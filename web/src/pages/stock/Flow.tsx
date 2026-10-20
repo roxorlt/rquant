@@ -39,7 +39,7 @@ export function FlowPanel({ s }: { s: Profile }) {
   return (
     <Panel
       title="主力资金"
-      sub={`大单+特大单主动净买入累计（亿元，Tushare 资金流向，L2 口径）；阴影 = 近 ${W} 日价格与资金方向相反`}
+      sub={`大单+特大单主动净买入累计（亿元）；阴影 = 近 ${W} 日价格与资金方向相反`}
     >
       <p className="chip-stats">
         <span>

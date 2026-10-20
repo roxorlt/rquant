@@ -42,7 +42,7 @@ export default function TasksPage() {
   const navigate = useNavigate();
   return (
     <>
-      <PageHeader eyebrow="运维" title="任务与调度" note="只读：服务和定时器的运行时间" />
+      <PageHeader eyebrow="运维" title="任务与调度" />
       <QueryView query={query}>
         {(rows) => (
           <Panel title={`任务 · ${rows.length}`} sub="点一行看日志" flush>

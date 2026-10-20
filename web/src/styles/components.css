@@ -86,6 +86,12 @@
   border-color: transparent;
   color: var(--faint);
 }
+.btn.quiet.in-watch,
+.btn.quiet.in-watch[aria-disabled="true"],
+.btn.quiet.in-watch[aria-disabled="true"]:hover {
+  color: var(--c-muted);
+  cursor: default;
+}
 
 /* ---------- pills ---------- */
 .pill {
@@ -348,6 +354,9 @@
 }
 .kpi .val[data-tone="ok"] {
   color: var(--ok-t);
+}
+.kpi .val[data-tone="muted"] {
+  color: var(--c-muted);
 }
 
 /* ---------- tables ---------- */
@@ -1074,6 +1083,10 @@
   .kpis {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
+  .kpis:has(> .kpi:last-child:nth-child(odd))::after {
+    content: "";
+    background: var(--c-surface);
+  }
   .kpi {
     padding: 10px 12px;
   }
@@ -1268,11 +1281,43 @@
   border: 0;
   margin: 0;
   padding: 0;
-  font: 600 13px / 18px var(--font-sans);
+  font: 400 12px / 16px var(--font-sans);
+  color: var(--c-muted);
+}
+.rule-fields legend {
+  font: inherit;
+  color: inherit;
+  padding: 0;
 }
 .rule-fields input {
   min-height: 32px;
   font-weight: 400;
+  color: var(--c-ink);
+}
+.rule-fields .seg {
+  display: flex;
+  width: 100%;
+}
+.rule-fields .seg button {
+  flex: 1 1 0;
+}
+.suffix-field {
+  position: relative;
+  display: block;
+}
+.suffix-field input {
+  width: 100%;
+  padding-right: 44px;
+  text-align: right;
+}
+.suffix-field .suffix {
+  position: absolute;
+  right: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--c-muted);
+  font-weight: 400;
+  pointer-events: none;
 }
 .rule-check {
   display: flex;
@@ -1300,10 +1345,53 @@
   justify-content: flex-end;
   gap: 8px;
 }
+.ack-cell .btn.sm {
+  height: 32px;
+  min-height: 32px;
+}
+.help-mark {
+  width: 22px;
+  height: 22px;
+  border: 1px solid var(--c-rule);
+  border-radius: var(--r-pill);
+  background: var(--c-surface);
+  color: var(--c-muted);
+  font: 600 12px / 1 var(--font-sans);
+  cursor: pointer;
+}
+.help-body {
+  max-width: 320px;
+  white-space: pre-wrap;
+  font: 400 13px / 20px var(--font-sans);
+  color: var(--c-ink);
+}
+.surge-sub,
+.sf-note-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
 @media (max-width: 599px) {
   .rule-fields input {
     min-height: 44px;
     font-size: 16px;
+  }
+  .seg button {
+    height: 44px;
+  }
+  .ack-cell .btn.sm {
+    height: 44px;
+    min-height: 44px;
+  }
+  .help-mark {
+    width: 44px;
+    height: 44px;
+  }
+  .touch-44 {
+    min-width: 44px;
+    min-height: 44px;
+    height: 44px;
   }
 }
 
@@ -1541,8 +1629,9 @@
 /* v1.2: drawer, log, toast, in-flow notices. */
 .notice {
   display: flex;
-  gap: 10px;
-  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  align-items: center;
   margin: 0 0 12px;
   padding: 10px 14px;
   border-radius: var(--r-sm);
@@ -1550,12 +1639,16 @@
   background: var(--surface-2);
   color: var(--ink-2);
 }
+.notice .acts {
+  display: inline-flex;
+  gap: 12px;
+  align-items: center;
+}
 .notice.crit {
   background: var(--crit-weak);
   color: var(--crit);
 }
 .notice .act {
-  margin-left: auto;
   color: inherit;
   font-weight: 500;
   white-space: nowrap;
@@ -1612,7 +1705,7 @@ button.scrim,
 .scrim {
   position: fixed;
   inset: 0;
-  z-index: 20;
+  z-index: var(--z-scrim);
   border: 0;
   padding: 0;
   margin: 0;
@@ -1624,7 +1717,7 @@ button.scrim,
   top: 0;
   right: 0;
   bottom: 0;
-  z-index: 21;
+  z-index: var(--z-drawer);
   width: min(400px, 100%);
   display: flex;
   flex-direction: column;
@@ -1666,9 +1759,19 @@ button.scrim,
 }
 .drawer-b {
   flex: 1;
+  min-height: 0;
   overflow: auto;
   overscroll-behavior: contain;
   padding: 12px 16px 16px;
+}
+.drawer-f {
+  flex: none;
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--rule);
+  background: var(--surface);
 }
 .drawer-grab {
   display: none;
@@ -1688,7 +1791,7 @@ button.scrim,
   position: fixed;
   left: 50%;
   bottom: 24px;
-  z-index: 30;
+  z-index: var(--z-toast);
   transform: translateX(-50%);
   display: flex;
   align-items: center;
@@ -1767,11 +1870,15 @@ button.scrim,
 @media (max-width: 599px) {
   .drawer {
     top: auto;
+    bottom: 0;
     left: 0;
     width: 100%;
     max-height: 85vh;
     border-radius: var(--r-md) var(--r-md) 0 0;
-    padding-bottom: env(safe-area-inset-bottom);
+  }
+  .drawer-f,
+  .drawer:not(:has(.drawer-f)) .drawer-b {
+    padding-bottom: calc(12px + env(safe-area-inset-bottom));
   }
   .drawer-grab {
     display: flex;
@@ -1809,8 +1916,14 @@ button.scrim,
   .query-main {
     order: 1;
   }
-  .query-schema {
+  .query-results {
     order: 2;
+  }
+  .query-history {
+    order: 3;
+  }
+  .query-schema {
+    order: 4;
   }
 }
 @media (pointer: coarse) {

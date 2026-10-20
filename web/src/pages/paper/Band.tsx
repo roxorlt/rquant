@@ -28,7 +28,7 @@ export function PaperBand() {
   return (
     <Panel
       title="与回测区间对照"
-      sub="用回测日收益自助抽样（假设独立同分布）得到 N 日后 5–95% 区间，看模拟盘是否落在区间内"
+      sub="用回测日收益自助抽样得到 N 日后 5–95% 区间，看模拟盘是否落在区间内"
     >
       <div className="rule-form">
         <select aria-label="对照回测" value={runId} onChange={(e) => setRunId(e.target.value)}>
@@ -86,7 +86,7 @@ export function PaperBand() {
           </tbody>
         </table>
       ) : (
-        <p className="sub">选好回测和起始日后显示区间（回测至少需要 5 个交易日）。</p>
+        <p className="sub">选好回测和起始日后显示区间。</p>
       )}
     </Panel>
   );

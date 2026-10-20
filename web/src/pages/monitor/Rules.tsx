@@ -9,7 +9,7 @@ import { QueryView } from "../shared";
 
 type Rule = Schemas["AlertRuleBody"];
 const POOLS = ["pool1", "pool2", "manual"] as const;
-const POOL_LABEL: Record<string, string> = { pool1: "一号池", pool2: "二号池", manual: "自选池" };
+const POOL_LABEL: Record<string, string> = { pool1: "一号池", pool2: "二号池", manual: "自选" };
 const LEVELS = ["L1", "L2", "L3"] as const;
 
 export function AlertRules() {
@@ -28,6 +28,7 @@ export function AlertRules() {
     cooldown_minutes: 30,
   });
   const submit = (rule: Rule) => {
+    if (readOnly) return;
     const ruleId = rule.rule_id || `r${Date.now().toString(36)}`.slice(0, 40);
     save.mutate(
       { ...rule, rule_id: ruleId },
@@ -60,7 +61,7 @@ export function AlertRules() {
               <Button
                 size="sm"
                 variant="primary"
-                disabled={!!readOnly}
+                ariaDisabled={!!readOnly}
                 aria-describedby={readOnly ? "readonly-notice" : undefined}
                 onClick={() => setOpen(true)}
               >
@@ -107,7 +108,7 @@ export function AlertRules() {
                       variant="ghost"
                       onClick={() => submit({ ...row, enabled: !row.enabled })}
                       aria-describedby={readOnly ? "readonly-notice" : undefined}
-                      disabled={!!readOnly}
+                      ariaDisabled={!!readOnly}
                     >
                       {row.enabled ? <Pill kind="ok">启用</Pill> : <Pill kind="warn">停用</Pill>}
                     </Button>
@@ -125,8 +126,30 @@ export function AlertRules() {
           </Panel>
         )}
       </QueryView>
-      <AppDrawer open={open} onClose={() => setOpen(false)} title="新建规则" label="新建规则">
-        <form className="rule-fields" onSubmit={onSubmit} aria-label="新建规则">
+      <AppDrawer
+        open={open}
+        onClose={() => setOpen(false)}
+        title="新建规则"
+        label="新建规则"
+        footer={
+          <div className="rule-acts">
+            <Button type="button" onClick={() => setOpen(false)}>
+              取消
+            </Button>
+            <Button
+              type="submit"
+              form="rule-form"
+              variant="primary"
+              disabled={!draft.title.trim()}
+              ariaDisabled={!!readOnly}
+              aria-describedby={readOnly ? "readonly-notice" : undefined}
+            >
+              保存规则
+            </Button>
+          </div>
+        }
+      >
+        <form id="rule-form" className="rule-fields" onSubmit={onSubmit} aria-label="新建规则">
           <label className="fld">
             名称
             <input
@@ -179,7 +202,7 @@ export function AlertRules() {
           </fieldset>
           <label className="fld">
             冷却
-            <span className="cool">
+            <span className="suffix-field">
               <input
                 aria-label="冷却分钟"
                 type="number"
@@ -188,7 +211,7 @@ export function AlertRules() {
                 value={draft.cooldown_minutes ?? 30}
                 onChange={(e) => setDraft({ ...draft, cooldown_minutes: Number(e.target.value) })}
               />
-              <span>分钟</span>
+              <span className="suffix">分钟</span>
             </span>
           </label>
           {ruleFail ? (
@@ -198,14 +221,6 @@ export function AlertRules() {
               onRetry={() => submit(ruleFail.rule)}
             />
           ) : null}
-          <div className="rule-acts">
-            <Button type="button" onClick={() => setOpen(false)}>
-              取消
-            </Button>
-            <Button type="submit" variant="primary" disabled={!draft.title.trim() || !!readOnly}>
-              保存规则
-            </Button>
-          </div>
         </form>
       </AppDrawer>
     </>

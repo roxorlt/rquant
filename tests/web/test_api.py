@@ -77,6 +77,38 @@ def test_write_validation(client: TestClient, sent: list[dict]) -> None:
     assert sent == []
 
 
+def test_screener_schemes_round_trip(tmp_path) -> None:
+    from rquant.web.screener_schemes import SqliteSchemeStore
+
+    app = create_app(FixtureSource(), dist=None)
+    app.state.screener_schemes = SqliteSchemeStore(tmp_path / "schemes.sqlite3")
+    client = TestClient(app)
+    body = {"name": "放量", "filters": [{"field": "pct_chg", "op": ">=", "value": 1}],
+            "ranks": [{"field": "pct_chg", "desc": True, "weight": 100}]}
+    assert client.put("/api/v1/screener-schemes", json=body).json()["status"] == "succeeded"
+    rows = client.get("/api/v1/screener-schemes").json()["data"]["schemes"]
+    assert rows[0]["name"] == "放量" and rows[0]["filters"] == body["filters"]
+    assert client.delete("/api/v1/screener-schemes", params={"name": "放量"}).status_code == 200
+    assert client.get("/api/v1/screener-schemes").json()["data"]["schemes"] == []
+
+
+def test_preview_fail_is_fixture_only() -> None:
+    app = create_app(FixtureSource(), dist=None)
+
+    def transport(payload: dict) -> dict:
+        return {"command_id": payload["command_id"], "status": "succeeded"}
+
+    app.state.page_control_transport = transport
+    client = TestClient(app)
+    ok = client.post("/api/v1/watchlist", json={"code": "600519.SH"},
+                     headers={"X-Rquant-Preview-Fail": "1"})
+    assert ok.status_code == 200
+    app.state.preview_writes = True
+    forced = client.post("/api/v1/watchlist", json={"code": "600519.SH"},
+                         headers={"X-Rquant-Preview-Fail": "1"})
+    assert forced.status_code == 503
+
+
 def test_page_control_down_is_503() -> None:
     app = create_app(FixtureSource(), dist=None)
 

@@ -40,6 +40,7 @@ export const fmtPct = (v: number | null | undefined, digits = 2) =>
 export const tone = (v: number | null | undefined) =>
   v == null || v === 0 ? "" : v > 0 ? "up" : "down";
 
+/** Categorical hues for one chart. Assigned in draw order; none repeats inside that chart. */
 export const LINE_COLORS = [
   "#2448D0",
   "#C47B12",
@@ -47,7 +48,11 @@ export const LINE_COLORS = [
   "#0E7490",
   "#9A3412",
   "#3F6212",
-  "#1D4E89",
+  "#BE185D",
+  "#7C3AED",
+  "#0F6E56",
+  "#B45309",
+  "#4338CA",
   "#A16207",
 ];
 
@@ -83,15 +88,25 @@ export function defaultSelection(sectors: Sector[], k: number): string[] {
   return [...ins, ...outs].map((s) => s.name);
 }
 
-/** Stable colours: inflow names get warm hues, outflow cool, by rank among the shown lines. */
-/** Categorical hues, stable by name. Not the red/green up-down pair. */
+/** Categorical hues in the order the lines are drawn. A chart does not reuse a colour. */
 export function colorMap(shown: Sector[]): Map<string, string> {
   const m = new Map<string, string>();
-  const names = shown.map((s) => s.name).sort((a, b) => a.localeCompare(b, "zh"));
-  names.forEach((name, index) => {
-    m.set(name, LINE_COLORS[index % LINE_COLORS.length] ?? "#2448D0");
+  const used = new Set<string>();
+  shown.forEach((sector, index) => {
+    let color = LINE_COLORS[index];
+    if (!color || used.has(color)) {
+      const spare = LINE_COLORS.find((item) => !used.has(item));
+      color = spare ?? `hsl(${(index * 47) % 360} 45% 42%)`;
+    }
+    used.add(color);
+    m.set(sector.name, color);
   });
   return m;
+}
+
+/** Sector series values are already 亿. Do not divide by 1e8 again. */
+export function fmtSectorNet(yi: number | null | undefined): string {
+  return fmtYi(yi);
 }
 
 /** Default number of inflow and of outflow sectors drawn on the main chart (phone and desktop). */

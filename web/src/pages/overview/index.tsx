@@ -22,7 +22,6 @@ function Pipeline() {
     <section aria-labelledby="pipe-h">
       <div className="block-h">
         <h2 id="pipe-h">今日链路</h2>
-        <span className="hint">数据采集 → 存储 → Serving → 信号盯盘 → 研究产出 → 网页</span>
       </div>
       <ol
         className="pipe"
@@ -100,8 +99,7 @@ function Attention() {
         </ul>
       ) : (
         <p className="hint" style={{ padding: "12px 16px" }}>
-          {(health.data?.layers ?? []).length > 0 &&
-          (health.data?.layers ?? []).every((layer) => layer.state === "unknown")
+          {(health.data?.layers ?? []).some((layer) => layer.state === "unknown")
             ? "还不知道服务是否正常"
             : "一切正常"}
         </p>
@@ -187,9 +185,9 @@ export default function OverviewPage() {
               label="关键数字"
               items={data.kpis.map((kpi) => {
                 const layers = health.data?.layers ?? [];
-                const unknown = layers.length > 0 && layers.every((layer) => layer.state === "unknown");
+                const unknown = layers.some((layer) => layer.state === "unknown");
                 if (unknown && (kpi.key === "services" || kpi.label === "服务异常")) {
-                  return { ...kpi, label: "服务状态", value: "未知", tone: "warn" as const };
+                  return { ...kpi, value: "—", tone: "muted" as const };
                 }
                 return { ...kpi, tone: kpi.tone ?? undefined };
               })}
