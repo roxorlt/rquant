@@ -756,7 +756,7 @@ def test_byte_envelope_order_uses_known_profile_and_geometry(side):
     binding = {"kind": "vendor4027", "code": "603258", "market": 17, "side": side, "page_id": 10117}
     model = MarketObservation.model_validate(market_model_data(body, result, binding=binding))
     assert model.table.row_count == len(model.table.rows) == 501
-    assert {cell["12"]["value"] for cell in model.table.rows} == {1 if side == "buy" else 2}
+    assert {cell["12"].value for cell in model.table.rows} == {1 if side == "buy" else 2}
 
 
 def test_byte_envelope_compressed_logical_boundary_and_preallocation(monkeypatch):
