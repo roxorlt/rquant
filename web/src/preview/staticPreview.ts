@@ -5,11 +5,24 @@
  *
  * GET and HEAD go to the frozen files the static export wrote next to the page.
  * Each preview directory (empty, error, viewer, stale, normal) keeps its own
- * files; this module does not substitute a bundled sample. Successful writes
- * are remembered in memory and applied on top of those files, so a later
- * refresh of the same page still shows the write. `?fail=1` makes writes 503
- * and does not remember them.
+ * files; this module does not substitute a bundled sample. Only the writes
+ * listed in PREVIEW_WRITES are answered as success and remembered in memory,
+ * so a later refresh of the same page still shows that write. Every other
+ * non-GET (query, translate, generate, explain, …) is 503, and the page uses
+ * its own error notice. `?fail=1` makes the allowlisted writes 503 too, and
+ * does not remember them.
  */
+
+/** Writes the public preview can complete. Anything else fails closed. */
+const PREVIEW_WRITES: readonly { method: string; path: string }[] = [
+  { method: "POST", path: "/api/v1/alerts/ack" },
+  { method: "POST", path: "/api/v1/alerts/unack" },
+  { method: "POST", path: "/api/v1/watchlist" },
+  { method: "PUT", path: "/api/v1/screener-schemes" },
+  { method: "DELETE", path: "/api/v1/screener-schemes" },
+  { method: "POST", path: "/api/v1/pools" },
+  { method: "POST", path: "/api/v1/alert-rules" },
+];
 export const STATIC_PREVIEW_WRITE_MOCK = "STATIC_PREVIEW_WRITE_MOCK";
 
 interface AlertMark {
@@ -116,6 +129,11 @@ function rememberWrite(url: string, body: unknown): void {
   }
 }
 
+function allowlistedWrite(method: string, url: string): boolean {
+  const path = parsedUrl(url).pathname.replace(/\/$/, "");
+  return PREVIEW_WRITES.some((item) => item.method === method && path.endsWith(item.path));
+}
+
 function overlayEmpty(): boolean {
   return (
     overlay.alerts.size === 0 &&
@@ -184,7 +202,7 @@ export function installStaticPreview(): void {
     ).toUpperCase();
     const url = requestUrl(input);
     if (method !== "GET" && method !== "HEAD") {
-      if (failRequested()) {
+      if (!allowlistedWrite(method, url) || failRequested()) {
         return jsonResponse({ detail: "暂时不能写", marker: STATIC_PREVIEW_WRITE_MOCK }, 503);
       }
       rememberWrite(url, await readJsonBody(input, init));

@@ -497,7 +497,11 @@ export function useRunQuery() {
           typeof detail === "string" ? detail : `HTTP ${response.status}`,
         );
       }
-      return data.data;
+      const result = data.data;
+      if (!result || !Array.isArray(result.rows) || !Array.isArray(result.columns)) {
+        throw new ApiError(503, "查询结果不完整");
+      }
+      return result;
     },
   });
 }

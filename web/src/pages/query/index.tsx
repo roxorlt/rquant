@@ -151,6 +151,9 @@ export default function QueryPage() {
   const ref = useRef<HTMLTextAreaElement>(null);
   const resultRef = useRef<HTMLDivElement>(null);
   const result = run.data;
+  const resultRows = Array.isArray(result?.rows) ? result.rows : null;
+  const resultColumns = Array.isArray(result?.columns) ? result.columns : null;
+  const resultBroken = result != null && (resultRows == null || resultColumns == null);
   const tables = schema.data ?? {};
   const { start, word } = wordAt(sql, cursor);
   const sugg = useMemo(() => candidates(sql, word, tables), [sql, word, tables]);
@@ -158,6 +161,7 @@ export default function QueryPage() {
   const exec = (text: string) => {
     run.mutate(text, {
       onSuccess: (data) => {
+        if (!Array.isArray(data?.rows)) return;
         const next = remember(history, text.trim(), { ok: true, rows: data.rows.length });
         setHistory(next);
         storeHistory(next);
@@ -323,7 +327,7 @@ export default function QueryPage() {
           )}
         </QuerySection>
         <div className="query-results" ref={resultRef}>
-          {run.error ? (
+          {run.error || resultBroken ? (
             <Panel title="结果">
               <div className="error-block" role="alert">
                 <b id="query-error-title" tabIndex={-1}>
@@ -352,26 +356,26 @@ export default function QueryPage() {
               </div>
             </Panel>
           ) : null}
-          {result && !run.error ? (
+          {resultRows && resultColumns && !run.error ? (
             <>
               <Panel
-                title={`结果 · ${result.rows.length} 行${result.truncated ? "（已截断）" : ""}`}
+                title={`结果 · ${resultRows.length} 行${result?.truncated ? "（已截断）" : ""}`}
                 flush
               >
                 <DataTable
                   label="查询结果"
                   tools="查询结果"
                   emptyText="查询成功但 0 行：表为空，或 WHERE 条件没有匹配。"
-                  rows={result.rows.map((r, i) => ({ i, r }))}
+                  rows={resultRows.map((r, i) => ({ i, r }))}
                   rowKey={(x) => String(x.i)}
                   height={480}
-                  columns={result.columns.map((c, j) => ({
+                  columns={resultColumns.map((c, j) => ({
                     id: c,
                     header: c,
                     sortable: true,
                     numeric:
-                      result.rows.length > 0 &&
-                      result.rows.every((r) => r[j] == null || typeof r[j] === "number"),
+                      resultRows.length > 0 &&
+                      resultRows.every((r) => r[j] == null || typeof r[j] === "number"),
                     value: (x: { r: unknown[] }) => {
                       const v = x.r[j];
                       return v === null || v === undefined
@@ -383,11 +387,7 @@ export default function QueryPage() {
                   }))}
                 />
               </Panel>
-              <QuickChart
-                key={result.columns.join(",")}
-                columns={result.columns}
-                rows={result.rows}
-              />
+              <QuickChart key={resultColumns.join(",")} columns={resultColumns} rows={resultRows} />
             </>
           ) : null}
         </div>

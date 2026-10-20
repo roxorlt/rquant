@@ -257,6 +257,61 @@ describe("static preview reads frozen files", () => {
     expect(screen.queryByText("星河股份")).not.toBeInTheDocument();
   });
 
+  it("returns success only for the allowlisted writes", async () => {
+    installFrozenFiles();
+    const allowed = [
+      ["POST", "/api/v1/alerts/ack"],
+      ["POST", "/api/v1/alerts/unack"],
+      ["POST", "/api/v1/watchlist"],
+      ["PUT", "/api/v1/screener-schemes"],
+      ["DELETE", "/api/v1/screener-schemes"],
+      ["POST", "/api/v1/pools"],
+      ["POST", "/api/v1/alert-rules"],
+    ] as const;
+    for (const [method, path] of allowed) {
+      const response = await fetch(`http://localhost:3000/states/normal${path}`, {
+        method,
+        body: JSON.stringify({ name: "演示", alert_id: alertId, code: "XQ0003.BJ", rule_id: "r1" }),
+      });
+      expect(response.status, `${method} ${path}`).toBe(200);
+    }
+    const blocked = [
+      ["POST", "/api/v1/query"],
+      ["POST", "/api/v1/formula/translate"],
+      ["POST", "/api/v1/formula/from-text"],
+      ["POST", "/api/v1/portfolio-backtests/run-1/explain"],
+    ] as const;
+    for (const [method, path] of blocked) {
+      const response = await fetch(`http://localhost:3000/states/normal${path}`, {
+        method,
+        body: JSON.stringify({ sql: "SELECT 1", tdx: "C>0", text: "站上均线" }),
+      });
+      expect(response.status, `${method} ${path}`).toBe(503);
+    }
+  });
+
+  it("shows the query error notice when a query write is refused", async () => {
+    setPage("normal");
+    installFrozenFiles();
+    renderApp("/query");
+    expect(await screen.findByRole("button", { name: "运行" })).toBeInTheDocument();
+    screen.getByRole("button", { name: "运行" }).click();
+    expect(await screen.findByText("查询没有运行")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "重试" })).toBeInTheDocument();
+    expect(screen.queryByText("有 0 处不认识")).not.toBeInTheDocument();
+  });
+
+  it("shows the formula error notice when translation is refused", async () => {
+    setPage("normal");
+    installFrozenFiles();
+    renderApp("/screener");
+    const translate = await screen.findByRole("button", { name: "翻译" });
+    translate.click();
+    expect(await screen.findByText(/公式没翻译上/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "重试" })).toBeInTheDocument();
+    expect(screen.queryByText("有 0 处不认识")).not.toBeInTheDocument();
+  });
+
   it("still shows 已确认 after the alerts query is refreshed", async () => {
     setPage("normal");
     installFrozenFiles();
