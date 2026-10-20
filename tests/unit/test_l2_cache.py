@@ -70,6 +70,57 @@ def test_date_validators_do_not_run_on_raw_cell_fields():
             adapter.validate_python({"value": "123", "raw_hex": "7b000000", "style": 255, **invalid})
 
 
+def test_raw_cell_is_closed_and_cannot_acquire_unvalidated_fields():
+    from dataclasses import FrozenInstanceError, dataclass
+    from pydantic import TypeAdapter
+    from rquant.l2.models import RawCell
+
+    adapter = TypeAdapter(RawCell)
+    data = {"value": "123", "raw_hex": "7b000000", "style": 255}
+    cell = adapter.validate_python(data)
+    assert RawCell(**data) == cell
+    assert adapter.dump_python(cell) == data
+    assert adapter.dump_python(adapter.validate_python(cell)) == data
+    assert adapter.dump_python(adapter.validate_json(json.dumps(data))) == data
+    with pytest.raises(TypeError, match="closed three-field"):
+        class DerivedCell(RawCell):
+            pass
+    with pytest.raises(TypeError, match="closed three-field"):
+        @dataclass(frozen=True, slots=True)
+        class ExtraCell(RawCell):
+            unknown: int = 1
+    assert not hasattr(cell, "__dict__")
+    with pytest.raises(AttributeError):
+        object.__setattr__(cell, "unknown", 1)
+    with pytest.raises(FrozenInstanceError):
+        cell.value = "changed"
+
+
+@pytest.mark.parametrize("field,value", [
+    ("value", True), ("value", False), ("value", b"1"),
+    ("style", True), ("raw_hex", "xyz"),
+])
+def test_raw_cell_forged_instance_is_revalidated_before_commit(tmp_path, field, value):
+    from pydantic import TypeAdapter
+    from rquant.l2.cache import RawL2Cache
+    from rquant.l2.models import MarketObservation, RawCell
+
+    original = order640_observation()
+    cache = RawL2Cache(tmp_path / "forged-cell")
+    with cache.writer():
+        cache.append(original)
+        cell = original.table.rows[0]["1"]
+        object.__setattr__(cell, field, value)
+        with pytest.raises(ValueError):
+            TypeAdapter(RawCell).validate_python(cell)
+        with pytest.raises(ValueError):
+            MarketObservation.model_validate(original.model_dump(mode="python", serialize_as_any=True))
+        with pytest.raises(ValueError):
+            cache.append(original)
+        assert cache.read_status().last_sequence == 1
+        assert not list((cache.root / "batches").glob(".pending-*"))
+
+
 @pytest.mark.parametrize("field", ["received_at", "cached_at", "last_transport_received_at",
                                    "last_market_received_at", "seed_received_at"])
 @pytest.mark.parametrize("value,valid", [
@@ -333,8 +384,8 @@ def test_market_model_retains_raw_cells_and_json_roundtrip():
     data = observation()
     restored = MarketObservation.model_validate_json(data.model_dump_json())
     assert restored == data
-    assert restored.table.rows[0]["13"]["value"] == "2"
-    assert restored.table.rows[0]["13"]["raw_hex"] == "02000000"
+    assert restored.table.rows[0]["13"].value == "2"
+    assert restored.table.rows[0]["13"].raw_hex == "02000000"
 
 
 def test_binding_rejects_mismatched_market_and_side():
@@ -1144,7 +1195,7 @@ def test_head_receipt_selected_batches_are_revalidated_and_not_shared(tmp_path, 
     monkeypatch.setattr(RawL2Batch, 'model_validate_json', counted)
     assert reader.read_status().last_sequence == 1
     first = reader.read_batches(limit=1)
-    first.batches[0].table.rows[0]['1']['value'] = 'caller mutation'
+    object.__setattr__(first.batches[0].table.rows[0]['1'], 'value', 'caller mutation')
     second = reader.read_batches(limit=128)
     assert second.batches[0].model_dump_json() == expected
     assert first.batches[0] is not second.batches[0]
