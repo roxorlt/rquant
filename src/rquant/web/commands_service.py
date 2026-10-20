@@ -1,7 +1,8 @@
 """rquant-web-commands: the tiny write sink for the web app's commands.
 
 Accepts ``POST /v1/commands`` with the same payload ``rquant.web.page_control`` sends
-(``ack_alert``, ``unack_alert``, ``add_watchlist_item``, ``save_alert_rule``, ``save_canvas``), validates it
+(``ack_alert``, ``unack_alert``, ``add_watchlist_item``, ``save_alert_rule``,
+``save_canvas``), validates it
 with page control's own command models, and appends one JSON line (idempotent by
 ``command_id``) under a fixed data directory, in page control's on-disk layout:
 

@@ -182,7 +182,7 @@
 
 @media (max-width: 599px) {
   :root {
-    --topbar-h: 48px;
+    --topbar-h: 68px;
   }
 }
 
@@ -199,6 +199,7 @@
   --c-rule: var(--rule);
   --c-rule-strong: var(--rule-strong);
   --c-accent: var(--accent);
+  --c-focus: var(--accent);
   --c-accent-weak: var(--accent-weak);
   --c-up: var(--up);
   --c-down: var(--down);

@@ -403,7 +403,7 @@ function MacroBody({ data }: { data: MacroData }) {
         {buffett ? (
           <Banded
             title="巴菲特指标（A股总市值 / GDP）"
-            sub="总市值=daily_basic 全A total_mv 月末合计；GDP=cn_gdp 滚动4季，按季末+20天视为已公布。虚线=全样本20/80分位与均值"
+            sub="总市值是全部 A 股月末市值合计，GDP 是最近四个季度的合计，季末过 20 天视为已公布。虚线是全部样本的 20%、80% 分位和均值。"
             c={buffett}
             k="ratio"
             name="总市值/GDP"
@@ -454,7 +454,7 @@ function MacroBody({ data }: { data: MacroData }) {
             </Panel>
             <Panel
               title="北向资金"
-              sub={`${data.north_regime_change} 起交易所停止披露北向每日净买入，此后 Tushare north_money 不再是净流入，改为展示北向成交额，两段不可比`}
+              sub={`${data.north_regime_change} 起交易所停止披露北向每日净买入，此后改为展示北向成交额，两段不可比`}
             >
               <IndexChart c={daily} />
               <TimeChart
@@ -548,10 +548,7 @@ export default function MacroPage() {
           data.available ? (
             <MacroBody data={data} />
           ) : (
-            <EmptyState
-              title="宏观数据尚未生成"
-              hint="刷新后会显示最新数据。"
-            />
+            <EmptyState title="宏观数据尚未生成" hint="刷新后会显示最新数据。" />
           )
         }
       </QueryView>
@@ -645,7 +642,7 @@ function HkSystem({ data }: { data: MacroData }) {
   return (
     <Panel
       title="定价权系统C"
-      sub="恒生科技指数 × 恒生科技ETF成交量 构造 SMARTMONEY；信号=SM>MA20 且 上证50/沪深300/创业板 同日收涨"
+      sub="用恒生科技指数和恒生科技 ETF 成交量算出聪明钱。信号是聪明钱高于其 20 日均线，并且上证 50、沪深 300、创业板当天都收涨。"
     >
       <TimeChart
         label="沪深300与信号"
@@ -659,13 +656,13 @@ function HkSystem({ data }: { data: MacroData }) {
         ]}
       />
       <TimeChart
-        label="SMARTMONEY"
+        label="聪明钱"
         dates={c.dates}
         height={104}
         bands={eventBands(c.dates)}
         format={(v) => v.toFixed(2)}
         series={[
-          { name: "SMARTMONEY", values: col(c, "smart"), color: "var(--accent)" },
+          { name: "聪明钱", values: col(c, "smart"), color: "var(--accent)" },
           { name: "MA20", values: col(c, "smart_ma20"), color: "var(--warn)", dashed: true },
         ]}
       />
@@ -720,18 +717,19 @@ function Studies({ data }: { data: MacroData }) {
         rows={data.studies}
         rowKey={(r) => `${r.study}-${r.horizon}`}
         columns={[
-          { id: "s", header: "信号", value: (r) => r.study },
+          { id: "s", header: "信号", sortable: true, value: (r) => r.study },
           {
             id: "sp",
             header: "样本",
+            sortable: true,
             value: (r) => (r.split === "train" ? "训练" : r.split === "test" ? "测试" : "全样本"),
           },
-          { id: "h", header: "持有天数", value: (r) => r.horizon },
-          { id: "n", header: "次数", value: (r) => r.n },
-          { id: "m", header: "平均收益", value: (r) => f(r.mean) },
-          { id: "w", header: "胜率", value: (r) => f(r.win) },
-          { id: "bm", header: "基准平均", value: (r) => f(r.base_mean) },
-          { id: "bw", header: "基准胜率", value: (r) => f(r.base_win) },
+          { id: "h", header: "持有天数", sortable: true, value: (r) => r.horizon },
+          { id: "n", header: "次数", sortable: true, numeric: true, value: (r) => r.n },
+          { id: "m", header: "平均收益", sortable: true, value: (r) => f(r.mean) },
+          { id: "w", header: "胜率", sortable: true, value: (r) => f(r.win) },
+          { id: "bm", header: "基准平均", sortable: true, value: (r) => f(r.base_mean) },
+          { id: "bw", header: "基准胜率", sortable: true, value: (r) => f(r.base_win) },
         ]}
       />
     </Panel>

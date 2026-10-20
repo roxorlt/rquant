@@ -102,23 +102,23 @@ export function Conditions() {
                   : "还没有条件选股结果"
               }
               flush
+              actions={
+                runs.length > 1 ? (
+                  <select
+                    className="select"
+                    aria-label="演示条件"
+                    value={picked}
+                    onChange={(e) => setPicked(Number(e.target.value))}
+                  >
+                    {runs.map((r, i) => (
+                      <option key={r.run_id} value={i}>
+                        {r.name}
+                      </option>
+                    ))}
+                  </select>
+                ) : null
+              }
             >
-              {runs.length > 1 ? (
-                <div className="cond-pick">
-                <select
-                  className="select"
-                  aria-label="选择条件"
-                  value={picked}
-                  onChange={(e) => setPicked(Number(e.target.value))}
-                >
-                  {runs.map((r, i) => (
-                    <option key={r.run_id} value={i}>
-                      {r.name}
-                    </option>
-                  ))}
-                </select>
-                </div>
-              ) : null}
               {run ? (
                 <DataTable
                   label="条件命中"

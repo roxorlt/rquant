@@ -10,6 +10,7 @@ import {
 import type { components } from "@/api/schema";
 import { useUrlState } from "@/app/useUrlState";
 import { TimeChart } from "@/charts/Chart";
+import { presetLabel } from "@/copy/publicText";
 import { formatPrice } from "@/format/number";
 import { DataTable } from "@/table/DataTable";
 import { Button, ChangeText, KpiStrip, Panel, Pill } from "@/ui";
@@ -163,12 +164,13 @@ function Explain({ runId }: { runId: string }) {
       }
     >
       {explain.error ? (
-        <div className="error-block" role="alert">
-          <b>解读没生成</b>
-          <p>解读服务暂时没有响应，回测数字不受影响。</p>
-          <Button size="sm" onClick={() => explain.mutate(runId)}>
-            重试
-          </Button>
+        <div className="notice crit" role="alert">
+          <span>解读没生成。解读服务暂时没有响应，回测数字不受影响。</span>
+          <span className="acts">
+            <button type="button" className="act" onClick={() => explain.mutate(runId)}>
+              重试
+            </button>
+          </span>
         </div>
       ) : null}
       {result ? (
@@ -315,7 +317,7 @@ export function PortfolioRuns() {
           <>
             <Panel
               title={`组合回测 · ${data.runs.length}`}
-              sub={preset ? `只看入场池 ${preset}` : "点一行看净值和委托"}
+              sub={preset ? `只看入场池 ${presetLabel(preset)}` : "点一行看净值和委托"}
               actions={
                 <>
                   <span className="hint cmp-count">已选 {picked.length} / 5</span>
@@ -453,9 +455,10 @@ export function StrategyList() {
                 id: "ver",
                 header: "当前版本",
                 value: (row) => row.version,
-                cell: (row) => `${row.slug}@${row.version}（共 ${row.versions} 版）`,
+                cell: (row) =>
+                  `${presetLabel(`${row.slug}@${row.version}`)}（共 ${row.versions} 版）`,
               },
-              { id: "preset", header: "入场池", value: (row) => row.preset },
+              { id: "preset", header: "入场池", value: (row) => presetLabel(row.preset) },
               { id: "n", header: "持股数", numeric: true, value: (row) => row.max_positions },
               {
                 id: "method",

@@ -1,6 +1,7 @@
 import { useReportFactors } from "@/api/endpoints";
 import { useUrlState } from "@/app/useUrlState";
 import { TimeChart } from "@/charts/Chart";
+import { tokenLabel } from "@/copy/publicText";
 import { DataTable } from "@/table/DataTable";
 import { KpiStrip, PageHeader, Panel, Pill } from "@/ui";
 import { QueryView } from "../shared";
@@ -133,7 +134,7 @@ function Recent({ sum }: { sum: WeeklySummary | null }) {
                 {n.title}
               </a>{" "}
               <Pill kind={n.status === "registered" ? "idle" : "acc"}>
-                {STATUS[n.status] ?? n.status}
+                {STATUS[n.status] ?? tokenLabel(n.status)}
               </Pill>
             </li>
           ))}
@@ -164,7 +165,7 @@ function Detail({ r, hold }: { r: FactorResult; hold: number }) {
   const s = r.series;
   return (
     <Panel
-      title={`${r.name} · ${r.data}`}
+      title={`${r.name} · ${tokenLabel(r.data)}`}
       sub={`方向 ${r.sign > 0 ? "越大越好" : "越小越好"} · 训练/测试切分 ${r.split} · 每 ${hold} 日调仓 · 最新 ${r.latest_date}`}
     >
       <KpiStrip
@@ -381,7 +382,7 @@ function Body({ res, sum }: { res: Results; sum: WeeklySummary | null }) {
                   value: (c) => c.replicability,
                   cell: (c) => {
                     const m = REPL[c.replicability] ?? {
-                      label: c.replicability,
+                      label: tokenLabel(c.replicability),
                       kind: "acc" as const,
                     };
                     return <Pill kind={m.kind}>{m.label}</Pill>;
@@ -400,10 +401,7 @@ export default function ReportMiningPage() {
   const query = useReportFactors();
   return (
     <>
-      <PageHeader
-        eyebrow="研究"
-        title="研报挖掘"
-      />
+      <PageHeader eyebrow="研究" title="研报挖掘" />
       <QueryView query={query}>
         {(data) =>
           data.results ? (
@@ -413,9 +411,7 @@ export default function ReportMiningPage() {
             />
           ) : (
             <Panel>
-              <p className="hint">
-                还没有研报因子结果。
-              </p>
+              <p className="hint">还没有研报因子结果。</p>
             </Panel>
           )
         }

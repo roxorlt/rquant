@@ -1,10 +1,19 @@
 /** Words an end user can read. Internal ids stay in the API. */
 
-const TRIGGER_LABEL: Record<string, string> = {
+export const TRIGGER_LABEL: Record<string, string> = {
   gap_up: "跳空高开",
   volume_surge: "放量",
   take_profit: "止盈",
   breakout: "突破",
+  stop_loss: "止损",
+  open_strength: "开盘强度",
+  break_t_high: "突破前高",
+  strong_carry: "强势延续",
+  near_limit_up: "临近涨停",
+  attack_open_strength: "开盘强度",
+  attack_break_high: "突破前高",
+  attack_strong_carry: "强势延续",
+  attack_near_limit: "临近涨停",
 };
 
 const SERVICE_LABEL: Record<string, string> = {
@@ -13,6 +22,16 @@ const SERVICE_LABEL: Record<string, string> = {
   "rquant-notifier": "通知",
   "rquant-replica-sync": "数据副本",
   "rquant-backup": "备份",
+  "rquant-page-control": "页面写入",
+  "page-control": "页面写入",
+  "rquant-snapshot-collector": "快照采集",
+  "snapshot-collector": "快照采集",
+  "rquant-reference-slow": "参考数据",
+  "reference-slow": "参考数据",
+  "rquant-report-factors": "研报因子",
+  "report-factors": "研报因子",
+  "rquant-web": "网页服务",
+  serving: "数据发布",
 };
 
 const STATUS_LABEL: Record<string, string> = {
@@ -20,6 +39,11 @@ const STATUS_LABEL: Record<string, string> = {
   running: "运行中",
   failed: "失败",
   error: "出错",
+  degraded: "降级",
+  active: "运行中",
+  inactive: "未运行",
+  waiting: "等待",
+  dead: "已停止",
 };
 
 const LAYER_TITLE: Record<string, string> = {
@@ -38,13 +62,98 @@ const DATASET_LABEL: Record<string, string> = {
   adj_factor: "复权因子",
 };
 
+const PRESET_LABEL: Record<string, string> = {
+  "auction-gap": "竞价高开",
+  breakout: "突破",
+  "volume-surge": "放量",
+  volume_surge: "放量",
+  "demo-breakout": "演示突破",
+  research_mom20: "20日动量",
+  research_breakout55: "55日新高",
+  research_lowvol: "低波动",
+  research_value: "低市净率",
+  research_trend: "趋势",
+  "n-shape-pool1": "N形态一号池",
+  "n-shape-pool2": "N形态二号池",
+  "breakout55-top10": "55日新高",
+};
+
+const TOKEN_LABEL: Record<string, string> = {
+  high: "高",
+  medium: "中",
+  low: "低",
+  unclassified: "未分类",
+  daily: "日线",
+  "5min": "5分钟",
+  "1min bar": "1分钟线",
+};
+
 export function triggerLabel(value: string | null | undefined): string {
   if (!value) return "—";
-  return TRIGGER_LABEL[value] ?? value;
+  const label = TRIGGER_LABEL[value];
+  if (label) return label;
+  return /[A-Za-z]/.test(value) ? "其他" : value;
 }
 
 export function serviceLabel(id: string): string {
-  return SERVICE_LABEL[id] ?? id.replace(/^rquant-/, "");
+  return SERVICE_LABEL[id] ?? SERVICE_LABEL[id.replace(/^rquant-/, "")] ?? "后台服务";
+}
+
+export function planeLabel(plane: string | null | undefined): string {
+  if (!plane) return "—";
+  if (plane === "batch") return "定时";
+  if (plane === "live") return "实时";
+  return /[A-Za-z]/.test(plane) ? "其他" : plane;
+}
+
+export function statusLabel(status: string, stale = false): string {
+  const text = STATUS_LABEL[status] ?? (/[A-Za-z]/.test(status) ? "未知" : status);
+  return stale ? `${text}（过期）` : text;
+}
+
+export function presetLabel(value: string | null | undefined): string {
+  if (!value) return "—";
+  const at = value.lastIndexOf("@");
+  const slug = at > 0 ? value.slice(0, at) : value;
+  const version = at > 0 ? value.slice(at + 1) : "";
+  const known = PRESET_LABEL[slug];
+  const name = known ?? (/^[a-z0-9][a-z0-9_-]*$/i.test(slug) ? "选股方案" : slug);
+  return version && known ? `${name} ${version}` : name;
+}
+
+export function datasetLabel(id: string | null | undefined): string {
+  if (!id) return "—";
+  return DATASET_LABEL[id] ?? (/[a-z]/.test(id) && /[_-]/.test(id) ? "数据表" : id);
+}
+
+export function tokenLabel(value: string | null | undefined): string {
+  if (!value) return "—";
+  return TOKEN_LABEL[value] ?? (/[A-Za-z]/.test(value) ? "未标注" : value);
+}
+
+export function taskState(active: string, sub: string): string {
+  const left = STATUS_LABEL[active] ?? "未知";
+  const right = STATUS_LABEL[sub] ?? "未知";
+  return `${left} · ${right}`;
+}
+
+export function taskDescription(text: string | null | undefined): string {
+  if (!text) return "—";
+  const known: Record<string, string> = {
+    "rQuant daily ingest timer": "每个交易日收盘后采集日线",
+    "rQuant daily ingest": "采集日线",
+    "rQuant web API": "网页服务",
+    "rQuant 研报因子 weekly": "每周更新研报因子",
+  };
+  if (known[text]) return known[text];
+  if (/[A-Za-z]{3,}/.test(text)) return "定时任务";
+  return text;
+}
+
+export function unitLabel(unit: string): string {
+  const kind = unit.endsWith(".timer") ? "定时器" : unit.endsWith(".service") ? "服务" : "";
+  const id = unit.replace(/\.(service|timer)$/, "");
+  return `${serviceLabel(id)}${kind}`;
 }
 
 export function layerTitle(title: string): string {
@@ -71,8 +180,18 @@ export function poolDisplayName(name: string): string {
 export function publicLine(line: string): string | null {
   if (/python -m|HTTP|API \d|Serving/.test(line)) return null;
   let text = line.replace(/（落后\s*\d+\s*个工作日）/g, "");
+  text = text.replace(/当前代/g, "当前版本");
+  text = text.replace(/没有已发布的代/g, "没有已发布的版本");
   text = text.replace(/rquant-[a-z0-9-]+/gi, (id) => SERVICE_LABEL[id] ?? "后台服务");
-  text = text.replace(/\b(idle|running|failed|error)\b/g, (word) => STATUS_LABEL[word] ?? word);
+  text = text.replace(
+    /page-control|snapshot-collector|reference-slow|report-factors|\bserving\b/g,
+    (id) => SERVICE_LABEL[id] ?? "后台服务",
+  );
+  text = text.replace(
+    /\b(idle|running|failed|error|degraded|active|inactive|waiting|dead)\b/g,
+    (word) => STATUS_LABEL[word] ?? word,
+  );
+  text = text.replace(/\bbatch\b/g, "定时").replace(/\blive\b/g, "实时");
   text = text.replace(/\b([a-z][a-z0-9_]*)\s+缺\s+(\d+)\s*天/g, (all, id: string, days: string) => {
     const label = DATASET_LABEL[id];
     return label ? `${label}缺 ${days} 天` : all;

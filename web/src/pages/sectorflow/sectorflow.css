@@ -77,11 +77,22 @@
 .sf-ch {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   margin-bottom: 8px;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
+  min-width: 0;
+}
+.sf-ch .tools {
+  flex: 0 0 auto;
+  flex-wrap: nowrap;
+  margin-left: auto;
 }
 .sf-ch h3 {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-size: 15px;
   font-weight: 700;
   margin: 0;
@@ -90,7 +101,7 @@
   flex: 1;
 }
 .sf-pill {
-  font-size: 11px;
+  font-size: 12px;
   color: var(--sf-sub);
   border: 1px solid var(--sf-line);
   border-radius: 999px;
@@ -107,6 +118,14 @@
   display: inline-flex;
   align-items: center;
   gap: 6px;
+}
+.sf-ch .sf-sub,
+.sf-ch .sf-live,
+.sf-ch .sf-pill {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .sf-live i {
   width: 7px;
@@ -206,7 +225,7 @@
   stroke-width: 1.2;
 }
 .sf-chart .sf-tick {
-  font-size: 11px;
+  font-size: 12px;
   fill: var(--sf-sub);
 }
 .sf-chart .sf-tick.up {
@@ -216,11 +235,11 @@
   fill: var(--down);
 }
 .sf-chart .sf-xtick {
-  font-size: 11px;
+  font-size: 12px;
   fill: var(--sf-sub);
 }
 .sf-chart .sf-axis-note {
-  font-size: 10px;
+  font-size: 12px;
   fill: var(--sf-mute);
 }
 .sf-chart .sf-auction {
@@ -240,7 +259,7 @@
 }
 .sf-chart .sf-now-text {
   fill: #fff;
-  font-size: 10px;
+  font-size: 12px;
   font-weight: 700;
 }
 .sf-chart .sf-cross {
@@ -363,24 +382,18 @@
   font-size: 13px;
 }
 .sf-note {
-  font-size: 11px;
+  font-size: 12px;
   color: var(--sf-mute);
   margin: 8px 0 0;
   line-height: 1.6;
 }
 .sf-foot {
-  font-size: 11px;
+  font-size: 12px;
   color: var(--sf-mute);
   margin: 10px 0 0;
 }
 .sf-day {
-  font: inherit;
-  font-size: 13px;
-  padding: 5px 8px;
-  border-radius: 8px;
-  border: 1px solid var(--sf-line);
-  background: var(--surface);
-  color: var(--ink);
+  flex: 0 0 auto;
 }
 /* bars */
 .sf-bars {
@@ -477,7 +490,7 @@
   white-space: nowrap;
 }
 .sf .tag {
-  font-size: 10px;
+  font-size: 12px;
   padding: 1px 5px;
   border-radius: 4px;
   background: var(--up-weak);
@@ -505,7 +518,7 @@
   text-overflow: ellipsis;
 }
 .sf-stk .c {
-  font-size: 11px;
+  font-size: 12px;
   margin-left: 4px;
   font-weight: 400;
 }
@@ -513,7 +526,7 @@
   color: var(--sf-mute);
 }
 .sf-stk .r {
-  font-size: 11px;
+  font-size: 12px;
   color: var(--sf-sub);
   margin-top: 1px;
   white-space: nowrap;
@@ -557,7 +570,15 @@
   padding: 3px 0;
 }
 .sf-out .small {
-  font-size: 11px;
+  font-size: 12px;
+}
+.sf-legend {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 4px;
+  font-size: 12px;
+  color: var(--c-muted);
 }
 /* ---- iPhone: designed for the device, not a squeezed desktop ---- */
 .sf-phone .sf-stats {
@@ -585,14 +606,6 @@
 .sf-phone .sf-card {
   padding: 12px;
   border-radius: 12px;
-}
-.sf-phone .sf-seg {
-  width: 100%;
-}
-.sf-phone .sf-seg button {
-  flex: 1;
-  min-height: 34px;
-  font-size: 13px;
 }
 .sf-phone .sf-chips {
   flex-wrap: nowrap;
@@ -623,7 +636,7 @@
   grid-template-columns: 18px 92px 1fr 64px;
   font-size: 13px;
 }
-.sf-phone .sf-bar .cb {
+.sf-phone .sf-bars .sf-bar .cb {
   width: 16px;
   height: 16px;
 }
@@ -642,7 +655,34 @@
   padding-bottom: env(safe-area-inset-bottom);
 }
 .sf-phone .sf-day {
-  min-height: 34px;
+  flex: 0 0 auto;
+}
+.sf-phone .sf-ch {
+  flex-wrap: wrap;
+}
+.sf-phone .sf-ch h3 {
+  order: 1;
+  flex: 0 1 5em;
+  max-width: 5em;
+}
+.sf-phone .sf-ch .tools {
+  order: 2;
+  flex: 1 1 0;
+  min-width: 0;
+  justify-content: flex-start;
+  overflow: hidden;
+}
+.sf-phone .sf-ch .tools .seg {
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: auto;
+}
+.sf-phone .sf-ch .sf-sub,
+.sf-phone .sf-ch .sf-live,
+.sf-phone .sf-ch .sf-pill {
+  order: 3;
+  flex: 1 1 100%;
 }
 .sf .sf-chip button {
   appearance: none;

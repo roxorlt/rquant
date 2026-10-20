@@ -19,9 +19,11 @@
   color: var(--muted);
   font-size: 11px;
 }
-.cond-grid .cond-row select:not(.select),
+.cond-grid .cond-row select,
 .cond-grid .cond-row input {
-  height: 28px;
+  height: 32px;
+  padding-left: 12px;
+  font-size: 14px;
   background: var(--surface-2);
   color: var(--ink);
 }
@@ -36,7 +38,7 @@
   margin-bottom: 8px;
 }
 .formula-ai .btn.quiet {
-  color: var(--c-ink-2);
+  color: var(--c-muted);
 }
 .formula-ai input {
   flex: 1;
@@ -45,8 +47,8 @@
   border: 1px solid var(--c-rule);
   border-radius: var(--r-sm);
   background: var(--c-surface);
-  padding-inline: 8px;
-  font-size: 13px;
+  padding-left: 12px;
+  font-size: 14px;
 }
 .formula-actions {
   display: flex;
@@ -61,22 +63,27 @@
 .select,
 .cond-grid .cond-row select.select {
   height: 32px;
-  padding-inline: 8px;
-  background: var(--c-surface);
-  color: var(--c-ink);
-  border: 1px solid var(--c-rule);
-  border-radius: var(--r-sm);
+  padding: 0 32px 0 12px;
+  font-size: 14px;
 }
 .cond-pick {
   padding: 8px 16px 0;
 }
-@media (max-width: 599px) {
+@media (max-width: 599px), (pointer: coarse) {
   .formula-ai input,
   .formula-actions .btn,
   .select,
-  .cond-grid .cond-row select.select {
+  .cond-grid .cond-row select,
+  .cond-grid .cond-row input,
+  .schemes input {
     height: 44px;
+    min-height: 44px;
     font-size: 16px;
+    padding-left: 16px;
+  }
+  .scheme-chip button + button {
+    min-width: 44px;
+    min-height: 44px;
   }
   .formula-actions .btn {
     width: auto;
@@ -171,7 +178,9 @@
 }
 .schemes input {
   width: 150px;
-  height: 26px;
+  height: 32px;
+  padding-left: 12px;
+  font-size: 14px;
 }
 .scheme-chip {
   display: inline-flex;
@@ -188,7 +197,10 @@
   cursor: pointer;
 }
 .scheme-chip button + button {
-  padding: 2px 6px;
+  box-sizing: border-box;
+  min-width: 32px;
+  min-height: 32px;
+  padding: 0 8px;
   border-left: 1px solid var(--rule);
   color: var(--muted);
 }

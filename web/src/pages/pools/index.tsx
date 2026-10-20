@@ -1,7 +1,7 @@
 import { Link } from "react-router";
 import { inTradingHours, useAuctionPoolLive, usePools } from "@/api/endpoints";
 import { useUrlState } from "@/app/useUrlState";
-import { poolDisplayName } from "@/copy/publicText";
+import { poolDisplayName, presetLabel } from "@/copy/publicText";
 import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
 import { EmptyState, FlowSteps, PageHeader, Panel, ReadOnlyBanner, Segmented } from "@/ui";
@@ -220,7 +220,13 @@ export default function PoolsPage() {
                             ),
                           },
                         ]
-                      : [{ id: "preset", header: "来源", value: (row: Member) => row.preset }]),
+                      : [
+                          {
+                            id: "preset",
+                            header: "来源",
+                            value: (row: Member) => presetLabel(row.preset),
+                          },
+                        ]),
                   ]}
                 />
               </Panel>

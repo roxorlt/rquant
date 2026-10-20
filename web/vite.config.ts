@@ -21,7 +21,7 @@ function staticPreviewPlugin(): Plugin {
     },
     load(id) {
       if (id !== STATIC_PREVIEW_STUB) return null;
-      return "export function installStaticPreview() {}\n";
+      return "export function installStaticPreview() {}\nexport function previewWatchlistCodes() { return []; }\n";
     },
   };
 }

@@ -1,6 +1,7 @@
 import { useNavigate } from "react-router";
 import { useDataCenter, useFundamentals } from "@/api/endpoints";
 import { useUrlState } from "@/app/useUrlState";
+import { datasetLabel } from "@/copy/publicText";
 import { toneClass, toneOf } from "@/format/color";
 import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
@@ -22,7 +23,7 @@ function Fundamentals() {
   return (
     <Panel
       title={`财务指标 · ${doc.rows.length}`}
-      sub={`Tushare fina_indicator，更新于 ${formatShanghaiDateTime(doc.fetched_at)}`}
+      sub={`财务指标，更新于 ${formatShanghaiDateTime(doc.fetched_at)}`}
       flush
     >
       <DataTable
@@ -124,7 +125,7 @@ export default function DataCenterPage() {
                 onClose={() => navigate(-1)}
                 title={dataset?.name ?? ""}
                 label={dataset ? `${dataset.name} 字段` : "字段"}
-                extra={<span className="mono">{dataset?.table_name}</span>}
+                extra={<span>{dataset ? datasetLabel(dataset.table_name) : ""}</span>}
               >
                 {dataset ? (
                   <>
@@ -144,13 +145,13 @@ export default function DataCenterPage() {
                   </>
                 ) : null}
               </AppDrawer>
-              <Panel title="研究库覆盖" sub="research market.duckdb 各表最近 30 天" flush>
+              <Panel title="研究库覆盖" sub="行情库各表最近 30 天" flush>
                 <DataTable
                   label="研究库覆盖"
                   rows={(data.audit?.datasets ?? []).filter((c) => !c.error)}
                   rowKey={(c) => c.dataset_id}
                   columns={[
-                    { id: "table", header: "表", value: (c) => c.table_name },
+                    { id: "table", header: "表", value: (c) => datasetLabel(c.table_name) },
                     { id: "latest", header: "最新日期", value: (c) => c.latest_date ?? null },
                     {
                       id: "rows",

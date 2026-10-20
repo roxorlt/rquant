@@ -399,8 +399,10 @@ def _prev_open(root: Path, day: str) -> str | None:
     try:
         con = duckdb.connect(str(root / "market.duckdb"), read_only=True)
         try:
-            row = con.execute("SELECT max(cal_date) FROM trade_calendar WHERE is_open AND cal_date < ?",
-                              [_date.fromisoformat(day)]).fetchone()
+            row = con.execute(
+                "SELECT max(cal_date) FROM trade_calendar WHERE is_open AND cal_date < ?",
+                [_date.fromisoformat(day)],
+            ).fetchone()
         finally:
             con.close()
     except duckdb.Error:

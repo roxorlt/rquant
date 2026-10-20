@@ -17,11 +17,7 @@ export default function OpsPage() {
       <PageHeader eyebrow="运维" title="操作记录" />
       <QueryView query={query}>
         {(data) => (
-          <Panel
-            title={`${data.items.length} 条`}
-            sub="页面写操作经 page control 落盘后的回读"
-            flush
-          >
+          <Panel title={`${data.items.length} 条`} sub="网页上的修改会记在这里，可以回头核对" flush>
             <DataTable
               label="操作记录"
               rows={data.items}

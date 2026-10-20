@@ -1,7 +1,9 @@
+import { previewWatchlistCodes } from "virtual:static-preview";
 import { useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router";
 import { type ScreenRow, useAddWatch, usePools, useSavePool, useScreen } from "@/api/endpoints";
 import { useReadOnlyReason } from "@/api/useMeta";
+import { presetLabel } from "@/copy/publicText";
 import { formatPrice } from "@/format/number";
 import { DataTable } from "@/table/DataTable";
 import {
@@ -25,6 +27,7 @@ import {
   type Field,
   type Filter,
   fieldsFor,
+  groupsFor,
   type Rank,
   score,
 } from "./Builder";
@@ -107,27 +110,42 @@ function RankRows({
 }) {
   const set = (i: number, patch: Partial<Rank>) =>
     onChange(ranks.map((r, j) => (j === i ? { ...r, ...patch } : r)));
+  const groups = groupsFor(fields);
   return (
     <div>
       {ranks.map((r, i) => (
         // biome-ignore lint/suspicious/noArrayIndexKey: rows are positional.
-        <div className="cond-row" key={i}>
+        <div className="tools" key={i}>
           <span className="mono">{i + 1}</span>
-          <FieldPicker
-            label="排名字段"
-            value={r.field}
-            fields={fields}
-            onChange={(v) => set(i, { field: v as Field })}
-          />
-          <select
-            aria-label="方向"
-            className="select"
-            value={r.desc ? "d" : "a"}
-            onChange={(e) => set(i, { desc: e.target.value === "d" })}
-          >
-            <option value="d">降序</option>
-            <option value="a">升序</option>
-          </select>
+          <span className="tools-group">
+            <select
+              className="select"
+              aria-label="排序指标"
+              value={r.field}
+              onChange={(e) => set(i, { field: e.target.value })}
+            >
+              {groups.map(([name, opts]) =>
+                opts.length ? (
+                  <optgroup key={name} label={name}>
+                    {opts.map(([value, label]) => (
+                      <option key={value} value={value}>
+                        {label}
+                      </option>
+                    ))}
+                  </optgroup>
+                ) : null,
+              )}
+            </select>
+            <select
+              className="select"
+              aria-label="排序方向"
+              value={r.desc ? "d" : "a"}
+              onChange={(e) => set(i, { desc: e.target.value === "d" })}
+            >
+              <option value="d">降序</option>
+              <option value="a">升序</option>
+            </select>
+          </span>
           <input
             aria-label="权重"
             type="number"
@@ -154,6 +172,40 @@ function RankRows({
   );
 }
 
+const rememberedWatch = new Set<string>();
+
+/** Test hook: the in-memory watchlist dies with a full reload, not with navigation. */
+export function resetRememberedWatch(): void {
+  rememberedWatch.clear();
+}
+
+function currentWatch(): Set<string> {
+  return new Set([...rememberedWatch, ...previewWatchlistCodes()]);
+}
+
+interface WatchFail {
+  code: string;
+  name: string;
+  copy: FailureCopy;
+}
+
+function watchBanner(fails: WatchFail[]): FailureCopy {
+  const latest = fails[fails.length - 1];
+  const reason = latest?.copy.text.split("：")[1]?.split("。")[0] ?? "这项操作暂时用不了";
+  if (fails.length < 2 && latest) {
+    return {
+      text: `${latest.name}（${latest.code}）没加进自选：${reason}。`,
+      retry: latest.copy.retry,
+      health: latest.copy.health,
+    };
+  }
+  return {
+    text: `${fails.length} 只股票没加进自选：${reason}。可以在每一行点「重试」。`,
+    retry: true,
+    health: latest?.copy.health ?? true,
+  };
+}
+
 const ALL = "__all__";
 
 export default function ScreenerPage() {
@@ -169,8 +221,8 @@ export default function ScreenerPage() {
   const [poolName, setPoolName] = useState("");
   const pools = usePools();
   const [saveFail, setSaveFail] = useState<FailureCopy | null>(null);
-  const [watchFail, setWatchFail] = useState<{ code: string; copy: FailureCopy } | null>(null);
-  const [inPool, setInPool] = useState<Set<string>>(new Set());
+  const [watchFails, setWatchFails] = useState<WatchFail[]>([]);
+  const [inPool, setInPool] = useState<Set<string>>(currentWatch);
   const presets = query.data?.presets ?? [];
   const [params] = useSearchParams();
   const q = (params.get("q") ?? "").trim();
@@ -221,16 +273,23 @@ export default function ScreenerPage() {
     if (readOnly) return;
     addWatch.mutate(row.code, {
       onSuccess: () => {
-        setInPool((prev) => new Set(prev).add(row.code));
-        setWatchFail(null);
+        rememberedWatch.add(row.code);
+        setInPool(currentWatch());
+        setWatchFails((prev) => prev.filter((item) => item.code !== row.code));
         toast({ text: "已加入自选", duration: 4000 });
       },
       onError: (error) => {
-        const who = `${row.name ?? row.code}（${row.code}）`;
-        setWatchFail({ code: row.code, copy: failureCopy(who, "加进自选", error) });
+        const name = row.name ?? row.code;
+        const who = `${name}（${row.code}）`;
+        const copy = failureCopy(who, "加进自选", error);
+        setWatchFails((prev) => [
+          ...prev.filter((item) => item.code !== row.code),
+          { code: row.code, name, copy },
+        ]);
       },
     });
   };
+  const failedCodes = new Set(watchFails.map((item) => item.code));
 
   return (
     <>
@@ -257,7 +316,10 @@ export default function ScreenerPage() {
         label="选股方案"
         value={preset}
         onChange={setPreset}
-        options={[{ value: ALL, label: "全部" }, ...presets.map((p) => ({ value: p, label: p }))]}
+        options={[
+          { value: ALL, label: "全部" },
+          ...presets.map((p) => ({ value: p, label: presetLabel(p) })),
+        ]}
       />
       <Panel title="条件" sub={q ? `搜索：${q}` : "门槛全部满足才保留；排名按加权分位打分"}>
         <div className="cond-grid">
@@ -293,18 +355,23 @@ export default function ScreenerPage() {
       <QueryView query={query}>
         {() => (
           <Panel title={`结果 · 命中 ${filtered.rows.length} 只`} flush>
-            {watchFail ? (
+            {watchFails.length ? (
               <FailureNotice
-                copy={watchFail.copy}
+                pin
+                copy={watchBanner(watchFails)}
+                busy={addWatch.isPending}
                 onRetry={() => {
-                  const row = filtered.rows.find((item) => item.code === watchFail.code);
-                  if (row) watch(row);
+                  for (const item of watchFails) {
+                    const row = filtered.rows.find((candidate) => candidate.code === item.code);
+                    if (row) watch(row);
+                  }
                 }}
               />
             ) : null}
             <DataTable
               label="选股结果"
               tools="选股结果"
+              phoneSort
               pinEnds
               rows={filtered.rows}
               rowKey={(row) => `${row.preset}:${row.code}`}
@@ -319,7 +386,12 @@ export default function ScreenerPage() {
                   cell: (row) => <StockLink code={row.code} />,
                 },
                 { id: "name", header: "名称", value: (row) => row.name ?? null },
-                { id: "preset", header: "方案", value: (row) => row.preset, secondary: true },
+                {
+                  id: "preset",
+                  header: "方案",
+                  value: (row) => presetLabel(row.preset),
+                  secondary: true,
+                },
                 {
                   id: "close",
                   header: "收盘",
@@ -402,6 +474,9 @@ export default function ScreenerPage() {
                       </Button>
                     ) : (
                       <span className="ack-cell">
+                        {failedCodes.has(row.code) ? (
+                          <span className="row-err">没加进自选</span>
+                        ) : null}
                         <Button
                           size="sm"
                           variant="ghost"
@@ -410,7 +485,7 @@ export default function ScreenerPage() {
                           disabled={addWatch.isPending}
                           onClick={() => watch(row)}
                         >
-                          {watchFail?.code === row.code ? "重试" : "加自选"}
+                          {failedCodes.has(row.code) ? "重试" : "加自选"}
                         </Button>
                       </span>
                     ),

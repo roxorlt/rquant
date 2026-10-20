@@ -82,7 +82,34 @@ export function Schemes({
   };
   const remove = (n: string) => {
     if (readOnly) return;
+    const scheme = list.find((s) => s.name === n);
+    const snapshot: Scheme | null = scheme
+      ? {
+          name: scheme.name,
+          filters: scheme.filters.map((f) => ({ ...f })),
+          ranks: scheme.ranks.map((r) => ({ ...r })),
+        }
+      : null;
     removeScheme.mutate(n, {
+      onSuccess: () => {
+        if (!snapshot) return;
+        toast({
+          text: `已删除方案『${snapshot.name}』`,
+          duration: 6000,
+          action: {
+            label: "撤销",
+            onClick: () => {
+              saveScheme.mutate({
+                name: snapshot.name,
+                filters: snapshot.filters as unknown as Record<string, unknown>[],
+                ranks: snapshot.ranks as unknown as Record<string, unknown>[],
+              });
+              const next = [...loadSchemes().filter((s) => s.name !== snapshot.name), snapshot];
+              if (storeLocal(next)) setLocal(next);
+            },
+          },
+        });
+      },
       onError: () => {
         const next = local.filter((s) => s.name !== n);
         storeLocal(next);

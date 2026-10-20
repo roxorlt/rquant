@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { useIntraday } from "@/api/endpoints";
 import { deltas, profile, stitch } from "@/charts/orderflow";
 import { useTouchScrub } from "@/charts/useTouchScrub";
@@ -11,7 +11,15 @@ const DELTA_H = 80;
 const GAP = 10;
 
 /** 分时: price & VWAP vs prior close, volume, estimated order flow (all estimates from bars). */
-export function IntradayPanel({ code, span = 1 }: { code: string; span?: 1 | 5 }) {
+export function IntradayPanel({
+  code,
+  span = 1,
+  period,
+}: {
+  code: string;
+  span?: 1 | 5;
+  period?: ReactNode;
+}) {
   const [day, setDay] = useState<string | undefined>(undefined);
   const q = useIntraday(code, day, span);
   const [bands, setBands] = useState(true);
@@ -50,7 +58,7 @@ export function IntradayPanel({ code, span = 1 }: { code: string; span?: 1 | 5 }
   useTouchScrub(svgEl, (clientX) => scrubRef.current(clientX));
   if (!d || bars.length === 0) {
     return (
-      <Panel title={span === 5 ? "5日分时" : "分时"}>
+      <Panel title={span === 5 ? "5日分时" : "分时"} actions={period}>
         <div ref={ref} />
         <p className="hint">
           {q.isLoading
@@ -140,44 +148,56 @@ export function IntradayPanel({ code, span = 1 }: { code: string; span?: 1 | 5 }
       title={span === 5 ? "5日分时" : "分时"}
       sub={`${multi ? `${sessions[0]?.date} ~ ` : ""}${d.date} · ${d.freq === "1min" ? "1 分钟线" : "5 分钟线"} · ${d.source === "intraday" ? "盘中库" : "研究库"}；黄线 = 均价(VWAP)，资金/订单流均为由 K 线估算`}
       actions={
-        <span className="qc-ctl">
-          <span className="seg" title={`共 ${d.days.length} 个交易日有分钟线`}>
-            <button type="button" disabled={di <= 0} onClick={() => go(-1)} aria-label="前一交易日">
-              ‹
-            </button>
-            <DatePicker
-              label="分时日期"
-              value={d.date}
-              allowed={d.days}
-              onChange={(x) => setDay(x)}
-            />
-            <button
-              type="button"
-              disabled={di < 0 || di >= d.days.length - 1}
-              onClick={() => go(1)}
-              aria-label="后一交易日"
-            >
-              ›
-            </button>
-            {di < d.days.length - 1 ? (
-              <button type="button" onClick={() => setDay(undefined)}>
-                最新
+        <>
+          {period}
+          <span className="qc-ctl">
+            <span className="seg" title={`共 ${d.days.length} 个交易日有分钟线`}>
+              <button
+                type="button"
+                disabled={di <= 0}
+                onClick={() => go(-1)}
+                aria-label="前一交易日"
+              >
+                ‹
               </button>
-            ) : null}
+              <DatePicker
+                label="分时日期"
+                value={d.date}
+                allowed={d.days}
+                onChange={(x) => setDay(x)}
+              />
+              <button
+                type="button"
+                disabled={di < 0 || di >= d.days.length - 1}
+                onClick={() => go(1)}
+                aria-label="后一交易日"
+              >
+                ›
+              </button>
+              {di < d.days.length - 1 ? (
+                <button type="button" onClick={() => setDay(undefined)}>
+                  最新
+                </button>
+              ) : null}
+            </span>
+            <label>
+              <input type="checkbox" checked={bands} onChange={(e) => setBands(e.target.checked)} />{" "}
+              VWAP ±1σ/2σ
+            </label>
+            <label>
+              <input
+                type="checkbox"
+                checked={showVp}
+                onChange={(e) => setShowVp(e.target.checked)}
+              />{" "}
+              成交量分布
+            </label>
+            <label>
+              <input type="checkbox" checked={marks} onChange={(e) => setMarks(e.target.checked)} />{" "}
+              异动标记
+            </label>
           </span>
-          <label>
-            <input type="checkbox" checked={bands} onChange={(e) => setBands(e.target.checked)} />{" "}
-            VWAP ±1σ/2σ
-          </label>
-          <label>
-            <input type="checkbox" checked={showVp} onChange={(e) => setShowVp(e.target.checked)} />{" "}
-            成交量分布
-          </label>
-          <label>
-            <input type="checkbox" checked={marks} onChange={(e) => setMarks(e.target.checked)} />{" "}
-            异动标记
-          </label>
-        </span>
+        </>
       }
     >
       <div ref={ref} className="intraday">

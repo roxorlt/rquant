@@ -5,7 +5,7 @@ import {
   useSectorFlow,
   useSectorLeadersAt,
 } from "@/api/endpoints";
-import { HelpMark, PageHeader } from "@/ui";
+import { HelpMark, PageHeader, Segmented } from "@/ui";
 import { StockLink } from "@/ui/StockLink";
 import { PHONE_QUERY, useMedia } from "../panorama/useMedia";
 import { FlowChart } from "./FlowChart";
@@ -15,8 +15,8 @@ import {
   defaultSelection,
   fmtAmountYi,
   fmtPct,
-  fmtTurnoverChg,
   fmtSectorNet,
+  fmtTurnoverChg,
   fmtValue,
   fmtYi,
   type Mode,
@@ -42,10 +42,7 @@ export default function SectorFlowPage() {
   const data = q.data;
   return (
     <div className={`sf ${phone ? "sf-phone" : ""}`}>
-      <PageHeader
-        eyebrow="跟踪与告警"
-        title="板块资金流"
-      />
+      <PageHeader eyebrow="跟踪与告警" title="板块资金流" />
       {q.error ? <p className="hint pad">暂时读不到数据</p> : null}
       {!data && !q.error ? <p className="hint pad">加载中…</p> : null}
       {data?.warming ? <p className="hint pad">正在汇总当日快照（首次约 10–60 秒）…</p> : null}
@@ -150,35 +147,23 @@ function Body({
                 {live && !replay ? <i /> : null}
                 {replay ? clock : (data.time ?? "")}
               </span>
-              <span className="sf-sp" />
-              {data.days?.length ? (
-                <select
-                  className="sf-day select"
-                  aria-label="交易日"
-                  value={day ?? ""}
-                  onChange={(e) => onDay(e.target.value || null)}
-                >
-                  <option value="">{replayAt ? `今天 · 回放 ${replayAt}` : "今天 / 最新"}</option>
-                  {data.days.slice(1).map((d) => (
-                    <option key={d} value={d}>
-                      {d}
-                    </option>
-                  ))}
-                </select>
-              ) : null}
-              <div className="sf-seg" role="tablist" aria-label="口径">
-                {MODES.map((o) => (
-                  <button
-                    key={o.value}
-                    type="button"
-                    role="tab"
-                    aria-selected={mode === o.value}
-                    className={mode === o.value ? "on" : ""}
-                    onClick={() => setMode(o.value)}
+              <div className="tools">
+                {data.days?.length ? (
+                  <select
+                    className="select sf-day"
+                    aria-label="数据时间"
+                    value={day ?? ""}
+                    onChange={(e) => onDay(e.target.value || null)}
                   >
-                    {o.label}
-                  </button>
-                ))}
+                    <option value="">{replayAt ? `今天 · 回放 ${replayAt}` : "今天 / 最新"}</option>
+                    {data.days.slice(1).map((d) => (
+                      <option key={d} value={d}>
+                        {d}
+                      </option>
+                    ))}
+                  </select>
+                ) : null}
+                <Segmented label="口径" value={mode} onChange={setMode} options={MODES} />
               </div>
             </div>
             <div className="sf-chips">
@@ -244,8 +229,8 @@ function Body({
             <p className="sf-note sf-note-row">
               估算值，看相对强弱，和同花顺、东方财富的数会不一样
               <HelpMark label="估算口径">
-                每只股票 3 秒快照间的成交额增量按“价 ≥ 前卖一记主动买、≤
-                前买一记主动卖，否则按涨跌 tick”归类；09:25 竞价按竞价价对昨收定方向。
+                每只股票 3 秒快照间的成交额增量按“价 ≥ 前卖一记主动买、≤ 前买一记主动卖，否则按涨跌
+                tick”归类；09:25 竞价按竞价价对昨收定方向。
               </HelpMark>
             </p>
           </section>
@@ -299,7 +284,7 @@ function TurnoverCard({ sm }: { sm: NonNullable<SectorFlowData["summary"]> }) {
   const yi = sm.turnover ?? sm.amount / 1e8;
   const chg = fmtTurnoverChg(sm.turnover_chg, sm.turnover_chg_pct);
   const snap = sm.turnover_source === "snapshot_last";
-  const src = snap ? "快照末笔累计（Tushare 日线未入库）" : "Tushare 日线合计";
+  const src = snap ? "快照末笔累计（日线尚未入库）" : "日线合计";
   const prev =
     sm.prev_turnover != null
       ? `；上一交易日 ${sm.prev_date ?? ""} ${sm.prev_turnover.toFixed(1)}亿`

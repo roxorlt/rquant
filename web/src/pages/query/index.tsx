@@ -243,12 +243,13 @@ export default function QueryPage() {
             ))}
           </nav>
           {schema.error ? (
-            <div className="error-block" role="alert">
-              <b>表列表没有读到</b>
-              <p>数据服务没有响应，可以直接重试。</p>
-              <Button className="touch-44" onClick={() => schema.refetch()}>
-                重试
-              </Button>
+            <div className="notice crit" role="alert">
+              <span>表列表没有读到。数据服务没有响应，可以直接重试。</span>
+              <span className="acts">
+                <button type="button" className="act" onClick={() => schema.refetch()}>
+                  重试
+                </button>
+              </span>
             </div>
           ) : null}
         </QuerySection>
@@ -328,33 +329,34 @@ export default function QueryPage() {
         </QuerySection>
         <div className="query-results" ref={resultRef}>
           {run.error || resultBroken ? (
-            <Panel title="结果">
-              <div className="error-block" role="alert">
+            <div className="notice crit" role="alert">
+              <span>
                 <b id="query-error-title" tabIndex={-1}>
                   查询没有运行
-                </b>
-                <p>
-                  {run.error instanceof ApiError &&
-                  run.error.status === 400 &&
-                  !/HTTP|API/i.test(run.error.message)
-                    ? run.error.message
-                    : "数据服务没有响应，SQL 已保留，可以直接重试。"}
-                </p>
+                </b>{" "}
+                {run.error instanceof ApiError &&
+                run.error.status === 400 &&
+                !/HTTP|API/i.test(run.error.message)
+                  ? run.error.message
+                  : "数据服务没有响应，SQL 已保留，可以直接重试。"}
+              </span>
+              <span className="acts">
                 {run.error instanceof ApiError && run.error.status === 400 ? (
-                  <Button className="touch-44" onClick={() => ref.current?.focus()}>
+                  <button type="button" className="act" onClick={() => ref.current?.focus()}>
                     改 SQL
-                  </Button>
+                  </button>
                 ) : (
-                  <Button
-                    className="touch-44"
+                  <button
+                    type="button"
+                    className="act"
                     aria-busy={run.isPending || undefined}
                     onClick={() => exec(sql)}
                   >
                     重试
-                  </Button>
+                  </button>
                 )}
-              </div>
-            </Panel>
+              </span>
+            </div>
           ) : null}
           {resultRows && resultColumns && !run.error ? (
             <>

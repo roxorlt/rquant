@@ -76,17 +76,17 @@ export default function MonitorPage() {
     } catch (error) {
       alertsCache.restore(previous);
       const attempt = fail?.ids.includes(row.alert_id) ? fail.attempt + 1 : 1;
-      const who = `${row.code} ${row.name ?? ""}`.trim();
+      const who = `${row.name ?? row.code}（${row.code}）`;
       const one = failureCopy(`告警『${who}』`, "确认", error, attempt);
       setFail((prev) => {
         const ids = [...new Set([...(prev?.ids ?? []), row.alert_id])];
         if (ids.length < 2) return { ids, attempt, copy: one };
-        const reason = one.text.split("：")[1]?.replace(/。.*$/, "") ?? "服务没有响应";
+        const rest = one.text.split("：").slice(1).join("：");
         return {
           ids,
           attempt,
           copy: {
-            text: `${ids.length} 条告警没确认上：${reason}。`,
+            text: `${ids.length} 条告警没确认上：${rest}`,
             retry: one.retry,
             health: one.health,
           },
@@ -108,7 +108,7 @@ export default function MonitorPage() {
       alertsCache.patchAck(row.alert_id, false);
       toast({ text: "已撤销确认", duration: 4000 });
     } catch (error) {
-      const who = `${row.code} ${row.name ?? ""}`.trim();
+      const who = `${row.name ?? row.code}（${row.code}）`;
       setFail({
         ids: [row.alert_id],
         attempt: 1,
@@ -149,6 +149,7 @@ export default function MonitorPage() {
             >
               {fail ? (
                 <FailureNotice
+                  pin
                   copy={fail.copy}
                   busy={busyId != null && fail.ids.includes(busyId)}
                   onRetry={

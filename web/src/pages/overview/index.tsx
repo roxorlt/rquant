@@ -1,7 +1,7 @@
 import type { CSSProperties } from "react";
 import { Link } from "react-router";
 import { useAlerts, useHealth, useOverview } from "@/api/endpoints";
-import { layerTitle, publicLine, publicLines, triggerLabel } from "@/copy/publicText";
+import { layerTitle, presetLabel, publicLine, publicLines, triggerLabel } from "@/copy/publicText";
 import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
 import { Button, KpiStrip, PageHeader, Panel, Pill } from "@/ui";
@@ -220,7 +220,11 @@ export default function OverviewPage() {
                     cell: (row) => <StockLink code={row.code} />,
                   },
                   { id: "name", header: "名称", value: (row) => row.name ?? null },
-                  { id: "strategy", header: "策略", value: (row) => row.strategy_id },
+                  {
+                    id: "strategy",
+                    header: "策略",
+                    value: (row) => presetLabel(row.strategy_id),
+                  },
                   {
                     id: "action",
                     header: "动作",

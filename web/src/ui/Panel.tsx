@@ -22,7 +22,7 @@ export function Panel({ title, sub, actions, flush, label, titleId, children }: 
             </h2>
           ) : null}
           {sub ? <span className="sub">{sub}</span> : null}
-          {actions ? <div className="row">{actions}</div> : null}
+          {actions ? <div className="tools">{actions}</div> : null}
         </div>
       ) : null}
       <div className={flush ? "panel-b flush" : "panel-b"}>{children}</div>

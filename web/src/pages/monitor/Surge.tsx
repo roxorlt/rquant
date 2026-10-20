@@ -4,7 +4,7 @@ import { DataTable } from "@/table/DataTable";
 import { HelpMark, Panel, Pill } from "@/ui";
 import { StockLink } from "@/ui/StockLink";
 import { QueryView } from "../shared";
-import { surgeHelp, type SurgeRules, surgeSubtitle } from "./surgeCopy";
+import { type SurgeRules, surgeHelp, surgeSubtitle } from "./surgeCopy";
 
 function rulesOf(data: { rules?: SurgeRules }): SurgeRules | null {
   return data.rules ?? null;

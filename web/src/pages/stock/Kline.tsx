@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { type ReactNode, useMemo, useState } from "react";
 import type { Schemas } from "@/api/client";
 import { useChips } from "@/api/endpoints";
 import { Candles, clampView } from "@/charts/Candles";
@@ -169,10 +169,12 @@ export function KlinePanel({
   code,
   bars,
   flow = [],
+  period,
 }: {
   code: string;
   bars: readonly Bar[];
   flow?: readonly Flow[];
+  period?: ReactNode;
 }) {
   const [view, setView] = useState<[number, number]>(() =>
     clampView(bars.length - 250, bars.length, bars.length),
@@ -224,39 +226,46 @@ export function KlinePanel({
       title="日K线 · 筹码"
       sub="前复权"
       actions={
-        <span className="qc-ctl">
-          <label>
-            <input
-              type="checkbox"
-              checked={showChips}
-              onChange={(e) => setShowChips(e.target.checked)}
-            />{" "}
-            筹码分布
-          </label>
-          <label>
-            <input
-              type="checkbox"
-              checked={showBoll}
-              onChange={(e) => setShowBoll(e.target.checked)}
-            />{" "}
-            BOLL
-          </label>
-          <label title="点击 K 线设置锚点">
-            <input
-              type="checkbox"
-              checked={showVwap}
-              onChange={(e) => setShowVwap(e.target.checked)}
-            />{" "}
-            锚定 VWAP ±1σ/2σ
-          </label>
-          <label>
-            <input type="checkbox" checked={showVp} onChange={(e) => setShowVp(e.target.checked)} />{" "}
-            成交量分布
-            {c?.profile
-              ? `（近 ${c.profile.days} 日 · ${c.profile.source === "5min" ? "5 分钟线" : "日线"}）`
-              : ""}
-          </label>
-        </span>
+        <>
+          {period}
+          <span className="qc-ctl">
+            <label>
+              <input
+                type="checkbox"
+                checked={showChips}
+                onChange={(e) => setShowChips(e.target.checked)}
+              />{" "}
+              筹码分布
+            </label>
+            <label>
+              <input
+                type="checkbox"
+                checked={showBoll}
+                onChange={(e) => setShowBoll(e.target.checked)}
+              />{" "}
+              BOLL
+            </label>
+            <label title="点击 K 线设置锚点">
+              <input
+                type="checkbox"
+                checked={showVwap}
+                onChange={(e) => setShowVwap(e.target.checked)}
+              />{" "}
+              锚定 VWAP ±1σ/2σ
+            </label>
+            <label>
+              <input
+                type="checkbox"
+                checked={showVp}
+                onChange={(e) => setShowVp(e.target.checked)}
+              />{" "}
+              成交量分布
+              {c?.profile
+                ? `（近 ${c.profile.days} 日 · ${c.profile.source === "5min" ? "5 分钟线" : "日线"}）`
+                : ""}
+            </label>
+          </span>
+        </>
       }
     >
       <Candles

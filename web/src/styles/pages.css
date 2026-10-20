@@ -12,16 +12,12 @@ input[type="text"],
 input[type="number"],
 input[type="date"],
 input:not([type]) {
-  height: 30px;
-  padding-inline: 8px;
+  height: 32px;
+  padding-inline: 12px;
   border: 1px solid var(--rule);
   border-radius: 6px;
   background: var(--surface-2);
   color: var(--ink);
-}
-input:focus {
-  border-color: var(--accent);
-  outline: none;
 }
 .sql-tables {
   display: flex;
@@ -493,7 +489,7 @@ input:focus {
 }
 
 .chart-tabs {
-  margin: 4px 0 8px;
+  margin: 0;
 }
 .intraday .chart-axis.up {
   fill: var(--up);
@@ -911,4 +907,101 @@ fieldset.bd-sort {
 }
 svg.touch-scrub {
   touch-action: pan-y;
+}
+
+/* Shared native select. One chevron, one height, used everywhere a dropdown appears. */
+.select {
+  appearance: none;
+  -webkit-appearance: none;
+  height: 32px;
+  padding: 0 32px 0 12px;
+  border: 1px solid var(--c-rule);
+  border-radius: var(--r-sm);
+  background-color: var(--c-surface);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5l5 5 5-5' fill='none' stroke='%235e6776' stroke-width='1.6' stroke-linecap='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  background-size: 12px 8px;
+  color: var(--c-ink);
+  font-size: 14px;
+  line-height: 1.2;
+}
+[data-theme="dark"] .select {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5l5 5 5-5' fill='none' stroke='%23c5cad3' stroke-width='1.6' stroke-linecap='round'/%3E%3C/svg%3E");
+}
+.tbl-sort {
+  display: none;
+}
+
+/* Phone and coarse pointers share one control size with the buttons. */
+@media (max-width: 599px), (pointer: coarse) {
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]):not(
+    [type="color"]
+  ),
+  select,
+  textarea,
+  .search input,
+  .search-screen-input,
+  .cond-row input,
+  .cond-row select,
+  .suffix-field input,
+  .rule-fields input {
+    font-size: 16px;
+  }
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]):not(
+    [type="color"]
+  ),
+  select,
+  .search input,
+  .search-screen-input,
+  .cond-row input,
+  .cond-row select,
+  .suffix-field input,
+  .rule-fields input,
+  .btn,
+  .btn.sm,
+  .notice .act {
+    height: 44px;
+    min-height: 44px;
+  }
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]):not(
+    [type="color"]
+  ):not([type="search"]),
+  select,
+  .cond-row input,
+  .suffix-field input {
+    padding-left: 16px;
+  }
+  .select {
+    height: 44px;
+    font-size: 16px;
+    padding: 0 32px 0 16px;
+  }
+  .seg {
+    height: auto;
+    min-height: 44px;
+    padding: 0;
+  }
+  .seg button {
+    height: 44px;
+    min-height: 44px;
+  }
+  .tbl thead th,
+  .tbl th button.sort {
+    height: 44px;
+    min-height: 44px;
+  }
+  .notice .act {
+    margin-block: 0;
+    min-width: 44px;
+  }
+  .tbl-sort {
+    display: inline-block;
+    width: auto;
+    max-width: 100%;
+  }
+  .scheme-chip button + button {
+    min-width: 44px;
+    min-height: 44px;
+  }
 }

@@ -4,7 +4,13 @@ import { render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { QueryView } from "@/pages/shared";
 import { renderApp } from "@/test/render";
-import { boardSystemLabel, poolDisplayName, publicLine, triggerLabel } from "./publicText";
+import {
+  boardSystemLabel,
+  poolDisplayName,
+  publicLine,
+  TRIGGER_LABEL,
+  triggerLabel,
+} from "./publicText";
 
 const serving = { state: "ready", generation_id: "g", generated_at: "2026-10-20T07:00:00Z" };
 
@@ -23,6 +29,23 @@ const BANNED = [
   "可能是 Serving",
   "idle",
   "daily_bar",
+  "stop_loss",
+  "page-control",
+  "snapshot-collector",
+  "reference-slow",
+  "report-factors",
+  "SMARTMONEY",
+  "daily_basic",
+  "cn_gdp",
+  "market.duckdb",
+  "auction-gap",
+  "volume-surge",
+  "--strategy",
+  "systemd",
+  "systemctl",
+  "fina_indicator",
+  "当前代",
+  "degraded",
 ];
 
 function assertClean(text: string): void {
@@ -35,6 +58,14 @@ describe("public copy", () => {
   it("translates the internal phrases", () => {
     expect(triggerLabel("gap_up")).toBe("跳空高开");
     expect(triggerLabel("volume_surge")).toBe("放量");
+    expect(triggerLabel("stop_loss")).toBe("止损");
+    expect(triggerLabel("not_a_type")).toBe("其他");
+    for (const [key, label] of Object.entries(TRIGGER_LABEL)) {
+      expect(label, key).not.toMatch(/[A-Za-z]/);
+      expect(triggerLabel(key)).toBe(label);
+    }
+    expect(publicLine("当前代发布于 0.0 小时前")).toContain("当前版本");
+    expect(publicLine("没有已发布的代")).toBe("没有已发布的版本");
     expect(publicLine("rquant-daily：idle")).toBe("日线采集：空闲");
     expect(publicLine("日线最新 2026-10-20（落后 0 个工作日）")).toBe("日线最新 2026-10-20");
     expect(publicLine("daily_bar 缺 1 天")).toBe("日线数据缺 1 天");

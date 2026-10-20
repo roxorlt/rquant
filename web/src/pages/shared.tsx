@@ -1,6 +1,6 @@
 import { type ReactNode, useEffect, useState } from "react";
 import type { ServingQueryResult } from "@/api/useServingQuery";
-import { Button, EmptyState, PageSkeleton } from "@/ui";
+import { PageSkeleton } from "@/ui";
 
 /** Matches `--delay-skeleton`: a fast response must not flash a skeleton. */
 export const SKELETON_DELAY_MS = 300;
@@ -30,17 +30,14 @@ export function QueryView<T>({
   if (query.isLoading) return showSkeleton ? <PageSkeleton /> : null;
   if (query.error || query.data === undefined) {
     return (
-      <EmptyState
-        title="暂时读不到数据"
-        hint={
-          <>
-            {query.error?.message ?? "接口没有返回数据"}。请稍后再试。{" "}
-            <Button size="sm" className="touch-44" onClick={() => query.refetch()}>
-              重试
-            </Button>
-          </>
-        }
-      />
+      <div className="notice crit" role="alert">
+        <span>{query.error?.message ?? "接口没有返回数据"}。请稍后再试。</span>
+        <span className="acts">
+          <button type="button" className="act" onClick={() => query.refetch()}>
+            重试
+          </button>
+        </span>
+      </div>
     );
   }
   return <>{children(query.data)}</>;

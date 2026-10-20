@@ -177,9 +177,7 @@ function QuantilePanel({ result }: { result: TestResult }) {
           series={[...series, longShort]}
         />
       ) : (
-        <p className="hint">
-          这条检验结果产出较早，没有逐日分组数据。
-        </p>
+        <p className="hint">这条检验结果产出较早，没有逐日分组数据。</p>
       )}
       <div className="risk-block">
         <div>
@@ -227,11 +225,7 @@ export default function FactorPage() {
       <PageHeader eyebrow="研究" title="因子研究" />
       <QueryView query={query}>
         {(data) => (
-          <Panel
-            title={`因子 · ${data.factors.length}`}
-            sub="检验结果出现在这里"
-            flush
-          >
+          <Panel title={`因子 · ${data.factors.length}`} sub="检验结果出现在这里" flush>
             <DataTable
               label="因子列表"
               tools="因子"

@@ -1,10 +1,10 @@
-import { useCallback } from "react";
+import { useCallback, useState } from "react";
 import { useLocation, useNavigate, useSearchParams } from "react-router";
 import { inTradingHours, useMarketLive } from "@/api/endpoints";
 import { TimeChart } from "@/charts/Chart";
 import { formatAmount, formatCount } from "@/format/number";
 import { DataTable } from "@/table/DataTable";
-import { ChangeText, KpiStrip, Panel } from "@/ui";
+import { ChangeText, KpiStrip, Panel, Segmented } from "@/ui";
 import { QueryView } from "../shared";
 import { BoardDetail } from "./BoardDetail";
 import { Heatmap } from "./Heatmap";
@@ -12,8 +12,11 @@ import { PHONE_QUERY, useMedia } from "./useMedia";
 
 const pct = (v: number) => `${(v * 100).toFixed(0)}%`;
 
+type Lens = "breadth" | "limit";
+
 /** Live 市场全景 from the research 3-second snapshots (rebuild of the old Streamlit page). */
 export function LivePanorama() {
+  const [lens, setLens] = useState<Lens>("breadth");
   // The open board lives in the URL (?board=…) as its own history entry, so the iOS
   // back-swipe / browser back closes the detail instead of leaving the page.
   const [params, setParams] = useSearchParams();
@@ -37,8 +40,7 @@ export function LivePanorama() {
     <QueryView query={query}>
       {(data) => {
         const p = data.pulse;
-        if (!p || !data.curve)
-          return <p className="hint pad">今天还没有快照。</p>;
+        if (!p || !data.curve) return <p className="hint pad">今天还没有快照。</p>;
         const c = data.curve;
         const live = inTradingHours();
         const boards = data.boards;
@@ -114,29 +116,43 @@ export function LivePanorama() {
             {phone ? heatPanel : null}
             <div className="card-grid">
               <Panel
-                title="赚钱效应（逐分钟）"
+                title="盘中"
                 sub={`上涨家数占比；50% 以上说明多数股票在涨${live ? " · 每 15 秒刷新" : ""}`}
+                actions={
+                  <Segmented
+                    label="盘中图"
+                    value={lens}
+                    onChange={setLens}
+                    options={[
+                      { value: "breadth", label: "赚钱效应" },
+                      { value: "limit", label: "涨停炸板" },
+                    ]}
+                  />
+                }
               >
-                <TimeChart
-                  label="上涨占比"
-                  dates={c.t}
-                  height={150}
-                  baseline={0.5}
-                  format={pct}
-                  series={[
-                    { name: "上涨占比", values: c.up_ratio, color: "var(--accent)", area: true },
-                  ]}
-                />
-                <TimeChart
-                  label="涨停与炸板家数"
-                  dates={c.t}
-                  height={110}
-                  format={(v) => v.toFixed(0)}
-                  series={[
-                    { name: "涨停", values: c.limit_up, color: "var(--up)" },
-                    { name: "炸板", values: c.broken, color: "var(--muted)", dashed: true },
-                  ]}
-                />
+                {lens === "breadth" ? (
+                  <TimeChart
+                    label="上涨占比"
+                    dates={c.t}
+                    height={150}
+                    baseline={0.5}
+                    format={pct}
+                    series={[
+                      { name: "上涨占比", values: c.up_ratio, color: "var(--accent)", area: true },
+                    ]}
+                  />
+                ) : (
+                  <TimeChart
+                    label="涨停与炸板家数"
+                    dates={c.t}
+                    height={150}
+                    format={(v) => v.toFixed(0)}
+                    series={[
+                      { name: "涨停", values: c.limit_up, color: "var(--up)" },
+                      { name: "炸板", values: c.broken, color: "var(--muted)", dashed: true },
+                    ]}
+                  />
+                )}
               </Panel>
               {phone ? null : heatPanel}
               <Panel

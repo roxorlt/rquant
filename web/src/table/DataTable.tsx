@@ -56,6 +56,8 @@ export interface DataTableProps<T> {
   tools?: boolean | string;
   /** Keep the first and last columns in view while the rest scroll sideways. */
   pinEnds?: boolean;
+  /** Phone and coarse pointers sort from a select; the header buttons stay for a mouse. */
+  phoneSort?: boolean;
 }
 
 /** CSV text (with BOM so Excel reads UTF-8) of the given columns and rows. */
@@ -117,6 +119,7 @@ export function DataTable<T>({
   estimatedRowHeight = 37,
   tools,
   pinEnds = false,
+  phoneSort = false,
 }: DataTableProps<T>) {
   const prefKey = `cols.${label}`;
   const [hidden, setHidden] = useState<Set<string>>(() => {
@@ -244,6 +247,32 @@ export function DataTable<T>({
 
   const selectable = onSelect !== undefined;
 
+  const sortChoices = columns.filter(
+    (column) => (column.sortable ?? column.numeric ?? false) && column.header,
+  );
+  const sortValue = sorting[0] ? `${sorting[0].id}:${sorting[0].desc ? "desc" : "asc"}` : "";
+  const phoneSortSelect =
+    phoneSort && sortChoices.length ? (
+      <select
+        className="select tbl-sort"
+        aria-label="排序"
+        value={sortValue}
+        onChange={(event) => {
+          const [id, dir] = event.target.value.split(":");
+          if (id) setSorting([{ id, desc: dir === "desc" }]);
+        }}
+      >
+        {sortChoices.flatMap((column) => [
+          <option key={`${column.id}:desc`} value={`${column.id}:desc`}>
+            {column.header} 降序
+          </option>,
+          <option key={`${column.id}:asc`} value={`${column.id}:asc`}>
+            {column.header} 升序
+          </option>,
+        ])}
+      </select>
+    ) : null;
+
   const toolbar = tools ? (
     <div className="tbl-tools">
       <span className="tbl-count">{sortedRows.length} 行</span>
@@ -282,6 +311,7 @@ export function DataTable<T>({
   return (
     <>
       {toolbar}
+      {phoneSortSelect}
       <div
         ref={scrollRef}
         className={`tbl-wrap${height === undefined ? "" : " scroll"}${pinEnds ? " pin-cols" : ""}`}

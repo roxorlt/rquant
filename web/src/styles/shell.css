@@ -154,13 +154,10 @@
   border: 1px solid var(--rule);
   border-radius: 6px;
   background: var(--surface-2);
-  font-size: 13px;
+  font-size: 14px;
 }
 .search input:focus {
   background: var(--surface);
-  border-color: var(--accent);
-  outline: none;
-  box-shadow: 0 0 0 2px var(--accent-weak);
 }
 .stock-search-pop {
   position: absolute;
@@ -417,7 +414,7 @@
   flex: 1;
   min-width: 0;
   height: 44px;
-  padding: 0 12px;
+  padding: 0 16px;
   border: 1px solid var(--rule);
   border-radius: 6px;
   background: var(--surface-2);

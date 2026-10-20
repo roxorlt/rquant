@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { surgeHelp, surgeSubtitle, type SurgeRules } from "./surgeCopy";
+import { type SurgeRules, surgeHelp, surgeSubtitle } from "./surgeCopy";
 
 /** Defaults in src/rquant/research/surge.py. The API test checks the route returns these. */
 const RULES: SurgeRules = {

@@ -4,8 +4,8 @@ import dayjs from "dayjs";
 import "dayjs/locale/zh-cn";
 import { type ReactNode, useMemo } from "react";
 import { useTheme } from "@/theme/ThemeProvider";
-import { antdThemeFor } from "./theme";
 import { ToastHost } from "./Toast";
+import { antdThemeFor } from "./theme";
 
 dayjs.locale("zh-cn");
 

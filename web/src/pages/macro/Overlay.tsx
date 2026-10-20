@@ -111,7 +111,7 @@ function buildIndicators(d: MacroData): Ind[] {
   if (d.hk) {
     const sm = d.hk.cols.smart ?? [];
     const ma = d.hk.cols.smart_ma20 ?? [];
-    add("hk_gap", "SMARTMONEY−MA20", "港股", [
+    add("hk_gap", "聪明钱减 20 日均线", "港股", [
       d.hk.dates,
       sm.map((v, i) => (v == null || ma[i] == null ? null : v - (ma[i] as number))),
     ]);

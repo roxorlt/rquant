@@ -127,6 +127,20 @@ it("does not show 已确认 when the write fails, and offers 重试 on the row",
   expect(screen.queryByText(/HTTP/)).not.toBeInTheDocument();
 });
 
+it("names the stock and keeps the next step when several confirms fail", async () => {
+  stub({ failAck: true });
+  renderApp("/monitor");
+  const first = (await screen.findAllByRole("button", { name: "确认" }))[0] as HTMLElement;
+  fireEvent.click(first);
+  expect(await screen.findByText(/澜屿科技（999001\.SH）/)).toBeInTheDocument();
+  expect(screen.getByRole("link", { name: "看系统健康" })).toBeInTheDocument();
+  const second = screen.getAllByRole("button", { name: "确认" })[0] as HTMLElement;
+  fireEvent.click(second);
+  expect(
+    await screen.findByText("2 条告警没确认上：这项操作暂时用不了。稍后再试，或去看系统健康"),
+  ).toBeInTheDocument();
+});
+
 it("undo restores the alert and says 已撤销确认", async () => {
   stub();
   renderApp("/monitor");

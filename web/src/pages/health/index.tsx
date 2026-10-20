@@ -1,23 +1,11 @@
 import { useHealth } from "@/api/endpoints";
-import { layerTitle, publicLines, serviceLabel } from "@/copy/publicText";
+import { layerTitle, planeLabel, publicLines, serviceLabel, statusLabel } from "@/copy/publicText";
 import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
 import { KpiStrip, PageHeader, Panel, StatusBadge } from "@/ui";
 import { QueryView } from "../shared";
 
 /** Large counts get thousands separators; dates and text pass through. */
-const STATUS_LABEL: Record<string, string> = {
-  running: "运行中",
-  idle: "空闲",
-  failed: "失败",
-  error: "出错",
-};
-
-function statusLabel(status: string, stale: boolean): string {
-  const text = STATUS_LABEL[status] ?? status;
-  return stale ? `${text}（过期）` : text;
-}
-
 function formatFresh(value: string | number): string {
   const n = typeof value === "number" ? value : /^\d+$/.test(value) ? Number(value) : null;
   return n === null ? String(value) : n.toLocaleString("zh-CN");
@@ -62,7 +50,7 @@ export default function HealthPage() {
                     header: "服务",
                     value: (row) => serviceLabel(row.service_id),
                   },
-                  { id: "plane", header: "平面", value: (row) => row.plane },
+                  { id: "plane", header: "平面", value: (row) => planeLabel(row.plane) },
                   {
                     id: "status",
                     header: "状态",

@@ -7,13 +7,16 @@ export function FailureNotice({
   copy,
   busy,
   onRetry,
+  pin = false,
 }: {
   copy: FailureCopy;
   busy?: boolean;
   onRetry?: () => void;
+  /** Stick to the top of the visible page when the notice would scroll away. */
+  pin?: boolean;
 }) {
   return (
-    <div className="notice crit" role="alert">
+    <div className={pin ? "notice crit pin" : "notice crit"} role="alert">
       <span>{copy.text}</span>
       {copy.retry || copy.health ? (
         <span className="acts">

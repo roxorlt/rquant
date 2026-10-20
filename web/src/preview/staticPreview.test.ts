@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { renderApp } from "@/test/render";
 import {
   installStaticPreview,
+  previewWatchlistCodes,
   resetStaticPreviewWrites,
   STATIC_PREVIEW_WRITE_MOCK,
 } from "./staticPreview";
@@ -253,8 +254,31 @@ describe("static preview reads frozen files", () => {
     setPage("error");
     installFrozenFiles();
     renderApp("/overview");
-    expect(await screen.findByText("暂时读不到数据")).toBeInTheDocument();
+    expect(await screen.findByText(/暂时读不到数据/)).toBeInTheDocument();
     expect(screen.queryByText("星河股份")).not.toBeInTheDocument();
+  });
+
+  it("remembers a watchlist code until the preview writes are reset", async () => {
+    installFrozenFiles();
+    const added = await fetch("http://localhost:3000/states/normal/api/v1/watchlist", {
+      method: "POST",
+      body: JSON.stringify({ code: "XQ0003.BJ" }),
+    });
+    expect(added.status).toBe(200);
+    expect(previewWatchlistCodes()).toEqual(["XQ0003.BJ"]);
+    resetStaticPreviewWrites();
+    expect(previewWatchlistCodes()).toEqual([]);
+  });
+
+  it("does not remember a watchlist code when the page asks to fail", async () => {
+    installFrozenFiles();
+    window.history.pushState({}, "", "/preview.html?fail=1");
+    const failed = await fetch("http://localhost:3000/states/normal/api/v1/watchlist", {
+      method: "POST",
+      body: JSON.stringify({ code: "XQ0003.BJ" }),
+    });
+    expect(failed.status).toBe(503);
+    expect(previewWatchlistCodes()).toEqual([]);
   });
 
   it("returns success only for the allowlisted writes", async () => {
@@ -334,6 +358,7 @@ describe("static preview reads frozen files", () => {
       const prodText = bundleText(prod);
       const previewText = bundleText(preview);
       expect(prodText).not.toContain(STATIC_PREVIEW_WRITE_MOCK);
+      expect(prodText).not.toContain("仅供 UI 走查");
       expect(previewText).toContain(STATIC_PREVIEW_WRITE_MOCK);
       for (const name of REAL_LISTINGS) {
         expect(previewText, name).not.toContain(name);

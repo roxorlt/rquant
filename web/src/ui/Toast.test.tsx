@@ -1,5 +1,5 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
-import { ToastHost, dismissToast, pauseToast, resumeToast, showToast } from "./Toast";
+import { dismissToast, pauseToast, resumeToast, showToast, ToastHost } from "./Toast";
 
 afterEach(() => {
   dismissToast();
@@ -10,8 +10,16 @@ it("keeps only the latest toast and drops undo after 6 seconds", () => {
   vi.useFakeTimers();
   render(<ToastHost />);
   act(() => {
-    showToast({ text: "已确认 1 条告警", duration: 6000, action: { label: "撤销", onClick: () => undefined } });
-    showToast({ text: "已确认另一条", duration: 6000, action: { label: "撤销", onClick: () => undefined } });
+    showToast({
+      text: "已确认 1 条告警",
+      duration: 6000,
+      action: { label: "撤销", onClick: () => undefined },
+    });
+    showToast({
+      text: "已确认另一条",
+      duration: 6000,
+      action: { label: "撤销", onClick: () => undefined },
+    });
   });
   expect(screen.getAllByRole("status")).toHaveLength(1);
   expect(screen.getByRole("status")).toHaveTextContent("已确认另一条");
@@ -26,7 +34,11 @@ it("pauses the undo timer while the toast is hovered", () => {
   vi.useFakeTimers();
   render(<ToastHost />);
   act(() => {
-    showToast({ text: "已确认 1 条告警", duration: 6000, action: { label: "撤销", onClick: () => undefined } });
+    showToast({
+      text: "已确认 1 条告警",
+      duration: 6000,
+      action: { label: "撤销", onClick: () => undefined },
+    });
   });
   fireEvent.mouseEnter(screen.getByRole("status"));
   act(() => {

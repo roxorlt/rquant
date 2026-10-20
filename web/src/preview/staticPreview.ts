@@ -35,6 +35,7 @@ interface WriteOverlay {
   schemes: Map<string, Record<string, unknown> | null>;
   pools: Map<string, Record<string, unknown>>;
   rules: Map<string, Record<string, unknown>>;
+  watch: Set<string>;
 }
 
 function emptyOverlay(): WriteOverlay {
@@ -43,7 +44,13 @@ function emptyOverlay(): WriteOverlay {
     schemes: new Map(),
     pools: new Map(),
     rules: new Map(),
+    watch: new Set(),
   };
+}
+
+/** Codes added to the watchlist during this preview session. */
+export function previewWatchlistCodes(): string[] {
+  return [...overlay.watch];
 }
 
 let overlay: WriteOverlay = emptyOverlay();
@@ -126,6 +133,10 @@ function rememberWrite(url: string, body: unknown): void {
   }
   if (path.endsWith("/api/v1/alert-rules") && payload && typeof payload.rule_id === "string") {
     overlay.rules.set(payload.rule_id, { ...payload, saved_at: new Date().toISOString() });
+    return;
+  }
+  if (path.endsWith("/api/v1/watchlist") && payload && typeof payload.code === "string") {
+    overlay.watch.add(payload.code);
   }
 }
 
@@ -139,7 +150,8 @@ function overlayEmpty(): boolean {
     overlay.alerts.size === 0 &&
     overlay.schemes.size === 0 &&
     overlay.pools.size === 0 &&
-    overlay.rules.size === 0
+    overlay.rules.size === 0 &&
+    overlay.watch.size === 0
   );
 }
 

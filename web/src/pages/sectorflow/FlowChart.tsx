@@ -238,6 +238,7 @@ export function FlowChart({ t, shown, colors, mode, upto, phone, focus, onFocus 
         }
       }}
     >
+      <div className="sf-legend">竞价</div>
       <svg width={w} height={h} role="img" aria-label="板块累计净流入走势">
         <defs>
           <pattern
@@ -251,9 +252,6 @@ export function FlowChart({ t, shown, colors, mode, upto, phone, focus, onFocus 
           </pattern>
         </defs>
         <rect x={X(0) - 2} y={m.t} width={X(1) - X(0) - 2} height={ih} className="sf-auction" />
-        <text x={(X(0) + X(1)) / 2 - 2} y={m.t + 11} className="sf-axis-note" textAnchor="middle">
-          竞价
-        </text>
         {upto < SLOTS - 1 ? (
           <rect
             x={X(upto)}

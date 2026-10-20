@@ -36,7 +36,7 @@ it("closes the log drawer with the browser back button", async () => {
     }),
   );
   const view = renderApp("/tasks");
-  fireEvent.click(await screen.findByText("rquant-daily.service"));
+  fireEvent.click(await screen.findByText("日线采集服务"));
   expect(await screen.findByRole("dialog")).toBeInTheDocument();
   await waitFor(() => expect(view.router.state.location.search).toContain("unit="));
   await view.router.navigate(-1);
