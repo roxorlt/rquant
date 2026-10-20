@@ -1,0 +1,2 @@
+# installed into lighthouse's crontab on 82.156.0.68 (server clock is Asia/Shanghai, CST +0800)
+40 15 * * * /home/lighthouse/rquant-ops/serving-retention/run-daily.sh >> /home/lighthouse/rquant/logs/serving-retention.cron.log 2>&1 # rquant serving-retention R2
