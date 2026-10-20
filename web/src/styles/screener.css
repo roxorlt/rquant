@@ -1,7 +1,7 @@
 /* Screener condition area: filters and ranks side by side, funnel as one line. */
 .cond-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 340px), 1fr));
   gap: 6px 24px;
 }
 .cond-grid h3.sub {
@@ -16,7 +16,7 @@
   margin-bottom: 4px;
 }
 .cond-grid .cond-row > .mono {
-  color: var(--faint);
+  color: var(--muted);
   font-size: 11px;
 }
 .cond-grid .cond-row select,
@@ -31,7 +31,7 @@
 }
 .cond-none {
   margin: 0 0 4px;
-  color: var(--faint);
+  color: var(--muted);
   font-size: 12px;
 }
 .funnel-inline {
@@ -98,7 +98,7 @@
 .scheme-chip button + button {
   padding: 2px 6px;
   border-left: 1px solid var(--rule);
-  color: var(--faint);
+  color: var(--muted);
 }
 .scheme-chip button:hover {
   color: var(--accent-t);

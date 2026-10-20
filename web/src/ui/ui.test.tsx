@@ -174,13 +174,13 @@ describe("antd theme", () => {
     style.textContent = tokensCss;
     document.head.append(style);
     expect(antdThemeFor("light").token).toMatchObject({
-      colorPrimary: "#2e58e6",
-      colorError: "#d6333b",
+      colorPrimary: "#2448d0",
+      colorError: "#b4232b",
     });
     document.documentElement.setAttribute("data-theme", "dark");
     expect(antdThemeFor("dark").token).toMatchObject({
-      colorPrimary: "#7090ff",
-      colorBgContainer: "#161a21",
+      colorPrimary: "#7c98ff",
+      colorBgContainer: "#171b21",
     });
     style.remove();
   });

@@ -27,7 +27,7 @@
 }
 .tbl-count {
   margin-right: auto;
-  color: var(--faint);
+  color: var(--muted);
   font-family: var(--font-mono);
 }
 .tbl-tool {

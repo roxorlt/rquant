@@ -1,7 +1,7 @@
 import { useSyncExternalStore } from "react";
 
-/** Phone layout breakpoint — matches the shell's phone nav (max-width: 760px). */
-export const PHONE_QUERY = "(max-width: 760px)";
+/** Phone layout breakpoint — matches the shell (max-width: 599px). */
+export const PHONE_QUERY = "(max-width: 599px)";
 
 export function useMedia(query: string): boolean {
   return useSyncExternalStore(

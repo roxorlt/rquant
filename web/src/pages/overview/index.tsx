@@ -1,3 +1,4 @@
+import type { CSSProperties } from "react";
 import { Link } from "react-router";
 import { useAlerts, useHealth, useOverview } from "@/api/endpoints";
 import { formatShanghaiDateTime } from "@/format/time";
@@ -26,7 +27,7 @@ function Pipeline() {
       <ol
         className="pipe"
         aria-label="今日链路"
-        style={{ gridTemplateColumns: `repeat(${layers.length}, minmax(0, 1fr))` }}
+        style={{ "--pipe-cols": layers.length } as CSSProperties}
       >
         {layers.map((layer) => {
           const [kind, text] = STATE_PILL[layer.state];

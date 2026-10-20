@@ -115,6 +115,15 @@ export function MenuIcon() {
   );
 }
 
+export function BellIcon() {
+  return (
+    <Svg size={20}>
+      <path d="M6 9a6 6 0 1 1 12 0c0 6.5 2.5 8 2.5 8h-17S6 15.5 6 9z" />
+      <path d="M10 20.5a2 2 0 0 0 4 0" />
+    </Svg>
+  );
+}
+
 export function SearchIcon() {
   return (
     <Svg>

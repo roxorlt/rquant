@@ -25,7 +25,7 @@ export interface DataColumn<T> {
   /** Long text that wraps instead of widening the table. */
   wrap?: boolean;
   sortable?: boolean;
-  /** Secondary columns are hidden on phones (≤ 760 px) to keep rows one-hand readable. */
+  /** Secondary columns are hidden on phones (≤ 599 px) to keep rows one-hand readable. */
   secondary?: boolean;
 }
 

@@ -62,7 +62,7 @@ export default function StockPage() {
                   {last ? <ChangeText value={last.pct_chg ?? null} /> : null}
                 </span>
               }
-              note={last ? `截至 ${last.date}` : "没有行情"}
+              note={last ? null : "没有行情"}
             />
             <QuoteGrid s={s} />
             <ChartTabs

@@ -30,7 +30,7 @@ export default function PoolsPage() {
     isAuction && auctionPool
       ? `${typeof auctionDate === "string" ? auctionDate : ""} · 观察 ${nWatch}${
           typeof lockedAt === "string" ? " · 09:30 已锁定" : ""
-        }${nCand !== null ? `（候选 ${nCand}）` : ""}`
+        }${nCand !== null ? ` · 候选 ${nCand}` : ""}`
       : (query.data?.trade_date ?? undefined);
   return (
     <>

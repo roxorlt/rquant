@@ -43,7 +43,6 @@ export default function SectorFlowPage() {
       <PageHeader
         eyebrow="跟踪与告警"
         title="板块资金流"
-        note="行业（Tushare 分类，与市场全景一致）· 自 09:25 累计主动买卖估算"
         actions={
           data?.days?.length ? (
             <select

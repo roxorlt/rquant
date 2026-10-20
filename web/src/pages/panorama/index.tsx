@@ -14,11 +14,7 @@ export default function PanoramaPage() {
   const [system, setSystem] = useState<string | null>(null);
   return (
     <>
-      <PageHeader
-        eyebrow="跟踪与告警"
-        title="市场全景"
-        note="全 A 股 3 秒快照 · 行业按 Tushare 分类"
-      />
+      <PageHeader eyebrow="跟踪与告警" title="市场全景" />
       <LivePanorama />
       <QueryView query={query}>
         {(data) => {

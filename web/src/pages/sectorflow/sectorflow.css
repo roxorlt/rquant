@@ -2,14 +2,14 @@
   --sf-card: var(--surface);
   --sf-line: var(--rule);
   --sf-sub: var(--muted);
-  --sf-mute: var(--faint);
+  --sf-mute: var(--muted);
   font-variant-numeric: tabular-nums;
 }
 .sf .up {
-  color: var(--up);
+  color: var(--up-t);
 }
 .sf .down {
-  color: var(--down);
+  color: var(--down-t);
 }
 .sf .up-bg {
   background: var(--up);
@@ -19,7 +19,7 @@
 }
 .sf-stats {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 10px;
   margin: 4px 0 12px;
 }
@@ -454,7 +454,7 @@
   height: 20px;
   border-radius: 6px;
   background: var(--up-weak);
-  color: var(--up);
+  color: var(--up-t);
   font-weight: 800;
   font-size: 12px;
   display: flex;
@@ -468,7 +468,7 @@
 }
 .sf-sh .sname em {
   font-style: normal;
-  color: var(--up);
+  color: var(--up-t);
   margin-left: 2px;
 }
 .sf-sh .smeta {
@@ -481,7 +481,7 @@
   padding: 1px 5px;
   border-radius: 4px;
   background: var(--up-weak);
-  color: var(--up);
+  color: var(--up-t);
   font-weight: 700;
   margin-left: 5px;
   white-space: nowrap;
@@ -519,7 +519,7 @@
   white-space: nowrap;
 }
 .sf-stk .r b {
-  color: var(--up);
+  color: var(--up-t);
   font-weight: 600;
 }
 .sf-stk .p {
@@ -561,7 +561,7 @@
 }
 /* ---- iPhone: designed for the device, not a squeezed desktop ---- */
 .sf-phone .sf-stats {
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
   margin: 0 0 10px;
 }
