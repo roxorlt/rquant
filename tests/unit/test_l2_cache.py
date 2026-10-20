@@ -1262,3 +1262,175 @@ def test_head_receipt_cold_exception_releases_lock_and_does_not_publish(tmp_path
     thread.start(); thread.join(3)
     assert not thread.is_alive() and not errors
     assert len(results) == 1 and results[0].last_sequence == 1 and len(calls) == 2
+
+
+def test_cold_selected_head_reuses_only_its_own_model_after_full_reread(tmp_path, monkeypatch):
+    from rquant.l2 import cache as module
+    from rquant.l2.models import RawL2Batch
+
+    cache = module.RawL2Cache(tmp_path / 'cold-selected')
+    with cache.writer(): committed = cache.append(order640_observation())
+    target = cache.root / 'batches' / f'{1:020d}' / 'batch.json'
+    payload = target.read_bytes()
+    validate, read = RawL2Batch.model_validate_json, module._read
+    calls, rereads = [], []
+    def counted(raw, **kwargs):
+        calls.append(len(raw))
+        return validate(raw, **kwargs)
+    def reread(path, maximum, **kwargs):
+        result = read(path, maximum, **kwargs)
+        if path == target:
+            assert result == payload
+            rereads.append(len(result))
+        return result
+    monkeypatch.setattr(RawL2Batch, 'model_validate_json', counted)
+    monkeypatch.setattr(module, '_read', reread)
+    reader = module.RawL2Cache(cache.root)
+    first = reader.read_batches(limit=1)
+    assert first.batches[0].model_dump_json() == committed.model_dump_json()
+    assert calls == [len(payload)] and rereads == [len(payload)]
+    object.__setattr__(first.batches[0].table.rows[0]['1'], 'value', 'caller mutation')
+    second = reader.read_batches(limit=128)
+    assert second.batches[0].model_dump_json() == committed.model_dump_json()
+    assert first.batches[0] is not second.batches[0]
+    assert calls == [len(payload)] * 2 and rereads == [len(payload)] * 2
+
+
+@pytest.mark.parametrize('fault', ['payload', 'inode', 'mode', 'owner', 'sidecar', 'sequence'])
+def test_cold_selected_head_rejects_changes_at_fresh_open_and_closes_fds(tmp_path, monkeypatch, fault):
+    import os
+    from rquant.l2 import cache as module
+
+    cache = module.RawL2Cache(tmp_path / fault)
+    with cache.writer(): cache.append(observation())
+    target = cache.root / 'batches' / f'{1:020d}' / 'batch.json'
+    payload = target.read_bytes()
+    original_open, original_fstat = os.open, os.fstat
+    opened, selected, fired = [], set(), False
+    def interleaved(path, flags, *args, **kwargs):
+        nonlocal fired
+        if Path(path) == target and not fired:
+            fired = True
+            if fault in {'payload', 'sequence'}:
+                changed = (payload.replace(b'2026-10-15T07:00:00Z', b'2026-10-15T07:00:01Z', 1)
+                    if fault == 'payload' else payload.replace(b'"local_batch_sequence":1', b'"local_batch_sequence":2', 1))
+                assert changed != payload and len(changed) == len(payload)
+                target.write_bytes(changed)
+                (target.parent / 'sha256').write_bytes(hashlib.sha256(changed).hexdigest().encode() + b'\n')
+            elif fault == 'inode':
+                replacement = target.parent / 'replacement'
+                replacement.write_bytes(payload); replacement.chmod(0o600)
+                os.replace(replacement, target)
+            elif fault == 'mode': target.chmod(0o640)
+            elif fault == 'sidecar': (target.parent / 'sha256').write_bytes(b'0' * 64 + b'\n')
+        fd = original_open(path, flags, *args, **kwargs)
+        opened.append(fd)
+        if Path(path) == target: selected.add(fd)
+        return fd
+    def fstat(fd):
+        info = original_fstat(fd)
+        if fault == 'owner' and fd in selected:
+            fields = list(info); fields[4] += 1
+            return os.stat_result(fields)
+        return info
+    reader = module.RawL2Cache(cache.root)
+    with monkeypatch.context() as patch:
+        patch.setattr(os, 'open', interleaved); patch.setattr(os, 'fstat', fstat)
+        with pytest.raises(module.CacheError, match='invalid_batch'):
+            reader.read_batches(limit=1)
+    assert fired and selected
+    for fd in opened:
+        with pytest.raises(OSError): original_fstat(fd)
+    # A failed selection must leave no held cold-validation lock.
+    assert reader._head_lock.acquire(timeout=1)
+    reader._head_lock.release()
+
+
+def test_cold_selected_head_concurrent_readers_return_independent_models(tmp_path, monkeypatch):
+    from threading import Barrier, Lock, Thread
+    from rquant.l2.cache import RawL2Cache
+    from rquant.l2.models import RawL2Batch
+
+    cache = RawL2Cache(tmp_path / 'selected-concurrent')
+    with cache.writer(): committed = cache.append(observation())
+    reader = RawL2Cache(cache.root)
+    validate = RawL2Batch.model_validate_json
+    begin, lock = Barrier(4), Lock()
+    calls, pages, errors = [], [], []
+    def counted(raw, **kwargs):
+        with lock: calls.append(len(raw))
+        return validate(raw, **kwargs)
+    def read():
+        try:
+            begin.wait(3)
+            pages.append(reader.read_batches(limit=1))
+        except BaseException as error: errors.append(error)
+    monkeypatch.setattr(RawL2Batch, 'model_validate_json', counted)
+    threads = [Thread(target=read, daemon=True) for _ in range(4)]
+    try:
+        for thread in threads: thread.start()
+    finally:
+        for thread in threads: thread.join(3)
+    assert not any(thread.is_alive() for thread in threads) and not errors
+    assert len(pages) == len(calls) == 4
+    assert len({id(page.batches[0]) for page in pages}) == 4
+    object.__setattr__(pages[0].batches[0].table.rows[0]['1'], 'value', 'caller mutation')
+    assert all(page.batches[0].model_dump_json() == committed.model_dump_json() for page in pages[1:])
+
+
+@pytest.mark.parametrize('mode', ['older', 'legacy', 'excluded'])
+def test_cold_head_model_is_not_carried_to_ineligible_selection(tmp_path, monkeypatch, mode):
+    import weakref
+    from rquant.l2 import cache as module
+    from rquant.l2.models import RawL2Batch
+
+    cache = module.RawL2Cache(tmp_path / mode)
+    with cache.writer():
+        cache.append(observation())
+        if mode != 'excluded': cache.append(observation())
+    if mode == 'legacy': (cache.root / 'batches' / '.head').unlink()
+    validate, read = RawL2Batch.model_validate_json, module._read
+    references = []
+    def counted(raw, **kwargs):
+        batch = validate(raw, **kwargs)
+        references.append(weakref.ref(batch))
+        return batch
+    def reread(path, maximum, **kwargs):
+        if mode == 'older' and path.name == 'batch.json':
+            assert len(references) == 1 and references[0]() is None
+        return read(path, maximum, **kwargs)
+    monkeypatch.setattr(RawL2Batch, 'model_validate_json', counted)
+    monkeypatch.setattr(module, '_read', reread)
+    if mode == 'excluded': monkeypatch.setattr(module, 'MAX_BATCH_PAGE_BYTES', 1)
+    reader = module.RawL2Cache(cache.root)
+    page = reader.read_batches(limit=1)
+    assert len(references) == {'older': 2, 'legacy': 3, 'excluded': 1}[mode]
+    assert page.next_sequence == (0 if mode == 'excluded' else 1)
+    assert all(reference() is None for reference in references[:-1] if mode != 'excluded')
+    if mode == 'excluded': assert references[0]() is None
+    assert reader._last_batch is None
+
+
+@pytest.mark.parametrize('fault', ['duplicate', 'keys', 'width', 'raw', 'style', 'hash'])
+def test_table_column_reuse_preserves_every_row_and_byte_check(fault):
+    from rquant.l2.models import RawTable
+    table = observation().table
+    if fault == 'duplicate':
+        columns = list(table.columns)
+        columns[1] = columns[1].model_copy(update={'field_id': columns[0].field_id})
+        table = table.model_copy(update={'columns': tuple(columns)})
+    elif fault == 'width':
+        columns = list(table.columns)
+        columns[0] = columns[0].model_copy(update={'width': columns[0].width + 1})
+        columns[1] = columns[1].model_copy(update={'width': columns[1].width - 1})
+        table = table.model_copy(update={'columns': tuple(columns)})
+    elif fault == 'hash': table = table.model_copy(update={'row_data_sha256': '0' * 64})
+    else:
+        rows = list(table.rows); row = dict(rows[-1])
+        if fault == 'keys': row['unexpected'] = row.pop(next(iter(row)))
+        else:
+            cell = row[next(iter(row))]
+            object.__setattr__(cell, 'raw_hex' if fault == 'raw' else 'style', '00' if fault == 'raw' else 254)
+        rows[-1] = row
+        table = table.model_copy(update={'rows': tuple(rows)})
+    with pytest.raises(ValueError): RawTable.validate_rows(table)
