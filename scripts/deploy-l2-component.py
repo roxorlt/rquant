@@ -634,9 +634,9 @@ def change_current(paths: Paths, target: str) -> None:
     finally: os.close(descriptor)
 
 
-def read_cache_api(path: str, limit: int) -> dict[str, Any]:
+def read_cache_api(path: str, limit: int, *, timeout: float = 2) -> dict[str, Any]:
     try:
-        with urlopen("http://127.0.0.1:8771/api/v1/l2/" + path, timeout=2) as response:
+        with urlopen("http://127.0.0.1:8771/api/v1/l2/" + path, timeout=timeout) as response:
             data = response.read(limit + 1)
         if len(data) > limit:
             raise DeployError("api_health_failed")
@@ -650,7 +650,7 @@ def health_status() -> dict[str, Any]:
 
 
 def health_batches(after_sequence: int) -> dict[str, Any]:
-    return read_cache_api(f"batches?after_sequence={after_sequence}&limit=128", 16 << 20)
+    return read_cache_api(f"batches?after_sequence={after_sequence}&limit=1", 32 << 20, timeout=5)
 
 
 def wait_health(health: Callable[[], dict[str, Any]], sleep: Callable[[float], None], *, collector: bool,
