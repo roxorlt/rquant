@@ -235,17 +235,18 @@ class RawTable(Model):
                 or sum(c.width + 1 for c in self.columns) != self.row_width
                 or self.row_count * self.row_width > 1024 * 1024):
             raise ValueError("table dimensions mismatch")
-        keys = {str(c.field_id) for c in self.columns}
+        fields = tuple((str(c.field_id), c.width) for c in self.columns)
+        keys = {key for key, _ in fields}
         if len(keys) != self.col_count:
             raise ValueError("duplicate vendor fields")
         raw = bytearray()
         for row in self.rows:
             if set(row) != keys:
                 raise ValueError("row vendor fields mismatch")
-            for column in self.columns:
-                cell = row[str(column.field_id)]
+            for key, width in fields:
+                cell = row[key]
                 data = bytes.fromhex(cell.raw_hex)
-                if len(data) != column.width:
+                if len(data) != width:
                     raise ValueError("cell width mismatch")
                 raw.extend(data)
                 raw.append(cell.style)
