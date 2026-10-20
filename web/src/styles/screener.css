@@ -29,6 +29,55 @@
   font-family: var(--font-mono);
   text-align: right;
 }
+.formula-ai {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+.formula-ai input {
+  flex: 1;
+  min-width: 0;
+  height: 32px;
+  border: 1px solid var(--c-rule);
+  border-radius: var(--r-sm);
+  background: var(--c-surface);
+  padding-inline: 8px;
+  font-size: 13px;
+}
+.formula-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 8px;
+}
+@media (max-width: 599px) {
+  .formula-actions .btn {
+    height: 44px;
+  }
+}
+.formula-result {
+  margin-top: 8px;
+  background: var(--c-surface-2);
+  border-radius: var(--r-sm);
+  padding: 12px;
+}
+.formula-result-h {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.formula-result-label {
+  font-size: 12px;
+  line-height: 16px;
+  color: var(--c-muted);
+}
+.formula-result-expr {
+  margin-top: 4px;
+  font-size: 13px;
+  line-height: 20px;
+  color: var(--c-ink);
+  overflow-wrap: anywhere;
+}
 .cond-none {
   margin: 0 0 4px;
   color: var(--muted);

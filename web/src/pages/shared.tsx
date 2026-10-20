@@ -1,6 +1,22 @@
-import type { ReactNode } from "react";
+import { type ReactNode, useEffect, useState } from "react";
 import type { ServingQueryResult } from "@/api/useServingQuery";
 import { Button, EmptyState, PageSkeleton } from "@/ui";
+
+/** Matches `--delay-skeleton`: a fast response must not flash a skeleton. */
+export const SKELETON_DELAY_MS = 300;
+
+function useDelayedFlag(active: boolean, delayMs: number): boolean {
+  const [show, setShow] = useState(false);
+  useEffect(() => {
+    if (!active) {
+      setShow(false);
+      return;
+    }
+    const id = window.setTimeout(() => setShow(true), delayMs);
+    return () => window.clearTimeout(id);
+  }, [active, delayMs]);
+  return show;
+}
 
 /** Loading / error / content for one query, the same way on every page. */
 export function QueryView<T>({
@@ -10,7 +26,8 @@ export function QueryView<T>({
   query: ServingQueryResult<T>;
   children: (data: T) => ReactNode;
 }) {
-  if (query.isLoading) return <PageSkeleton />;
+  const showSkeleton = useDelayedFlag(query.isLoading, SKELETON_DELAY_MS);
+  if (query.isLoading) return showSkeleton ? <PageSkeleton /> : null;
   if (query.error || query.data === undefined) {
     return (
       <EmptyState

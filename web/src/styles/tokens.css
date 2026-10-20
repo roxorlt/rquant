@@ -193,6 +193,7 @@
   --c-up: var(--up);
   --c-down: var(--down);
   --c-warn: var(--warn);
+  --c-ok: var(--ok);
   --c-crit: var(--crit);
   --c-crit-weak: var(--crit-weak);
   --c-scrim: var(--scrim);
@@ -200,8 +201,8 @@
   --r-sm: 6px;
   --r-md: 10px;
   --r-pill: 999px;
-  --t-body: 400 13px/20px var(--font-sans);
-  --t-section: 600 15px/22px var(--font-sans);
-  --t-label: 500 12px/16px var(--font-sans);
+  --t-body: 400 13px / 20px var(--font-sans);
+  --t-section: 600 15px / 22px var(--font-sans);
+  --t-label: 500 12px / 16px var(--font-sans);
   --h-tabbar-phone: 56px;
 }

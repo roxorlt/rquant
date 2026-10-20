@@ -1268,7 +1268,7 @@
   border: 0;
   margin: 0;
   padding: 0;
-  font: 600 13px/18px var(--font-sans);
+  font: 600 13px / 18px var(--font-sans);
 }
 .rule-fields input {
   min-height: 32px;
@@ -1568,6 +1568,33 @@
   color: var(--crit);
   font: var(--t-label);
 }
+.st {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font: var(--t-label);
+  white-space: nowrap;
+}
+.st::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  flex: none;
+}
+.st.ok {
+  color: var(--c-ok);
+}
+.st.warn {
+  color: var(--c-warn);
+}
+.st.crit {
+  color: var(--c-crit);
+}
+.st.idle {
+  color: var(--c-muted);
+}
 .error-block {
   padding: 16px;
   text-align: left;
@@ -1632,7 +1659,7 @@ button.scrim,
   border-radius: var(--r-sm);
   color: var(--ink-2);
   cursor: pointer;
-  font: 400 20px/1 var(--font-sans);
+  font: 400 20px / 1 var(--font-sans);
 }
 .drawer-h .x:hover {
   background: var(--surface-2);
@@ -1652,7 +1679,7 @@ button.scrim,
   border-radius: var(--r-sm);
   background: var(--surface-2);
   color: var(--ink-2);
-  font: 400 12px/18px var(--font-mono);
+  font: 400 12px / 18px var(--font-mono);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   tab-size: 2;
@@ -1681,7 +1708,7 @@ button.scrim,
   border: 0;
   background: none;
   color: inherit;
-  font: 600 13px/1 var(--font-sans);
+  font: 600 13px / 1 var(--font-sans);
   text-decoration: underline;
   text-underline-offset: 3px;
   cursor: pointer;

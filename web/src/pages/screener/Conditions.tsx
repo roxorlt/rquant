@@ -3,9 +3,16 @@ import { useConditions, useTextToCondition, useTranslateTdx } from "@/api/endpoi
 import { toneClass, toneOf } from "@/format/color";
 import { formatPrice } from "@/format/number";
 import { DataTable } from "@/table/DataTable";
-import { Button, Panel } from "@/ui";
+import { Button, failureCopy, Panel } from "@/ui";
 import { StockLink } from "@/ui/StockLink";
 import { QueryView } from "../shared";
+
+/** How many tokens the translator refused. One message is one miss. */
+function unrecognizedCount(error: string | null): number {
+  if (!error) return 0;
+  const hits = error.match(/不支持：|无法识别：/g);
+  return hits?.length ?? 1;
+}
 
 function TdxImport() {
   const [tdx, setTdx] = useState("C>MA(C,5) AND V>REF(V,1)*2");
@@ -13,18 +20,19 @@ function TdxImport() {
   const result = translate.data;
   const [text, setText] = useState("");
   const ai = useTextToCondition();
+  const passed = Boolean(result?.expression);
+  const misses = unrecognizedCount(result?.error ?? null);
   return (
     <Panel title="通达信公式导入" sub="只翻译和校验。">
-      <div className="cond-row">
+      <div className="formula-ai">
         <input
           aria-label="一句话条件"
           placeholder="一句话描述条件，例如：站上20日线且放量一倍"
           value={text}
           onChange={(e) => setText(e.target.value)}
-          style={{ flex: 1 }}
         />
         <Button
-          size="sm"
+          variant="quiet"
           disabled={ai.isPending || text.trim().length < 2}
           onClick={() =>
             ai.mutate(text, {
@@ -38,15 +46,7 @@ function TdxImport() {
           {ai.isPending ? "生成中…" : "一句话生成"}
         </Button>
       </div>
-      {ai.data ? (
-        <output aria-label="生成结果" className="sub">
-          {ai.data.expression
-            ? `AI 公式：${ai.data.tdx} → 表达式：${ai.data.expression}`
-            : `AI 公式未通过校验：${ai.data.error ?? ""}`}
-        </output>
-      ) : ai.error ? (
-        <output className="sub">{String(ai.error)}</output>
-      ) : null}
+      {ai.error ? <p className="row-err">{failureCopy("条件", "生成", ai.error).text}</p> : null}
       <textarea
         aria-label="通达信公式"
         rows={3}
@@ -54,13 +54,22 @@ function TdxImport() {
         value={tdx}
         onChange={(e) => setTdx(e.target.value)}
       />
-      <Button size="sm" onClick={() => translate.mutate(tdx)}>
-        翻译
-      </Button>
+      <div className="formula-actions">
+        <Button onClick={() => translate.mutate(tdx)}>翻译</Button>
+      </div>
+      {translate.error ? (
+        <p className="row-err">{failureCopy("公式", "翻译", translate.error).text}</p>
+      ) : null}
       {result ? (
-        <output aria-label="翻译结果" className="sub">
-          {result.expression ? `表达式：${result.expression}` : `不支持：${result.error}`}
-        </output>
+        <div className="formula-result">
+          <div className="formula-result-h">
+            <span className="formula-result-label">翻译结果</span>
+            <span className={passed ? "st ok" : "st warn"}>
+              {passed ? "校验通过" : `有 ${misses} 处不认识`}
+            </span>
+          </div>
+          <div className="formula-result-expr">{result.expression ?? result.error}</div>
+        </div>
       ) : null}
     </Panel>
   );

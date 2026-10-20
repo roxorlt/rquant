@@ -2,7 +2,7 @@ import type { ButtonHTMLAttributes, ReactNode } from "react";
 import { Tip } from "./Tip";
 
 export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
-  variant?: "default" | "primary" | "ghost";
+  variant?: "default" | "primary" | "ghost" | "quiet";
   size?: "md" | "sm";
   /**
    * Why the button cannot be used right now. Disables it and shows the reason in a
