@@ -15,7 +15,7 @@
   border: 1px solid var(--rule-strong);
   background: var(--surface);
   color: var(--ink);
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 500;
   cursor: pointer;
   white-space: nowrap;
@@ -48,7 +48,7 @@
   height: 32px;
   min-height: 32px;
   padding-inline: 8px;
-  font-size: 14px;
+  font-size: 13px;
 }
 .btn.quiet {
   border-color: transparent;
@@ -1666,10 +1666,15 @@
   background: var(--surface-2);
   color: var(--ink-2);
 }
+.notice > span:first-child {
+  flex: 1 1 auto;
+  min-width: 0;
+}
 .notice .acts {
   display: inline-flex;
   gap: 12px;
   align-items: center;
+  margin-left: auto;
 }
 .notice.crit {
   background: var(--crit-weak);
@@ -1687,7 +1692,7 @@
   font-weight: 500;
   white-space: nowrap;
   background: transparent;
-  border: 1px solid currentColor;
+  border: 0;
   border-radius: 6px;
   cursor: pointer;
   text-decoration: none;

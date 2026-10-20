@@ -19,6 +19,15 @@ input:not([type]) {
   background: var(--surface-2);
   color: var(--ink);
 }
+.suffix-field input[type="number"] {
+  padding-right: calc(2em + 20px);
+  text-align: left;
+}
+.suffix-field input[type="number"]::-webkit-inner-spin-button,
+.suffix-field input[type="number"]::-webkit-outer-spin-button {
+  margin: 0;
+  appearance: none;
+}
 .sql-tables {
   display: flex;
   flex-wrap: wrap;
@@ -963,6 +972,7 @@ svg.touch-scrub {
   .notice .act {
     height: 44px;
     min-height: 44px;
+    font-size: 15px;
   }
   input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]):not(
     [type="color"]

@@ -102,8 +102,9 @@ export function Conditions() {
                   : "还没有条件选股结果"
               }
               flush
-              actions={
-                runs.length > 1 ? (
+            >
+              {runs.length > 1 ? (
+                <div className="cond-pick">
                   <select
                     className="select"
                     aria-label="演示条件"
@@ -116,9 +117,8 @@ export function Conditions() {
                       </option>
                     ))}
                   </select>
-                ) : null
-              }
-            >
+                </div>
+              ) : null}
               {run ? (
                 <DataTable
                   label="条件命中"

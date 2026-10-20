@@ -141,12 +141,14 @@ function Body({
           <section className="sf-card">
             <div className="sf-ch">
               <h3>板块累计{mode === "pct" ? "涨幅" : "净流入"}</h3>
-              <span className="sf-sub">09:25 起，估算</span>
-              {replay ? <span className="sf-pill replay">回放 {clock}</span> : null}
-              <span className={`sf-live ${live && !replay ? "on" : ""}`}>
-                {live && !replay ? <i /> : null}
-                {replay ? clock : (data.time ?? "")}
-              </span>
+              <div className="sf-meta">
+                <span className="sf-sub">09:25 起，估算</span>
+                {replay ? <span className="sf-pill replay">回放 {clock}</span> : null}
+                <span className={`sf-live ${live && !replay ? "on" : ""}`}>
+                  {live && !replay ? <i /> : null}
+                  {replay ? clock : (data.time ?? "")}
+                </span>
+              </div>
               <div className="tools">
                 {data.days?.length ? (
                   <select

@@ -7,6 +7,7 @@ import { renderApp } from "@/test/render";
 import {
   boardSystemLabel,
   poolDisplayName,
+  presetLabel,
   publicLine,
   TRIGGER_LABEL,
   triggerLabel,
@@ -56,6 +57,9 @@ function assertClean(text: string): void {
 
 describe("public copy", () => {
   it("translates the internal phrases", () => {
+    expect(presetLabel("auction-gap")).toBe("竞价高开");
+    expect(presetLabel("breakout")).toBe("突破");
+    expect(presetLabel("volume-surge")).toBe("放量");
     expect(triggerLabel("gap_up")).toBe("跳空高开");
     expect(triggerLabel("volume_surge")).toBe("放量");
     expect(triggerLabel("stop_loss")).toBe("止损");

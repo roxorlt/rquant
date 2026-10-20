@@ -223,255 +223,257 @@ export function FlowChart({ t, shown, colors, mode, upto, phone, focus, onFocus 
       ];
 
   return (
-    <div
-      ref={box}
-      className="sf-chart"
-      style={{ height: h }}
-      onPointerMove={onMove}
-      onPointerDown={onDown}
-      onPointerUp={onUp}
-      onPointerCancel={onUp}
-      onPointerLeave={(e) => {
-        if (e.pointerType === "mouse") {
-          setHover(null);
-          onFocus(null);
-        }
-      }}
-    >
+    <div className="sf-plot">
       <div className="sf-legend">竞价</div>
-      <svg width={w} height={h} role="img" aria-label="板块累计净流入走势">
-        <defs>
-          <pattern
-            id="sf-hatch"
-            width="6"
-            height="6"
-            patternUnits="userSpaceOnUse"
-            patternTransform="rotate(45)"
-          >
-            <line x1="0" y1="0" x2="0" y2="6" className="sf-hatch" strokeWidth="2" />
-          </pattern>
-        </defs>
-        <rect x={X(0) - 2} y={m.t} width={X(1) - X(0) - 2} height={ih} className="sf-auction" />
-        {upto < SLOTS - 1 ? (
-          <rect
-            x={X(upto)}
-            y={m.t}
-            width={X(SLOTS - 1) - X(upto)}
-            height={ih}
-            fill="url(#sf-hatch)"
-            opacity={0.5}
-          />
-        ) : null}
-        {ticks.map((v) => (
-          <g key={v}>
-            <line
-              x1={m.l}
-              x2={m.l + iw}
-              y1={Y(v)}
-              y2={Y(v)}
-              className={v === 0 ? "sf-zero" : "sf-grid"}
-            />
-            <text
-              x={m.l - 6}
-              y={Y(v) + 4}
-              textAnchor="end"
-              className={`sf-tick ${v > 0 ? "up" : v < 0 ? "down" : ""}`}
+      <div
+        ref={box}
+        className="sf-chart"
+        style={{ height: h }}
+        onPointerMove={onMove}
+        onPointerDown={onDown}
+        onPointerUp={onUp}
+        onPointerCancel={onUp}
+        onPointerLeave={(e) => {
+          if (e.pointerType === "mouse") {
+            setHover(null);
+            onFocus(null);
+          }
+        }}
+      >
+        <svg width={w} height={h} role="img" aria-label="板块累计净流入走势">
+          <defs>
+            <pattern
+              id="sf-hatch"
+              width="6"
+              height="6"
+              patternUnits="userSpaceOnUse"
+              patternTransform="rotate(45)"
             >
-              {v > 0 ? "+" : ""}
-              {mode === "net" ? v : v.toFixed(step < 1 ? 1 : 0)}
+              <line x1="0" y1="0" x2="0" y2="6" className="sf-hatch" strokeWidth="2" />
+            </pattern>
+          </defs>
+          <rect x={X(0) - 2} y={m.t} width={X(1) - X(0) - 2} height={ih} className="sf-auction" />
+          {upto < SLOTS - 1 ? (
+            <rect
+              x={X(upto)}
+              y={m.t}
+              width={X(SLOTS - 1) - X(upto)}
+              height={ih}
+              fill="url(#sf-hatch)"
+              opacity={0.5}
+            />
+          ) : null}
+          {ticks.map((v) => (
+            <g key={v}>
+              <line
+                x1={m.l}
+                x2={m.l + iw}
+                y1={Y(v)}
+                y2={Y(v)}
+                className={v === 0 ? "sf-zero" : "sf-grid"}
+              />
+              <text
+                x={m.l - 6}
+                y={Y(v) + 4}
+                textAnchor="end"
+                className={`sf-tick ${v > 0 ? "up" : v < 0 ? "down" : ""}`}
+              >
+                {v > 0 ? "+" : ""}
+                {mode === "net" ? v : v.toFixed(step < 1 ? 1 : 0)}
+              </text>
+            </g>
+          ))}
+          <text x={m.l - 6} y={m.t - 9} textAnchor="end" className="sf-axis-note">
+            {unit}
+          </text>
+          <line x1={X(121)} x2={X(121)} y1={m.t} y2={m.t + ih} className="sf-grid" />
+          {xt.map(([s, l]) => (
+            <text
+              key={s}
+              x={X(s)}
+              y={m.t + ih + 17}
+              className="sf-xtick"
+              textAnchor={s === 0 ? "start" : s === 242 ? "end" : "middle"}
+            >
+              {l}
+            </text>
+          ))}
+          {shown
+            .map((s, k) => ({ s, k }))
+            .sort((a, b) => Number(a.s.name === focus) - Number(b.s.name === focus))
+            .map(({ s, k }) => {
+              const c = colors.get(s.name) ?? "#888";
+              const d = path(vals[k] ?? []);
+              const on = focus === s.name;
+              const dim = focus != null && !on;
+              const v0 = vals[k]?.[0];
+              return (
+                <g key={s.name} opacity={dim ? 0.18 : 1}>
+                  {on ? <path d={d} fill="none" stroke={c} strokeWidth={7} opacity={0.2} /> : null}
+                  <path
+                    d={d}
+                    fill="none"
+                    stroke={c}
+                    strokeWidth={on ? 2.6 : 1.6}
+                    strokeLinejoin="round"
+                  />
+                  {v0 != null ? <circle cx={X(0)} cy={Y(v0)} r={2.6} fill={c} /> : null}
+                  <circle
+                    cx={X(Math.min(upto, (vals[k]?.length ?? 1) - 1))}
+                    cy={Y(lastVal(vals[k] ?? []))}
+                    r={on ? 4 : 3}
+                    fill={c}
+                  />
+                </g>
+              );
+            })}
+          <line x1={X(upto)} x2={X(upto)} y1={m.t} y2={m.t + ih} className="sf-now" />
+          <g>
+            <rect
+              x={X(upto) - 22}
+              y={m.t - 18}
+              width={44}
+              height={15}
+              rx={3}
+              className="sf-now-tag"
+            />
+            <text x={X(upto)} y={m.t - 7} textAnchor="middle" className="sf-now-text">
+              {t[upto] ?? ""}
             </text>
           </g>
-        ))}
-        <text x={m.l - 6} y={m.t - 9} textAnchor="end" className="sf-axis-note">
-          {unit}
-        </text>
-        <line x1={X(121)} x2={X(121)} y1={m.t} y2={m.t + ih} className="sf-grid" />
-        {xt.map(([s, l]) => (
-          <text
-            key={s}
-            x={X(s)}
-            y={m.t + ih + 17}
-            className="sf-xtick"
-            textAnchor={s === 0 ? "start" : s === 242 ? "end" : "middle"}
-          >
-            {l}
-          </text>
-        ))}
-        {shown
-          .map((s, k) => ({ s, k }))
-          .sort((a, b) => Number(a.s.name === focus) - Number(b.s.name === focus))
-          .map(({ s, k }) => {
+          {labs.map(({ s, v, y, labelName }, index) => {
             const c = colors.get(s.name) ?? "#888";
-            const d = path(vals[k] ?? []);
-            const on = focus === s.name;
-            const dim = focus != null && !on;
-            const v0 = vals[k]?.[0];
+            const xText = placed[index]?.x ?? plotRight + 12;
+            const yLine = Y(v);
+            const dim = focus != null && focus !== s.name;
+            const rail = plotRight + 6;
             return (
-              <g key={s.name} opacity={dim ? 0.18 : 1}>
-                {on ? <path d={d} fill="none" stroke={c} strokeWidth={7} opacity={0.2} /> : null}
+              <g
+                key={s.name}
+                opacity={dim ? 0.3 : 1}
+                className="sf-endlab"
+                onPointerDown={(e) => {
+                  e.stopPropagation();
+                  onFocus(focus === s.name ? null : s.name);
+                }}
+              >
                 <path
-                  d={d}
-                  fill="none"
+                  d={`M${plotRight} ${yLine} H${rail} V${y} H${xText - 4}`}
                   stroke={c}
-                  strokeWidth={on ? 2.6 : 1.6}
-                  strokeLinejoin="round"
+                  fill="none"
+                  opacity={0.55}
                 />
-                {v0 != null ? <circle cx={X(0)} cy={Y(v0)} r={2.6} fill={c} /> : null}
-                <circle
-                  cx={X(Math.min(upto, (vals[k]?.length ?? 1) - 1))}
-                  cy={Y(lastVal(vals[k] ?? []))}
-                  r={on ? 4 : 3}
+                <text
+                  x={xText}
+                  y={y + 4}
+                  textAnchor="start"
                   fill={c}
-                />
+                  fontSize={font}
+                  fontWeight={focus === s.name ? 800 : 600}
+                >
+                  {labelName} <tspan className={v >= 0 ? "up" : "down"}>{fmtValue(v, mode)}</tspan>
+                </text>
               </g>
             );
           })}
-        <line x1={X(upto)} x2={X(upto)} y1={m.t} y2={m.t + ih} className="sf-now" />
-        <g>
-          <rect
-            x={X(upto) - 22}
-            y={m.t - 18}
-            width={44}
-            height={15}
-            rx={3}
-            className="sf-now-tag"
-          />
-          <text x={X(upto)} y={m.t - 7} textAnchor="middle" className="sf-now-text">
-            {t[upto] ?? ""}
-          </text>
-        </g>
-        {labs.map(({ s, v, y, labelName }, index) => {
-          const c = colors.get(s.name) ?? "#888";
-          const xText = placed[index]?.x ?? plotRight + 12;
-          const yLine = Y(v);
-          const dim = focus != null && focus !== s.name;
-          const rail = plotRight + 6;
-          return (
-            <g
-              key={s.name}
-              opacity={dim ? 0.3 : 1}
-              className="sf-endlab"
-              onPointerDown={(e) => {
-                e.stopPropagation();
-                onFocus(focus === s.name ? null : s.name);
-              }}
-            >
-              <path
-                d={`M${plotRight} ${yLine} H${rail} V${y} H${xText - 4}`}
-                stroke={c}
-                fill="none"
-                opacity={0.55}
-              />
-              <text
-                x={xText}
-                y={y + 4}
-                textAnchor="start"
-                fill={c}
-                fontSize={font}
-                fontWeight={focus === s.name ? 800 : 600}
-              >
-                {labelName} <tspan className={v >= 0 ? "up" : "down"}>{fmtValue(v, mode)}</tspan>
-              </text>
-            </g>
-          );
-        })}
-        {hv != null ? (
-          <g pointerEvents="none">
-            <line x1={X(hv)} x2={X(hv)} y1={m.t} y2={m.t + ih} className="sf-cross" />
-            {shown.map((s, k) => {
-              const v = vals[k]?.[hv];
-              return v == null ? null : (
-                <circle
-                  key={s.name}
-                  cx={X(hv)}
-                  cy={Y(v)}
-                  r={s.name === focus ? 4.5 : 2.6}
-                  fill={colors.get(s.name)}
-                  className="sf-dot"
-                />
-              );
-            })}
-            {!phone ? (
-              <g>
-                <rect
-                  x={tipX}
-                  y={m.t + 6}
-                  width={tipW}
-                  height={32 + rows.length * 18}
-                  rx={8}
-                  className="sf-tip"
-                />
-                <text x={tipX + 12} y={m.t + 26} className="sf-tip-h">
-                  {hv === 0 ? "09:25 集合竞价" : `${t[hv]} 累计`}
-                </text>
-                {rows.map((r, i) => {
-                  const yy = m.t + 46 + i * 18;
-                  const on = r.s.name === focus;
-                  return (
-                    <g key={r.s.name}>
-                      {on ? (
+          {hv != null ? (
+            <g pointerEvents="none">
+              <line x1={X(hv)} x2={X(hv)} y1={m.t} y2={m.t + ih} className="sf-cross" />
+              {shown.map((s, k) => {
+                const v = vals[k]?.[hv];
+                return v == null ? null : (
+                  <circle
+                    key={s.name}
+                    cx={X(hv)}
+                    cy={Y(v)}
+                    r={s.name === focus ? 4.5 : 2.6}
+                    fill={colors.get(s.name)}
+                    className="sf-dot"
+                  />
+                );
+              })}
+              {!phone ? (
+                <g>
+                  <rect
+                    x={tipX}
+                    y={m.t + 6}
+                    width={tipW}
+                    height={32 + rows.length * 18}
+                    rx={8}
+                    className="sf-tip"
+                  />
+                  <text x={tipX + 12} y={m.t + 26} className="sf-tip-h">
+                    {hv === 0 ? "09:25 集合竞价" : `${t[hv]} 累计`}
+                  </text>
+                  {rows.map((r, i) => {
+                    const yy = m.t + 46 + i * 18;
+                    const on = r.s.name === focus;
+                    return (
+                      <g key={r.s.name}>
+                        {on ? (
+                          <rect
+                            x={tipX + 4}
+                            y={yy - 12}
+                            width={tipW - 8}
+                            height={17}
+                            rx={4}
+                            className="sf-tip-hl"
+                          />
+                        ) : null}
                         <rect
-                          x={tipX + 4}
-                          y={yy - 12}
-                          width={tipW - 8}
-                          height={17}
-                          rx={4}
-                          className="sf-tip-hl"
+                          x={tipX + 12}
+                          y={yy - 6}
+                          width={9}
+                          height={3}
+                          rx={1.5}
+                          fill={colors.get(r.s.name)}
                         />
-                      ) : null}
-                      <rect
-                        x={tipX + 12}
-                        y={yy - 6}
-                        width={9}
-                        height={3}
-                        rx={1.5}
-                        fill={colors.get(r.s.name)}
-                      />
-                      <text x={tipX + 28} y={yy} className="sf-tip-n" fontWeight={on ? 700 : 400}>
-                        {r.s.name}
-                      </text>
-                      <text
-                        x={tipX + tipW - 12}
-                        y={yy}
-                        textAnchor="end"
-                        className={`sf-tip-v ${(r.v ?? 0) >= 0 ? "up" : "down"}`}
-                      >
-                        {fmtValue(r.v, mode)}
-                      </text>
-                    </g>
-                  );
-                })}
-              </g>
-            ) : null}
-          </g>
+                        <text x={tipX + 28} y={yy} className="sf-tip-n" fontWeight={on ? 700 : 400}>
+                          {r.s.name}
+                        </text>
+                        <text
+                          x={tipX + tipW - 12}
+                          y={yy}
+                          textAnchor="end"
+                          className={`sf-tip-v ${(r.v ?? 0) >= 0 ? "up" : "down"}`}
+                        >
+                          {fmtValue(r.v, mode)}
+                        </text>
+                      </g>
+                    );
+                  })}
+                </g>
+              ) : null}
+            </g>
+          ) : null}
+        </svg>
+        {phone && hv != null ? (
+          <div className="sf-phone-tip" onPointerDown={(e) => e.stopPropagation()}>
+            <div className="sf-phone-tip-h">
+              <b>{hv === 0 ? "09:25 竞价" : t[hv]}</b>
+              <button
+                type="button"
+                onClick={() => {
+                  setHover(null);
+                  onFocus(null);
+                }}
+                aria-label="关闭"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="sf-phone-tip-rows">
+              {rows.map((r) => (
+                <span key={r.s.name} className={r.s.name === focus ? "on" : ""}>
+                  <i style={{ background: colors.get(r.s.name) }} />
+                  {r.s.name}
+                  <b className={(r.v ?? 0) >= 0 ? "up" : "down"}>{fmtValue(r.v, mode)}</b>
+                </span>
+              ))}
+            </div>
+          </div>
         ) : null}
-      </svg>
-      {phone && hv != null ? (
-        <div className="sf-phone-tip" onPointerDown={(e) => e.stopPropagation()}>
-          <div className="sf-phone-tip-h">
-            <b>{hv === 0 ? "09:25 竞价" : t[hv]}</b>
-            <button
-              type="button"
-              onClick={() => {
-                setHover(null);
-                onFocus(null);
-              }}
-              aria-label="关闭"
-            >
-              ✕
-            </button>
-          </div>
-          <div className="sf-phone-tip-rows">
-            {rows.map((r) => (
-              <span key={r.s.name} className={r.s.name === focus ? "on" : ""}>
-                <i style={{ background: colors.get(r.s.name) }} />
-                {r.s.name}
-                <b className={(r.v ?? 0) >= 0 ? "up" : "down"}>{fmtValue(r.v, mode)}</b>
-              </span>
-            ))}
-          </div>
-        </div>
-      ) : null}
+      </div>
     </div>
   );
 }
