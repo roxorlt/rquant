@@ -34,8 +34,8 @@ export function QueryView<T>({
         title="暂时读不到数据"
         hint={
           <>
-            {query.error?.message ?? "接口没有返回数据"}。可能是 Serving 正在切换代或服务未启动。{" "}
-            <Button size="sm" onClick={() => query.refetch()}>
+            {query.error?.message ?? "接口没有返回数据"}。请稍后再试。{" "}
+            <Button size="sm" className="touch-44" onClick={() => query.refetch()}>
               重试
             </Button>
           </>

@@ -203,6 +203,8 @@
   --c-up: var(--up);
   --c-down: var(--down);
   --c-warn: var(--warn);
+  /* Light theme is #FBF1DC via --warn-weak; dark theme follows the same token. */
+  --c-warn-weak: var(--warn-weak);
   --c-ok: var(--ok);
   --c-crit: var(--crit);
   --c-crit-weak: var(--crit-weak);

@@ -117,6 +117,25 @@ export const DEFAULT_TOP_N = 5;
  * push them apart to at least `gap` px and keep them within [top, bottom].
  * If they can't fit, they are spread evenly across the range.
  */
+/**
+ * End labels sit in the gutter to the right of the plot, one row each.
+ * `x` is the text start; it is always past `plotRight`, so the words are not
+ * drawn on the curves. `y` keeps at least `gap` pixels between neighbours.
+ */
+export function placeEndLabels(
+  points: readonly { y: number }[],
+  opts: { gap: number; top: number; bottom: number; plotRight: number },
+): { y: number; x: number }[] {
+  const laid = layoutEndLabels(
+    points.map((point) => point.y),
+    opts.gap,
+    opts.top,
+    opts.bottom,
+  );
+  const x = opts.plotRight + 12;
+  return laid.map((y) => ({ y, x }));
+}
+
 export function layoutEndLabels(ys: number[], gap: number, top: number, bottom: number): number[] {
   const n = ys.length;
   if (n === 0) return [];

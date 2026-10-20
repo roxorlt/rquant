@@ -1380,9 +1380,21 @@
   .seg button {
     height: 44px;
   }
-  .ack-cell .btn.sm {
+  .ack-cell .btn.sm,
+  .empty-hint .btn,
+  .error-block .btn,
+  .notice .act,
+  .btn.touch-44 {
+    box-sizing: border-box;
     height: 44px;
     min-height: 44px;
+    min-width: 44px;
+    padding-inline: 12px;
+  }
+  .drawer-f .btn {
+    height: 44px;
+    min-height: 44px;
+    min-width: 44px;
   }
   .help-mark {
     width: 44px;
@@ -1866,6 +1878,12 @@ button.scrim,
 .compare-table th:first-child,
 .compare-table td:first-child {
   width: 120px;
+}
+#compare-title:focus,
+#compare-title:focus-visible {
+  outline: 2px solid var(--c-accent);
+  outline-offset: 3px;
+  border-radius: 2px;
 }
 @media (max-width: 599px) {
   .drawer {

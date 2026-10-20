@@ -1,6 +1,7 @@
 import { Link } from "react-router";
 import { inTradingHours, useAuctionPoolLive, usePools } from "@/api/endpoints";
 import { useUrlState } from "@/app/useUrlState";
+import { poolDisplayName } from "@/copy/publicText";
 import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
 import { EmptyState, FlowSteps, PageHeader, Panel, ReadOnlyBanner, Segmented } from "@/ui";
@@ -60,9 +61,7 @@ export default function PoolsPage() {
                 onChange={setSelected}
                 options={data.pools.map((p) => ({
                   value: p.name,
-                  label: p.name
-                    .replace("（同花顺原条件，非买入信号）", "")
-                    .replace(/（T-1=[^）]*）/g, ""),
+                  label: poolDisplayName(p.name),
                 }))}
               />
               <Panel
@@ -70,7 +69,7 @@ export default function PoolsPage() {
                   pool.name === AUCTION_POOL && live.data?.date ? (
                     <>
                       {inTradingHours() ? <span className="live-dot" aria-hidden /> : null}
-                      {`${pool.name} · ${pool.members.length} 只`}
+                      {`${poolDisplayName(pool.name)} · ${pool.members.length} 只`}
                       <span
                         className="faint"
                         style={{ fontWeight: 400, marginLeft: 8, fontSize: 12 }}
@@ -82,11 +81,11 @@ export default function PoolsPage() {
                       </span>
                     </>
                   ) : (
-                    `${pool.name} · ${pool.members?.length ?? 0} 只`
+                    `${poolDisplayName(pool.name)} · ${pool.members?.length ?? 0} 只`
                   )
                 }
                 sub={[
-                  pool.description,
+                  pool.description ? poolDisplayName(pool.description) : "",
                   (pool.pool_refs ?? []).join(" + "),
                   pool.updated_at ? `更新于 ${formatShanghaiDateTime(pool.updated_at)}` : "",
                 ]

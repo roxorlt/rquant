@@ -1,0 +1,213 @@
+import { readdirSync, readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
+import { render, screen } from "@testing-library/react";
+import { describe, expect, it } from "vitest";
+import { QueryView } from "@/pages/shared";
+import { renderApp } from "@/test/render";
+import { boardSystemLabel, poolDisplayName, publicLine, triggerLabel } from "./publicText";
+
+const serving = { state: "ready", generation_id: "g", generated_at: "2026-10-20T07:00:00Z" };
+
+const BANNED = [
+  "gap_up",
+  "volume_surge",
+  "API 0.31",
+  "rquant-daily",
+  "落后 0 个工作日",
+  "落后 1 个工作日",
+  "Serving",
+  "东财板块热力图",
+  "dc_industry",
+  "同花顺原条件，非买入信号",
+  "T-1=",
+  "可能是 Serving",
+  "idle",
+];
+
+function assertClean(text: string): void {
+  for (const term of BANNED) {
+    expect(text, term).not.toContain(term);
+  }
+}
+
+describe("public copy", () => {
+  it("translates the internal phrases", () => {
+    expect(triggerLabel("gap_up")).toBe("跳空高开");
+    expect(triggerLabel("volume_surge")).toBe("放量");
+    expect(publicLine("rquant-daily：idle")).toBe("日线采集：空闲");
+    expect(publicLine("日线最新 2026-10-20（落后 0 个工作日）")).toBe("日线最新 2026-10-20");
+    expect(publicLine("API 0.31 正常响应")).toBeNull();
+    expect(boardSystemLabel("dc_industry")).toBe("行业");
+    expect(poolDisplayName("观察名单（同花顺原条件，非买入信号）")).toBe("观察名单");
+    expect(poolDisplayName("竞价（T-1=2026-10-17）")).toBe("竞价");
+  });
+
+  it("does not show the internal phrases on the overview, panorama, or pools", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = new URL(input instanceof Request ? input.url : String(input));
+        const key = url.pathname.split("/api/v1/")[1]?.split("/")[0] ?? "";
+        const data =
+          key === "overview"
+            ? {
+                trade_date: "2026-10-20",
+                kpis: [{ key: "candidates", label: "候选股", value: "1", tone: null }],
+                signals: [],
+              }
+            : key === "health"
+              ? {
+                  services: [],
+                  freshness: [],
+                  layers: [
+                    {
+                      key: "ingest",
+                      title: "数据采集",
+                      state: "ok",
+                      detail: ["rquant-daily：idle", "日线最新 2026-10-20（落后 0 个工作日）"],
+                    },
+                    {
+                      key: "serving",
+                      title: "Serving",
+                      state: "ok",
+                      detail: ["API 0.31 正常响应"],
+                    },
+                  ],
+                }
+              : key === "alerts"
+                ? {
+                    items: [
+                      {
+                        alert_id: "a".repeat(64),
+                        trade_date: "2026-10-20",
+                        at: "2026-10-20T06:00:00Z",
+                        code: "600519.SH",
+                        name: "贵州茅台",
+                        level: "L1",
+                        trigger_type: "gap_up",
+                        trigger_price: 10,
+                        level_price: 10,
+                        pool: null,
+                        acked_at: null,
+                        acked_by: null,
+                      },
+                      {
+                        alert_id: "b".repeat(64),
+                        trade_date: "2026-10-20",
+                        at: "2026-10-20T05:00:00Z",
+                        code: "000001.SZ",
+                        name: "平安银行",
+                        level: "L1",
+                        trigger_type: "volume_surge",
+                        trigger_price: 10,
+                        level_price: 10,
+                        pool: null,
+                        acked_at: null,
+                        acked_by: null,
+                      },
+                    ],
+                  }
+                : key === "panorama"
+                  ? {
+                      as_of: "2026-10-20T07:00:00Z",
+                      pulse: { up: 1, down: 1, flat: 0, limit_up: 0, limit_down: 0 },
+                      boards: [
+                        {
+                          system: "dc_industry",
+                          board_code: "BK01",
+                          board_name: "白酒",
+                          amount: 1,
+                          main_net_amount: 1,
+                          pct_chg_median: 1,
+                          pct_chg_mean: 1,
+                          limit_up_count: 0,
+                          limit_down_count: 0,
+                          member_count: 1,
+                          up_ratio: 0.5,
+                          leader_name: "贵州茅台",
+                        },
+                      ],
+                    }
+                  : key === "pools"
+                    ? {
+                        trade_date: "2026-10-20",
+                        pools: [
+                          {
+                            name: "观察名单（同花顺原条件，非买入信号）",
+                            description: "条件（T-1=2026-10-17）",
+                            pool_refs: [],
+                            updated_at: null,
+                            members: [],
+                          },
+                        ],
+                      }
+                    : key === "meta"
+                      ? { app: "rQuant", version: "0.31.0", role: "admin", generation: serving }
+                      : {};
+        return new Response(JSON.stringify({ data, serving }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }),
+    );
+    const overview = renderApp("/overview");
+    await screen.findByText("跳空高开");
+    expect(screen.getByText("放量")).toBeInTheDocument();
+    expect(screen.getByText("数据发布")).toBeInTheDocument();
+    expect(document.body.textContent ?? "").toContain("日线采集：空闲");
+    assertClean(document.body.textContent ?? "");
+    overview.unmount();
+
+    const panorama = renderApp("/panorama");
+    await screen.findByText(/板块热力图/);
+    expect(screen.getAllByText("行业").length).toBeGreaterThan(0);
+    assertClean(document.body.textContent ?? "");
+    panorama.unmount();
+
+    const pools = renderApp("/pools");
+    await screen.findByText("观察名单");
+    assertClean(document.body.textContent ?? "");
+    pools.unmount();
+  });
+
+  it("keeps the internal phrases out of page source", () => {
+    const root = join(process.cwd(), "src/pages");
+    const files: string[] = [];
+    const walk = (dir: string) => {
+      for (const name of readdirSync(dir)) {
+        const path = join(dir, name);
+        if (statSync(path).isDirectory()) walk(path);
+        else if (/\.tsx?$/.test(name) && !name.includes(".test.")) files.push(path);
+      }
+    };
+    walk(root);
+    const banned = BANNED.filter((term) => term !== "idle" && term !== "Serving");
+    const hits: string[] = [];
+    for (const file of files) {
+      const text = readFileSync(file, "utf8");
+      for (const term of banned) {
+        if (text.includes(term)) hits.push(`${file} contains ${term}`);
+      }
+    }
+    expect(hits).toEqual([]);
+  });
+
+  it("explains a failed read without naming the publisher", () => {
+    render(
+      <QueryView
+        query={{
+          data: undefined,
+          serving: undefined,
+          isLoading: false,
+          isFetching: false,
+          error: new Error("暂时读不到数据"),
+          refetch: () => undefined,
+        }}
+      >
+        {() => null}
+      </QueryView>,
+    );
+    assertClean(document.body.textContent ?? "");
+    expect(screen.getByText(/请稍后再试/)).toBeInTheDocument();
+  });
+});

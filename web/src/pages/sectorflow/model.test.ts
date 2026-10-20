@@ -7,6 +7,7 @@ import {
   fmtTurnoverChg,
   fmtYi,
   layoutEndLabels,
+  placeEndLabels,
   type Sector,
   tone,
 } from "./model";
@@ -29,6 +30,21 @@ describe("line colours", () => {
 describe("sectorflow defaults", () => {
   it("draws 5 inflow + 5 outflow lines by default (phone too)", () => {
     expect(DEFAULT_TOP_N).toBe(5);
+  });
+});
+
+describe("placeEndLabels", () => {
+  it("keeps a gap and stays in the gutter to the right of the lines", () => {
+    const placed = placeEndLabels(
+      [{ y: 80 }, { y: 82 }, { y: 84 }, { y: 86 }, { y: 90 }, { y: 92 }],
+      { gap: 18, top: 20, bottom: 280, plotRight: 200 },
+    );
+    expect(placed).toHaveLength(6);
+    for (const item of placed) expect(item.x).toBeGreaterThan(200);
+    expect(new Set(placed.map((item) => item.x)).size).toBe(1);
+    for (let i = 1; i < placed.length; i++) {
+      expect((placed[i]?.y ?? 0) - (placed[i - 1]?.y ?? 0)).toBeGreaterThanOrEqual(18);
+    }
   });
 });
 

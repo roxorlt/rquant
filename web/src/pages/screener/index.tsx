@@ -121,6 +121,7 @@ function RankRows({
           />
           <select
             aria-label="方向"
+            className="select"
             value={r.desc ? "d" : "a"}
             onChange={(e) => set(i, { desc: e.target.value === "d" })}
           >

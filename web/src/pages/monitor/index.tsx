@@ -7,6 +7,7 @@ import {
   useUnackAlert,
 } from "@/api/endpoints";
 import { useReadOnlyReason } from "@/api/useMeta";
+import { triggerLabel } from "@/copy/publicText";
 import { formatPrice } from "@/format/number";
 import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
@@ -26,18 +27,7 @@ import { QueryView } from "../shared";
 import { AlertRules } from "./Rules";
 import { SurgePanel } from "./Surge";
 
-const TRIGGER_LABEL: Record<string, string> = {
-  gap_up: "跳空高开",
-  volume_surge: "放量",
-  take_profit: "止盈",
-  breakout: "突破",
-};
 const POOL_LABEL: Record<string, string> = { pool1: "一号池", pool2: "二号池", manual: "自选" };
-
-function triggerLabel(value: string | null | undefined): string {
-  if (!value) return "—";
-  return TRIGGER_LABEL[value] ?? value;
-}
 
 function poolLabel(value: string | null | undefined): string {
   if (!value) return "—";

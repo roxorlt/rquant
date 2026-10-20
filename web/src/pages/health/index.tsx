@@ -1,4 +1,5 @@
 import { useHealth } from "@/api/endpoints";
+import { layerTitle, publicLines, serviceLabel } from "@/copy/publicText";
 import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
 import { KpiStrip, PageHeader, Panel, StatusBadge } from "@/ui";
@@ -15,10 +16,6 @@ const STATUS_LABEL: Record<string, string> = {
 function statusLabel(status: string, stale: boolean): string {
   const text = STATUS_LABEL[status] ?? status;
   return stale ? `${text}（过期）` : text;
-}
-
-function publicLines(lines: string[]): string[] {
-  return lines.filter((line) => !/python -m|HTTP|rquant-|API \d/.test(line));
 }
 
 function formatFresh(value: string | number): string {
@@ -45,7 +42,7 @@ export default function HealthPage() {
                             ? "warn"
                             : (layer.state as "ok" | "warn" | "crit")
                         }
-                        label={`${layer.title}${layer.state === "unknown" ? "（未知）" : ""}`}
+                        label={`${layerTitle(layer.title)}${layer.state === "unknown" ? "（未知）" : ""}`}
                         reason={publicLines(layer.detail).join("；")}
                       />
                       <span className="sub">{publicLines(layer.detail)[0] ?? "—"}</span>
@@ -60,7 +57,11 @@ export default function HealthPage() {
                 rows={data.services}
                 rowKey={(row) => row.service_id}
                 columns={[
-                  { id: "service", header: "服务", value: (row) => row.service_id },
+                  {
+                    id: "service",
+                    header: "服务",
+                    value: (row) => serviceLabel(row.service_id),
+                  },
                   { id: "plane", header: "平面", value: (row) => row.plane },
                   {
                     id: "status",

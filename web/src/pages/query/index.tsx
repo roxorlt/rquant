@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { ApiError } from "@/api/client";
 import { useQuerySchema, useRunQuery } from "@/api/endpoints";
 import { TimeChart } from "@/charts/Chart";
+import { PHONE_QUERY, useMedia } from "@/pages/panorama/useMedia";
 import { DataTable } from "@/table/DataTable";
 import { readPreference, writePreference } from "@/theme/storage";
 import { Button, PageHeader, Panel } from "@/ui";
@@ -37,6 +38,47 @@ function remember(list: Saved[], sql: string, outcome: Pick<Saved, "ok" | "rows"
   const starred = next.filter((h) => h.starred);
   const plain = next.filter((h) => !h.starred).slice(0, 20);
   return [...starred, ...plain];
+}
+
+/** Desktop keeps the section open. Phone collapses it behind a 44px panel header. */
+function QuerySection({
+  title,
+  sub,
+  className,
+  children,
+}: {
+  title: string;
+  sub: string;
+  className: string;
+  children: ReactNode;
+}) {
+  const phone = useMedia(PHONE_QUERY);
+  const [open, setOpen] = useState(false);
+  if (!phone) {
+    return (
+      <div className={className}>
+        <Panel title={title} sub={sub} flush>
+          {children}
+        </Panel>
+      </div>
+    );
+  }
+  return (
+    <div className={className}>
+      <section className="panel query-fold">
+        <button
+          type="button"
+          className="query-fold-h"
+          aria-expanded={open}
+          onClick={() => setOpen((value) => !value)}
+        >
+          <span>{title}</span>
+          <span className="hint">{open ? "收起" : "展开"}</span>
+        </button>
+        {open ? <div className="panel-b flush">{children}</div> : null}
+      </section>
+    </div>
+  );
 }
 
 function QuickChart({ columns, rows }: { columns: string[]; rows: unknown[][] }) {
@@ -155,60 +197,57 @@ export default function QueryPage() {
     <>
       <PageHeader eyebrow="数据" title="数据查询" note="只读查询，最多 1000 行。" />
       <div className="query-grid">
-        <div className="query-schema">
-          <Panel title="表与字段" sub="点表名插入" flush>
-            <details className="query-fold">
-            <summary>表与字段</summary>
-            <nav className="schema-tree" aria-label="可查询的表">
-              {Object.entries(tables).map(([t, cols]) => (
-                <div key={t}>
-                  <div className="schema-t">
-                    <button
-                      type="button"
-                      aria-expanded={open === t}
-                      className="schema-toggle"
-                      onClick={() => setOpen(open === t ? null : t)}
-                    >
-                      {open === t ? "▾" : "▸"}
-                    </button>
-                    <button
-                      type="button"
-                      className="sql-table"
-                      onClick={() => {
-                        const next = `SELECT * FROM ${t} LIMIT 50`;
-                        setSql(next);
-                        exec(next);
-                      }}
-                    >
-                      {t}
-                    </button>
-                    <span className="hint">{cols.length}</span>
-                  </div>
-                  {open === t ? (
-                    <ul>
-                      {cols.map(([c, type]) => (
-                        <li key={c}>
-                          <button type="button" onClick={() => insert(c ?? "")}>
-                            {c}
-                          </button>
-                          <span className="hint mono">{type?.toLowerCase()}</span>
-                        </li>
-                      ))}
-                    </ul>
-                  ) : null}
+        <QuerySection title="表与字段" sub="点表名插入" className="query-schema">
+          <nav className="schema-tree" aria-label="可查询的表">
+            {Object.entries(tables).map(([t, cols]) => (
+              <div key={t}>
+                <div className="schema-t">
+                  <button
+                    type="button"
+                    aria-expanded={open === t}
+                    className="schema-toggle"
+                    onClick={() => setOpen(open === t ? null : t)}
+                  >
+                    {open === t ? "▾" : "▸"}
+                  </button>
+                  <button
+                    type="button"
+                    className="sql-table"
+                    onClick={() => {
+                      const next = `SELECT * FROM ${t} LIMIT 50`;
+                      setSql(next);
+                      exec(next);
+                    }}
+                  >
+                    {t}
+                  </button>
+                  <span className="hint">{cols.length}</span>
                 </div>
-              ))}
-            </nav>
-            </details>
-            {schema.error ? (
-              <div className="error-block" role="alert">
-                <b>表列表没有读到</b>
-                <p>数据服务没有响应，可以直接重试。</p>
-                <Button onClick={() => schema.refetch()}>重试</Button>
+                {open === t ? (
+                  <ul>
+                    {cols.map(([c, type]) => (
+                      <li key={c}>
+                        <button type="button" onClick={() => insert(c ?? "")}>
+                          {c}
+                        </button>
+                        <span className="hint mono">{type?.toLowerCase()}</span>
+                      </li>
+                    ))}
+                  </ul>
+                ) : null}
               </div>
-            ) : null}
-          </Panel>
-        </div>
+            ))}
+          </nav>
+          {schema.error ? (
+            <div className="error-block" role="alert">
+              <b>表列表没有读到</b>
+              <p>数据服务没有响应，可以直接重试。</p>
+              <Button className="touch-44" onClick={() => schema.refetch()}>
+                重试
+              </Button>
+            </div>
+          ) : null}
+        </QuerySection>
         <div className="query-main query-stack">
           <Panel
             title="SQL"
@@ -254,98 +293,103 @@ export default function QueryPage() {
             </div>
           </Panel>
         </div>
-        {history.length ? (
-          <div className="query-history">
-            <Panel title="历史与收藏" sub="收藏的语句会留在这里" flush>
-              <details className="query-fold">
-              <summary>历史与收藏</summary>
-              <ul className="sql-history">
-                {history.map((h) => (
-                  <li key={h.sql}>
-                    <button
-                      type="button"
-                      className={h.starred ? "star on" : "star"}
-                      aria-pressed={!!h.starred}
-                      aria-label={h.starred ? "取消收藏" : "收藏"}
-                      onClick={() => toggleStar(h.sql)}
-                    >
-                      ★
-                    </button>
-                    <button type="button" className="mono" onClick={() => setSql(h.sql)}>
-                      {h.sql}
-                    </button>
-                    {h.ok === false ? (
-                      <span className="row-err">没运行</span>
-                    ) : h.rows != null ? (
-                      <span className="hint">{h.rows} 行</span>
-                    ) : null}
-                  </li>
-                ))}
-              </ul>
-              </details>
-            </Panel>
-          </div>
-        ) : null}
+        <QuerySection title="历史与收藏" sub="收藏的语句会留在这里" className="query-history">
+          {history.length ? (
+            <ul className="sql-history">
+              {history.map((h) => (
+                <li key={h.sql}>
+                  <button
+                    type="button"
+                    className={h.starred ? "star on" : "star"}
+                    aria-pressed={!!h.starred}
+                    aria-label={h.starred ? "取消收藏" : "收藏"}
+                    onClick={() => toggleStar(h.sql)}
+                  >
+                    ★
+                  </button>
+                  <button type="button" className="mono" onClick={() => setSql(h.sql)}>
+                    {h.sql}
+                  </button>
+                  {h.ok === false ? (
+                    <span className="row-err">没运行</span>
+                  ) : h.rows != null ? (
+                    <span className="hint">{h.rows} 行</span>
+                  ) : null}
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="hint query-empty">还没有查询记录。</p>
+          )}
+        </QuerySection>
         <div className="query-results" ref={resultRef}>
-        {run.error ? (
-          <div className="error-block" role="alert">
-            <b id="query-error-title" tabIndex={-1}>
-              查询没有运行
-            </b>
-            <p>
-              {run.error instanceof ApiError &&
-              run.error.status === 400 &&
-              !/HTTP|API/i.test(run.error.message)
-                ? run.error.message
-                : "数据服务没有响应，SQL 已保留，可以直接重试。"}
-            </p>
-            {run.error instanceof ApiError && run.error.status === 400 ? (
-              <Button onClick={() => ref.current?.focus()}>改 SQL</Button>
-            ) : (
-              <Button className="touch-44" aria-busy={run.isPending || undefined} onClick={() => exec(sql)}>
-                重试
-              </Button>
-            )}
-          </div>
-        ) : null}
-        {result && !run.error ? (
-          <>
-            <Panel
-              title={`结果 · ${result.rows.length} 行${result.truncated ? "（已截断）" : ""}`}
-              flush
-            >
-              <DataTable
-                label="查询结果"
-                tools="查询结果"
-                emptyText="查询成功但 0 行：表为空，或 WHERE 条件没有匹配。"
-                rows={result.rows.map((r, i) => ({ i, r }))}
-                rowKey={(x) => String(x.i)}
-                height={480}
-                columns={result.columns.map((c, j) => ({
-                  id: c,
-                  header: c,
-                  sortable: true,
-                  numeric:
-                    result.rows.length > 0 &&
-                    result.rows.every((r) => r[j] == null || typeof r[j] === "number"),
-                  value: (x: { r: unknown[] }) => {
-                    const v = x.r[j];
-                    return v === null || v === undefined
-                      ? null
-                      : typeof v === "number"
-                        ? v
-                        : String(v);
-                  },
-                }))}
-              />
+          {run.error ? (
+            <Panel title="结果">
+              <div className="error-block" role="alert">
+                <b id="query-error-title" tabIndex={-1}>
+                  查询没有运行
+                </b>
+                <p>
+                  {run.error instanceof ApiError &&
+                  run.error.status === 400 &&
+                  !/HTTP|API/i.test(run.error.message)
+                    ? run.error.message
+                    : "数据服务没有响应，SQL 已保留，可以直接重试。"}
+                </p>
+                {run.error instanceof ApiError && run.error.status === 400 ? (
+                  <Button className="touch-44" onClick={() => ref.current?.focus()}>
+                    改 SQL
+                  </Button>
+                ) : (
+                  <Button
+                    className="touch-44"
+                    aria-busy={run.isPending || undefined}
+                    onClick={() => exec(sql)}
+                  >
+                    重试
+                  </Button>
+                )}
+              </div>
             </Panel>
-            <QuickChart
-              key={result.columns.join(",")}
-              columns={result.columns}
-              rows={result.rows}
-            />
-          </>
-        ) : null}
+          ) : null}
+          {result && !run.error ? (
+            <>
+              <Panel
+                title={`结果 · ${result.rows.length} 行${result.truncated ? "（已截断）" : ""}`}
+                flush
+              >
+                <DataTable
+                  label="查询结果"
+                  tools="查询结果"
+                  emptyText="查询成功但 0 行：表为空，或 WHERE 条件没有匹配。"
+                  rows={result.rows.map((r, i) => ({ i, r }))}
+                  rowKey={(x) => String(x.i)}
+                  height={480}
+                  columns={result.columns.map((c, j) => ({
+                    id: c,
+                    header: c,
+                    sortable: true,
+                    numeric:
+                      result.rows.length > 0 &&
+                      result.rows.every((r) => r[j] == null || typeof r[j] === "number"),
+                    value: (x: { r: unknown[] }) => {
+                      const v = x.r[j];
+                      return v === null || v === undefined
+                        ? null
+                        : typeof v === "number"
+                          ? v
+                          : String(v);
+                    },
+                  }))}
+                />
+              </Panel>
+              <QuickChart
+                key={result.columns.join(",")}
+                columns={result.columns}
+                rows={result.rows}
+              />
+            </>
+          ) : null}
         </div>
       </div>
     </>

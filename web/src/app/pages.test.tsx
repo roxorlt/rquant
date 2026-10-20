@@ -133,7 +133,7 @@ describe("phone shell", () => {
 describe("MVP pages render from the API", () => {
   it.each([
     ["/overview", "候选股"],
-    ["/health", "rquant-monitor"],
+    ["/health", "盘中盯盘"],
     ["/panorama", "今天还没有快照"],
     ["/screener", "贵州茅台"],
     ["/pools", "还没有池子"],

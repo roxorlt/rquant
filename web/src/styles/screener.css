@@ -19,7 +19,7 @@
   color: var(--muted);
   font-size: 11px;
 }
-.cond-grid .cond-row select,
+.cond-grid .cond-row select:not(.select),
 .cond-grid .cond-row input {
   height: 28px;
   background: var(--surface-2);
@@ -36,7 +36,7 @@
   margin-bottom: 8px;
 }
 .formula-ai .btn.quiet {
-  color: var(--c-muted);
+  color: var(--c-ink-2);
 }
 .formula-ai input {
   flex: 1;
@@ -58,7 +58,8 @@
   height: 32px;
   padding-inline: 16px;
 }
-.select {
+.select,
+.cond-grid .cond-row select.select {
   height: 32px;
   padding-inline: 8px;
   background: var(--c-surface);
@@ -72,7 +73,8 @@
 @media (max-width: 599px) {
   .formula-ai input,
   .formula-actions .btn,
-  .select {
+  .select,
+  .cond-grid .cond-row select.select {
     height: 44px;
     font-size: 16px;
   }

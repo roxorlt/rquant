@@ -1,6 +1,7 @@
 import type { CSSProperties } from "react";
 import { Link } from "react-router";
 import { useAlerts, useHealth, useOverview } from "@/api/endpoints";
+import { layerTitle, publicLine, publicLines, triggerLabel } from "@/copy/publicText";
 import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
 import { Button, KpiStrip, PageHeader, Panel, Pill } from "@/ui";
@@ -32,12 +33,9 @@ function Pipeline() {
           const [kind, text] = STATE_PILL[layer.state];
           return (
             <li key={layer.key}>
-              <span className="pn">{layer.title}</span>
+              <span className="pn">{layerTitle(layer.title)}</span>
               <Pill kind={kind}>{text}</Pill>
-              <span className="pd">
-                {layer.detail.filter((line) => !line.includes("python -m")).slice(0, 2).join("；") ||
-                  "—"}
-              </span>
+              <span className="pd">{publicLines(layer.detail).slice(0, 2).join("；") || "—"}</span>
             </li>
           );
         })}
@@ -62,8 +60,8 @@ function Attention() {
       items.push({
         key: layer.key,
         kind: layer.state,
-        text: `${layer.title}：${layer.state === "crit" ? "异常" : "需留意"}`,
-        sub: layer.detail[0] ?? "",
+        text: `${layerTitle(layer.title)}：${layer.state === "crit" ? "异常" : "需留意"}`,
+        sub: publicLine(layer.detail[0] ?? "") ?? "",
         to: "/health",
         btn: "看健康",
       });
@@ -145,7 +143,11 @@ function LatestAlerts() {
             value: (r) => r.code,
             cell: (r) => `${r.name ?? ""} ${r.code}`,
           },
-          { id: "type", header: "规则", value: (r) => r.trigger_type ?? r.level },
+          {
+            id: "type",
+            header: "规则",
+            value: (r) => triggerLabel(r.trigger_type ?? r.level),
+          },
           {
             id: "state",
             header: "状态",

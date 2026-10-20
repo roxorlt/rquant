@@ -324,8 +324,12 @@ export function PortfolioRuns() {
                       size="sm"
                       className="touch-44"
                       onClick={() => {
-                        document.getElementById("compare-panel")?.scrollIntoView({ block: "start" });
-                        document.getElementById("compare-title")?.focus();
+                        document
+                          .getElementById("compare-panel")
+                          ?.scrollIntoView({ block: "start" });
+                        document.getElementById("compare-title")?.focus({
+                          focusVisible: true,
+                        } as FocusOptions);
                       }}
                     >
                       看对比
