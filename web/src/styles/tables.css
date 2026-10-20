@@ -13,6 +13,11 @@
     z-index: 2;
     box-shadow: inset 0 -1px 0 var(--rule);
   }
+  /* Panels keep a horizontal scroller, so sticky is relative to that box.
+     A topbar offset shifts the header down over the first row. */
+  .panel .tbl-wrap:not(.scroll) thead th {
+    top: 0;
+  }
 }
 
 /* DataTable toolbar (column picker + CSV export). */

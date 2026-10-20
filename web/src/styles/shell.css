@@ -112,6 +112,12 @@
   height: 6px;
   border-radius: 50%;
   background: currentColor;
+  flex: none;
+}
+.gen-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .gen-tag[data-state="ready"] {
   background: var(--ok-weak);
@@ -567,7 +573,6 @@
   .rail,
   .brand-name,
   .tb-date,
-  .tb-status,
   .search,
   .hstat-text,
   .theme-btn {
@@ -582,13 +587,35 @@
     padding-block: 12px calc(68px + env(safe-area-inset-bottom, 0px));
   }
   .topbar {
-    flex-wrap: nowrap;
-    gap: 4px;
+    flex-wrap: wrap;
+    gap: 2px 4px;
     padding-inline: 8px 4px;
   }
   .tb-title {
+    flex: 1 1 auto;
     font-size: 17px;
     line-height: 24px;
+  }
+  /* Data chip and the environment notice share one line under the title. */
+  .tb-status {
+    display: flex;
+    order: 9;
+    flex: 1 1 100%;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    overflow: hidden;
+  }
+  .gen-tag {
+    flex: 0 0 auto;
+    min-width: 0;
+    padding-inline: 6px;
+  }
+  .tb-status .gen-tag ~ .gen-tag {
+    flex: 1 1 0;
+  }
+  .gen-label {
+    min-width: 0;
   }
   .topbar .icon-btn,
   .topbar .hstat {
@@ -684,7 +711,7 @@
     width: 168px;
   }
 }
-@media (max-width: 860px) {
+@media (min-width: 600px) and (max-width: 860px) {
   .tb-status,
   .hstat-text {
     display: none;

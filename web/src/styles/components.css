@@ -1796,8 +1796,10 @@ button.scrim,
     min-height: 44px;
   }
   .gen-tag {
-    white-space: normal;
-    overflow-wrap: anywhere;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    overflow-wrap: normal;
     max-width: 100%;
   }
   .query-grid {

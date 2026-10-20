@@ -81,11 +81,11 @@ export function Topbar({ meta, failed }: { meta: MetaEnvelope | undefined; faile
           data-state={failed ? "unavailable" : (meta?.serving.state ?? "loading")}
         >
           <span className="gdot" aria-hidden="true" />
-          {text}
+          <span className="gen-label">{text}</span>
         </span>
         {meta?.data.notice ? (
           <span className="gen-tag" data-state="stale" role="status">
-            {meta.data.notice}
+            <span className="gen-label">{meta.data.notice}</span>
           </span>
         ) : null}
       </div>
