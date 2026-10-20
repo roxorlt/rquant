@@ -169,6 +169,28 @@ input:focus {
   gap: 16px;
   align-items: start;
 }
+@media (min-width: 901px) {
+  .query-grid {
+    grid-template-columns: minmax(240px, 280px) minmax(420px, 1fr);
+    grid-template-areas:
+      "schema main"
+      "schema history"
+      "schema results";
+  }
+  .query-schema {
+    grid-area: schema;
+  }
+  .query-main {
+    grid-area: main;
+  }
+  .query-history {
+    grid-area: history;
+    min-width: 420px;
+  }
+  .query-results {
+    grid-area: results;
+  }
+}
 @media (max-width: 900px) {
   .query-grid {
     grid-template-columns: 1fr;
@@ -262,6 +284,7 @@ input:focus {
 }
 .sql-history li {
   display: flex;
+  align-items: center;
   gap: 6px;
   padding: 2px 12px;
   font-size: 12px;
@@ -276,8 +299,18 @@ input:focus {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.sql-history button.mono {
+  flex: 1;
+  min-width: 0;
+}
 .sql-history .star {
+  flex: none;
   color: var(--faint);
+}
+.sql-history .row-err,
+.sql-history .hint {
+  flex: none;
+  white-space: nowrap;
 }
 .sql-history .star.on {
   color: var(--warn-t);

@@ -31,6 +31,13 @@ const BOARD_SYSTEM: Record<string, string> = {
   dc_concept: "概念",
 };
 
+const DATASET_LABEL: Record<string, string> = {
+  daily_bar: "日线数据",
+  minute_bar: "分钟数据",
+  auction_bar: "竞价数据",
+  adj_factor: "复权因子",
+};
+
 export function triggerLabel(value: string | null | undefined): string {
   if (!value) return "—";
   return TRIGGER_LABEL[value] ?? value;
@@ -66,6 +73,14 @@ export function publicLine(line: string): string | null {
   let text = line.replace(/（落后\s*\d+\s*个工作日）/g, "");
   text = text.replace(/rquant-[a-z0-9-]+/gi, (id) => SERVICE_LABEL[id] ?? "后台服务");
   text = text.replace(/\b(idle|running|failed|error)\b/g, (word) => STATUS_LABEL[word] ?? word);
+  text = text.replace(/\b([a-z][a-z0-9_]*)\s+缺\s+(\d+)\s*天/g, (all, id: string, days: string) => {
+    const label = DATASET_LABEL[id];
+    return label ? `${label}缺 ${days} 天` : all;
+  });
+  text = text.replace(/\b([a-z][a-z0-9_]*)\s+读取失败/g, (all, id: string) => {
+    const label = DATASET_LABEL[id];
+    return label ? `${label}读取失败` : all;
+  });
   text = text
     .replace(/\s+/g, " ")
     .replace(/：\s*$/, "")

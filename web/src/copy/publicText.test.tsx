@@ -22,6 +22,7 @@ const BANNED = [
   "T-1=",
   "可能是 Serving",
   "idle",
+  "daily_bar",
 ];
 
 function assertClean(text: string): void {
@@ -36,6 +37,7 @@ describe("public copy", () => {
     expect(triggerLabel("volume_surge")).toBe("放量");
     expect(publicLine("rquant-daily：idle")).toBe("日线采集：空闲");
     expect(publicLine("日线最新 2026-10-20（落后 0 个工作日）")).toBe("日线最新 2026-10-20");
+    expect(publicLine("daily_bar 缺 1 天")).toBe("日线数据缺 1 天");
     expect(publicLine("API 0.31 正常响应")).toBeNull();
     expect(boardSystemLabel("dc_industry")).toBe("行业");
     expect(poolDisplayName("观察名单（同花顺原条件，非买入信号）")).toBe("观察名单");
@@ -64,7 +66,11 @@ describe("public copy", () => {
                       key: "ingest",
                       title: "数据采集",
                       state: "ok",
-                      detail: ["rquant-daily：idle", "日线最新 2026-10-20（落后 0 个工作日）"],
+                      detail: [
+                        "rquant-daily：idle",
+                        "daily_bar 缺 1 天",
+                        "日线最新 2026-10-20（落后 0 个工作日）",
+                      ],
                     },
                     {
                       key: "serving",
@@ -155,6 +161,7 @@ describe("public copy", () => {
     expect(screen.getByText("放量")).toBeInTheDocument();
     expect(screen.getByText("数据发布")).toBeInTheDocument();
     expect(document.body.textContent ?? "").toContain("日线采集：空闲");
+    expect(document.body.textContent ?? "").toContain("日线数据缺 1 天");
     assertClean(document.body.textContent ?? "");
     overview.unmount();
 

@@ -94,7 +94,7 @@ export function Topbar({ meta, failed }: { meta: MetaEnvelope | undefined; faile
           <input
             type="search"
             aria-label="搜索股票"
-            placeholder="代码 / 名称，如 600519 或 茅台"
+            placeholder="代码 / 名称，如 XQ0001 或 星河股份"
             title="按 / 或 Ctrl+K 快速跳转"
             value={q}
             onChange={(e) => setQ(e.target.value)}

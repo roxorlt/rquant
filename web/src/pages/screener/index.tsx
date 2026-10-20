@@ -425,6 +425,16 @@ export default function ScreenerPage() {
         onClose={() => setSaveOpen(false)}
         title="保存为池子"
         label="保存为池子"
+        footer={
+          <Button
+            variant="primary"
+            aria-busy={savePool.isPending || undefined}
+            ariaDisabled={!!readOnly}
+            onClick={save}
+          >
+            保存
+          </Button>
+        }
       >
         <Segmented
           label="保存方式"
@@ -471,14 +481,6 @@ export default function ScreenerPage() {
         {saveFail ? (
           <FailureNotice copy={saveFail} busy={savePool.isPending} onRetry={save} />
         ) : null}
-        <Button
-          variant="primary"
-          aria-busy={savePool.isPending || undefined}
-          ariaDisabled={!!readOnly}
-          onClick={save}
-        >
-          保存
-        </Button>
       </AppDrawer>
       <Conditions />
     </>

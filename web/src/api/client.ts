@@ -38,9 +38,14 @@ export function createApiClient(baseUrl: string = apiBaseUrl()): ApiClient {
 }
 
 let sharedClient: ApiClient | null = null;
+let sharedBase = "";
 
 export function apiClient(): ApiClient {
-  sharedClient ??= createApiClient();
+  const base = apiBaseUrl();
+  if (sharedClient === null || sharedBase !== base) {
+    sharedClient = createApiClient(base);
+    sharedBase = base;
+  }
   return sharedClient;
 }
 
