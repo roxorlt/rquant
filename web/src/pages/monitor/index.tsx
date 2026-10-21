@@ -9,6 +9,7 @@ import {
 import { useReadOnlyReason } from "@/api/useMeta";
 import { AlertPoolTip } from "@/copy/AlertPoolTip";
 import { ALERT_POOL_TIP_WIDTH, alertPoolLabel, triggerLabel } from "@/copy/publicText";
+import { alertUnackEnabled } from "@/features";
 import { formatPrice } from "@/format/number";
 import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
@@ -63,9 +64,13 @@ export default function MonitorPage() {
       toast({
         text: "已确认 1 条告警",
         duration: 6000,
-        action: { label: "撤销", onClick: () => void undo(row) },
-        returnFocus: () =>
-          document.querySelector<HTMLElement>(`[data-alert-focus="${row.alert_id}"]`),
+        ...(alertUnackEnabled()
+          ? {
+              action: { label: "撤销", onClick: () => void undo(row) },
+              returnFocus: () =>
+                document.querySelector<HTMLElement>(`[data-alert-focus="${row.alert_id}"]`),
+            }
+          : {}),
       });
     } catch (error) {
       alertsCache.restore(previous);

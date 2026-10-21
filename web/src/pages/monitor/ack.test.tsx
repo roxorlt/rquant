@@ -97,6 +97,7 @@ function stub(opts: { failAck?: boolean } = {}) {
 
 afterEach(() => {
   currentFetch = async () => new Response("missing", { status: 404 });
+  vi.unstubAllEnvs();
 });
 
 it("confirms once on a double click, replaces the toast, and matches the server after refresh", async () => {
@@ -154,7 +155,20 @@ it("names the stock and keeps the next step when several confirms fail", async (
   ).toBeInTheDocument();
 });
 
+it("keeps 确认 and does not offer unack when the switch is off", async () => {
+  const { posts } = stub();
+  renderApp("/monitor");
+  fireEvent.click((await screen.findAllByRole("button", { name: "确认" }))[0] as HTMLElement);
+  expect(await screen.findByText("已确认 1 条告警")).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "撤销" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "取消确认" })).not.toBeInTheDocument();
+  expect(screen.getAllByRole("button", { name: "确认" }).length).toBeGreaterThan(0);
+  expect(posts).toContain("ack");
+  expect(posts).not.toContain("unack");
+});
+
 it("undo restores the alert and says 已撤销确认", async () => {
+  vi.stubEnv("VITE_FEATURE_ALERT_UNACK", "1");
   stub();
   renderApp("/monitor");
   fireEvent.click((await screen.findAllByRole("button", { name: "确认" }))[0] as HTMLElement);
