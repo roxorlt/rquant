@@ -218,4 +218,14 @@
   --t-section: 600 15px / 22px var(--font-sans);
   --t-label: 500 12px / 16px var(--font-sans);
   --h-tabbar-phone: 56px;
+  /* Spacing scale from design/rquant/system/tokens.css. 8px is --s-3 (--s-2 is 4px). */
+  --s-0: 0px;
+  --s-1: 2px;
+  --s-2: 4px;
+  --s-3: 8px;
+  --s-4: 12px;
+  --s-5: 16px;
+  --s-6: 24px;
+  --s-7: 32px;
+  --s-8: 48px;
 }
