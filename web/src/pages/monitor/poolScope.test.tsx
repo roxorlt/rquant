@@ -230,12 +230,13 @@ it("uses a two-line list for the phone timeline and keeps the title short", asyn
       .getAllByRole("listitem")
       .find((item) => item.textContent?.includes("澜屿科技"));
     expect(row).toBeDefined();
-    expect(row).toHaveTextContent(/14:00 · 10\.00 · L1 · 跳空高开 · N字初筛/);
+    expect(row).toHaveTextContent(/14:00 · 10\.00 · L1 · 跳空高开/);
+    expect(row).toHaveTextContent("N字初筛");
     expect(row?.querySelector(".alert-meta-keep")?.textContent).toMatch(
-      /^(?:\d{2}-\d{2} )?14:00 · 10\.00 · L1 · 跳空高开 · $/,
+      /^(?:\d{2}-\d{2} )?14:00 · 10\.00 · L1 · 跳空高开 ·$/,
     );
     expect(row?.querySelector(".alert-meta-pool")).toHaveTextContent("N字初筛");
-    expect(within(row as HTMLElement).getByText("未确认")).toBeInTheDocument();
+    expect(within(row as HTMLElement).queryByText("未确认")).not.toBeInTheDocument();
     expect(within(row as HTMLElement).getByRole("button", { name: "确认" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "排序" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /^未确认 / })).toBeInTheDocument();
@@ -271,6 +272,7 @@ it("keeps scope options in ink at 44px without extra row gaps", () => {
   expect(css).toMatch(/\.rule-check\s*\{[^}]*height:\s*44px/);
   expect(css).toMatch(/fieldset:has\(\.rule-check\)\s*\{[^}]*gap:\s*0/);
   expect(css).toMatch(/\.alert-meta-keep\s*\{[^}]*flex:\s*none/);
+  expect(css).toMatch(/\.li2 \.meta\.alert-meta\s*\{[^}]*gap:\s*0\.25em/);
   expect(css).toMatch(/\.alert-meta-pool\s*\{[^}]*text-overflow:\s*ellipsis/);
   expect(css).toMatch(/\.li2 \.v\s*\{[^}]*color:\s*var\(--c-ink\)/);
   expect(css).toMatch(/\.li2 \.v\s*\{[^}]*font-variant-numeric:\s*tabular-nums/);

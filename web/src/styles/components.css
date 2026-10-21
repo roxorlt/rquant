@@ -528,6 +528,7 @@
 .li2 .meta.alert-meta {
   display: flex;
   align-items: baseline;
+  gap: 0.25em;
   text-overflow: clip;
 }
 .alert-meta-keep {

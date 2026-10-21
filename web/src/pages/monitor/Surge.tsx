@@ -67,6 +67,12 @@ function kindLabel(kind: string): string {
   return kind === "ratio" ? "量比" : "加速";
 }
 
+/** Phone rows show minutes. Sort order and CSV keep the original `time`. */
+function surgeListClock(time: string): string {
+  const match = /^(\d{2}:\d{2}):\d{2}(?:\.\d+)?$/.exec(time.trim());
+  return match?.[1] ?? time;
+}
+
 function hiddenColumns(label: string): Set<string> {
   const saved = readPreference(`cols.${label}`);
   if (saved !== null) return new Set(saved.split(",").filter(Boolean));
@@ -131,7 +137,7 @@ function SurgeList({ rows }: { rows: readonly SurgeEvent[] }) {
             </span>
           </span>
           <span className="meta">
-            {row.time} · {kindLabel(row.kind)}
+            {surgeListClock(row.time)} · {kindLabel(row.kind)}
           </span>
           <span className="v">{formatNumber(row.ratio, 1)}</span>
         </li>

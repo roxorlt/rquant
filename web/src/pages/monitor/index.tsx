@@ -300,7 +300,9 @@ function sortedAlerts(rows: readonly AlertItem[], sort: string): AlertItem[] {
 
 function AlertMeta({ row }: { row: AlertItem }) {
   const clock = row.at ? formatListClock(row.at) : row.trade_date.slice(5);
-  const prefix = `${clock} · ${formatPrice(row.trigger_price)} · ${row.level} · ${triggerLabel(row.trigger_type)} · `;
+  // The separator sits at the end of the fixed part. The space after it is a flex gap,
+  // because a trailing space is dropped under nowrap + ellipsis.
+  const prefix = `${clock} · ${formatPrice(row.trigger_price)} · ${row.level} · ${triggerLabel(row.trigger_type)} ·`;
   return (
     <span className="meta alert-meta">
       <span className="alert-meta-keep">{prefix}</span>
@@ -349,15 +351,13 @@ function AlertList({
               </span>
             ) : (
               <span className="ack-cell">
-                <span className="st warn" data-alert-focus={row.alert_id} tabIndex={-1}>
-                  未确认
-                </span>
                 {fail?.ids.includes(row.alert_id) ? (
                   <span className="row-err">没确认上</span>
                 ) : null}
                 <Button
                   size="sm"
                   variant="ghost"
+                  data-alert-focus={row.alert_id}
                   aria-busy={busyId === row.alert_id || undefined}
                   aria-describedby={readOnly ? "readonly-notice" : undefined}
                   ariaDisabled={readOnly}

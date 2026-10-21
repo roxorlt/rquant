@@ -19,7 +19,7 @@ const ITEMS = [
     code: "600519.SH",
     name: "贵州茅台",
     kind: "ratio",
-    time: "14:55",
+    time: "14:55:38",
     ratio: 8.2,
     acc5: 3,
     pct: 0.012,
@@ -29,7 +29,7 @@ const ITEMS = [
     code: "000001.SZ",
     name: "平安银行",
     kind: "accel",
-    time: "14:11",
+    time: "14:11:02",
     ratio: 4.5,
     acc5: 11,
     pct: -0.006,
@@ -109,6 +109,21 @@ it("uses a two-line surge list on a phone and opens the title tip", async () => 
     expect(
       screen.queryByText(surgeSubtitle(RULES).slice(0, 8), { selector: ".sub" }),
     ).not.toBeInTheDocument();
+  } finally {
+    window.matchMedia = original;
+  }
+});
+
+it("shows the phone surge time to the minute", async () => {
+  const original = window.matchMedia;
+  window.matchMedia = media((query) => query.includes("max-width: 599px"));
+  try {
+    renderApp("/monitor");
+    const list = await screen.findByRole("list", { name: "量能异动" });
+    const meta = within(list).getAllByRole("listitem")[0]?.querySelector(".meta");
+    expect(meta?.textContent?.trim()).toMatch(/^\d{2}:\d{2} · (量比|加速)$/);
+    expect(meta?.textContent).not.toMatch(/\d{2}:\d{2}:\d{2}/);
+    expect(meta).toHaveTextContent("14:55 · 量比");
   } finally {
     window.matchMedia = original;
   }
