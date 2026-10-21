@@ -303,6 +303,9 @@
 .sf-chart .sf-endlab {
   cursor: pointer;
 }
+.sf-chart .sf-endlab text {
+  fill: var(--c-ink-2);
+}
 .sf-phone-tip {
   margin-top: 6px;
   background: var(--surface-2);
@@ -481,7 +484,7 @@
 }
 .sf-sh .sname em {
   font-style: normal;
-  color: var(--up-t);
+  color: var(--c-ink-2);
   margin-left: 2px;
 }
 .sf-sh .smeta {
@@ -527,12 +530,12 @@
 }
 .sf-stk .r {
   font-size: 12px;
-  color: var(--sf-sub);
+  color: var(--c-muted);
   margin-top: 1px;
   white-space: nowrap;
 }
 .sf-stk .r b {
-  color: var(--up-t);
+  color: var(--c-muted);
   font-weight: 600;
 }
 .sf-stk .p {

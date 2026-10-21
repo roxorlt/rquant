@@ -89,7 +89,7 @@ function stub(opts: { failWatch?: boolean } = {}) {
 it("keeps 已在自选 after leaving the page until a full reload", async () => {
   stub();
   const first = renderApp("/screener");
-  fireEvent.click((await screen.findAllByRole("button", { name: "加自选" }))[0] as HTMLElement);
+  fireEvent.click((await screen.findAllByRole("button", { name: "加入池子" }))[0] as HTMLElement);
   expect(await screen.findByText("✓ 已在自选")).toBeInTheDocument();
   first.unmount();
   renderApp("/screener");
@@ -100,14 +100,14 @@ it("merges two watchlist failures and keeps a retry on each row", async () => {
   stub({ failWatch: true });
   renderApp("/screener");
   const star = await screen.findByRole("row", { name: /星河股份/ });
-  fireEvent.click(within(star).getByRole("button", { name: "加自选" }));
+  fireEvent.click(within(star).getByRole("button", { name: "加入池子" }));
   expect(
-    await screen.findByText("星河股份（XQ0001.BJ）没加进自选：这项操作暂时用不了。"),
+    await screen.findByText("星河股份（XQ0001.BJ）没加进池子：这项操作暂时用不了。"),
   ).toBeInTheDocument();
-  expect(screen.getAllByText("没加进自选").length).toBeGreaterThan(0);
-  fireEvent.click(screen.getByRole("button", { name: "加自选" }));
+  expect(screen.getAllByText("没加进池子").length).toBeGreaterThan(0);
+  fireEvent.click(screen.getByRole("button", { name: "加入池子" }));
   expect(
-    await screen.findByText("2 只股票没加进自选：这项操作暂时用不了。可以在每一行点「重试」。"),
+    await screen.findByText("2 只股票没加进池子：这项操作暂时用不了。可以在每一行点「重试」。"),
   ).toBeInTheDocument();
   expect(screen.getAllByRole("button", { name: "重试" }).length).toBeGreaterThanOrEqual(2);
   expect(screen.getByRole("link", { name: "看系统健康" })).toBeInTheDocument();

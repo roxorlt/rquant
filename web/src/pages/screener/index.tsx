@@ -194,13 +194,13 @@ function watchBanner(fails: WatchFail[]): FailureCopy {
   const reason = latest?.copy.text.split("：")[1]?.split("。")[0] ?? "这项操作暂时用不了";
   if (fails.length < 2 && latest) {
     return {
-      text: `${latest.name}（${latest.code}）没加进自选：${reason}。`,
+      text: `${latest.name}（${latest.code}）没加进池子：${reason}。`,
       retry: latest.copy.retry,
       health: latest.copy.health,
     };
   }
   return {
-    text: `${fails.length} 只股票没加进自选：${reason}。可以在每一行点「重试」。`,
+    text: `${fails.length} 只股票没加进池子：${reason}。可以在每一行点「重试」。`,
     retry: true,
     health: latest?.copy.health ?? true,
   };
@@ -276,12 +276,12 @@ export default function ScreenerPage() {
         rememberedWatch.add(row.code);
         setInPool(currentWatch());
         setWatchFails((prev) => prev.filter((item) => item.code !== row.code));
-        toast({ text: "已加入自选", duration: 4000 });
+        toast({ text: "已加入池子", duration: 4000 });
       },
       onError: (error) => {
         const name = row.name ?? row.code;
         const who = `${name}（${row.code}）`;
-        const copy = failureCopy(who, "加进自选", error);
+        const copy = failureCopy(who, "加进池子", error);
         setWatchFails((prev) => [
           ...prev.filter((item) => item.code !== row.code),
           { code: row.code, name, copy },
@@ -475,7 +475,7 @@ export default function ScreenerPage() {
                     ) : (
                       <span className="ack-cell">
                         {failedCodes.has(row.code) ? (
-                          <span className="row-err">没加进自选</span>
+                          <span className="row-err">没加进池子</span>
                         ) : null}
                         <Button
                           size="sm"
@@ -485,7 +485,7 @@ export default function ScreenerPage() {
                           disabled={addWatch.isPending}
                           onClick={() => watch(row)}
                         >
-                          {failedCodes.has(row.code) ? "重试" : "加自选"}
+                          {failedCodes.has(row.code) ? "重试" : "加入池子"}
                         </Button>
                       </span>
                     ),

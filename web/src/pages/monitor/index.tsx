@@ -230,6 +230,9 @@ export default function MonitorPage() {
                           <span className="st warn" data-alert-focus={row.alert_id} tabIndex={-1}>
                             未确认
                           </span>
+                          {fail?.ids.includes(row.alert_id) ? (
+                            <span className="row-err">没确认上</span>
+                          ) : null}
                           <Button
                             size="sm"
                             variant="ghost"

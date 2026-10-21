@@ -1,4 +1,4 @@
-import { fireEvent, screen, waitFor } from "@testing-library/react";
+import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { renderApp } from "@/test/render";
 
 const ALERT = "a".repeat(64);
@@ -121,8 +121,10 @@ it("does not show 已确认 when the write fails, and offers 重试 on the row",
   fireEvent.click(
     await screen.findAllByRole("button", { name: "确认" }).then((n) => n[0] as HTMLElement),
   );
-  expect(await screen.findByText(/没确认上/)).toBeInTheDocument();
-  expect(screen.getAllByRole("button", { name: "重试" }).length).toBeGreaterThan(0);
+  const row = await screen.findByRole("row", { name: /澜屿科技/ });
+  expect(within(row).getByText("没确认上")).toBeInTheDocument();
+  expect(within(row).getByRole("button", { name: "重试" })).toBeInTheDocument();
+  expect(within(row).getByText("未确认")).toBeInTheDocument();
   expect(screen.queryByText("已确认 1 条告警")).not.toBeInTheDocument();
   expect(screen.queryByText(/HTTP/)).not.toBeInTheDocument();
 });

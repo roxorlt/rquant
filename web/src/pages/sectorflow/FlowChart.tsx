@@ -367,7 +367,6 @@ export function FlowChart({ t, shown, colors, mode, upto, phone, focus, onFocus 
                   x={xText}
                   y={y + 4}
                   textAnchor="start"
-                  fill={c}
                   fontSize={font}
                   fontWeight={focus === s.name ? 800 : 600}
                 >
