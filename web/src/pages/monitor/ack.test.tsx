@@ -16,7 +16,7 @@ function item(id: string, acked: boolean) {
     trigger_type: "跳空高开",
     trigger_price: 10,
     level_price: 10,
-    pool: null,
+    pool: id === ALERT ? "manual" : null,
     acked_at: acked ? "2026-10-20T06:05:00Z" : null,
     acked_by: acked ? "owner" : null,
   };
@@ -113,6 +113,16 @@ it("confirms once on a double click, replaces the toast, and matches the server 
   const again = screen.getAllByRole("button", { name: "确认" });
   fireEvent.click(again[0] as HTMLElement);
   await waitFor(() => expect(screen.getAllByRole("status")).toHaveLength(1));
+});
+
+it("labels the pool column 池子, with 已加入 or an em dash", async () => {
+  stub();
+  renderApp("/monitor");
+  expect(await screen.findByRole("columnheader", { name: "池子" })).toBeInTheDocument();
+  const inPool = await screen.findByRole("row", { name: /澜屿科技/ });
+  expect(within(inPool).getByText("已加入")).toBeInTheDocument();
+  const out = screen.getByRole("row", { name: /样例电子/ });
+  expect(within(out).getByText("—")).toBeInTheDocument();
 });
 
 it("does not show 已确认 when the write fails, and offers 重试 on the row", async () => {

@@ -5,6 +5,7 @@ import {
   formatNumber,
   formatPercent,
   formatPrice,
+  formatSignedFixed,
   formatSignedPercent,
 } from "./number";
 import {
@@ -35,6 +36,9 @@ describe("numbers", () => {
     expect(formatAmount(-8.302e6)).toBe("−830.2万");
     expect(formatAmount(512)).toBe("512");
     expect(formatPercent(48.26, 1)).toBe("48.3%");
+    expect(formatSignedFixed(4, 0)).toBe("+4");
+    expect(formatSignedFixed(-2, 0)).toBe("−2");
+    expect(formatSignedFixed(-1.2, 1)).toBe("−1.2");
     expect(formatSignedPercent(2.5)).toBe("+2.50%");
     expect(formatSignedPercent(-1.2)).toBe("−1.20%");
     expect(formatSignedPercent(-0.001)).toBe("0.00%");

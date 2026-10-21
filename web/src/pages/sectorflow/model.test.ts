@@ -3,6 +3,8 @@ import {
   colorMap,
   DEFAULT_TOP_N,
   fmtAmountYi,
+  fmtPct,
+  fmtRatioPct,
   fmtSectorNet,
   fmtTurnoverChg,
   fmtYi,
@@ -15,7 +17,11 @@ import {
 describe("leader net is already 亿", () => {
   it("does not divide a series value by 1e8", () => {
     expect(fmtSectorNet(2.4)).toBe("+2.4亿");
-    expect(fmtYi(2.4 / 1e8)).toBe("+0.0亿");
+    expect(fmtYi(-1.2)).toBe("−1.2亿");
+    expect(fmtPct(-1.41)).toBe("−1.41%");
+    expect(fmtRatioPct(2)).toBe("2.00%");
+    expect(fmtRatioPct(-1.2)).toBe("−1.20%");
+    expect(fmtYi(2.4 / 1e8)).toBe("0.0亿");
   });
 });
 
@@ -74,7 +80,7 @@ describe("layoutEndLabels", () => {
 describe("两市成交额 card", () => {
   it("formats 10-19 vs 10-16 (Tushare daily totals)", () => {
     expect(fmtAmountYi(14487.919 * 1e8)).toBe("1.45万亿");
-    expect(fmtTurnoverChg(-1202.741, -7.67)).toBe("较昨 -1202.7亿（-7.7%）");
+    expect(fmtTurnoverChg(-1202.741, -7.67)).toBe("较昨 −1202.7亿（−7.7%）");
     expect(tone(-1202.741)).toBe("down");
   });
   it("shows a rise in red and hides the line when there is no previous day", () => {

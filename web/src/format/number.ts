@@ -48,18 +48,28 @@ export function formatPercent(value: number | null | undefined, digits = 2): str
 }
 
 /**
- * A change already in percent units with an explicit sign, so the direction is
- * readable without colour: +2.50%, −1.20%, 0.00%.
+ * Fixed-point with an explicit sign and no thousands separator: +2.5, −1.2, 0.0.
+ * A value that rounds to zero drops the sign. The minus is U+2212, same as the
+ * monitor's amounts and percents.
  */
-export function formatSignedPercent(value: number | null | undefined, digits = 2): string {
+export function formatSignedFixed(value: number | null | undefined, digits = 2): string {
   if (isMissing(value)) {
     return EMPTY;
   }
   const fixed = Math.abs(value).toFixed(digits);
   if (Number(fixed) === 0) {
-    return `${(0).toFixed(digits)}%`;
+    return (0).toFixed(digits);
   }
-  return `${value > 0 ? "+" : MINUS}${fixed}%`;
+  return `${value > 0 ? "+" : MINUS}${fixed}`;
+}
+
+/**
+ * A change already in percent units with an explicit sign, so the direction is
+ * readable without colour: +2.50%, −1.20%, 0.00%.
+ */
+export function formatSignedPercent(value: number | null | undefined, digits = 2): string {
+  const fixed = formatSignedFixed(value, digits);
+  return fixed === EMPTY ? EMPTY : `${fixed}%`;
 }
 
 /** A whole count with thousands separators, e.g. 5,556. */

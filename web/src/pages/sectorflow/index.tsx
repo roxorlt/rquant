@@ -15,6 +15,7 @@ import {
   defaultSelection,
   fmtAmountYi,
   fmtPct,
+  fmtRatioPct,
   fmtSectorNet,
   fmtTurnoverChg,
   fmtValue,
@@ -468,7 +469,7 @@ function Leaders({
                   {s.sealed ? <span className="tag">涨停</span> : null}
                 </div>
                 <div className="r">
-                  占流通 <b>{s.net_ratio == null ? "—" : `${(s.net_ratio * 100).toFixed(2)}%`}</b> ·
+                  占流通 <b>{fmtRatioPct(s.net_ratio == null ? null : s.net_ratio * 100)}</b> ·
                   净流入 {fmtYi(s.net / 1e8)}
                 </div>
               </div>

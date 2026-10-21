@@ -8,7 +8,7 @@ import {
 } from "@/api/endpoints";
 import { useReadOnlyReason } from "@/api/useMeta";
 import { triggerLabel } from "@/copy/publicText";
-import { formatPrice } from "@/format/number";
+import { EMPTY, formatPrice } from "@/format/number";
 import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
 import {
@@ -27,11 +27,8 @@ import { QueryView } from "../shared";
 import { AlertRules } from "./Rules";
 import { SurgePanel } from "./Surge";
 
-const POOL_LABEL: Record<string, string> = { pool1: "一号池", pool2: "二号池", manual: "自选" };
-
-function poolLabel(value: string | null | undefined): string {
-  if (!value) return "—";
-  return POOL_LABEL[value] ?? value;
+function poolCell(value: string | null | undefined): string {
+  return value ? "已加入" : EMPTY;
 }
 
 interface RowFailure {
@@ -210,10 +207,10 @@ export default function MonitorPage() {
                   },
                   {
                     id: "pool",
-                    header: "池",
+                    header: "池子",
                     value: (row) => row.pool ?? null,
                     secondary: true,
-                    cell: (row) => poolLabel(row.pool),
+                    cell: (row) => poolCell(row.pool),
                   },
                   {
                     id: "ack",

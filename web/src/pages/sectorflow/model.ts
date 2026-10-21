@@ -1,4 +1,5 @@
 import type { SectorFlowData } from "@/api/endpoints";
+import { formatSignedFixed, formatSignedPercent } from "@/format/number";
 
 export type Sector = SectorFlowData["sectors"][number];
 export type Mode = "net" | "ratio" | "pct";
@@ -34,9 +35,15 @@ export function seriesOf(s: Sector, mode: Mode): (number | null)[] {
 }
 
 export const fmtYi = (v: number | null | undefined, digits = 1) =>
-  v == null ? "—" : `${v > 0 ? "+" : ""}${v.toFixed(digits)}亿`;
+  v == null ? "—" : `${formatSignedFixed(v, digits)}亿`;
 export const fmtPct = (v: number | null | undefined, digits = 2) =>
-  v == null ? "—" : `${v > 0 ? "+" : ""}${v.toFixed(digits)}%`;
+  v == null ? "—" : formatSignedPercent(v, digits);
+/** A share such as 占流通: positive stays unsigned, negative uses the monitor minus. */
+export function fmtRatioPct(v: number | null | undefined, digits = 2): string {
+  if (v == null) return "—";
+  const signed = formatSignedFixed(v, digits);
+  return `${signed.startsWith("+") ? signed.slice(1) : signed}%`;
+}
 export const tone = (v: number | null | undefined) =>
   v == null || v === 0 ? "" : v > 0 ? "up" : "down";
 
@@ -73,9 +80,8 @@ export function fmtTurnoverChg(
   pct: number | null | undefined,
 ): string | null {
   if (chg == null) return null;
-  const sign = (v: number) => (v > 0 ? "+" : "");
-  const p = pct == null ? "" : `（${sign(pct)}${pct.toFixed(1)}%）`;
-  return `较昨 ${sign(chg)}${chg.toFixed(1)}亿${p}`;
+  const p = pct == null ? "" : `（${formatSignedPercent(pct, 1)}）`;
+  return `较昨 ${formatSignedFixed(chg, 1)}亿${p}`;
 }
 
 /** Default lines: top-k inflow + top-k outflow by net now. */

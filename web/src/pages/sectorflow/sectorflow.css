@@ -226,13 +226,7 @@
 }
 .sf-chart .sf-tick {
   font-size: 12px;
-  fill: var(--sf-sub);
-}
-.sf-chart .sf-tick.up {
-  fill: var(--up);
-}
-.sf-chart .sf-tick.down {
-  fill: var(--down);
+  fill: var(--c-muted);
 }
 .sf-chart .sf-xtick {
   font-size: 12px;

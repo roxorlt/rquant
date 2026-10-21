@@ -1,4 +1,5 @@
 import { type PointerEvent, useEffect, useMemo, useRef, useState } from "react";
+import { formatSignedFixed } from "@/format/number";
 import { fmtValue, type Mode, placeEndLabels, type Sector, SLOTS, seriesOf } from "./model";
 
 const AUCTION_W = 8; // the 09:25 auction gets its own band, ~8 minutes wide
@@ -272,14 +273,11 @@ export function FlowChart({ t, shown, colors, mode, upto, phone, focus, onFocus 
                 y2={Y(v)}
                 className={v === 0 ? "sf-zero" : "sf-grid"}
               />
-              <text
-                x={m.l - 6}
-                y={Y(v) + 4}
-                textAnchor="end"
-                className={`sf-tick ${v > 0 ? "up" : v < 0 ? "down" : ""}`}
-              >
-                {v > 0 ? "+" : ""}
-                {mode === "net" ? v : v.toFixed(step < 1 ? 1 : 0)}
+              <text x={m.l - 6} y={Y(v) + 4} textAnchor="end" className="sf-tick">
+                {formatSignedFixed(
+                  v,
+                  mode === "net" ? (Number.isInteger(step) ? 0 : 1) : step < 1 ? 1 : 0,
+                )}
               </text>
             </g>
           ))}
