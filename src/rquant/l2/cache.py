@@ -99,7 +99,7 @@ class RawL2Cache:
         self.root = Path(root)
         self._writer_fd: int | None = None
         self._highwater = 0
-        self._last_batch: RawL2Batch | None = None
+        self._last_received_at: datetime | None = None
         self._head_receipt: tuple[tuple[int, int, str], int, datetime] | None = None
         self._head_lock = Lock()
 
@@ -126,7 +126,7 @@ class RawL2Cache:
             _directory(batches)
             committed = self._directories()
             for expected, directory in enumerate(committed, 1):
-                self._last_batch = self._read_batch(directory, expected)
+                self._last_received_at = self._read_batch(directory, expected).received_at
             self._highwater = len(committed)
             head = self._published_head()
             if committed and (head is None or head[0] != self._highwater):
@@ -145,7 +145,7 @@ class RawL2Cache:
         finally:
             self._writer_fd = None
             self._highwater = 0
-            self._last_batch = None
+            self._last_received_at = None
             if fd is not None:
                 os.close(fd)
 
@@ -299,7 +299,7 @@ class RawL2Cache:
 
     def _position(self) -> tuple[int, datetime | None]:
         if self._writer_fd is not None:
-            return self._highwater, self._last_batch.received_at if self._last_batch else None
+            return self._highwater, self._last_received_at
         _, count, last, _ = self._snapshot()
         return count, last
 
@@ -340,7 +340,7 @@ class RawL2Cache:
             os.rename(pending, target)
             pending = None
             self._highwater = batch.local_batch_sequence
-            self._last_batch = batch
+            self._last_received_at = batch.received_at
             self._publish_head(target)
             _fsync_dir(parent)
             return batch
