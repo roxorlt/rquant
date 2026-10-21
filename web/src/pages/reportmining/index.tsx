@@ -1,7 +1,7 @@
 import { useReportFactors } from "@/api/endpoints";
 import { useUrlState } from "@/app/useUrlState";
 import { TimeChart } from "@/charts/Chart";
-import { tokenLabel } from "@/copy/publicText";
+import { datasetListLabel, tokenLabel } from "@/copy/publicText";
 import { formatFixed } from "@/format/number";
 import { DataTable } from "@/table/DataTable";
 import { KpiStrip, PageHeader, Panel, Pill } from "@/ui";
@@ -167,7 +167,7 @@ function Detail({ r, hold }: { r: FactorResult; hold: number }) {
   const s = r.series;
   return (
     <Panel
-      title={`${r.name} · ${tokenLabel(r.data)}`}
+      title={`${r.name} · ${datasetListLabel(r.data)}`}
       sub={`方向 ${r.sign > 0 ? "越大越好" : "越小越好"} · 训练/测试切分 ${r.split} · 每 ${hold} 日调仓 · 最新 ${r.latest_date}`}
     >
       <KpiStrip
@@ -303,7 +303,7 @@ function Body({ res, sum }: { res: Results; sum: WeeklySummary | null }) {
                 {
                   id: "data",
                   header: "数据",
-                  value: (r) => tokenLabel(r.data),
+                  value: (r) => datasetListLabel(r.data),
                 },
                 {
                   id: "tr",

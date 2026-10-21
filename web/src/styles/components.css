@@ -465,46 +465,87 @@
   border: 0;
 }
 
-/* Phone alert timeline: 类型 then 范围 share the second line.
-   Column order is 时间 代码 名称 级别 类型 触发价 范围 状态. */
+/* Phone alert timeline: one 2-line grid shared by the header and every row.
+   Line 1 is 时间 代码 名称 级别. Line 2 is 类型 范围 触发价 状态,
+   so 范围 stays immediately after 类型 and the row fits the container. */
 @media (max-width: 599px) {
+  .tbl-wrap:has(> table[aria-label="告警时间线"]) {
+    overflow-x: clip;
+  }
   table[aria-label="告警时间线"] {
     display: grid;
-    grid-template-columns: repeat(6, max-content);
-    width: max-content;
-    min-width: 100%;
+    grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.95fr) minmax(0, 0.7fr) minmax(0, 1.25fr);
+    width: 100%;
+    min-width: 0;
   }
   table[aria-label="告警时间线"] > thead,
   table[aria-label="告警时间线"] > tbody {
     display: grid;
     grid-template-columns: subgrid;
     grid-column: 1 / -1;
+    min-width: 0;
   }
   table[aria-label="告警时间线"] tr:has([data-phone-line="2"]) {
     display: grid;
     grid-template-columns: subgrid;
     grid-column: 1 / -1;
-    align-items: center;
+    align-items: stretch;
+    min-width: 0;
+    border-bottom: 1px solid var(--rule);
   }
   table[aria-label="告警时间线"] tr:not(:has([data-phone-line="2"])) {
     display: block;
     grid-column: 1 / -1;
+  }
+  table[aria-label="告警时间线"] tr:has([data-phone-line="2"]) > th,
+  table[aria-label="告警时间线"] tr:has([data-phone-line="2"]) > td {
+    display: flex;
+    align-items: center;
+    min-width: 0;
+    height: auto;
+    white-space: normal;
+    border-bottom: 0;
+    box-shadow: none;
+    padding: 6px 8px;
+  }
+  table[aria-label="告警时间线"] tr:has([data-phone-line="2"]) > .num {
+    justify-content: flex-end;
+  }
+  table[aria-label="告警时间线"] .ack-cell {
+    flex-wrap: wrap;
+    min-width: 0;
+  }
+  table[aria-label="告警时间线"] tr:has([data-phone-line="2"]) > :nth-child(1) {
+    grid-column: 1;
+    grid-row: 1;
+  }
+  table[aria-label="告警时间线"] tr:has([data-phone-line="2"]) > :nth-child(2) {
+    grid-column: 2;
+    grid-row: 1;
+  }
+  table[aria-label="告警时间线"] tr:has([data-phone-line="2"]) > :nth-child(3) {
+    grid-column: 3;
+    grid-row: 1;
+  }
+  table[aria-label="告警时间线"] tr:has([data-phone-line="2"]) > :nth-child(4) {
+    grid-column: 4;
+    grid-row: 1;
   }
   table[aria-label="告警时间线"] tr:has([data-phone-line="2"]) > :nth-child(5) {
     grid-column: 1;
     grid-row: 2;
   }
   table[aria-label="告警时间线"] tr:has([data-phone-line="2"]) > :nth-child(6) {
-    grid-column: 5;
-    grid-row: 1;
+    grid-column: 3;
+    grid-row: 2;
   }
   table[aria-label="告警时间线"] tr:has([data-phone-line="2"]) > :nth-child(7) {
     grid-column: 2;
     grid-row: 2;
   }
   table[aria-label="告警时间线"] tr:has([data-phone-line="2"]) > :nth-child(8) {
-    grid-column: 6;
-    grid-row: 1;
+    grid-column: 4;
+    grid-row: 2;
   }
 }
 

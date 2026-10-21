@@ -1,7 +1,14 @@
 import type { CSSProperties } from "react";
 import { Link } from "react-router";
 import { useAlerts, useHealth, useOverview } from "@/api/endpoints";
-import { layerTitle, presetLabel, publicLine, publicLines, triggerLabel } from "@/copy/publicText";
+import {
+  layerTitle,
+  presetLabel,
+  publicLine,
+  publicLines,
+  signalActionLabel,
+  triggerLabel,
+} from "@/copy/publicText";
 import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
 import { Button, KpiStrip, PageHeader, Panel, Pill } from "@/ui";
@@ -239,11 +246,7 @@ export default function OverviewPage() {
                               : ""
                         }
                       >
-                        {/buy/i.test(row.action)
-                          ? "买入"
-                          : /sell/i.test(row.action)
-                            ? "卖出"
-                            : row.action}
+                        {signalActionLabel(row.action)}
                       </span>
                     ),
                   },

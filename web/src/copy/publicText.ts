@@ -207,6 +207,31 @@ export function datasetLabel(id: string | null | undefined): string {
   return DATASET_LABEL[id] ?? (/[a-z]/.test(id) && /[_-]/.test(id) ? "数据表" : id);
 }
 
+/** Comma-separated dataset ids, in the order they were stored. */
+export function datasetListLabel(value: string | null | undefined): string {
+  if (!value) return "—";
+  const parts = value
+    .split(/[,，]/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+  if (!parts.length) return "—";
+  return parts
+    .map((part) => DATASET_LABEL[part] ?? TOKEN_LABEL[part] ?? datasetLabel(part))
+    .join("、");
+}
+
+const SIGNAL_ACTION: Record<string, string> = {
+  buy: "买入",
+  sell: "卖出",
+  watch: "自选",
+};
+
+/** Latest-signal action. `watch` is the same word as the saved pool. */
+export function signalActionLabel(value: string | null | undefined): string {
+  if (!value) return "—";
+  return SIGNAL_ACTION[value.toLowerCase()] ?? (/[A-Za-z]/.test(value) ? "其他" : value);
+}
+
 export function tokenLabel(value: string | null | undefined): string {
   if (!value) return "—";
   return TOKEN_LABEL[value] ?? (/[A-Za-z]/.test(value) ? "未标注" : value);

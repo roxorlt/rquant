@@ -14,11 +14,13 @@ import {
   alertPoolLabels,
   boardSystemLabel,
   datasetLabel,
+  datasetListLabel,
   entryModeLabel,
   poolDisplayName,
   poolRefLabel,
   presetLabel,
   publicLine,
+  signalActionLabel,
   studyLabel,
   TRIGGER_LABEL,
   triggerLabel,
@@ -120,6 +122,11 @@ describe("public copy", () => {
     expect(studyLabel("SMARTMONEY上穿MA20")).toBe("聪明钱上穿MA20");
     expect(datasetLabel("daily_bar")).toBe("日线行情");
     expect(datasetLabel("daily_basic")).toBe("每日指标");
+    expect(datasetListLabel("daily_bar,daily_basic")).toBe("日线行情、每日指标");
+    expect(datasetListLabel("daily")).toBe("日线");
+    expect(signalActionLabel("watch")).toBe("自选");
+    expect(signalActionLabel("buy")).toBe("买入");
+    expect(signalActionLabel("sell")).toBe("卖出");
     expect(publicLine("API 0.31 正常响应")).toBeNull();
     expect(boardSystemLabel("dc_industry")).toBe("行业");
     expect(poolDisplayName("观察名单（同花顺原条件，非买入信号）")).toBe("观察名单");
@@ -137,7 +144,16 @@ describe("public copy", () => {
             ? {
                 trade_date: "2026-10-20",
                 kpis: [{ key: "candidates", label: "候选股", value: "1", tone: null }],
-                signals: [],
+                signals: [
+                  {
+                    sequence: 1,
+                    at: "2026-10-20T08:00:00Z",
+                    code: "600519.SH",
+                    name: "贵州茅台",
+                    strategy_id: "breakout",
+                    action: "watch",
+                  },
+                ],
               }
             : key === "health"
               ? {
@@ -240,6 +256,9 @@ describe("public copy", () => {
     );
     const overview = renderApp("/overview");
     await screen.findByText("跳空高开");
+    const signals = screen.getByRole("table", { name: "最新信号" });
+    expect(signals).toHaveTextContent("自选");
+    expect(signals).not.toHaveTextContent("watch");
     expect(screen.getByText("放量")).toBeInTheDocument();
     expect(screen.getByText("数据发布")).toBeInTheDocument();
     expect(document.body.textContent ?? "").toContain("日线采集：空闲");

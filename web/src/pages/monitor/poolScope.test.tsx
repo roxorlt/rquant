@@ -206,10 +206,15 @@ it("puts 类型 and 范围 on phone line 2, with 范围 immediately after 类型
   const start = css.indexOf("/* Phone alert timeline");
   const block = css.slice(start, css.indexOf("/* ---------- form controls", start));
   expect(block).toContain("@media (max-width: 599px)");
+  expect(block).toContain("width: 100%");
+  expect(block).toContain("overflow-x: clip");
+  expect(block).not.toContain("max-content");
   expect(block).toContain('tr:has([data-phone-line="2"]) > :nth-child(5)');
   expect(block).toContain("grid-row: 2");
   expect(block).toMatch(/:nth-child\(5\)\s*\{[^}]*grid-column:\s*1;[^}]*grid-row:\s*2;/);
   expect(block).toMatch(/:nth-child\(7\)\s*\{[^}]*grid-column:\s*2;[^}]*grid-row:\s*2;/);
+  expect(block).toMatch(/:nth-child\(6\)\s*\{[^}]*grid-column:\s*3;[^}]*grid-row:\s*2;/);
+  expect(block).toMatch(/:nth-child\(8\)\s*\{[^}]*grid-column:\s*4;[^}]*grid-row:\s*2;/);
 
   renderApp("/monitor");
   const timeline = await screen.findByRole("table", { name: "告警时间线" });

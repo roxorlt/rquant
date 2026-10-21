@@ -11,7 +11,7 @@ import {
   alertPoolLabels,
 } from "@/copy/publicText";
 import { DataTable } from "@/table/DataTable";
-import { AppDrawer, Button, FailureNotice, Panel, Pill, Tip, useToast } from "@/ui";
+import { AppDrawer, Button, FailureNotice, Panel, Pill, Tip, useToast, useTouchOnly } from "@/ui";
 import { type FailureCopy, failureCopy } from "@/ui/failure";
 import { QueryView } from "../shared";
 
@@ -36,6 +36,7 @@ export function AlertRules() {
   const readOnly = useReadOnlyReason();
   const [ruleFail, setRuleFail] = useState<{ copy: FailureCopy; rule: Rule } | null>(null);
   const [open, setOpen] = useState(false);
+  const touch = useTouchOnly();
   const [draft, setDraft] = useState<Rule>({
     rule_id: "",
     title: "",
@@ -176,7 +177,15 @@ export function AlertRules() {
           </label>
           <fieldset>
             <legend>
-              <Tip content={<AlertPoolTip />} width={ALERT_POOL_TIP_WIDTH} className="has-tip">
+              <Tip
+                content={<AlertPoolTip />}
+                width={ALERT_POOL_TIP_WIDTH}
+                placement={touch ? "topLeft" : "left"}
+                autoAdjustOverflow={false}
+                inset={12}
+                avoid='.drawer-h, label.fld:has([aria-label="规则名称"])'
+                className="has-tip"
+              >
                 范围
               </Tip>
             </legend>
