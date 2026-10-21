@@ -122,7 +122,6 @@ export default function MonitorPage() {
     <>
       <PageHeader eyebrow="跟踪与告警" title="盯盘与告警" />
       <ReadOnlyBanner />
-      <SurgePanel />
       <QueryView query={query}>
         {(data) => {
           const open = data.items.filter((r) => !r.acked_at).length;
@@ -285,6 +284,7 @@ export default function MonitorPage() {
           );
         }}
       </QueryView>
+      <SurgePanel />
       <AlertRules />
     </>
   );
@@ -298,15 +298,15 @@ function sortedAlerts(rows: readonly AlertItem[], sort: string): AlertItem[] {
   return [...rows].sort((a, b) => value(a).localeCompare(value(b), "zh-CN") * sign);
 }
 
-function alertMeta(row: AlertItem): string {
+function AlertMeta({ row }: { row: AlertItem }) {
   const clock = row.at ? formatListClock(row.at) : row.trade_date.slice(5);
-  return [
-    clock,
-    row.level,
-    triggerLabel(row.trigger_type),
-    alertPoolLabel(row.pool),
-    formatPrice(row.trigger_price),
-  ].join(" · ");
+  const prefix = `${clock} · ${formatPrice(row.trigger_price)} · ${row.level} · ${triggerLabel(row.trigger_type)} · `;
+  return (
+    <span className="meta alert-meta">
+      <span className="alert-meta-keep">{prefix}</span>
+      <span className="alert-meta-pool">{alertPoolLabel(row.pool)}</span>
+    </span>
+  );
 }
 
 function AlertList({
@@ -341,7 +341,7 @@ function AlertList({
               <StockLink code={row.code} />
             </span>
           </span>
-          <span className="meta">{alertMeta(row)}</span>
+          <AlertMeta row={row} />
           <span className="side">
             {row.acked_at ? (
               <span className="st" tabIndex={-1} data-alert-focus={row.alert_id}>

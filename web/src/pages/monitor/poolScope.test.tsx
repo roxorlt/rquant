@@ -230,20 +230,48 @@ it("uses a two-line list for the phone timeline and keeps the title short", asyn
       .getAllByRole("listitem")
       .find((item) => item.textContent?.includes("澜屿科技"));
     expect(row).toBeDefined();
-    expect(row).toHaveTextContent(/14:00 · L1 · 跳空高开 · N字初筛 · 10\.00/);
+    expect(row).toHaveTextContent(/14:00 · 10\.00 · L1 · 跳空高开 · N字初筛/);
+    expect(row?.querySelector(".alert-meta-keep")?.textContent).toMatch(
+      /^(?:\d{2}-\d{2} )?14:00 · 10\.00 · L1 · 跳空高开 · $/,
+    );
+    expect(row?.querySelector(".alert-meta-pool")).toHaveTextContent("N字初筛");
     expect(within(row as HTMLElement).getByText("未确认")).toBeInTheDocument();
     expect(within(row as HTMLElement).getByRole("button", { name: "确认" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "排序" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /^未确认 / })).toBeInTheDocument();
     expect(within(list).getAllByRole("listitem").length).toBeGreaterThanOrEqual(5);
+    const surge = screen.getByRole("heading", { name: /量能异动/ });
+    expect(timelineHeadingBefore(surge)).toBeTruthy();
+    expect(screen.queryByRole("table", { name: "量能异动" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "量能异动规则" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/\d+ 行/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^列/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "导出 CSV" })).toBeInTheDocument();
   } finally {
     window.matchMedia = original;
   }
 });
+
+it("keeps the alert timeline ahead of 量能异动 on desktop", async () => {
+  renderApp("/monitor");
+  const timeline = await screen.findByRole("heading", { name: /告警时间线/ });
+  const surge = screen.getByRole("heading", { name: /量能异动/ });
+  expect(timelineHeadingBefore(surge, timeline)).toBeTruthy();
+  expect(screen.getByRole("table", { name: "量能异动" })).toBeInTheDocument();
+});
+
+function timelineHeadingBefore(surge: HTMLElement, timeline?: HTMLElement): boolean {
+  const head = timeline ?? screen.getByRole("heading", { name: "告警时间线" });
+  return Boolean(head.compareDocumentPosition(surge) & Node.DOCUMENT_POSITION_FOLLOWING);
+}
 
 it("keeps scope options in ink at 44px without extra row gaps", () => {
   const css = readFileSync(join(process.cwd(), "src/styles/components.css"), "utf8");
   expect(css).toMatch(/\.rule-check\s*\{[^}]*color:\s*var\(--c-ink\)/);
   expect(css).toMatch(/\.rule-check\s*\{[^}]*height:\s*44px/);
   expect(css).toMatch(/fieldset:has\(\.rule-check\)\s*\{[^}]*gap:\s*0/);
+  expect(css).toMatch(/\.alert-meta-keep\s*\{[^}]*flex:\s*none/);
+  expect(css).toMatch(/\.alert-meta-pool\s*\{[^}]*text-overflow:\s*ellipsis/);
+  expect(css).toMatch(/\.li2 \.v\s*\{[^}]*color:\s*var\(--c-ink\)/);
+  expect(css).toMatch(/\.li2 \.v\s*\{[^}]*font-variant-numeric:\s*tabular-nums/);
 });

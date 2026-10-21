@@ -523,6 +523,22 @@
 .li2 .v {
   font: 600 15px / 20px var(--font-sans);
   font-variant-numeric: tabular-nums;
+  color: var(--c-ink);
+}
+.li2 .meta.alert-meta {
+  display: flex;
+  align-items: baseline;
+  text-overflow: clip;
+}
+.alert-meta-keep {
+  flex: none;
+  white-space: nowrap;
+}
+.alert-meta-pool {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* ---------- form controls ---------- */

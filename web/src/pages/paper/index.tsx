@@ -74,106 +74,110 @@ export default function PaperPage() {
               hint="模拟账户由模拟盘服务创建。创建并完成一次调仓后，这里显示净值和持仓。"
             />
           ) : (
-            data.accounts.map((account) => (
-              <Panel
-                key={account.account_id}
-                title={account.account_id}
-                sub={account.as_of ? `截至 ${formatShanghaiDateTime(account.as_of)}` : undefined}
-              >
-                <KpiStrip
-                  compact
-                  label="账户"
-                  items={[
-                    { key: "nav", label: "净值", value: formatAmount(account.nav) },
-                    { key: "cash", label: "现金", value: formatAmount(account.cash) },
-                    {
-                      key: "upnl",
-                      label: "浮动盈亏",
-                      value: formatAmount(account.unrealized_pnl),
-                      tone: kpiTone(account.unrealized_pnl),
-                    },
-                    {
-                      key: "rpnl",
-                      label: "已实现",
-                      value: formatAmount(account.realized_pnl),
-                      tone: kpiTone(account.realized_pnl),
-                    },
-                  ]}
-                />
-                <p className="hint">
-                  这是模拟账户，不用真钱：起始资金 10
-                  万，按策略信号自动模拟买卖。现价、市值、浮盈按最后一次成交价算，不是实时行情。
-                </p>
-                <PaperCharts account={account} />
-                <DataTable
-                  label="持仓"
-                  rows={account.holdings}
-                  rowKey={(row) => row.code}
-                  emptyText="空仓：模拟盘当前没有持仓，下一次调仓信号后会建仓。"
-                  columns={[
-                    {
-                      id: "code",
-                      header: "代码",
-                      value: (row) => row.code,
-                      cell: (row) => <StockLink code={row.code} />,
-                    },
-                    { id: "name", header: "名称", value: (row) => row.name ?? null },
-                    {
-                      id: "industry",
-                      header: "行业",
-                      value: (row) => row.industry ?? null,
-                      secondary: true,
-                    },
-                    {
-                      id: "weight",
-                      header: "权重",
-                      numeric: true,
-                      value: (row) => (account.nav > 0 ? row.market_value / equity(account) : null),
-                      cell: (row) => `${((row.market_value / equity(account)) * 100).toFixed(1)}%`,
-                    },
-                    {
-                      id: "qty",
-                      header: "数量",
-                      numeric: true,
-                      value: (row) => row.quantity,
-                      cell: (row) => formatCount(row.quantity),
-                    },
-                    {
-                      id: "cost",
-                      header: "成本",
-                      numeric: true,
-                      value: (row) => row.average_cost,
-                      cell: (row) => formatPrice(row.average_cost),
-                    },
-                    {
-                      id: "price",
-                      header: "现价",
-                      numeric: true,
-                      value: (row) => row.market_price,
-                      cell: (row) => formatPrice(row.market_price),
-                    },
-                    {
-                      id: "value",
-                      header: "市值",
-                      numeric: true,
-                      value: (row) => row.market_value,
-                      cell: (row) => formatAmount(row.market_value),
-                    },
-                    {
-                      id: "pnl",
-                      header: "浮盈",
-                      numeric: true,
-                      value: (row) => row.unrealized_pnl,
-                      cell: (row) => (
-                        <span className={toneClass(toneOf(row.unrealized_pnl))}>
-                          {formatAmount(row.unrealized_pnl)}
-                        </span>
-                      ),
-                    },
-                  ]}
-                />
-              </Panel>
-            ))
+            <>
+              <p className="hint">
+                这是模拟账户，不用真钱：起始资金 10
+                万，按策略信号自动模拟买卖。现价、市值、浮盈按最后一次成交价算，不是实时行情。
+              </p>
+              {data.accounts.map((account) => (
+                <Panel
+                  key={account.account_id}
+                  title={account.account_id}
+                  sub={account.as_of ? `截至 ${formatShanghaiDateTime(account.as_of)}` : undefined}
+                >
+                  <KpiStrip
+                    compact
+                    label="账户"
+                    items={[
+                      { key: "nav", label: "净值", value: formatAmount(account.nav) },
+                      { key: "cash", label: "现金", value: formatAmount(account.cash) },
+                      {
+                        key: "upnl",
+                        label: "浮动盈亏",
+                        value: formatAmount(account.unrealized_pnl),
+                        tone: kpiTone(account.unrealized_pnl),
+                      },
+                      {
+                        key: "rpnl",
+                        label: "已实现",
+                        value: formatAmount(account.realized_pnl),
+                        tone: kpiTone(account.realized_pnl),
+                      },
+                    ]}
+                  />
+                  <PaperCharts account={account} />
+                  <DataTable
+                    label="持仓"
+                    rows={account.holdings}
+                    rowKey={(row) => row.code}
+                    emptyText="空仓：模拟盘当前没有持仓，下一次调仓信号后会建仓。"
+                    columns={[
+                      {
+                        id: "code",
+                        header: "代码",
+                        value: (row) => row.code,
+                        cell: (row) => <StockLink code={row.code} />,
+                      },
+                      { id: "name", header: "名称", value: (row) => row.name ?? null },
+                      {
+                        id: "industry",
+                        header: "行业",
+                        value: (row) => row.industry ?? null,
+                        secondary: true,
+                      },
+                      {
+                        id: "weight",
+                        header: "权重",
+                        numeric: true,
+                        value: (row) =>
+                          account.nav > 0 ? row.market_value / equity(account) : null,
+                        cell: (row) =>
+                          `${((row.market_value / equity(account)) * 100).toFixed(1)}%`,
+                      },
+                      {
+                        id: "qty",
+                        header: "数量",
+                        numeric: true,
+                        value: (row) => row.quantity,
+                        cell: (row) => formatCount(row.quantity),
+                      },
+                      {
+                        id: "cost",
+                        header: "成本",
+                        numeric: true,
+                        value: (row) => row.average_cost,
+                        cell: (row) => formatPrice(row.average_cost),
+                      },
+                      {
+                        id: "price",
+                        header: "现价",
+                        numeric: true,
+                        value: (row) => row.market_price,
+                        cell: (row) => formatPrice(row.market_price),
+                      },
+                      {
+                        id: "value",
+                        header: "市值",
+                        numeric: true,
+                        value: (row) => row.market_value,
+                        cell: (row) => formatAmount(row.market_value),
+                      },
+                      {
+                        id: "pnl",
+                        header: "浮盈",
+                        numeric: true,
+                        value: (row) => row.unrealized_pnl,
+                        cell: (row) => (
+                          <span className={toneClass(toneOf(row.unrealized_pnl))}>
+                            {formatAmount(row.unrealized_pnl)}
+                          </span>
+                        ),
+                      },
+                    ]}
+                  />
+                </Panel>
+              ))}
+            </>
           )
         }
       </QueryView>
