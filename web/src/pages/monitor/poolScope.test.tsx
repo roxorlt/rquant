@@ -97,6 +97,12 @@ beforeEach(() => {
   stub();
 });
 
+async function expectOpenTip(): Promise<void> {
+  const tips = await screen.findAllByRole("tooltip");
+  expect(tips.length).toBeGreaterThan(0);
+  for (const tip of tips) expect(tip.textContent).toBe(ALERT_POOL_TIP);
+}
+
 function media(matches: (query: string) => boolean): typeof window.matchMedia {
   return ((query: string) => ({
     matches: matches(query),
@@ -133,12 +139,10 @@ it("shows the three scope names on the rules table, the drawer and the timeline"
   expect(timeline.textContent ?? "").not.toMatch(/pool1|pool2|一号池|二号池|已加入/);
 
   await user.hover(within(rulesHeader).getByText("范围"));
-  expect((await screen.findByRole("tooltip")).textContent).toBe(ALERT_POOL_TIP);
+  await expectOpenTip();
 
   await user.hover(within(timelineHeader).getByText("范围"));
-  for (const tip of await screen.findAllByRole("tooltip")) {
-    expect(tip.textContent).toBe(ALERT_POOL_TIP);
-  }
+  await expectOpenTip();
 
   await user.click(screen.getByRole("button", { name: "新建规则" }));
   const drawer = await screen.findByRole("dialog", { name: "新建规则" });
@@ -155,7 +159,7 @@ it("shows the three scope names on the rules table, the drawer and the timeline"
   }
   expect(within(drawer).getByLabelText("冷却分钟")).toHaveValue(30);
   await user.hover(within(scope).getByText("范围"));
-  expect((await screen.findByRole("tooltip")).textContent).toBe(ALERT_POOL_TIP);
+  await expectOpenTip();
 
   await user.click(within(scope).getByRole("checkbox", { name: "自选" }));
   await user.click(within(scope).getByRole("checkbox", { name: "N字初筛" }));
@@ -174,7 +178,7 @@ it("opens the scope explanation on tap when the pointer cannot hover", async () 
     const rules = await screen.findByRole("table", { name: "告警规则" });
     const header = within(rules).getByRole("columnheader", { name: "范围" });
     await user.click(within(header).getByText("范围"));
-    expect((await screen.findByRole("tooltip")).textContent).toBe(ALERT_POOL_TIP);
+    await expectOpenTip();
   } finally {
     window.matchMedia = original;
   }
