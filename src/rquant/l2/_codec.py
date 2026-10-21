@@ -202,9 +202,15 @@ def decode_order_response(body: bytes, *, request_id: int, page_id: int, code: s
         raise ValueError('unsupported order frame command')
     data = _response_payload(body, request_id=request_id, page_id=page_id,
                              command=command, allowed_flags=(0x1100,))
-    metadata = _table_metadata(data, version="tb1.0", max_rows=500 if request_id == 0xFFFFFFFF else max_rows)
-    if metadata["title"] != f"{code}-逐笔委托":
-        raise ValueError("order table title mismatch")
+    metadata = _table_metadata(data, version="tb1.0", max_rows=MAX_BYTES // 30 if request_id == 0xFFFFFFFF else max_rows)
+    if (metadata["title"] != f"{code}-逐笔委托"
+            or (metadata["col_count"], metadata["row_width"]) != (6, 30)):
+        raise ValueError("unsupported order table schema")
+    if metadata["row_count"] > 500:
+        expected = ((0x2001, 4, 220), (0x100A, 4, 220), (0x100D, 4, 220),
+                    (0x200C, 4, 220), (0x2038, 4, 220), (0xA561, 4, 220))
+        if tuple((int(c["flags_hex"], 16), c["width"], c["extra"]) for c in metadata["columns"]) != expected:
+            raise ValueError("unsupported expanded order table schema")
     return _response_result(body, data, metadata, request_id=request_id, page_id=page_id,
                             source_fd_ordinal=source_fd_ordinal)
 
@@ -223,7 +229,7 @@ def decode_trade_response(body: bytes, *, request_id: int, page_id: int, code: s
     data = _response_payload(body, request_id=request_id, page_id=page_id,
                              command=2357, allowed_flags=(0x1110, 0x1100, 0x1130))
     version = "tb1.0" if request_id == 0xFFFFFFFF and data[:6] == b"tb1.0\0" else "tb3.0"
-    metadata = _table_metadata(data, version=version, max_rows=4096 if request_id == 0xFFFFFFFF else 500)
+    metadata = _table_metadata(data, version=version, max_rows=MAX_BYTES // 66 if request_id == 0xFFFFFFFF else 500)
     expected_columns = [(0x2001, 4), (0x38, 30), (0x100A, 4), (0x100D, 4),
                         (0x104A, 4), (0x104B, 4), (0xA610, 4), (0x1012, 4)]
     actual_columns = [(int(c["flags_hex"], 16), c["width"]) for c in metadata["columns"]]

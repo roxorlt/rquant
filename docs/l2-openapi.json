@@ -505,8 +505,7 @@
             "title": "Rle Algorithm Reference"
           },
           "row_count": {
-            "description": "Above 500 rows only for a recognized trade sentinel candidate push.",
-            "maximum": 4096.0,
+            "description": "Must match the supported table geometry and rows; logical row data is at most 1048576 bytes.",
             "minimum": 0.0,
             "title": "Row Count",
             "type": "integer"

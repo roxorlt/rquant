@@ -81,10 +81,17 @@ def create_app(cache_root: Path, control_root: Path | None = None, max_symbols: 
                 page = await read_page(cursor)
                 has_batches = bool(page.batches)
                 if has_batches or asyncio.get_running_loop().time() >= heartbeat:
-                    await asyncio.wait_for(websocket.send_text(page.model_dump_json()), _WS_SEND_TIMEOUT_SECONDS)
-                    cursor = page.next_sequence
+                    next_sequence = page.next_sequence
+                    payload = page.model_dump_json()
+                    del page
+                    try:
+                        await asyncio.wait_for(websocket.send_text(payload), _WS_SEND_TIMEOUT_SECONDS)
+                    finally:
+                        del payload
+                    cursor = next_sequence
                     heartbeat = asyncio.get_running_loop().time() + _WS_HEARTBEAT_SECONDS
-                del page
+                else:
+                    del page
                 if not has_batches:
                     await asyncio.sleep(_WS_POLL_SECONDS)
 

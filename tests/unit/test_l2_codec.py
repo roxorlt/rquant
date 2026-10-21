@@ -431,8 +431,11 @@ def test_order_push_cardinality_preserves_normal_and_resource_limits(fault) -> N
             struct.pack_into("<H", raw, 20, 31)
             payload = literal(bytes(raw))
         body = struct.pack("<HIIHIII", 26, request, 0x1100, 10128, len(payload), 2267, 0) + b"\0\0" + payload
-    with pytest.raises(ValueError):
-        codec.decode_order_response(body, request_id=request, page_id=10128, code="300006", source_fd_ordinal=507)
+    if fault == "push501":
+        assert codec.decode_order_response(body, request_id=request, page_id=10128, code="300006", source_fd_ordinal=507)["table"]["row_count"] == 501
+    else:
+        with pytest.raises(ValueError):
+            codec.decode_order_response(body, request_id=request, page_id=10128, code="300006", source_fd_ordinal=507)
 
 
 # Actual commonframe2357 orders, original h32 seed/h26 push; no auth/control.
@@ -573,21 +576,17 @@ def market_model_data(body: bytes, result: dict, *, delivery: str = "candidate_p
 
 @pytest.mark.parametrize("version", ["tb1.0", "tb3.0"])
 @pytest.mark.parametrize("rows", [4096, 4097])
-def test_known_trade_push_row_budget_and_serialized_batch_bound(rows: int, version: str) -> None:
+def test_known_trade_push_keeps_complete_rows_and_serialized_batch_bound(rows: int, version: str) -> None:
     from datetime import UTC, datetime
     from rquant.l2.models import RawL2Batch
 
     codec = module("_codec")
     body = worst_trade_push(rows, version)
-    if rows > 4096:
-        with pytest.raises(ValueError, match="dimensions exceed bounds"):
-            codec.decode_trade_response(body, request_id=0xFFFFFFFF, page_id=10117, code="603258", market=17, source_fd_ordinal=1)
-        return
     result = codec.decode_trade_response(body, request_id=0xFFFFFFFF, page_id=10117, code="603258", market=17, source_fd_ordinal=1)
     batch = RawL2Batch.model_validate({**market_model_data(body, result), "local_batch_sequence": 1,
         "cached_at": datetime(2026, 10, 19, tzinfo=UTC)})
     serialized = batch.model_dump_json().encode() + b"\n"
-    assert batch.table.row_count == len(batch.table.rows) == 4096
+    assert batch.table.row_count == len(batch.table.rows) == rows
     assert len(body) <= 1024 * 1024 and len(result["raw_table"]) <= 1024 * 1024
     assert len(serialized) < 8 * 1024 * 1024
     assert RawL2Batch.model_validate_json(serialized) == batch
@@ -633,7 +632,7 @@ def test_seed_envelope_model_cannot_claim_expanded_candidate_push() -> None:
         MarketObservation.model_validate(market_model_data(seed, result))
 
 
-def test_order_model_does_not_inherit_expanded_trade_rows() -> None:
+def test_expanded_order_model_keeps_order_kind_and_side() -> None:
     from rquant.l2.models import MarketObservation
     codec = module("_codec")
     seed = response(trade=False, request_id=3, page_id=10117, ids=tuple(range(1, 502)))
@@ -641,20 +640,21 @@ def test_order_model_does_not_inherit_expanded_trade_rows() -> None:
     raw = codec.snappy_decompress(body[26:])
     result = codec._response_result(body, raw, codec._table_metadata(raw, version="tb1.0", max_rows=4096),
         request_id=0xFFFFFFFF, page_id=10117, source_fd_ordinal=1)
-    with pytest.raises(ValueError, match="market row count exceeds profile limit"):
-        MarketObservation.model_validate(market_model_data(body, result, binding={"kind": "vendor4027",
-            "code": "603258", "market": 17, "page_id": 10117, "side": "buy"}))
+    binding = {"kind": "vendor4027", "code": "603258", "market": 17, "page_id": 10117, "side": "buy"}
+    assert MarketObservation.model_validate(market_model_data(body, result, binding=binding)).table.row_count == 501
+    with pytest.raises(ValueError, match="expanded order side mismatch"):
+        MarketObservation.model_validate(market_model_data(body, result, binding={**binding, "side": "sell"}))
 
 
-def test_raw_table_keeps_absolute_4096_row_budget() -> None:
+def test_raw_table_keeps_logical_byte_budget_before_rows() -> None:
     from rquant.l2.models import RawTable
     codec = module("_codec")
-    body = worst_trade_push(4097)
+    body = worst_trade_push(2)
     raw = codec.snappy_decompress(body[26:])
     result = codec._response_result(body, raw, codec._table_metadata(raw, version="tb1.0", max_rows=4097),
         request_id=0xFFFFFFFF, page_id=10117, source_fd_ordinal=1)
-    with pytest.raises(ValueError, match="less than or equal to 4096"):
-        RawTable.model_validate(result["table"])
+    with pytest.raises(ValueError, match="table geometry exceeds byte bounds"):
+        RawTable.model_validate({**result["table"], "row_count": (1 << 20) // 66 + 1})
 
 
 @pytest.mark.parametrize("rows", [500, 501])
@@ -662,7 +662,8 @@ def test_raw_table_keeps_absolute_4096_row_budget() -> None:
 @pytest.mark.parametrize("fault", ["flags", "widths", "extra"])
 def test_expanded_trade_rejects_unrecognized_descriptor(tmp_path: Path, rows: int, target: str, fault: str) -> None:
     from rquant.l2.cache import RawL2Cache
-    from rquant.l2.models import Binding, MarketObservation, RawTable
+    from pydantic import TypeAdapter
+    from rquant.l2.models import Binding, MarketObservation, RawCell, RawColumn, RawTable
 
     codec = module("_codec")
     original = worst_trade_push(rows)
@@ -687,14 +688,214 @@ def test_expanded_trade_rejects_unrecognized_descriptor(tmp_path: Path, rows: in
         else:
             # Exercise append's own RawL2Batch revalidation independently of
             # observation construction, with valid typed cells and raw hashes.
+            cell_adapter = TypeAdapter(RawCell)
+            typed = RawTable.model_construct(**{**data["table"],
+                "columns": tuple(RawColumn.model_validate(c) for c in data["table"]["columns"]),
+                "rows": tuple({k: cell_adapter.validate_python(v) for k, v in row.items()}
+                              for row in data["table"]["rows"])})
             unchecked = MarketObservation.model_construct(**{**data,
-                "binding": Binding.model_validate(data["binding"]), "table": RawTable.model_validate(data["table"])})
+                "binding": Binding.model_validate(data["binding"]), "table": typed})
             action = lambda: cache.append(unchecked)
         if rows > 500:
-            with pytest.raises(ValueError, match="unsupported expanded trade table schema"):
+            with pytest.raises(ValueError, match="table descriptor"):
                 action()
             assert cache.read_status().last_sequence == 0
         else:
             accepted = action()
             assert accepted.table.row_count == 500
             assert cache.read_status().last_sequence == (1 if target == "cache" else 0)
+
+
+def order_push(rows: int, side: str = "buy") -> bytes:
+    seed = response(trade=False, request_id=3, page_id=10117, side=side, ids=tuple(range(rows)))
+    payload = seed[32:]
+    return struct.pack("<HIIHIII", 26, 0xFFFFFFFF, 0x1100, 10117, len(payload), 2357, 0) + b"\0\0" + payload
+
+
+def zero_rle_trade(rows: int) -> bytes:
+    codec = module("_codec")
+    raw = codec.snappy_decompress(worst_trade_push(2)[26:])
+    ext = int.from_bytes(raw[18:20], "little")
+    header = bytearray(raw[:ext])
+    header[:6] = b"tb3.0\0"
+    struct.pack_into("<i", header, 6, rows)
+    logical = rows * 66
+    packed = bytearray((255, 0, 0))
+    remaining = logical - 13
+    while remaining >= 32767:
+        packed.extend(b"\xff\xff")
+        remaining -= 32767
+    packed.extend(bytes((remaining,)) if remaining <= 127 else bytes((128 + (remaining >> 8), remaining & 255)))
+    assert module("_table")._decode_rle(bytes(packed), logical) == bytes(logical)
+    data = bytes(header) + struct.pack("<I", len(packed) + 4) + struct.pack(">I", logical) + packed
+    payload = literal(data)
+    return struct.pack("<HIIHIII", 26, 0xFFFFFFFF, 0x1100, 10117, len(payload), 2357, 0) + b"\0\0" + payload
+
+
+@pytest.mark.parametrize("rows", [4097, 8192])
+@pytest.mark.parametrize("version", ["tb1.0", "tb3.0"])
+def test_byte_envelope_trade_uses_geometry_not_fixed_count(rows, version):
+    from rquant.l2.models import MarketObservation
+    codec = module("_codec")
+    body = worst_trade_push(rows, version)
+    result = codec.decode_trade_response(body, request_id=0xFFFFFFFF, page_id=10117,
+        code="603258", market=17, source_fd_ordinal=1)
+    model = MarketObservation.model_validate(market_model_data(body, result))
+    assert model.table.row_count == len(model.table.rows) == rows
+    assert model.response_body_hex == body.hex()
+    assert model.table.source_sha256 == result["table"]["source_sha256"]
+
+
+@pytest.mark.parametrize("side", ["buy", "sell"])
+def test_byte_envelope_order_uses_known_profile_and_geometry(side):
+    from rquant.l2.models import MarketObservation
+    codec = module("_codec")
+    body = order_push(501, side)
+    result = codec.decode_order_response(body, request_id=0xFFFFFFFF, page_id=10117,
+        code="603258", source_fd_ordinal=1)
+    binding = {"kind": "vendor4027", "code": "603258", "market": 17, "side": side, "page_id": 10117}
+    model = MarketObservation.model_validate(market_model_data(body, result, binding=binding))
+    assert model.table.row_count == len(model.table.rows) == 501
+    assert {cell["12"].value for cell in model.table.rows} == {1 if side == "buy" else 2}
+
+
+def test_byte_envelope_compressed_logical_boundary_and_preallocation(monkeypatch):
+    from rquant.l2.models import MarketObservation
+    codec = module("_codec")
+    body = zero_rle_trade((1 << 20) // 66)
+    result = codec.decode_trade_response(body, request_id=0xFFFFFFFF, page_id=10117,
+        code="603258", market=17, source_fd_ordinal=1)
+    model = MarketObservation.model_validate(market_model_data(body, result))
+    assert model.table.row_count == 15887 and len(body) < 512
+    invalid = zero_rle_trade(15888)
+    monkeypatch.setattr(codec, "parse_table", lambda *args: pytest.fail("row parser reached"))
+    with pytest.raises(ValueError, match="dimensions exceed bounds"):
+        codec.decode_trade_response(invalid, request_id=0xFFFFFFFF, page_id=10117,
+            code="603258", market=17, source_fd_ordinal=1)
+
+
+@pytest.mark.parametrize("fault", ["stride", "count", "length", "descriptor", "logical", "header"])
+def test_byte_envelope_model_shape_precedes_nested_cell_validation(fault):
+    from pydantic import field_validator
+    from rquant.l2.models import RawTable
+    codec = module("_codec")
+    body = worst_trade_push(501)
+    result = codec._response_result(body, codec.snappy_decompress(body[26:]),
+        codec._table_metadata(codec.snappy_decompress(body[26:]), version="tb1.0", max_rows=8192),
+        request_id=0xFFFFFFFF, page_id=10117, source_fd_ordinal=1)
+
+    class NoCellAllocation(RawTable):
+        @field_validator("rows", mode="before")
+        @classmethod
+        def prohibit_rows(cls, value):
+            raise AssertionError("nested cell allocation reached")
+
+    with pytest.raises(ValueError, match="nested cell allocation"):
+        NoCellAllocation.model_validate(result["table"])
+    data = dict(result["table"])
+    if fault == "stride": data["row_width"] = 1
+    elif fault == "count": data["col_count"] = 32
+    elif fault == "length": data["rows"] = data["rows"][:-1]
+    elif fault == "descriptor":
+        data["columns"] = [dict(c) for c in data["columns"]]
+        data["columns"][0]["extra"] = 164
+    elif fault == "header": data["extended_header_length"] = 23
+    else: data["row_count"] = 15888
+    with pytest.raises(ValueError, match="table (geometry|shape|descriptor)"):
+        NoCellAllocation.model_validate(data)
+
+
+@pytest.mark.parametrize("fault", ["stride", "count", "descriptor", "logical", "header", "duplicate"])
+def test_byte_envelope_codec_metadata_precedes_row_parser(fault, monkeypatch):
+    from unittest.mock import Mock
+    codec = module("_codec")
+    body = order_push(501)
+    row_parser = Mock(side_effect=ValueError("parser sentinel"))
+    monkeypatch.setattr(codec, "parse_table", row_parser)
+    with pytest.raises(ValueError, match="invalid market table layout"):
+        codec.decode_order_response(body, request_id=0xFFFFFFFF, page_id=10117, code="603258", source_fd_ordinal=1)
+    assert row_parser.call_count == 1
+    row_parser.reset_mock()
+    raw = bytearray(codec.snappy_decompress(body[26:]))
+    if fault == "stride": struct.pack_into("<H", raw, 20, 1)
+    elif fault == "count": struct.pack_into("<H", raw, 22, 32)
+    elif fault == "descriptor": raw[27] = 219
+    elif fault == "header": struct.pack_into("<H", raw, 18, 23)
+    elif fault == "duplicate": raw[24:26] = raw[28:30]
+    else: struct.pack_into("<i", raw, 6, (1 << 20) // 30 + 1)
+    payload = literal(bytes(raw))
+    invalid = struct.pack("<HIIHIII", 26, 0xFFFFFFFF, 0x1100, 10117, len(payload), 2357, 0) + b"\0\0" + payload
+    with pytest.raises(ValueError):
+        codec.decode_order_response(invalid, request_id=0xFFFFFFFF, page_id=10117, code="603258", source_fd_ordinal=1)
+    row_parser.assert_not_called()
+
+
+@pytest.mark.parametrize("fault", ["seed", "backfill", "ordinary_id", "wrong_page"])
+def test_byte_envelope_context_precedes_nested_table_allocation(fault):
+    from pydantic import field_validator
+    from rquant.l2.models import MarketObservation
+    codec = module("_codec")
+    body = worst_trade_push(501)
+    result = codec.decode_trade_response(body, request_id=0xFFFFFFFF, page_id=10117,
+        code="603258", market=17, source_fd_ordinal=1)
+    data = market_model_data(body, result)
+
+    class NoTableAllocation(MarketObservation):
+        @field_validator("table", mode="before")
+        @classmethod
+        def prohibit_table(cls, value):
+            raise AssertionError("nested table allocation reached")
+
+    with pytest.raises(ValueError, match="nested table allocation"):
+        NoTableAllocation.model_validate(data)
+    if fault in {"seed", "backfill"}: data["delivery"] = fault
+    elif fault == "ordinary_id": data["request_id"] = 3
+    else: data["binding"] = {**data["binding"], "page_id": 10118}
+    with pytest.raises(ValueError) as error:
+        NoTableAllocation.model_validate(data)
+    assert "nested table allocation" not in str(error.value)
+
+
+@pytest.mark.parametrize("delivery", ["seed", "backfill"])
+def test_byte_envelope_revalidated_model_copy_keeps_context_guard(delivery):
+    from rquant.l2.models import MarketObservation
+    codec = module("_codec")
+    body = worst_trade_push(501)
+    result = codec.decode_trade_response(body, request_id=0xFFFFFFFF, page_id=10117,
+        code="603258", market=17, source_fd_ordinal=1)
+    model = MarketObservation.model_validate(market_model_data(body, result))
+    with pytest.raises(ValueError, match="market row count exceeds profile limit"):
+        MarketObservation.model_validate(model.model_copy(update={"delivery": delivery}))
+
+
+def test_byte_envelope_known_value_and_header_extremes():
+    from rquant.l2._table import decode_packed32
+    from rquant.l2.models import MarketObservation
+    longest = 0
+    for mantissa in (0, 1, 0x07FFFFFF):
+        for exponent in range(8):
+            for sign in (0, 0x08000000):
+                for exponent_sign in (0, 0x80000000):
+                    raw = struct.pack("<I", mantissa | exponent << 28 | sign | exponent_sign)
+                    value = decode_packed32(raw)
+                    longest = max(longest, len(value or "null"))
+    assert longest == 17
+    assert decode_packed32(b"\xff" * 4) is None
+    codec = module("_codec")
+    body = worst_trade_push(2)
+    raw = codec.snappy_decompress(body[26:])
+    original_ext = int.from_bytes(raw[18:20], "little")
+    header = bytearray(raw[:56])
+    struct.pack_into("<H", header, 18, 65535)
+    # Empty trade title, one maximal bounded UTF16 column label, seven empty
+    # labels and one padding byte. Labels are retained in raw bytes, not DTOs.
+    name_units = (65535 - 56 - 2 - 2 - 14) // 2
+    header.extend(b"\0\0" + struct.pack("<H", name_units) + b"\x01\x00" * name_units + b"\0\0" * 7)
+    header.extend(b"\0" * (65535 - len(header)))
+    payload = literal(bytes(header) + raw[original_ext:])
+    large_header = struct.pack("<HIIHIII", 26, 0xFFFFFFFF, 0x1100, 10117, len(payload), 2357, 0) + b"\0\0" + payload
+    result = codec.decode_trade_response(large_header, request_id=0xFFFFFFFF, page_id=10117,
+        code="603258", market=17, source_fd_ordinal=1)
+    model = MarketObservation.model_validate(market_model_data(large_header, result))
+    assert model.table.extended_header_length == 65535 and model.table.row_count == 2
+    assert model.raw_table_hex == result["raw_table"].hex()

@@ -14,14 +14,15 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Lock
 
 from rquant.l2.models import BatchPage, FeedStatus, MarketObservation, RawL2Batch, SubscriptionReceipt
 
 _ACTIVE = {"starting", "connected", "seeded_waiting", "listening_candidate"}
 _STALE_SECONDS = 60
-_MAX_BATCH_BYTES = 8 * 1024 * 1024
+_MAX_BATCH_BYTES = 20 * 1024 * 1024
 MAX_BATCH_PAGE = 128
-MAX_BATCH_PAGE_BYTES = 12 * 1024 * 1024
+MAX_BATCH_PAGE_BYTES = 24 * 1024 * 1024
 _MAX_RUNTIME_BYTES = 256 * 1024
 
 
@@ -36,7 +37,7 @@ def _directory(path: Path) -> None:
         raise CacheError("unsafe_path")
 
 
-def _read(path: Path, maximum: int) -> bytes:
+def _read(path: Path, maximum: int, *, identity: os.stat_result | None = None) -> bytes:
     info = path.lstat()
     if not stat.S_ISREG(info.st_mode) or info.st_size > maximum:
         raise CacheError("unsafe_path")
@@ -45,6 +46,11 @@ def _read(path: Path, maximum: int) -> bytes:
         opened = os.fstat(stream.fileno())
         if not stat.S_ISREG(opened.st_mode) or opened.st_size > maximum:
             raise CacheError("unsafe_path")
+        if identity is not None and (
+                (opened.st_dev, opened.st_ino, opened.st_uid, opened.st_mode, opened.st_size)
+                != (identity.st_dev, identity.st_ino, identity.st_uid, identity.st_mode, identity.st_size)
+                or opened.st_uid != os.geteuid()):
+            raise CacheError("invalid_batch")
         data = stream.read(maximum + 1)
     if len(data) > maximum:
         raise CacheError("invalid_cache")
@@ -93,7 +99,9 @@ class RawL2Cache:
         self.root = Path(root)
         self._writer_fd: int | None = None
         self._highwater = 0
-        self._last_batch: RawL2Batch | None = None
+        self._last_received_at: datetime | None = None
+        self._head_receipt: tuple[tuple[int, int, str], int, datetime] | None = None
+        self._head_lock = Lock()
 
     def _require_writer(self) -> None:
         if self._writer_fd is None:
@@ -118,10 +126,10 @@ class RawL2Cache:
             _directory(batches)
             committed = self._directories()
             for expected, directory in enumerate(committed, 1):
-                self._last_batch = self._read_batch(directory, expected)
+                self._last_received_at = self._read_batch(directory, expected).received_at
             self._highwater = len(committed)
             head = self._published_head()
-            if committed and (head is None or head.local_batch_sequence != self._highwater):
+            if committed and (head is None or head[0] != self._highwater):
                 self._publish_head(committed[-1])
                 _fsync_dir(batches)
             previous = self.read_status()
@@ -137,7 +145,7 @@ class RawL2Cache:
         finally:
             self._writer_fd = None
             self._highwater = 0
-            self._last_batch = None
+            self._last_received_at = None
             if fd is not None:
                 os.close(fd)
 
@@ -163,7 +171,7 @@ class RawL2Cache:
                     raise CacheError("sequence_gap")
             # A readdir may see a pending rename and a later batch but omit the
             # renamed middle entry. Check every path within this finite bound.
-            upper = max(minimum_committed, head.local_batch_sequence if head else 0,
+            upper = max(minimum_committed, head[0] if head else 0,
                         max((int(name) for name in names), default=0))
             directories = []
             for expected in range(1, upper + 1):
@@ -183,21 +191,30 @@ class RawL2Cache:
             raise CacheError("cache_io") from None
 
     @staticmethod
-    def _read_batch(directory: Path, expected: int, *, maximum: int = _MAX_BATCH_BYTES) -> RawL2Batch:
+    def _read_batch(directory: Path, expected: int, *, maximum: int = _MAX_BATCH_BYTES,
+                    candidate: tuple[RawL2Batch, os.stat_result, str] | None = None) -> RawL2Batch:
         try:
             _directory(directory)
-            payload = _read(directory / "batch.json", min(maximum, _MAX_BATCH_BYTES))
+            payload = _read(directory / "batch.json", min(maximum, _MAX_BATCH_BYTES),
+                            identity=candidate[1] if candidate is not None else None)
             digest = _read(directory / "sha256", 65)
-            if digest != hashlib.sha256(payload).hexdigest().encode() + b"\n":
+            actual_digest = hashlib.sha256(payload).hexdigest()
+            if digest != actual_digest.encode() + b"\n":
                 raise CacheError("invalid_batch")
-            batch = RawL2Batch.model_validate_json(payload)
+            if candidate is not None:
+                if actual_digest != candidate[2]:
+                    raise CacheError("invalid_batch")
+                batch = candidate[0]
+            else:
+                batch = RawL2Batch.model_validate_json(payload)
             if batch.local_batch_sequence != expected:
                 raise CacheError("invalid_batch")
             return batch
         except (OSError, ValueError):
             raise CacheError("invalid_batch") from None
 
-    def _published_head(self, *, minimum: int = 0) -> RawL2Batch | None:
+    def _published_head(self, *, minimum: int = 0, after_sequence: int | None = None
+                        ) -> tuple[int, datetime, tuple[RawL2Batch, os.stat_result, str] | None] | None:
         parent = self.root / "batches"
         if self.root.is_symlink() or parent.is_symlink():
             raise CacheError("unsafe_path")
@@ -222,19 +239,35 @@ class RawL2Cache:
                 payload = stream.read(_MAX_BATCH_BYTES + 1)
                 if len(payload) > _MAX_BATCH_BYTES:
                     raise CacheError("invalid_batch")
-                batch = RawL2Batch.model_validate_json(payload)
-                if batch.local_batch_sequence >= 10**20:
-                    raise CacheError("invalid_batch")
-                directory = parent / f"{batch.local_batch_sequence:020d}"
-                _directory(directory)
-                actual = (directory / "batch.json").lstat()
-                if (not stat.S_ISREG(actual.st_mode)
-                        or (actual.st_dev, actual.st_ino) != (info.st_dev, info.st_ino)
-                        or _read(directory / "sha256", 65) != hashlib.sha256(payload).hexdigest().encode() + b"\n"):
-                    raise CacheError("invalid_batch")
-                if batch.local_batch_sequence < minimum:
-                    raise CacheError("sequence_gap")
-                return batch
+                digest = hashlib.sha256(payload).hexdigest()
+                key = (info.st_dev, info.st_ino, digest)
+                # The receipt remains scalar. Only the caller selecting this
+                # freshly validated head may carry its model to a full reread.
+                candidate = None
+                with self._head_lock:
+                    receipt = self._head_receipt
+                    if receipt is None or receipt[0] != key:
+                        batch = RawL2Batch.model_validate_json(payload)
+                        count, last = batch.local_batch_sequence, batch.received_at
+                        if after_sequence is not None and after_sequence + 1 == count:
+                            candidate = (batch, info, digest)
+                        del batch
+                    else:
+                        _, count, last = receipt
+                    if count >= 10**20:
+                        raise CacheError("invalid_batch")
+                    directory = parent / f"{count:020d}"
+                    _directory(directory)
+                    actual = (directory / "batch.json").lstat()
+                    if (not stat.S_ISREG(actual.st_mode)
+                            or (actual.st_dev, actual.st_ino) != (info.st_dev, info.st_ino)
+                            or _read(directory / "sha256", 65) != digest.encode() + b"\n"):
+                        raise CacheError("invalid_batch")
+                    if count < minimum:
+                        raise CacheError("sequence_gap")
+                    self._head_receipt = (key, count, last)
+                    del payload
+                    return count, last, candidate
         except (OSError, ValueError):
             raise CacheError("invalid_batch") from None
 
@@ -250,23 +283,24 @@ class RawL2Cache:
             if created:
                 temporary.unlink(missing_ok=True)
 
-    def _snapshot(self) -> tuple[FeedStatus, int, RawL2Batch | None]:
+    def _snapshot(self, *, after_sequence: int | None = None
+                  ) -> tuple[FeedStatus, int, datetime | None, tuple[RawL2Batch, os.stat_result, str] | None]:
         status = self._stored_status()
-        head = self._published_head(minimum=status.last_sequence)
+        head = self._published_head(minimum=status.last_sequence, after_sequence=after_sequence)
         if head is not None:
-            return status, head.local_batch_sequence, head
+            return status, *head
         # Legacy caches have no publication head. Audit every raw record before
         # exposing them; only a fully audited writer recovery may create .head.
         directories = self._directories()
         last = None
         for expected, directory in enumerate(directories, 1):
-            last = self._read_batch(directory, expected)
-        return status, len(directories), last
+            last = self._read_batch(directory, expected).received_at
+        return status, len(directories), last, None
 
-    def _position(self) -> tuple[int, RawL2Batch | None]:
+    def _position(self) -> tuple[int, datetime | None]:
         if self._writer_fd is not None:
-            return self._highwater, self._last_batch
-        _, count, last = self._snapshot()
+            return self._highwater, self._last_received_at
+        _, count, last, _ = self._snapshot()
         return count, last
 
     def append(self, observation: MarketObservation) -> RawL2Batch:
@@ -274,7 +308,7 @@ class RawL2Cache:
         if not isinstance(observation, MarketObservation):
             raise ValueError("typed market observation required")
         batch = RawL2Batch.model_validate({
-            **observation.model_dump(mode="python"),
+            **observation.model_dump(mode="python", serialize_as_any=True),
             "local_batch_sequence": self._highwater + 1,
             "cached_at": datetime.now(UTC),
         })
@@ -306,7 +340,7 @@ class RawL2Cache:
             os.rename(pending, target)
             pending = None
             self._highwater = batch.local_batch_sequence
-            self._last_batch = batch
+            self._last_received_at = batch.received_at
             self._publish_head(target)
             _fsync_dir(parent)
             return batch
@@ -328,9 +362,8 @@ class RawL2Cache:
             raise CacheError("invalid_status") from None
 
     @staticmethod
-    def _with_committed_receipt(status: FeedStatus, count: int, last_batch: RawL2Batch | None,
+    def _with_committed_receipt(status: FeedStatus, count: int, last: datetime | None,
                                 now: datetime) -> FeedStatus:
-        last = last_batch.received_at if last_batch else None
         age = max(0.0, (now - last).total_seconds()) if last else None
         return FeedStatus.model_validate({
             **status.model_dump(mode="python"),
@@ -389,16 +422,17 @@ class RawL2Cache:
         if clock.tzinfo is None or clock.utcoffset() != datetime.now(UTC).utcoffset():
             raise ValueError("status clock must be aware UTC")
         if self._writer_fd is not None:
-            status, count, last = self._stored_status(), self._highwater, self._last_batch
+            status = self._stored_status()
+            count, last = self._position()
         else:
-            status, count, last = self._snapshot()
+            status, count, last, _ = self._snapshot()
         return self._with_committed_receipt(status, count, last, clock)
 
     def read_batches(self, *, after_sequence: int = 0, limit: int = 1) -> BatchPage:
         if (type(after_sequence) is not int or after_sequence < 0 or type(limit) is not int
                 or not 1 <= limit <= MAX_BATCH_PAGE):
             raise ValueError("invalid local batch cursor")
-        stored_status, count, last = self._snapshot()
+        stored_status, count, last, candidate = self._snapshot(after_sequence=after_sequence)
         if after_sequence > count:
             raise ValueError("invalid local batch cursor")
         selected_list = []
@@ -412,14 +446,16 @@ class RawL2Cache:
             if size > _MAX_BATCH_BYTES:
                 raise CacheError('invalid_batch')
             if payload_bytes + size > MAX_BATCH_PAGE_BYTES:
+                candidate = None
                 break
-            batch = (last if sequence == count else self._read_batch(
-                path, sequence, maximum=MAX_BATCH_PAGE_BYTES - payload_bytes))
-            assert batch is not None
+            batch = self._read_batch(path, sequence, maximum=MAX_BATCH_PAGE_BYTES - payload_bytes,
+                                     candidate=candidate)
+            candidate = None
             # Include canonical model bytes as well as committed payload bytes in
             # the budget, including noncanonical older JSON that expands on output.
             size = max(size, len(batch.model_dump_json().encode()) + 1)
             if payload_bytes + size > MAX_BATCH_PAGE_BYTES:
+                del batch
                 break
             selected_list.append(batch)
             payload_bytes += size
