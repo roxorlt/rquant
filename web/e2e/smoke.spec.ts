@@ -44,7 +44,10 @@ test("a portfolio backtest shows orders and performance", async ({ page }) => {
   await page.getByRole("button", { name: "生成解读" }).click();
   await expect(page.getByText("数字已全部核对")).toBeVisible();
   await expect(page.getByRole("table", { name: "行业暴露" })).toContainText("白酒");
-  await page.getByRole("table", { name: "组合回测列表" }).getByRole("button", { name: "加入对比" }).click();
+  await page
+    .getByRole("table", { name: "组合回测列表" })
+    .getByRole("button", { name: "加入对比" })
+    .click();
   await expect(page.getByText("再选一条就能对比")).toBeVisible();
   await expect(page.getByRole("table", { name: "Brinson 归因" })).toContainText("现金");
 });
