@@ -43,6 +43,14 @@ export function weekdayOf(isoDate: string): string {
   return WEEKDAY_FORMAT.format(new Date(`${isoDate}T12:00:00+08:00`));
 }
 
+/** "HH:MM" today, "MM-DD HH:MM" when the Shanghai date is not today. */
+export function formatListClock(at: Date | string, now: Date = new Date()): string {
+  const time = formatShanghaiTime(at);
+  const date = shanghaiDateOf(typeof at === "string" ? at : at.toISOString());
+  if (date === shanghaiDate(now).date) return time;
+  return `${date.slice(5)} ${time}`;
+}
+
 /** "HH:MM" in Shanghai. */
 export function formatShanghaiTime(at: Date | string): string {
   return TIME_FORMAT.format(typeof at === "string" ? new Date(at) : at);

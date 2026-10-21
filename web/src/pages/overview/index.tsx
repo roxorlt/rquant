@@ -1,4 +1,4 @@
-import type { CSSProperties } from "react";
+import { type CSSProperties, useState } from "react";
 import { Link } from "react-router";
 import { useAlerts, useHealth, useOverview } from "@/api/endpoints";
 import {
@@ -11,10 +11,12 @@ import {
   signalActionTone,
   triggerLabel,
 } from "@/copy/publicText";
-import { formatShanghaiDateTime } from "@/format/time";
+import { formatListClock, formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
+import { SortMenu } from "@/table/SortMenu";
 import { Button, KpiStrip, PageHeader, Panel, Pill } from "@/ui";
 import { StockLink } from "@/ui/StockLink";
+import { PHONE_QUERY, useMedia } from "../panorama/useMedia";
 import { QueryView } from "../shared";
 
 const STATE_PILL = {
@@ -115,6 +117,58 @@ function Attention() {
   );
 }
 
+function sortedSignals<T extends { at: string | null }>(rows: readonly T[], sort: string): T[] {
+  const desc = sort !== "at:asc";
+  return [...rows].sort((a, b) => {
+    const av = a.at ?? "";
+    const bv = b.at ?? "";
+    return desc ? bv.localeCompare(av) : av.localeCompare(bv);
+  });
+}
+
+function SignalList({
+  rows,
+}: {
+  rows: readonly {
+    sequence: number;
+    at: string | null;
+    code: string;
+    name: string | null;
+    strategy_id: string;
+    action: string;
+  }[];
+}) {
+  if (!rows.length) {
+    return (
+      <p className="hint" style={{ padding: "12px 16px" }}>
+        今天还没有信号：策略信号在盘后生成，生成后会出现在这里。
+      </p>
+    );
+  }
+  return (
+    <ul className="li2-list" aria-label="最新信号">
+      {rows.map((row) => {
+        const code = listedStockCode(row.code);
+        const tone = signalActionTone(row.action);
+        return (
+          <li key={row.sequence} className="li2">
+            <span className="t">
+              <span className="name">{row.name ?? "—"}</span>
+              <span className="code">{code ? <StockLink code={code} /> : "—"}</span>
+            </span>
+            <span className="meta">
+              {row.at ? formatListClock(row.at) : "—"} · {presetLabel(row.strategy_id)}
+            </span>
+            <span className="v">
+              <span className={tone || undefined}>{signalActionLabel(row.action)}</span>
+            </span>
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
 function LatestAlerts() {
   const alerts = useAlerts();
   const health = useHealth();
@@ -173,6 +227,8 @@ function LatestAlerts() {
 export default function OverviewPage() {
   const query = useOverview();
   const health = useHealth();
+  const phone = useMedia(PHONE_QUERY);
+  const [signalSort, setSignalSort] = useState("at:desc");
   return (
     <>
       <PageHeader
@@ -207,50 +263,70 @@ export default function OverviewPage() {
               <LatestAlerts />
               <Attention />
             </div>
-            <Panel title={`最新信号 · ${data.signals.length}`} sub="盘后策略产出，最新在上" flush>
-              <DataTable
-                label="最新信号"
-                rows={data.signals}
-                rowKey={(row) => String(row.sequence)}
-                initialSort={{ id: "at", desc: true }}
-                emptyText="今天还没有信号：策略信号在盘后生成，生成后会出现在这里。"
-                columns={[
-                  {
-                    id: "at",
-                    header: "时间",
-                    sortable: true,
-                    value: (row) => row.at ?? null,
-                    cell: (row) => (row.at ? formatShanghaiDateTime(row.at) : "—"),
-                  },
-                  {
-                    id: "code",
-                    header: "代码",
-                    value: (row) => listedStockCode(row.code),
-                    cell: (row) => {
-                      const code = listedStockCode(row.code);
-                      return code ? <StockLink code={code} /> : "—";
+            <Panel
+              title={`最新信号 · ${data.signals.length}`}
+              sub="盘后策略产出，最新在上"
+              flush
+              actions={
+                phone ? (
+                  <SortMenu
+                    value={signalSort}
+                    onChange={setSignalSort}
+                    options={[
+                      { value: "at:desc", label: "时间降序" },
+                      { value: "at:asc", label: "时间升序" },
+                    ]}
+                  />
+                ) : undefined
+              }
+            >
+              {phone ? (
+                <SignalList rows={sortedSignals(data.signals, signalSort)} />
+              ) : (
+                <DataTable
+                  label="最新信号"
+                  rows={data.signals}
+                  rowKey={(row) => String(row.sequence)}
+                  initialSort={{ id: "at", desc: true }}
+                  emptyText="今天还没有信号：策略信号在盘后生成，生成后会出现在这里。"
+                  columns={[
+                    {
+                      id: "at",
+                      header: "时间",
+                      sortable: true,
+                      value: (row) => row.at ?? null,
+                      cell: (row) => (row.at ? formatShanghaiDateTime(row.at) : "—"),
                     },
-                  },
-                  { id: "name", header: "名称", value: (row) => row.name ?? null },
-                  {
-                    id: "strategy",
-                    header: "策略",
-                    phoneLine: 2,
-                    value: (row) => presetLabel(row.strategy_id),
-                  },
-                  {
-                    id: "action",
-                    header: "动作",
-                    phoneLine: 2,
-                    value: (row) => row.action,
-                    cell: (row) => (
-                      <span className={signalActionTone(row.action) || undefined}>
-                        {signalActionLabel(row.action)}
-                      </span>
-                    ),
-                  },
-                ]}
-              />
+                    {
+                      id: "code",
+                      header: "代码",
+                      value: (row) => listedStockCode(row.code),
+                      cell: (row) => {
+                        const code = listedStockCode(row.code);
+                        return code ? <StockLink code={code} /> : "—";
+                      },
+                    },
+                    { id: "name", header: "名称", value: (row) => row.name ?? null },
+                    {
+                      id: "strategy",
+                      header: "策略",
+                      phoneLine: 2,
+                      value: (row) => presetLabel(row.strategy_id),
+                    },
+                    {
+                      id: "action",
+                      header: "动作",
+                      phoneLine: 2,
+                      value: (row) => row.action,
+                      cell: (row) => (
+                        <span className={signalActionTone(row.action) || undefined}>
+                          {signalActionLabel(row.action)}
+                        </span>
+                      ),
+                    },
+                  ]}
+                />
+              )}
             </Panel>
           </>
         )}

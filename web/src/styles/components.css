@@ -465,152 +465,85 @@
   border: 0;
 }
 
-/* Phone alert timeline: one 2-line grid shared by the header and every row.
-   Line 1 is 时间 代码 名称 级别. Line 2 is 类型 范围 触发价 状态,
-   so 范围 stays immediately after 类型 and the row fits the container. */
-@media (max-width: 599px) {
-  .tbl-wrap:has(> table[aria-label="告警时间线"]) {
-    overflow-x: clip;
-  }
-  table[aria-label="告警时间线"] {
-    display: grid;
-    grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.95fr) minmax(0, 0.7fr) minmax(0, 1.25fr);
-    width: 100%;
-    min-width: 0;
-  }
-  table[aria-label="告警时间线"] > thead,
-  table[aria-label="告警时间线"] > tbody {
-    display: grid;
-    grid-template-columns: subgrid;
-    grid-column: 1 / -1;
-    min-width: 0;
-  }
-  table[aria-label="告警时间线"] tr:has([data-phone-line="2"]) {
-    display: grid;
-    grid-template-columns: subgrid;
-    grid-column: 1 / -1;
-    align-items: stretch;
-    min-width: 0;
-    border-bottom: 1px solid var(--rule);
-  }
-  table[aria-label="告警时间线"] tr:not(:has([data-phone-line="2"])) {
-    display: block;
-    grid-column: 1 / -1;
-  }
-  table[aria-label="告警时间线"] tr:has([data-phone-line="2"]) > th,
-  table[aria-label="告警时间线"] tr:has([data-phone-line="2"]) > td {
-    display: flex;
-    align-items: center;
-    min-width: 0;
-    height: auto;
-    white-space: normal;
-    border-bottom: 0;
-    box-shadow: none;
-    padding: 6px 8px;
-  }
-  table[aria-label="告警时间线"] tr:has([data-phone-line="2"]) > .num {
-    justify-content: flex-end;
-  }
-  table[aria-label="告警时间线"] .ack-cell {
-    flex-wrap: wrap;
-    min-width: 0;
-  }
-  table[aria-label="告警时间线"] tr:has([data-phone-line="2"]) > :nth-child(1) {
-    grid-column: 1;
-    grid-row: 1;
-  }
-  table[aria-label="告警时间线"] tr:has([data-phone-line="2"]) > :nth-child(2) {
-    grid-column: 2;
-    grid-row: 1;
-  }
-  table[aria-label="告警时间线"] tr:has([data-phone-line="2"]) > :nth-child(3) {
-    grid-column: 3;
-    grid-row: 1;
-  }
-  table[aria-label="告警时间线"] tr:has([data-phone-line="2"]) > :nth-child(4) {
-    grid-column: 4;
-    grid-row: 1;
-  }
-  table[aria-label="告警时间线"] tr:has([data-phone-line="2"]) > :nth-child(5) {
-    grid-column: 1;
-    grid-row: 2;
-  }
-  table[aria-label="告警时间线"] tr:has([data-phone-line="2"]) > :nth-child(6) {
-    grid-column: 3;
-    grid-row: 2;
-  }
-  table[aria-label="告警时间线"] tr:has([data-phone-line="2"]) > :nth-child(7) {
-    grid-column: 2;
-    grid-row: 2;
-  }
-  table[aria-label="告警时间线"] tr:has([data-phone-line="2"]) > :nth-child(8) {
-    grid-column: 4;
-    grid-row: 2;
-  }
+/* Phone lists replace the wide tables. Two lines, no header. */
+.li2-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
 }
-
-/* Phone latest signals: line 1 is 时间 代码 名称, line 2 is 策略 and 动作,
-   so 动作 stays inside the container. */
-@media (max-width: 599px) {
-  .tbl-wrap:has(> table[aria-label="最新信号"]) {
-    overflow-x: clip;
-  }
-  table[aria-label="最新信号"] {
-    display: grid;
-    grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr) minmax(0, 0.95fr);
-    width: 100%;
-    min-width: 0;
-  }
-  table[aria-label="最新信号"] > thead,
-  table[aria-label="最新信号"] > tbody {
-    display: grid;
-    grid-template-columns: subgrid;
-    grid-column: 1 / -1;
-    min-width: 0;
-  }
-  table[aria-label="最新信号"] tr:has([data-phone-line="2"]) {
-    display: grid;
-    grid-template-columns: subgrid;
-    grid-column: 1 / -1;
-    align-items: stretch;
-    min-width: 0;
-    border-bottom: 1px solid var(--rule);
-  }
-  table[aria-label="最新信号"] tr:not(:has([data-phone-line="2"])) {
-    display: block;
-    grid-column: 1 / -1;
-  }
-  table[aria-label="最新信号"] tr:has([data-phone-line="2"]) > th,
-  table[aria-label="最新信号"] tr:has([data-phone-line="2"]) > td {
-    display: flex;
-    align-items: center;
-    min-width: 0;
-    height: auto;
-    white-space: normal;
-    border-bottom: 0;
-    box-shadow: none;
-    padding: 6px 8px;
-  }
-  table[aria-label="最新信号"] tr:has([data-phone-line="2"]) > :nth-child(1) {
-    grid-column: 1;
-    grid-row: 1;
-  }
-  table[aria-label="最新信号"] tr:has([data-phone-line="2"]) > :nth-child(2) {
-    grid-column: 2;
-    grid-row: 1;
-  }
-  table[aria-label="最新信号"] tr:has([data-phone-line="2"]) > :nth-child(3) {
-    grid-column: 3;
-    grid-row: 1;
-  }
-  table[aria-label="最新信号"] tr:has([data-phone-line="2"]) > :nth-child(4) {
-    grid-column: 1 / 3;
-    grid-row: 2;
-  }
-  table[aria-label="最新信号"] tr:has([data-phone-line="2"]) > :nth-child(5) {
-    grid-column: 3;
-    grid-row: 2;
-  }
+.li2 {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 2px 12px;
+  min-height: 44px;
+  padding: 8px 16px;
+  border-top: 1px solid var(--surface-2);
+  color: var(--ink);
+}
+.li2 .t {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  min-width: 0;
+  overflow: hidden;
+  font-weight: 500;
+}
+.li2 .t .name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.li2 .t .code {
+  flex: none;
+  font: var(--t-label);
+  font-variant-numeric: tabular-nums;
+  color: var(--c-muted);
+}
+.li2 .meta {
+  grid-column: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: var(--t-label);
+  color: var(--c-muted);
+}
+.li2 .v,
+.li2 .side {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  text-align: right;
+  white-space: nowrap;
+}
+.li2 .v {
+  font: 600 15px / 20px var(--font-sans);
+  font-variant-numeric: tabular-nums;
+  color: var(--c-ink);
+}
+/* 390px dated rows are 2px short of a 4-character pool name. This gap is the room. */
+.li2.alert-row {
+  column-gap: 8px;
+}
+.li2 .meta.alert-meta {
+  display: flex;
+  align-items: baseline;
+  gap: 0.25em;
+  text-overflow: clip;
+}
+.alert-meta-keep {
+  flex: none;
+  white-space: nowrap;
+}
+.alert-meta-pool {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* ---------- form controls ---------- */
@@ -1478,6 +1411,12 @@
   font: 400 12px / 16px var(--font-sans);
   color: var(--c-muted);
 }
+.rule-fields fieldset:has(.rule-check) {
+  gap: 0;
+}
+.rule-fields fieldset:has(.rule-check) legend {
+  margin-bottom: 4px;
+}
 .rule-fields legend {
   font: inherit;
   color: inherit;
@@ -1517,13 +1456,20 @@
   display: flex;
   align-items: center;
   gap: 8px;
+  box-sizing: border-box;
+  height: 44px;
   min-height: 44px;
-  font-weight: 400;
+  max-height: 44px;
+  margin: 0;
+  color: var(--c-ink);
+  font: 400 14px / 20px var(--font-sans);
 }
-.rule-check input {
+.rule-fields .rule-check input {
   width: 16px;
   height: 16px;
   min-height: 16px;
+  max-height: 16px;
+  margin: 0;
 }
 .cool {
   display: flex;
