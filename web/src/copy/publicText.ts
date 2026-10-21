@@ -220,16 +220,38 @@ export function datasetListLabel(value: string | null | undefined): string {
     .join("、");
 }
 
+/**
+ * Strategy signal actions. Same words as
+ * `rquant.runtime_notification_providers.SIGNAL_ACTION_LABELS`.
+ * `watch` is the strategy's watching state, not the saved pool 自选.
+ */
 const SIGNAL_ACTION: Record<string, string> = {
-  buy: "买入",
-  sell: "卖出",
-  watch: "自选",
+  watch: "重点观察",
+  b_intent: "买入观察",
+  reduce: "减仓观察",
+  s_intent: "卖出观察",
+  cancel: "取消信号",
 };
 
-/** Latest-signal action. `watch` is the same word as the saved pool. */
 export function signalActionLabel(value: string | null | undefined): string {
   if (!value) return "—";
   return SIGNAL_ACTION[value.toLowerCase()] ?? (/[A-Za-z]/.test(value) ? "其他" : value);
+}
+
+/** Rising red for a buy intent, falling green for a sell or a reduction. */
+export function signalActionTone(value: string | null | undefined): "up" | "down" | "" {
+  const key = value?.toLowerCase();
+  if (key === "b_intent") return "up";
+  if (key === "s_intent" || key === "reduce") return "down";
+  return "";
+}
+
+const LISTED_STOCK = /^\d{6}\.(SH|SZ|BJ)$/;
+
+/** An A-share code. Anything else, such as `daily-summary:<date>`, is not a code. */
+export function listedStockCode(value: string | null | undefined): string | null {
+  if (!value || !LISTED_STOCK.test(value)) return null;
+  return value;
 }
 
 export function tokenLabel(value: string | null | undefined): string {

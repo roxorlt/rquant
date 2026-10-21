@@ -37,6 +37,8 @@ export interface TipProps {
   autoAdjustOverflow?: boolean;
   /** CSS selector for fields the bubble must sit above, such as the name input. */
   avoid?: string;
+  /** CSS selector for the label the bubble should stay against. */
+  pinTo?: string;
 }
 
 export function overlaps(
@@ -78,6 +80,31 @@ function nudge(el: HTMLElement, dx: number, dy: number): void {
   else if (dy && bottom && bottom !== "auto") el.style.bottom = `${parseFloat(bottom) - dy}px`;
 }
 
+type Box = { left: number; top: number; right: number; bottom: number };
+
+/** Keep the bubble against the label: above it, or below when above would leave the viewport. */
+export function pinBeside(
+  tip: Box,
+  anchor: Box,
+  viewport: { width: number; height: number },
+  inset: number,
+  gap: number,
+): { x: number; y: number } {
+  const aboveY = anchor.top - gap - tip.bottom;
+  const aboveTop = tip.top + aboveY;
+  const belowY = anchor.bottom + gap - tip.top;
+  const belowBottom = tip.bottom + belowY;
+  const y = aboveTop >= inset || belowBottom > viewport.height - inset ? aboveY : belowY;
+  const moved = {
+    left: tip.left,
+    top: tip.top + y,
+    right: tip.right,
+    bottom: tip.bottom + y,
+  };
+  const clamped = clampShift(moved, viewport, inset);
+  return { x: clamped.x, y: y + clamped.y };
+}
+
 export function clampShift(
   rect: { left: number; top: number; right: number; bottom: number },
   viewport: { width: number; height: number },
@@ -113,6 +140,7 @@ export function Tip({
   inset,
   autoAdjustOverflow,
   avoid,
+  pinTo,
 }: TipProps) {
   const touch = useTouchOnly();
   if (content === null || content === undefined || content === "") {
@@ -135,7 +163,7 @@ export function Tip({
       mouseEnterDelay={0.15}
       destroyOnHidden
       onOpenChange={(open) => {
-        if (inset === undefined) return;
+        if (inset === undefined && !pinTo) return;
         const apply = (tries = 0) => {
           const el = document.querySelector<HTMLElement>(".rq-tip:not(.ant-tooltip-hidden)");
           if (!el) {
@@ -144,6 +172,14 @@ export function Tip({
           }
           if (!open) return;
           const rect = el.getBoundingClientRect();
+          const viewport = { width: window.innerWidth, height: window.innerHeight };
+          const anchor = pinTo ? document.querySelector(pinTo) : null;
+          if (anchor && inset !== undefined) {
+            const shift = pinBeside(rect, anchor.getBoundingClientRect(), viewport, inset, 4);
+            nudge(el, shift.x, shift.y);
+            return;
+          }
+          if (inset === undefined) return;
           const blockers = avoid
             ? [...document.querySelectorAll(avoid)].map((node) => node.getBoundingClientRect())
             : [];
@@ -154,11 +190,7 @@ export function Tip({
             right: rect.right + clear.x,
             bottom: rect.bottom + clear.y,
           };
-          const shift = clampShift(
-            moved,
-            { width: window.innerWidth, height: window.innerHeight },
-            inset,
-          );
+          const shift = clampShift(moved, viewport, inset);
           nudge(el, clear.x + shift.x, clear.y + shift.y);
         };
         window.setTimeout(() => apply(0), 80);

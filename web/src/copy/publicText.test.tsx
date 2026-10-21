@@ -1,6 +1,6 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { QueryView } from "@/pages/shared";
 import { renderApp } from "@/test/render";
@@ -16,11 +16,13 @@ import {
   datasetLabel,
   datasetListLabel,
   entryModeLabel,
+  listedStockCode,
   poolDisplayName,
   poolRefLabel,
   presetLabel,
   publicLine,
   signalActionLabel,
+  signalActionTone,
   studyLabel,
   TRIGGER_LABEL,
   triggerLabel,
@@ -124,9 +126,18 @@ describe("public copy", () => {
     expect(datasetLabel("daily_basic")).toBe("每日指标");
     expect(datasetListLabel("daily_bar,daily_basic")).toBe("日线行情、每日指标");
     expect(datasetListLabel("daily")).toBe("日线");
-    expect(signalActionLabel("watch")).toBe("自选");
-    expect(signalActionLabel("buy")).toBe("买入");
-    expect(signalActionLabel("sell")).toBe("卖出");
+    expect(signalActionLabel("watch")).toBe("重点观察");
+    expect(signalActionLabel("b_intent")).toBe("买入观察");
+    expect(signalActionLabel("reduce")).toBe("减仓观察");
+    expect(signalActionLabel("s_intent")).toBe("卖出观察");
+    expect(signalActionLabel("cancel")).toBe("取消信号");
+    expect(signalActionTone("b_intent")).toBe("up");
+    expect(signalActionTone("s_intent")).toBe("down");
+    expect(signalActionTone("reduce")).toBe("down");
+    expect(signalActionTone("watch")).toBe("");
+    expect(signalActionTone("cancel")).toBe("");
+    expect(listedStockCode("600519.SH")).toBe("600519.SH");
+    expect(listedStockCode("daily-summary:2026-10-20")).toBeNull();
     expect(publicLine("API 0.31 正常响应")).toBeNull();
     expect(boardSystemLabel("dc_industry")).toBe("行业");
     expect(poolDisplayName("观察名单（同花顺原条件，非买入信号）")).toBe("观察名单");
@@ -150,6 +161,46 @@ describe("public copy", () => {
                     at: "2026-10-20T08:00:00Z",
                     code: "600519.SH",
                     name: "贵州茅台",
+                    strategy_id: "breakout",
+                    action: "watch",
+                  },
+                  {
+                    sequence: 2,
+                    at: "2026-10-20T07:00:00Z",
+                    code: "000001.SZ",
+                    name: "平安银行",
+                    strategy_id: "breakout",
+                    action: "b_intent",
+                  },
+                  {
+                    sequence: 3,
+                    at: "2026-10-20T06:00:00Z",
+                    code: "300750.SZ",
+                    name: "宁德时代",
+                    strategy_id: "breakout",
+                    action: "reduce",
+                  },
+                  {
+                    sequence: 4,
+                    at: "2026-10-20T05:00:00Z",
+                    code: "601318.SH",
+                    name: "中国平安",
+                    strategy_id: "breakout",
+                    action: "s_intent",
+                  },
+                  {
+                    sequence: 5,
+                    at: "2026-10-20T04:00:00Z",
+                    code: "600519.SH",
+                    name: "贵州茅台",
+                    strategy_id: "breakout",
+                    action: "cancel",
+                  },
+                  {
+                    sequence: 6,
+                    at: "2026-10-20T03:00:00Z",
+                    code: "daily-summary:2026-10-20",
+                    name: null,
                     strategy_id: "breakout",
                     action: "watch",
                   },
@@ -257,8 +308,21 @@ describe("public copy", () => {
     const overview = renderApp("/overview");
     await screen.findByText("跳空高开");
     const signals = screen.getByRole("table", { name: "最新信号" });
-    expect(signals).toHaveTextContent("自选");
+    expect(signals).toHaveTextContent("重点观察");
+    expect(signals).toHaveTextContent("买入观察");
+    expect(signals).toHaveTextContent("减仓观察");
+    expect(signals).toHaveTextContent("卖出观察");
+    expect(signals).toHaveTextContent("取消信号");
     expect(signals).not.toHaveTextContent("watch");
+    expect(signals).not.toHaveTextContent("daily-summary");
+    expect(signals).not.toHaveTextContent("自选");
+    expect(screen.getByText("买入观察")).toHaveClass("up");
+    expect(screen.getByText("卖出观察")).toHaveClass("down");
+    expect(screen.getByText("减仓观察")).toHaveClass("down");
+    expect(within(signals).getByRole("columnheader", { name: "动作" })).toHaveAttribute(
+      "data-phone-line",
+      "2",
+    );
     expect(screen.getByText("放量")).toBeInTheDocument();
     expect(screen.getByText("数据发布")).toBeInTheDocument();
     expect(document.body.textContent ?? "").toContain("日线采集：空闲");

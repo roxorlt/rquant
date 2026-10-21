@@ -3,10 +3,12 @@ import { Link } from "react-router";
 import { useAlerts, useHealth, useOverview } from "@/api/endpoints";
 import {
   layerTitle,
+  listedStockCode,
   presetLabel,
   publicLine,
   publicLines,
   signalActionLabel,
+  signalActionTone,
   triggerLabel,
 } from "@/copy/publicText";
 import { formatShanghaiDateTime } from "@/format/time";
@@ -223,29 +225,26 @@ export default function OverviewPage() {
                   {
                     id: "code",
                     header: "代码",
-                    value: (row) => row.code,
-                    cell: (row) => <StockLink code={row.code} />,
+                    value: (row) => listedStockCode(row.code),
+                    cell: (row) => {
+                      const code = listedStockCode(row.code);
+                      return code ? <StockLink code={code} /> : "—";
+                    },
                   },
                   { id: "name", header: "名称", value: (row) => row.name ?? null },
                   {
                     id: "strategy",
                     header: "策略",
+                    phoneLine: 2,
                     value: (row) => presetLabel(row.strategy_id),
                   },
                   {
                     id: "action",
                     header: "动作",
+                    phoneLine: 2,
                     value: (row) => row.action,
                     cell: (row) => (
-                      <span
-                        className={
-                          /buy|买/i.test(row.action)
-                            ? "up"
-                            : /sell|卖/i.test(row.action)
-                              ? "down"
-                              : ""
-                        }
-                      >
+                      <span className={signalActionTone(row.action) || undefined}>
                         {signalActionLabel(row.action)}
                       </span>
                     ),

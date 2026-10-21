@@ -183,7 +183,7 @@ export function AlertRules() {
                 placement={touch ? "topLeft" : "left"}
                 autoAdjustOverflow={false}
                 inset={12}
-                avoid='.drawer-h, label.fld:has([aria-label="规则名称"])'
+                pinTo={touch ? "fieldset legend .tip-anchor" : undefined}
                 className="has-tip"
               >
                 范围
