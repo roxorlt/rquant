@@ -2,9 +2,10 @@ import { type FormEvent, useState } from "react";
 import type { Schemas } from "@/api/client";
 import { useAlertRules, useSaveAlertRule } from "@/api/endpoints";
 import { useReadOnlyReason } from "@/api/useMeta";
+import { AlertPoolTip } from "@/copy/AlertPoolTip";
 import {
   ALERT_POOL_ORDER,
-  ALERT_POOL_TIP,
+  ALERT_POOL_TIP_WIDTH,
   type AlertPoolId,
   alertPoolLabel,
   alertPoolLabels,
@@ -96,7 +97,8 @@ export function AlertRules() {
                 {
                   id: "pools",
                   header: "范围",
-                  headerTip: ALERT_POOL_TIP,
+                  headerTip: <AlertPoolTip />,
+                  headerTipWidth: ALERT_POOL_TIP_WIDTH,
                   value: (row) => (row.pools ?? []).join(","),
                   cell: (row) => alertPoolLabels(row.pools),
                 },
@@ -174,7 +176,7 @@ export function AlertRules() {
           </label>
           <fieldset>
             <legend>
-              <Tip content={ALERT_POOL_TIP} className="has-tip">
+              <Tip content={<AlertPoolTip />} width={ALERT_POOL_TIP_WIDTH} className="has-tip">
                 范围
               </Tip>
             </legend>

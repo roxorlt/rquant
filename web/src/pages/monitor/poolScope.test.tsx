@@ -2,7 +2,13 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { ALERT_POOL_TIP, alertPoolLabel, alertPoolLabels } from "@/copy/publicText";
+import {
+  ALERT_POOL_TIP,
+  ALERT_POOL_TIP_PARAGRAPHS,
+  ALERT_POOL_TIP_WIDTH,
+  alertPoolLabel,
+  alertPoolLabels,
+} from "@/copy/publicText";
 import { renderApp } from "@/test/render";
 
 const serving = { state: "ready", generation_id: "g", generated_at: "2026-10-20T07:00:00Z" };
@@ -100,7 +106,18 @@ beforeEach(() => {
 async function expectOpenTip(): Promise<void> {
   const tips = await screen.findAllByRole("tooltip");
   expect(tips.length).toBeGreaterThan(0);
-  for (const tip of tips) expect(tip.textContent).toBe(ALERT_POOL_TIP);
+  for (const tip of tips) {
+    expect(tip.textContent).toBe(ALERT_POOL_TIP);
+    const paragraphs = [...tip.querySelectorAll("p")].map((paragraph) => paragraph.textContent);
+    expect(paragraphs).toEqual([...ALERT_POOL_TIP_PARAGRAPHS]);
+    const bubble = tip.closest(".ant-tooltip");
+    expect(bubble).toHaveStyle({ maxWidth: `${ALERT_POOL_TIP_WIDTH}px` });
+    const box = tip.querySelector(".ant-tooltip-container") ?? tip;
+    expect(box).toHaveStyle({
+      width: `${ALERT_POOL_TIP_WIDTH}px`,
+      maxWidth: `${ALERT_POOL_TIP_WIDTH}px`,
+    });
+  }
 }
 
 function media(matches: (query: string) => boolean): typeof window.matchMedia {

@@ -144,8 +144,16 @@ const ALERT_POOL_LABEL: Record<AlertPoolId, string> = {
   manual: "自选",
 };
 
-export const ALERT_POOL_TIP =
-  "N字初筛：每个交易日 17:00 后，按 N 字形态自动筛出的股票，每天整批更新。N字精选：从最近的 N字初筛里再筛出的股票，最多跟踪 6 个交易日，跌破止损位会提前移出。两者都自动更新，不用手动维护。";
+/** Visible width of the scope explanation bubble. */
+export const ALERT_POOL_TIP_WIDTH = 240;
+
+export const ALERT_POOL_TIP_PARAGRAPHS = [
+  "N字初筛：每个交易日 17:00 后，按 N 字形态自动筛出的股票，每天整批更新。",
+  "N字精选：从最近的 N字初筛里再筛出的股票，最多跟踪 6 个交易日，跌破止损位会提前移出。两者都自动更新，不用手动维护。",
+] as const;
+
+/** Same wording as the two paragraphs, with no extra characters between them. */
+export const ALERT_POOL_TIP = ALERT_POOL_TIP_PARAGRAPHS.join("");
 
 const ALERT_POOL_RANK = new Map<string, number>(ALERT_POOL_ORDER.map((id, index) => [id, index]));
 

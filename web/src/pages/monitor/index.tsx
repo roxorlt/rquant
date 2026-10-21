@@ -7,7 +7,8 @@ import {
   useUnackAlert,
 } from "@/api/endpoints";
 import { useReadOnlyReason } from "@/api/useMeta";
-import { ALERT_POOL_TIP, alertPoolLabel, triggerLabel } from "@/copy/publicText";
+import { AlertPoolTip } from "@/copy/AlertPoolTip";
+import { ALERT_POOL_TIP_WIDTH, alertPoolLabel, triggerLabel } from "@/copy/publicText";
 import { formatPrice } from "@/format/number";
 import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
@@ -205,7 +206,8 @@ export default function MonitorPage() {
                   {
                     id: "pool",
                     header: "范围",
-                    headerTip: ALERT_POOL_TIP,
+                    headerTip: <AlertPoolTip />,
+                    headerTipWidth: ALERT_POOL_TIP_WIDTH,
                     phoneLine: 2,
                     value: (row) => row.pool ?? null,
                     cell: (row) => alertPoolLabel(row.pool),

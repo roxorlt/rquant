@@ -7,6 +7,8 @@ import { renderApp } from "@/test/render";
 import {
   ALERT_POOL_ORDER,
   ALERT_POOL_TIP,
+  ALERT_POOL_TIP_PARAGRAPHS,
+  ALERT_POOL_TIP_WIDTH,
   actorLabel,
   alertPoolLabel,
   alertPoolLabels,
@@ -100,6 +102,11 @@ describe("public copy", () => {
       "N字精选",
       "自选",
     ]);
+    expect(ALERT_POOL_TIP_WIDTH).toBe(240);
+    expect(ALERT_POOL_TIP_PARAGRAPHS[0]).toMatch(/^N字初筛：/);
+    expect(ALERT_POOL_TIP_PARAGRAPHS[1]).toMatch(/^N字精选：/);
+    expect(ALERT_POOL_TIP_PARAGRAPHS[1]?.endsWith("两者都自动更新，不用手动维护。")).toBe(true);
+    expect(ALERT_POOL_TIP_PARAGRAPHS.join("")).toBe(ALERT_POOL_TIP);
     expect(ALERT_POOL_TIP).toBe(
       "N字初筛：每个交易日 17:00 后，按 N 字形态自动筛出的股票，每天整批更新。N字精选：从最近的 N字初筛里再筛出的股票，最多跟踪 6 个交易日，跌破止损位会提前移出。两者都自动更新，不用手动维护。",
     );

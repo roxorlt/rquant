@@ -35,6 +35,8 @@ export interface DataColumn<T> {
   hiddenByDefault?: boolean;
   /** Dotted-underline explanation on the header word. The menu and CSV keep `header`. */
   headerTip?: ReactNode;
+  /** Bubble width for `headerTip`. Omit it and the tip keeps the default width. */
+  headerTipWidth?: number;
   /** On a phone, this column shares the second line of its row. */
   phoneLine?: 2;
 }
@@ -359,7 +361,11 @@ export function DataTable<T>({
                           </span>
                         </button>
                       ) : meta?.headerTip ? (
-                        <Tip content={meta.headerTip} className="has-tip">
+                        <Tip
+                          content={meta.headerTip}
+                          width={meta.headerTipWidth}
+                          className="has-tip"
+                        >
                           {meta.header}
                         </Tip>
                       ) : (

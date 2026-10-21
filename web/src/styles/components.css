@@ -800,6 +800,14 @@
   line-height: 1.6;
   max-width: min(360px, calc(100vw - 32px));
 }
+.scope-tip {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-3);
+}
+.scope-tip p {
+  margin: 0;
+}
 .tip-detail {
   font-family: var(--font-mono);
   font-size: 11px;

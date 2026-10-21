@@ -29,6 +29,8 @@ export interface TipProps {
    */
   interactive?: boolean;
   className?: string;
+  /** Visible bubble width in pixels. Omit it and the tip keeps the default width. */
+  width?: number;
 }
 
 /**
@@ -36,7 +38,14 @@ export interface TipProps {
  * where there is no hover. Technical detail (ids, raw errors) lives here, never in the
  * page text (web/CLAUDE.md 「界面与文案原则」).
  */
-export function Tip({ content, children, placement = "top", interactive, className }: TipProps) {
+export function Tip({
+  content,
+  children,
+  placement = "top",
+  interactive,
+  className,
+  width,
+}: TipProps) {
   const touch = useTouchOnly();
   if (content === null || content === undefined || content === "") {
     return <>{children}</>;
@@ -57,6 +66,14 @@ export function Tip({ content, children, placement = "top", interactive, classNa
       mouseEnterDelay={0.15}
       destroyOnHidden
       classNames={{ root: "rq-tip" }}
+      styles={
+        width === undefined
+          ? undefined
+          : {
+              root: { maxWidth: width },
+              container: { width, maxWidth: width, boxSizing: "border-box" },
+            }
+      }
     >
       {anchor}
     </Tooltip>
