@@ -41,9 +41,7 @@ function PaperCharts({ account }: { account: Account }) {
             format={(v) => v.toFixed(3)}
             series={[{ name: "净值", values: nav.map((p) => p.nav), color: "var(--accent)" }]}
           />
-        ) : (
-          <p className="hint">这个账户没有逐日净值（实盘镜像账户只有当前快照）。</p>
-        )}
+        ) : null}
       </div>
       <div>
         <h3 className="sub">行业权重</h3>
@@ -102,6 +100,10 @@ export default function PaperPage() {
                     },
                   ]}
                 />
+                <p className="hint">
+                  这是模拟账户，不用真钱：起始资金 10
+                  万，按策略信号自动模拟买卖。现价、市值、浮盈按最后一次成交价算，不是实时行情。
+                </p>
                 <PaperCharts account={account} />
                 <DataTable
                   label="持仓"
