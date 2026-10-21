@@ -52,6 +52,17 @@ function TdxImport() {
           onRetry={() => ai.mutate(text)}
         />
       ) : null}
+      {ai.data ? (
+        <output className="formula-result" aria-label="生成结果">
+          <div className="formula-result-h">
+            <span className="formula-result-label">生成结果</span>
+            <span className={ai.data.expression ? "st ok" : "st warn"}>
+              {ai.data.expression ? "校验通过" : "有 1 处不认识"}
+            </span>
+          </div>
+          <div className="formula-result-expr">{ai.data.expression ?? ai.data.error}</div>
+        </output>
+      ) : null}
       <textarea
         aria-label="通达信公式"
         rows={3}
@@ -69,7 +80,7 @@ function TdxImport() {
         />
       ) : null}
       {result ? (
-        <div className="formula-result">
+        <output className="formula-result" aria-label="翻译结果">
           <div className="formula-result-h">
             <span className="formula-result-label">翻译结果</span>
             <span className={passed ? "st ok" : "st warn"}>
@@ -77,7 +88,7 @@ function TdxImport() {
             </span>
           </div>
           <div className="formula-result-expr">{result.expression ?? result.error}</div>
-        </div>
+        </output>
       ) : null}
     </Panel>
   );

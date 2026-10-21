@@ -111,6 +111,7 @@
   }
 }
 .formula-result {
+  display: block;
   margin-top: 8px;
   background: var(--c-surface-2);
   border-radius: var(--r-sm);
