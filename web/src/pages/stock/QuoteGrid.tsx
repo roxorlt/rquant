@@ -1,21 +1,22 @@
 import { useState } from "react";
 import type { Schemas } from "@/api/client";
+import { formatFixed } from "@/format/number";
 import { PHONE_QUERY, useMedia } from "../panorama/useMedia";
 
 type Profile = Schemas["StockProfile"];
 type Cell = { k: string; v: string; tone?: "up" | "down" | "" };
 
-const f2 = (v: number | null | undefined, d = 2) => (v == null ? "—" : v.toFixed(d));
+const f2 = (v: number | null | undefined, d = 2) => (v == null ? "—" : formatFixed(v, d));
 const sign = (v: number | null | undefined): "up" | "down" | "" =>
   v == null || v === 0 ? "" : v > 0 ? "up" : "down";
 const pct = (v: number | null | undefined) =>
-  v == null ? "—" : `${v > 0 ? "+" : ""}${(v * 100).toFixed(2)}%`;
+  v == null ? "—" : `${v > 0 ? "+" : ""}${formatFixed(v * 100, 2)}%`;
 /** 万元 → 亿 */
 const yi = (wan: number | null | undefined) =>
-  wan == null ? "—" : wan >= 1e4 ? `${(wan / 1e4).toFixed(2)}亿` : `${wan.toFixed(0)}万`;
+  wan == null ? "—" : wan >= 1e4 ? `${formatFixed(wan / 1e4, 2)}亿` : `${formatFixed(wan, 0)}万`;
 
 /** 手 → 万手; 外/内盘 come from the 5-minute bars (tick rule), absent without them */
-const lots = (v: number | null | undefined) => (v == null ? "—" : `${(v / 1e4).toFixed(2)}万手`);
+const lots = (v: number | null | undefined) => (v == null ? "—" : `${formatFixed(v / 1e4, 2)}万手`);
 
 /** Phone first screen, in this order. Everything else sits behind 全部 N 项. */
 const PHONE_FIRST = ["今开", "最高", "最低", "成交额", "换手率", "总市值"] as const;
@@ -47,12 +48,15 @@ export function QuoteGrid({ s }: { s: Profile }) {
     { k: "昨收", v: f2(pre) },
     { k: "涨停", v: f2(q.limit_up), tone: "up" },
     { k: "跌停", v: f2(q.limit_down), tone: "down" },
-    { k: "成交量", v: t.vol == null ? "—" : `${(t.vol / 1e4).toFixed(2)}万手` },
-    { k: "成交额", v: t.amount == null ? "—" : `${(t.amount / 1e5).toFixed(2)}亿` },
-    { k: "振幅", v: amp == null ? "—" : `${amp.toFixed(2)}%` },
+    { k: "成交量", v: t.vol == null ? "—" : `${formatFixed(t.vol / 1e4, 2)}万手` },
+    { k: "成交额", v: t.amount == null ? "—" : `${formatFixed(t.amount / 1e5, 2)}亿` },
+    { k: "振幅", v: amp == null ? "—" : `${formatFixed(amp, 2)}%` },
     { k: "量比", v: f2(volRatio), tone: volRatio == null ? "" : volRatio >= 1 ? "up" : "down" },
-    { k: "换手率", v: v?.turnover_rate == null ? "—" : `${v.turnover_rate.toFixed(2)}%` },
-    { k: "换手(自由)", v: v?.turnover_rate_f == null ? "—" : `${v.turnover_rate_f.toFixed(2)}%` },
+    { k: "换手率", v: v?.turnover_rate == null ? "—" : `${formatFixed(v.turnover_rate, 2)}%` },
+    {
+      k: "换手(自由)",
+      v: v?.turnover_rate_f == null ? "—" : `${formatFixed(v.turnover_rate_f, 2)}%`,
+    },
     { k: "外盘", v: lots(outer), tone: "up" },
     { k: "内盘", v: lots(inner), tone: "down" },
     {
@@ -65,7 +69,7 @@ export function QuoteGrid({ s }: { s: Profile }) {
     { k: "PE(TTM)", v: f2(v?.pe_ttm, 1) },
     { k: "PB", v: f2(v?.pb) },
     { k: "PS(TTM)", v: f2(v?.ps_ttm) },
-    { k: "股息率", v: v?.dv_ttm == null ? "—" : `${v.dv_ttm.toFixed(2)}%` },
+    { k: "股息率", v: v?.dv_ttm == null ? "—" : `${formatFixed(v.dv_ttm, 2)}%` },
     { k: "ROE", v: s.fundamentals.roe == null ? "—" : `${f2(s.fundamentals.roe)}%` },
     { k: "52周高", v: f2(hi52) },
     { k: "52周低", v: f2(lo52) },

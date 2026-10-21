@@ -2,7 +2,7 @@ import { useCallback, useState } from "react";
 import { useLocation, useNavigate, useSearchParams } from "react-router";
 import { inTradingHours, useMarketLive } from "@/api/endpoints";
 import { TimeChart } from "@/charts/Chart";
-import { formatAmount, formatCount } from "@/format/number";
+import { formatAmount, formatCount, formatFixed } from "@/format/number";
 import { DataTable } from "@/table/DataTable";
 import { ChangeText, KpiStrip, Panel, Segmented } from "@/ui";
 import { QueryView } from "../shared";
@@ -10,7 +10,7 @@ import { BoardDetail } from "./BoardDetail";
 import { Heatmap } from "./Heatmap";
 import { PHONE_QUERY, useMedia } from "./useMedia";
 
-const pct = (v: number) => `${(v * 100).toFixed(0)}%`;
+const pct = (v: number) => `${formatFixed(v * 100, 0)}%`;
 
 type Lens = "breadth" | "limit";
 
@@ -146,7 +146,7 @@ export function LivePanorama() {
                     label="涨停与炸板家数"
                     dates={c.t}
                     height={150}
-                    format={(v) => v.toFixed(0)}
+                    format={(v) => formatFixed(v, 0)}
                     series={[
                       { name: "涨停", values: c.limit_up, color: "var(--up)" },
                       { name: "炸板", values: c.broken, color: "var(--muted)", dashed: true },

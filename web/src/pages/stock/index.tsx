@@ -2,7 +2,8 @@ import type { ReactNode } from "react";
 import { Link, useParams } from "react-router";
 import { useStock } from "@/api/endpoints";
 import { useUrlState } from "@/app/useUrlState";
-import { triggerLabel } from "@/copy/publicText";
+import { poolRefLabel, triggerLabel } from "@/copy/publicText";
+import { formatFixed } from "@/format/number";
 import { formatShanghaiDateTime } from "@/format/time";
 import { ChangeText, PageHeader, Panel, Pill, Segmented } from "@/ui";
 import { QueryView } from "../shared";
@@ -12,7 +13,7 @@ import { KlinePanel } from "./Kline";
 import { QuoteGrid } from "./QuoteGrid";
 import { TpoPanel } from "./Tpo";
 
-const fix = (v: number | null | undefined, d = 2) => (v == null ? "—" : v.toFixed(d));
+const fix = (v: number | null | undefined, d = 2) => (v == null ? "—" : formatFixed(v, d));
 
 function ChartTabs({
   kline,
@@ -56,7 +57,7 @@ export default function StockPage() {
                 <span className="stock-head">
                   <span>{s.name ?? s.code}</span>
                   <span className="mono hint">{s.code}</span>
-                  {last ? <span className="px">{last.close.toFixed(2)}</span> : null}
+                  {last ? <span className="px">{formatFixed(last.close, 2)}</span> : null}
                   {last ? <ChangeText value={last.pct_chg ?? null} /> : null}
                 </span>
               }
@@ -109,7 +110,7 @@ export default function StockPage() {
                   {s.pools.length ? (
                     s.pools.map((p) => (
                       <Link key={p} to={`/pools?pool=${encodeURIComponent(p)}`}>
-                        <Pill kind="ok">{p}</Pill>
+                        <Pill kind="ok">{poolRefLabel(p)}</Pill>
                       </Link>
                     ))
                   ) : (

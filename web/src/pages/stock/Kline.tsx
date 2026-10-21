@@ -4,14 +4,15 @@ import { useChips } from "@/api/endpoints";
 import { Candles, clampView } from "@/charts/Candles";
 import { boll, kdj, macd, obv, rsi, sma } from "@/charts/indicators";
 import { SubChart, type SubSeries } from "@/charts/SubChart";
+import { formatFixed } from "@/format/number";
 import { Panel } from "@/ui";
 
 type Bar = Schemas["StockProfile"]["bars"][number];
 
-const pct = (v: number) => `${(v * 100).toFixed(1)}%`;
-const band = (b: readonly number[]) => `${(b[0] ?? 0).toFixed(2)}–${(b[1] ?? 0).toFixed(2)}`;
+const pct = (v: number) => `${formatFixed(v * 100, 1)}%`;
+const band = (b: readonly number[]) => `${formatFixed(b[0] ?? 0, 2)}–${formatFixed(b[1] ?? 0, 2)}`;
 
-const fmt = (v: number | null | undefined) => (v == null ? "—" : v.toFixed(2));
+const fmt = (v: number | null | undefined) => (v == null ? "—" : formatFixed(v, 2));
 
 /**
  * Anchored VWAP from ``from`` on: volume-weighted typical price (H+L+C)/3 of the
@@ -160,7 +161,7 @@ function subSeries(
           },
         ],
         levels: [50],
-        format: (v) => v.toFixed(1),
+        format: (v) => formatFixed(v, 1),
       };
   }
 }
@@ -357,7 +358,7 @@ export function KlinePanel({
       {chip ? (
         <div className="chip-stats">
           <span>
-            {chip.date} 平均成本 <b>{chip.avg_cost.toFixed(2)}</b>
+            {chip.date} 平均成本 <b>{formatFixed(chip.avg_cost, 2)}</b>
           </span>
           <span>
             获利比例{" "}
@@ -379,9 +380,9 @@ export function KlinePanel({
           ) : null}
           {showVp && c?.profile ? (
             <span>
-              POC <b>{c.profile.poc.toFixed(2)}</b> 价值区{" "}
+              POC <b>{formatFixed(c.profile.poc, 2)}</b> 价值区{" "}
               <b>
-                {c.profile.val.toFixed(2)}–{c.profile.vah.toFixed(2)}
+                {formatFixed(c.profile.val, 2)}–{formatFixed(c.profile.vah, 2)}
               </b>
             </span>
           ) : null}

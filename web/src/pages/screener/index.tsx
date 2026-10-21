@@ -4,7 +4,7 @@ import { useNavigate, useSearchParams } from "react-router";
 import { type ScreenRow, useAddWatch, usePools, useSavePool, useScreen } from "@/api/endpoints";
 import { useReadOnlyReason } from "@/api/useMeta";
 import { presetLabel } from "@/copy/publicText";
-import { formatPrice } from "@/format/number";
+import { formatFixed, formatPrice } from "@/format/number";
 import { DataTable } from "@/table/DataTable";
 import {
   AppDrawer,
@@ -191,16 +191,10 @@ interface WatchFail {
 
 function watchBanner(fails: WatchFail[]): FailureCopy {
   const latest = fails[fails.length - 1];
+  if (fails.length < 2 && latest) return latest.copy;
   const reason = latest?.copy.text.split("：")[1]?.split("。")[0] ?? "这项操作暂时用不了";
-  if (fails.length < 2 && latest) {
-    return {
-      text: `${latest.name}（${latest.code}）没加进池子：${reason}。`,
-      retry: latest.copy.retry,
-      health: latest.copy.health,
-    };
-  }
   return {
-    text: `${fails.length} 只股票没加进池子：${reason}。可以在每一行点「重试」。`,
+    text: `${fails.length} 只股票没加进自选：${reason}。可以在每一行点「重试」。`,
     retry: true,
     health: latest?.copy.health ?? true,
   };
@@ -276,12 +270,12 @@ export default function ScreenerPage() {
         rememberedWatch.add(row.code);
         setInPool(currentWatch());
         setWatchFails((prev) => prev.filter((item) => item.code !== row.code));
-        toast({ text: "已加入池子", duration: 4000 });
+        toast({ text: "已加入自选", duration: 4000 });
       },
       onError: (error) => {
         const name = row.name ?? row.code;
         const who = `${name}（${row.code}）`;
-        const copy = failureCopy(who, "加进池子", error);
+        const copy = failureCopy(who, "加进自选", error);
         setWatchFails((prev) => [
           ...prev.filter((item) => item.code !== row.code),
           { code: row.code, name, copy },
@@ -417,28 +411,28 @@ export default function ScreenerPage() {
                   header: "PE",
                   numeric: true,
                   value: (row) => row.pe_ttm ?? null,
-                  cell: (row) => (row.pe_ttm == null ? "—" : row.pe_ttm.toFixed(1)),
+                  cell: (row) => (row.pe_ttm == null ? "—" : formatFixed(row.pe_ttm, 1)),
                 },
                 {
                   id: "pb",
                   header: "PB",
                   numeric: true,
                   value: (row) => row.pb ?? null,
-                  cell: (row) => (row.pb == null ? "—" : row.pb.toFixed(2)),
+                  cell: (row) => (row.pb == null ? "—" : formatFixed(row.pb, 2)),
                 },
                 {
                   id: "mv",
                   header: "市值(亿)",
                   numeric: true,
                   value: (row) => row.total_mv ?? null,
-                  cell: (row) => (row.total_mv == null ? "—" : row.total_mv.toFixed(0)),
+                  cell: (row) => (row.total_mv == null ? "—" : formatFixed(row.total_mv, 0)),
                 },
                 {
                   id: "roe",
                   header: "ROE%",
                   numeric: true,
                   value: (row) => row.roe ?? null,
-                  cell: (row) => (row.roe == null ? "—" : row.roe.toFixed(1)),
+                  cell: (row) => (row.roe == null ? "—" : formatFixed(row.roe, 1)),
                 },
                 {
                   id: "npyoy",
@@ -453,14 +447,14 @@ export default function ScreenerPage() {
                   numeric: true,
                   hiddenByDefault: true,
                   value: (row: ScreenRow) => row.factors?.[name] ?? null,
-                  cell: (row: ScreenRow) => row.factors?.[name]?.toFixed(0) ?? "—",
+                  cell: (row: ScreenRow) => formatFixed(row.factors?.[name], 0),
                 })),
                 {
                   id: "score",
                   header: "排名分",
                   numeric: true,
                   value: (row) => scores.get(row) ?? null,
-                  cell: (row) => (scores.get(row) ?? 0).toFixed(1),
+                  cell: (row) => formatFixed(scores.get(row) ?? 0, 1),
                 },
                 {
                   id: "watch",
@@ -475,7 +469,7 @@ export default function ScreenerPage() {
                     ) : (
                       <span className="ack-cell">
                         {failedCodes.has(row.code) ? (
-                          <span className="row-err">没加进池子</span>
+                          <span className="row-err">没加进自选</span>
                         ) : null}
                         <Button
                           size="sm"
@@ -485,7 +479,7 @@ export default function ScreenerPage() {
                           disabled={addWatch.isPending}
                           onClick={() => watch(row)}
                         >
-                          {failedCodes.has(row.code) ? "重试" : "加入池子"}
+                          {failedCodes.has(row.code) ? "重试" : "加自选"}
                         </Button>
                       </span>
                     ),

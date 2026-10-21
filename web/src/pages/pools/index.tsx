@@ -1,7 +1,7 @@
 import { Link } from "react-router";
 import { inTradingHours, useAuctionPoolLive, usePools } from "@/api/endpoints";
 import { useUrlState } from "@/app/useUrlState";
-import { poolDisplayName, presetLabel } from "@/copy/publicText";
+import { poolDisplayName, poolRefLabel, presetLabel } from "@/copy/publicText";
 import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
 import { EmptyState, FlowSteps, PageHeader, Panel, ReadOnlyBanner, Segmented } from "@/ui";
@@ -86,7 +86,7 @@ export default function PoolsPage() {
                 }
                 sub={[
                   pool.description ? poolDisplayName(pool.description) : "",
-                  (pool.pool_refs ?? []).join(" + "),
+                  (pool.pool_refs ?? []).map((ref) => poolRefLabel(ref)).join(" + "),
                   pool.updated_at ? `更新于 ${formatShanghaiDateTime(pool.updated_at)}` : "",
                 ]
                   .filter(Boolean)

@@ -3,6 +3,7 @@ import { useDataCenter, useFundamentals } from "@/api/endpoints";
 import { useUrlState } from "@/app/useUrlState";
 import { datasetLabel } from "@/copy/publicText";
 import { toneClass, toneOf } from "@/format/color";
+import { formatFixed } from "@/format/number";
 import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
 import { AppDrawer, PageHeader, Panel, Pill } from "@/ui";
@@ -49,9 +50,9 @@ function Fundamentals() {
               if (v === null || v === undefined) return "—";
               // Growth rates (同比) carry direction: red up / green down.
               return /同比|增长/.test(doc.fields[k] ?? "") ? (
-                <span className={toneClass(toneOf(v))}>{v.toFixed(2)}</span>
+                <span className={toneClass(toneOf(v))}>{formatFixed(v, 2)}</span>
               ) : (
-                v.toFixed(2)
+                formatFixed(v, 2)
               );
             },
           })),
@@ -91,7 +92,7 @@ export default function DataCenterPage() {
                   selectedKey={picked}
                   columns={[
                     { id: "name", header: "名称", value: (row) => row.name },
-                    { id: "table", header: "表", value: (row) => row.table_name },
+                    { id: "table", header: "表", value: (row) => datasetLabel(row.table_name) },
                     { id: "cat", header: "类别", value: (row) => row.category },
                     { id: "src", header: "来源", value: (row) => row.sources.join(" / ") },
                     { id: "upd", header: "更新", value: (row) => row.update_note },

@@ -1,5 +1,6 @@
 import type { Schemas } from "@/api/client";
 import { TimeChart } from "@/charts/Chart";
+import { formatFixed } from "@/format/number";
 import { Panel } from "@/ui";
 
 type Profile = Schemas["StockProfile"];
@@ -43,7 +44,7 @@ export function FlowPanel({ s }: { s: Profile }) {
     >
       <p className="chip-stats">
         <span>
-          区间累计 <b className={acc >= 0 ? "up" : "down"}>{acc.toFixed(2)} 亿</b>
+          区间累计 <b className={acc >= 0 ? "up" : "down"}>{formatFixed(acc, 2)} 亿</b>
         </span>
         <span>
           近 {W} 日{" "}
@@ -52,7 +53,7 @@ export function FlowPanel({ s }: { s: Profile }) {
               (cum[cum.length - 1] ?? 0) - (cum[cum.length - 1 - W] ?? 0) >= 0 ? "up" : "down"
             }
           >
-            {((cum[cum.length - 1] ?? 0) - (cum[cum.length - 1 - W] ?? 0)).toFixed(2)} 亿
+            {formatFixed((cum[cum.length - 1] ?? 0) - (cum[cum.length - 1 - W] ?? 0), 2)} 亿
           </b>
         </span>
         <span>
@@ -71,7 +72,7 @@ export function FlowPanel({ s }: { s: Profile }) {
         dates={dates}
         height={130}
         bands={bands}
-        format={(v) => v.toFixed(2)}
+        format={(v) => formatFixed(v, 2)}
         series={[{ name: "收盘(前复权)", values: px, color: "var(--muted)" }]}
       />
       <TimeChart
@@ -80,7 +81,7 @@ export function FlowPanel({ s }: { s: Profile }) {
         height={130}
         baseline={0}
         bands={bands}
-        format={(v) => `${v.toFixed(2)}亿`}
+        format={(v) => `${formatFixed(v, 2)}亿`}
         series={[{ name: "累计主力净流入", values: cum, color: "var(--accent)" }]}
       />
     </Panel>

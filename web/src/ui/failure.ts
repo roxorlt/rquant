@@ -37,6 +37,6 @@ export function failureCopy(
   }
   const times = attempt === 2 ? "（第 2 次）" : "";
   const tail = next ? `。${next}` : "";
-  const done = verb === "加进池子" ? `${object}没${verb}` : `${object}没${verb}上`;
+  const done = verb === "加进自选" ? `${object}没${verb}` : `${object}没${verb}上`;
   return { text: `${done}：${reason}${tail}${times}`, retry, health };
 }

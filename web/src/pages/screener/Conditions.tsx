@@ -1,7 +1,7 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useConditions, useTextToCondition, useTranslateTdx } from "@/api/endpoints";
 import { toneClass, toneOf } from "@/format/color";
-import { formatPrice } from "@/format/number";
+import { formatFixed, formatPrice } from "@/format/number";
 import { DataTable } from "@/table/DataTable";
 import { Button, FailureNotice, failureCopy, Panel } from "@/ui";
 import { StockLink } from "@/ui/StockLink";
@@ -22,6 +22,11 @@ function TdxImport() {
   const ai = useTextToCondition();
   const passed = Boolean(result?.expression);
   const misses = unrecognizedCount(result?.error ?? null);
+  const failRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!ai.error) return;
+    failRef.current?.scrollIntoView({ block: "center" });
+  }, [ai.error]);
   return (
     <Panel title="通达信公式导入" sub="只翻译和校验">
       <div className="formula-ai">
@@ -47,10 +52,12 @@ function TdxImport() {
         </Button>
       </div>
       {ai.error ? (
-        <FailureNotice
-          copy={failureCopy("条件", "生成", ai.error)}
-          onRetry={() => ai.mutate(text)}
-        />
+        <div ref={failRef}>
+          <FailureNotice
+            copy={failureCopy("条件", "生成", ai.error)}
+            onRetry={() => ai.mutate(text)}
+          />
+        </div>
       ) : null}
       {ai.data ? (
         <output className="formula-result" aria-label="生成结果">
@@ -112,10 +119,8 @@ export function Conditions() {
                   ? `${run.name} · ${run.trade_date ?? "—"} · 命中 ${run.hits.length}/${run.universe}`
                   : "还没有条件选股结果"
               }
-              flush
-            >
-              {runs.length > 1 ? (
-                <div className="cond-pick">
+              actions={
+                runs.length > 1 ? (
                   <select
                     className="select"
                     aria-label="演示条件"
@@ -128,8 +133,10 @@ export function Conditions() {
                       </option>
                     ))}
                   </select>
-                </div>
-              ) : null}
+                ) : null
+              }
+              flush
+            >
               {run ? (
                 <DataTable
                   label="条件命中"
@@ -163,7 +170,7 @@ export function Conditions() {
                         ) : (
                           <span className={toneClass(toneOf(row.pct_chg))}>
                             {row.pct_chg > 0 ? "+" : ""}
-                            {row.pct_chg.toFixed(2)}
+                            {formatFixed(row.pct_chg, 2)}
                           </span>
                         ),
                     },

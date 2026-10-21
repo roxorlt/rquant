@@ -1,6 +1,8 @@
 import { useMemo, useState } from "react";
 import { type MacroData, useMacro } from "@/api/endpoints";
 import { type LineSeries, TimeChart } from "@/charts/Chart";
+import { studyLabel } from "@/copy/publicText";
+import { formatFixed } from "@/format/number";
 import { DataTable } from "@/table/DataTable";
 import { EmptyState, KpiStrip, PageHeader, Panel, Segmented } from "@/ui";
 import { QueryView } from "../shared";
@@ -22,8 +24,8 @@ const EVENTS: readonly [string, string][] = [
   ["20260501", "20260531"],
 ];
 
-const pct = (v: number) => `${(v * 100).toFixed(1)}%`;
-const yi = (v: number) => `${(v / 1e8).toFixed(0)}亿`;
+const pct = (v: number) => `${formatFixed(v * 100, 1)}%`;
+const yi = (v: number) => `${formatFixed(v / 1e8, 0)}亿`;
 
 function cut(c: Cols, range: Range): Cols {
   if (range === "all" || c.dates.length === 0) return c;
@@ -63,7 +65,7 @@ function IndexChart({ c, k = "csi300", name = "沪深300" }: { c: Cols; k?: stri
       dates={c.dates}
       height={96}
       bands={eventBands(c.dates)}
-      format={(v) => v.toFixed(0)}
+      format={(v) => formatFixed(v, 0)}
       series={[{ name, values: col(c, k), color: "var(--muted)" }]}
     />
   );
@@ -122,7 +124,7 @@ function Holders({ data }: { data: MacroData }) {
         dates={dates}
         height={90}
         bands={bands}
-        format={(v) => v.toFixed(0)}
+        format={(v) => formatFixed(v, 0)}
         series={[{ name: "沪深300", values: qIdx, color: "var(--muted)" }]}
       />
       <h3 className="sub">净增持金额（亿元）</h3>
@@ -133,7 +135,7 @@ function Holders({ data }: { data: MacroData }) {
         baseline={0}
         height={120}
         bands={bands}
-        format={(v) => `${v.toFixed(0)}亿`}
+        format={(v) => `${formatFixed(v, 0)}亿`}
         series={[
           { name: "净增持", values: rows.map((r) => (r.flow ?? 0) / 1e8), color: "var(--accent)" },
         ]}
@@ -144,7 +146,7 @@ function Holders({ data }: { data: MacroData }) {
         dates={dates}
         height={120}
         bands={bands}
-        format={(v) => v.toFixed(0)}
+        format={(v) => formatFixed(v, 0)}
         series={[
           { name: "新进", values: rows.map((r) => r.n_new), color: "var(--up)" },
           { name: "增持", values: rows.map((r) => r.n_add), color: "var(--accent)" },
@@ -172,12 +174,12 @@ function Holders({ data }: { data: MacroData }) {
           {
             id: "flow",
             header: "净增持(亿)",
-            value: (r) => (r.flow == null ? "—" : (r.flow / 1e8).toFixed(1)),
+            value: (r) => (r.flow == null ? "—" : formatFixed(r.flow / 1e8, 1)),
           },
           {
             id: "mv",
             header: "持仓市值(亿)",
-            value: (r) => (r.mv == null ? "—" : (r.mv / 1e8).toFixed(0)),
+            value: (r) => (r.mv == null ? "—" : formatFixed(r.mv / 1e8, 0)),
           },
         ]}
       />
@@ -254,10 +256,10 @@ function Options({ data }: { data: MacroData }) {
         columns={[
           { id: "u", header: "标的", value: (r) => r.und },
           { id: "d", header: "日期", value: (r) => r.trade_date },
-          { id: "pv", header: "PCR(量)", value: (r) => r.pcr_vol?.toFixed(2) ?? "—" },
-          { id: "po", header: "PCR(持仓)", value: (r) => r.pcr_oi?.toFixed(2) ?? "—" },
-          { id: "vs", header: "放量倍数", value: (r) => r.vol_surge?.toFixed(2) ?? "—" },
-          { id: "os", header: "持仓变化倍数", value: (r) => r.oi_surge?.toFixed(2) ?? "—" },
+          { id: "pv", header: "PCR(量)", value: (r) => formatFixed(r.pcr_vol, 2) },
+          { id: "po", header: "PCR(持仓)", value: (r) => formatFixed(r.pcr_oi, 2) },
+          { id: "vs", header: "放量倍数", value: (r) => formatFixed(r.vol_surge, 2) },
+          { id: "os", header: "持仓变化倍数", value: (r) => formatFixed(r.oi_surge, 2) },
           { id: "iv", header: "ATM IV", value: (r) => (r.atm_iv == null ? "—" : pct(r.atm_iv)) },
           {
             id: "ivp",
@@ -275,7 +277,7 @@ function Options({ data }: { data: MacroData }) {
             height={110}
             baseline={1}
             bands={eventBands(c.dates)}
-            format={(v) => v.toFixed(2)}
+            format={(v) => formatFixed(v, 2)}
             series={[
               { name: "PCR(量)", values: col(c, "pcr_vol"), color: "var(--accent)" },
               { name: "上轨", values: col(c, "pcr_vol_up"), color: "var(--up)", dashed: true },
@@ -287,7 +289,7 @@ function Options({ data }: { data: MacroData }) {
             dates={c.dates}
             height={96}
             bands={eventBands(c.dates)}
-            format={(v) => v.toFixed(2)}
+            format={(v) => formatFixed(v, 2)}
             series={[
               { name: "PCR(持仓)", values: col(c, "pcr_oi"), color: "var(--warn)" },
               { name: "上轨", values: col(c, "pcr_oi_up"), color: "var(--up)", dashed: true },
@@ -308,7 +310,7 @@ function Options({ data }: { data: MacroData }) {
             height={90}
             bars
             baseline={1}
-            format={(v) => v.toFixed(1)}
+            format={(v) => formatFixed(v, 1)}
             series={[
               {
                 name: "成交放量",
@@ -383,7 +385,7 @@ function MacroBody({ data }: { data: MacroData }) {
           {
             key: "erp",
             label: "股债利差",
-            value: eb ? `${eb.current.toFixed(2)}%` : "—",
+            value: eb ? `${formatFixed(eb.current, 2)}%` : "—",
             sub: eb ? `历史分位 ${pct(eb.current_pct)}` : undefined,
             tip: "沪深300 1/PE(TTM) − 10年国债收益率；越高股票相对越便宜",
           },
@@ -423,7 +425,7 @@ function MacroBody({ data }: { data: MacroData }) {
               k="erp"
               name="股债利差%"
               bands={eb}
-              format={(v) => `${v.toFixed(1)}%`}
+              format={(v) => `${formatFixed(v, 1)}%`}
             />
             <Panel title="两融" sub="沪深两市合计；融资买入占比=融资买入额 ÷ 中证全指成交额">
               <IndexChart c={daily} k="all_a" name="中证全指" />
@@ -462,7 +464,7 @@ function MacroBody({ data }: { data: MacroData }) {
                 dates={daily.dates}
                 height={104}
                 bands={eventBands(daily.dates)}
-                format={(v) => `${(v / 100).toFixed(0)}亿`}
+                format={(v) => `${formatFixed(v / 100, 0)}亿`}
                 series={[
                   {
                     name: "累计净买入",
@@ -476,7 +478,7 @@ function MacroBody({ data }: { data: MacroData }) {
                 dates={daily.dates}
                 height={90}
                 bands={eventBands(daily.dates)}
-                format={(v) => `${(v / 100).toFixed(0)}亿`}
+                format={(v) => `${formatFixed(v / 100, 0)}亿`}
                 series={[
                   {
                     name: "北向成交额",
@@ -499,7 +501,7 @@ function MacroBody({ data }: { data: MacroData }) {
               dates={etf.dates}
               height={120}
               bands={eventBands(etf.dates)}
-              format={(v) => `${v.toFixed(0)}亿份`}
+              format={(v) => `${formatFixed(v, 0)}亿份`}
               series={[{ name: "300ETF合计份额", values: etf300, color: "var(--accent)" }]}
             />
             <TimeChart
@@ -509,7 +511,7 @@ function MacroBody({ data }: { data: MacroData }) {
               bars
               baseline={0}
               bands={eventBands(etf.dates)}
-              format={(v) => `${v.toFixed(0)}亿份`}
+              format={(v) => `${formatFixed(v, 0)}亿份`}
               series={[
                 {
                   name: "宽基ETF份额日变动",
@@ -590,7 +592,7 @@ function Futures({ data }: { data: MacroData }) {
         height={104}
         baseline={0}
         bands={eventBands(c.dates)}
-        format={(v) => v.toFixed(0)}
+        format={(v) => formatFixed(v, 0)}
         series={[{ name: "前20净多(手)", values: col(c, "net"), color: "var(--warn)" }]}
       />
     </Panel>
@@ -612,8 +614,8 @@ function Breadth({ data }: { data: MacroData }) {
         columns={[
           { id: "g", header: "类别", value: (r) => r.group },
           { id: "v", header: "入选变体", value: (r) => r.variant },
-          { id: "tr", header: "训练IC", value: (r) => r.train_ic.toFixed(3) },
-          { id: "te", header: "测试IC", value: (r) => r.test_ic.toFixed(3) },
+          { id: "tr", header: "训练IC", value: (r) => formatFixed(r.train_ic, 3) },
+          { id: "te", header: "测试IC", value: (r) => formatFixed(r.test_ic, 3) },
           { id: "w", header: "理由", value: (r) => r.reason },
         ]}
       />
@@ -625,7 +627,7 @@ function Breadth({ data }: { data: MacroData }) {
           dates={c.dates}
           height={90}
           bands={eventBands(c.dates)}
-          format={(v) => (Math.abs(v) < 5 ? v.toFixed(2) : v.toFixed(0))}
+          format={(v) => (Math.abs(v) < 5 ? formatFixed(v, 2) : formatFixed(v, 0))}
           series={[
             { name: `${p.group}：${p.variant}`, values: col(c, p.variant), color: "var(--accent)" },
           ]}
@@ -649,7 +651,7 @@ function HkSystem({ data }: { data: MacroData }) {
         dates={c.dates}
         height={110}
         bands={eventBands(c.dates)}
-        format={(v) => v.toFixed(0)}
+        format={(v) => formatFixed(v, 0)}
         series={[
           { name: "沪深300", values: col(c, "csi300"), color: "var(--muted)" },
           { name: "信号日", values: sig, color: "var(--up)" },
@@ -660,7 +662,7 @@ function HkSystem({ data }: { data: MacroData }) {
         dates={c.dates}
         height={104}
         bands={eventBands(c.dates)}
-        format={(v) => v.toFixed(2)}
+        format={(v) => formatFixed(v, 2)}
         series={[
           { name: "聪明钱", values: col(c, "smart"), color: "var(--accent)" },
           { name: "MA20", values: col(c, "smart_ma20"), color: "var(--warn)", dashed: true },
@@ -673,7 +675,7 @@ function HkSystem({ data }: { data: MacroData }) {
           height={96}
           baseline={0}
           bars
-          format={(v) => v.toFixed(3)}
+          format={(v) => formatFixed(v, 3)}
           series={[
             {
               name: "corr(恒科 t, 沪深300 t+k)",
@@ -689,7 +691,7 @@ function HkSystem({ data }: { data: MacroData }) {
           dates={data.hk_rollcorr.dates}
           height={84}
           baseline={0}
-          format={(v) => v.toFixed(2)}
+          format={(v) => formatFixed(v, 2)}
           series={[
             {
               name: "250日滚动 corr(恒科 t, 沪深300 t+1)",
@@ -717,7 +719,7 @@ function Studies({ data }: { data: MacroData }) {
         rows={data.studies}
         rowKey={(r) => `${r.study}-${r.horizon}`}
         columns={[
-          { id: "s", header: "信号", sortable: true, value: (r) => r.study },
+          { id: "s", header: "信号", sortable: true, value: (r) => studyLabel(r.study) },
           {
             id: "sp",
             header: "样本",

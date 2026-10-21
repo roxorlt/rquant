@@ -1,13 +1,14 @@
 import { useFactor, useFactors } from "@/api/endpoints";
 import { useUrlState } from "@/app/useUrlState";
 import { TimeChart } from "@/charts/Chart";
+import { formatFixed } from "@/format/number";
 import { DataTable } from "@/table/DataTable";
 import { KpiStrip, PageHeader, Panel } from "@/ui";
 import { QueryView } from "../shared";
 import { CorrelationPanel } from "./Correlation";
 
-const num = (v: number | null | undefined, d = 3) => (v == null ? "—" : v.toFixed(d));
-const pct = (v: number | null | undefined) => (v == null ? "—" : `${(v * 100).toFixed(2)}%`);
+const num = (v: number | null | undefined, d = 3) => (v == null ? "—" : formatFixed(v, d));
+const pct = (v: number | null | undefined) => (v == null ? "—" : `${formatFixed(v * 100, 2)}%`);
 
 function IcBars({
   points,
@@ -23,7 +24,7 @@ function IcBars({
       bars
       baseline={0}
       height={140}
-      format={(v) => v.toFixed(3)}
+      format={(v) => formatFixed(v, 3)}
       series={[{ name: "IC", values: points.map((p) => p.ic), color: "var(--accent)" }]}
     />
   );
@@ -173,7 +174,7 @@ function QuantilePanel({ result }: { result: TestResult }) {
           label="分组累计收益"
           dates={days.map((d) => d.date)}
           baseline={1}
-          format={(v) => v.toFixed(3)}
+          format={(v) => formatFixed(v, 3)}
           series={[...series, longShort]}
         />
       ) : (
@@ -188,7 +189,7 @@ function QuantilePanel({ result }: { result: TestResult }) {
             bars
             baseline={0}
             height={130}
-            format={(v) => v.toFixed(3)}
+            format={(v) => formatFixed(v, 3)}
             series={[
               {
                 name: "IC",
@@ -203,11 +204,11 @@ function QuantilePanel({ result }: { result: TestResult }) {
           {ics.length > 1 ? (
             <TimeChart
               label="IC 分布"
-              dates={counts.map((_, k) => (lo + (k + 0.5) * width).toFixed(2))}
+              dates={counts.map((_, k) => formatFixed(lo + (k + 0.5) * width, 2))}
               bars
               baseline={0}
               height={130}
-              format={(v) => v.toFixed(0)}
+              format={(v) => formatFixed(v, 0)}
               series={[{ name: "天数", values: counts, color: "var(--accent)", neutral: true }]}
             />
           ) : null}

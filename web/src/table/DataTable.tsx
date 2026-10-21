@@ -25,7 +25,10 @@ export interface DataColumn<T> {
   /** Long text that wraps instead of widening the table. */
   wrap?: boolean;
   sortable?: boolean;
-  /** Secondary columns are hidden on phones (≤ 599 px) to keep rows one-hand readable. */
+  /**
+   * Secondary columns start hidden on phones (≤ 599 px). The column menu is the
+   * only switch: a check shows the column. A saved preference wins over this.
+   */
   secondary?: boolean;
   /** Hidden until the viewer turns the column on. Ignored once a preference is saved. */
   hiddenByDefault?: boolean;
@@ -125,8 +128,12 @@ export function DataTable<T>({
   const [hidden, setHidden] = useState<Set<string>>(() => {
     const saved = tools ? readPreference(prefKey) : null;
     if (saved !== null) return new Set(saved.split(",").filter(Boolean));
+    const narrow =
+      typeof window.matchMedia === "function" && window.matchMedia("(max-width: 599px)").matches;
     return new Set(
-      allColumns.filter((column) => column.hiddenByDefault).map((column) => column.id),
+      allColumns
+        .filter((column) => column.hiddenByDefault || (narrow && column.secondary))
+        .map((column) => column.id),
     );
   });
   const toggleColumn = (id: string) =>
@@ -134,7 +141,9 @@ export function DataTable<T>({
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
       else next.add(id);
-      writePreference(prefKey, next.size ? [...next].join(",") : null);
+      // Empty string is a saved "show every column", so a phone reload does not
+      // hide the secondary columns again.
+      writePreference(prefKey, [...next].join(","));
       return next;
     });
   const columns = useMemo(() => allColumns.filter((c) => !hidden.has(c.id)), [allColumns, hidden]);

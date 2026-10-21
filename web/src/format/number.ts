@@ -7,15 +7,28 @@ function isMissing(value: number | null | undefined): value is null | undefined 
   return value === null || value === undefined || !Number.isFinite(value);
 }
 
-/** Fixed decimals with thousands separators, e.g. 12,345.60. */
+/** Fixed decimals with thousands separators, e.g. 12,345.60. Negatives use U+2212. */
 export function formatNumber(value: number | null | undefined, digits = 2): string {
   if (isMissing(value)) {
     return EMPTY;
   }
-  return value.toLocaleString("zh-CN", {
-    minimumFractionDigits: digits,
-    maximumFractionDigits: digits,
-  });
+  return value
+    .toLocaleString("zh-CN", {
+      minimumFractionDigits: digits,
+      maximumFractionDigits: digits,
+    })
+    .replaceAll("-", MINUS);
+}
+
+/**
+ * Fixed decimals without a thousands separator. Negatives use U+2212, same as
+ * fund-flow. Display only: inputs keep the ASCII hyphen.
+ */
+export function formatFixed(value: number | null | undefined, digits = 2): string {
+  if (isMissing(value)) {
+    return EMPTY;
+  }
+  return value.toFixed(digits).replaceAll("-", MINUS);
 }
 
 /** A price: always two decimals, no separators beyond the thousands. */
@@ -44,7 +57,7 @@ export function formatPercent(value: number | null | undefined, digits = 2): str
   if (isMissing(value)) {
     return EMPTY;
   }
-  return `${value.toFixed(digits)}%`;
+  return `${formatFixed(value, digits)}%`;
 }
 
 /**

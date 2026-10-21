@@ -951,7 +951,7 @@ def operations(request: Request, source: SourceDep) -> Envelope[OperationsData]:
              for r in _optional_rows(source, "SELECT alert_id, acked_at, actor_id, command_id "
                                      "FROM alert_ack ORDER BY acked_at DESC LIMIT 200")]
     items += [OperationRow(at=r["added_at"], kind="add_watchlist_item",
-                           summary=f"加入池子 {r['ts_code']} {r['note']}".strip(), actor=None,
+                           summary=f"加自选 {r['ts_code']} {r['note']}".strip(), actor=None,
                            command_id=r["command_id"])
               for r in _optional_rows(source, "SELECT ts_code, note, added_at, command_id "
                                       "FROM manual_watchlist ORDER BY added_at DESC LIMIT 200")]

@@ -56,7 +56,8 @@ const BOARD_SYSTEM: Record<string, string> = {
 };
 
 const DATASET_LABEL: Record<string, string> = {
-  daily_bar: "日线数据",
+  daily_bar: "日线行情",
+  daily_basic: "每日指标",
   minute_bar: "分钟数据",
   auction_bar: "竞价数据",
   adj_factor: "复权因子",
@@ -64,6 +65,7 @@ const DATASET_LABEL: Record<string, string> = {
 
 const PRESET_LABEL: Record<string, string> = {
   "auction-gap": "竞价高开",
+  "auction-pick": "竞价选股",
   breakout: "突破",
   "volume-surge": "放量",
   volume_surge: "放量",
@@ -111,6 +113,16 @@ export function statusLabel(status: string, stale = false): string {
   return stale ? `${text}（过期）` : text;
 }
 
+const ENTRY_MODE: Record<string, string> = {
+  open: "开盘",
+  close: "收盘",
+};
+
+const VARIANT_LABEL: Record<string, string> = {
+  tight: "收紧",
+  base: "基准",
+};
+
 export function presetLabel(value: string | null | undefined): string {
   if (!value) return "—";
   const at = value.lastIndexOf("@");
@@ -119,6 +131,36 @@ export function presetLabel(value: string | null | undefined): string {
   const known = PRESET_LABEL[slug];
   const name = known ?? (/^[a-z0-9][a-z0-9_-]*$/i.test(slug) ? "选股方案" : slug);
   return version && known ? `${name} ${version}` : name;
+}
+
+/** A pool id or preset slug shown on a pool, a profile, or a saved scheme. */
+export function poolRefLabel(value: string | null | undefined): string {
+  if (!value) return "—";
+  if (value === "watch" || value === "manual") return "自选";
+  return presetLabel(value);
+}
+
+export function entryModeLabel(value: string | null | undefined): string {
+  if (!value) return "—";
+  return ENTRY_MODE[value] ?? (/[A-Za-z]/.test(value) ? "其他" : value);
+}
+
+export function variantLabel(value: string | null | undefined): string {
+  if (!value) return "—";
+  return VARIANT_LABEL[value] ?? (/[A-Za-z]/.test(value) ? "其他" : value);
+}
+
+/** The unsigned local actor stored when a request has no user. */
+export function actorLabel(actor: string | null | undefined): string {
+  if (!actor) return "—";
+  if (actor === "owner") return "本机";
+  return actor;
+}
+
+/** Macro event-study names. The series id stays in the API. */
+export function studyLabel(name: string | null | undefined): string {
+  if (!name) return "—";
+  return name.replaceAll("SMARTMONEY", "聪明钱");
 }
 
 export function datasetLabel(id: string | null | undefined): string {

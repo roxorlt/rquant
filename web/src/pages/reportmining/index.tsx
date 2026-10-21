@@ -2,6 +2,7 @@ import { useReportFactors } from "@/api/endpoints";
 import { useUrlState } from "@/app/useUrlState";
 import { TimeChart } from "@/charts/Chart";
 import { tokenLabel } from "@/copy/publicText";
+import { formatFixed } from "@/format/number";
 import { DataTable } from "@/table/DataTable";
 import { KpiStrip, PageHeader, Panel, Pill } from "@/ui";
 import { QueryView } from "../shared";
@@ -144,8 +145,9 @@ function Recent({ sum }: { sum: WeeklySummary | null }) {
   );
 }
 
-const pct = (v: number | null | undefined, d = 1) => (v == null ? "—" : `${(v * 100).toFixed(d)}%`);
-const num = (v: number | null | undefined, d = 2) => (v == null ? "—" : v.toFixed(d));
+const pct = (v: number | null | undefined, d = 1) =>
+  v == null ? "—" : `${formatFixed(v * 100, d)}%`;
+const num = (v: number | null | undefined, d = 2) => (v == null ? "—" : formatFixed(v, d));
 
 const REPL: Record<string, { label: string; kind: "ok" | "acc" | "warn" | "crit" }> = {
   daily: { label: "日线可做", kind: "ok" },
@@ -188,7 +190,7 @@ function Detail({ r, hold }: { r: FactorResult; hold: number }) {
             height={150}
             dates={s.dates}
             baseline={1}
-            format={(v) => v.toFixed(3)}
+            format={(v) => formatFixed(v, 3)}
             bands={[]}
             series={[
               { name: "多空(扣费)", values: s.ls_nav_net, color: "var(--accent)" },
@@ -203,7 +205,7 @@ function Detail({ r, hold }: { r: FactorResult; hold: number }) {
             dates={s.dates}
             baseline={1}
             height={150}
-            format={(v) => v.toFixed(3)}
+            format={(v) => formatFixed(v, 3)}
             series={s.q_nav.map((v, k) => ({
               name: `Q${k + 1}`,
               values: v,
@@ -221,7 +223,7 @@ function Detail({ r, hold }: { r: FactorResult; hold: number }) {
             bars
             baseline={0}
             height={96}
-            format={(v) => v.toFixed(3)}
+            format={(v) => formatFixed(v, 3)}
             series={[{ name: "RankIC", values: s.rank_ic, color: "var(--accent)" }]}
           />
         </div>
@@ -233,7 +235,7 @@ function Detail({ r, hold }: { r: FactorResult; hold: number }) {
             bars
             baseline={0}
             height={96}
-            format={(v) => v.toFixed(3)}
+            format={(v) => formatFixed(v, 3)}
             series={[
               { name: "RankIC", values: Object.values(r.horizon_rank_ic), color: "var(--accent)" },
             ]}
@@ -265,7 +267,7 @@ function Body({ res, sum }: { res: Results; sum: WeeklySummary | null }) {
       <div className="card-grid">
         <Panel
           title="测试期 RankIC 一览"
-          sub={`已按训练期方向调整；>0 即样本外仍有效。成本 ${(res.cost_per_side * 100).toFixed(1)}%/单边`}
+          sub={`已按训练期方向调整；>0 即样本外仍有效。成本 ${formatFixed(res.cost_per_side * 100, 1)}%/单边`}
         >
           <TimeChart
             label="测试 RankIC"
@@ -273,7 +275,7 @@ function Body({ res, sum }: { res: Results; sum: WeeklySummary | null }) {
             bars
             baseline={0}
             height={110}
-            format={(v) => v.toFixed(3)}
+            format={(v) => formatFixed(v, 3)}
             series={[
               {
                 name: "测试RankIC",
@@ -298,7 +300,11 @@ function Body({ res, sum }: { res: Results; sum: WeeklySummary | null }) {
               onSelect={(r) => setSel(r.key)}
               columns={[
                 { id: "name", header: "因子", value: (r) => r.name },
-                { id: "data", header: "数据", value: (r) => r.data },
+                {
+                  id: "data",
+                  header: "数据",
+                  value: (r) => tokenLabel(r.data),
+                },
                 {
                   id: "tr",
                   header: "训练RankIC",

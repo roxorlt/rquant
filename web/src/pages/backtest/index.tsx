@@ -1,5 +1,6 @@
 import { useBacktestDetail, useBacktests } from "@/api/endpoints";
 import { useUrlState } from "@/app/useUrlState";
+import { entryModeLabel, variantLabel } from "@/copy/publicText";
 import { formatPercent, formatPrice } from "@/format/number";
 import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
@@ -81,8 +82,12 @@ export default function BacktestPage() {
               emptyText="还没有已发布的回测。"
               columns={[
                 { id: "run", header: "运行", value: (row) => row.run_id },
-                { id: "mode", header: "入场", value: (row) => row.entry_mode },
-                { id: "variant", header: "变体", value: (row) => row.profile_variant },
+                { id: "mode", header: "入场", value: (row) => entryModeLabel(row.entry_mode) },
+                {
+                  id: "variant",
+                  header: "变体",
+                  value: (row) => variantLabel(row.profile_variant),
+                },
                 {
                   id: "range",
                   header: "区间",

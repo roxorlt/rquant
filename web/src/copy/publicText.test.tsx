@@ -5,12 +5,18 @@ import { describe, expect, it } from "vitest";
 import { QueryView } from "@/pages/shared";
 import { renderApp } from "@/test/render";
 import {
+  actorLabel,
   boardSystemLabel,
+  datasetLabel,
+  entryModeLabel,
   poolDisplayName,
+  poolRefLabel,
   presetLabel,
   publicLine,
+  studyLabel,
   TRIGGER_LABEL,
   triggerLabel,
+  variantLabel,
 } from "./publicText";
 
 const serving = { state: "ready", generation_id: "g", generated_at: "2026-10-20T07:00:00Z" };
@@ -72,7 +78,18 @@ describe("public copy", () => {
     expect(publicLine("没有已发布的代")).toBe("没有已发布的版本");
     expect(publicLine("rquant-daily：idle")).toBe("日线采集：空闲");
     expect(publicLine("日线最新 2026-10-20（落后 0 个工作日）")).toBe("日线最新 2026-10-20");
-    expect(publicLine("daily_bar 缺 1 天")).toBe("日线数据缺 1 天");
+    expect(publicLine("daily_bar 缺 1 天")).toBe("日线行情缺 1 天");
+    expect(presetLabel("auction-pick")).toBe("竞价选股");
+    expect(poolRefLabel("watch")).toBe("自选");
+    expect(poolRefLabel("auction-pick")).toBe("竞价选股");
+    expect(entryModeLabel("open")).toBe("开盘");
+    expect(entryModeLabel("close")).toBe("收盘");
+    expect(variantLabel("tight")).toBe("收紧");
+    expect(variantLabel("base")).toBe("基准");
+    expect(actorLabel("owner")).toBe("本机");
+    expect(studyLabel("SMARTMONEY上穿MA20")).toBe("聪明钱上穿MA20");
+    expect(datasetLabel("daily_bar")).toBe("日线行情");
+    expect(datasetLabel("daily_basic")).toBe("每日指标");
     expect(publicLine("API 0.31 正常响应")).toBeNull();
     expect(boardSystemLabel("dc_industry")).toBe("行业");
     expect(poolDisplayName("观察名单（同花顺原条件，非买入信号）")).toBe("观察名单");
@@ -196,7 +213,7 @@ describe("public copy", () => {
     expect(screen.getByText("放量")).toBeInTheDocument();
     expect(screen.getByText("数据发布")).toBeInTheDocument();
     expect(document.body.textContent ?? "").toContain("日线采集：空闲");
-    expect(document.body.textContent ?? "").toContain("日线数据缺 1 天");
+    expect(document.body.textContent ?? "").toContain("日线行情缺 1 天");
     assertClean(document.body.textContent ?? "");
     overview.unmount();
 

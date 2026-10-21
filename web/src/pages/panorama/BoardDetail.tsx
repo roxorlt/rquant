@@ -2,13 +2,13 @@ import { useState } from "react";
 import { Link } from "react-router";
 import { useMarketLive } from "@/api/endpoints";
 import type { components } from "@/api/schema";
-import { formatAmount } from "@/format/number";
+import { formatAmount, formatFixed } from "@/format/number";
 import { AppDrawer, ChangeText, SkeletonRows } from "@/ui";
 
 type LiveBoard = components["schemas"]["LiveBoard"];
 type Sort = "pct" | "amount";
 const pctText = (v: number | null | undefined) =>
-  v == null ? "—" : `${v > 0 ? "+" : ""}${v.toFixed(2)}%`;
+  v == null ? "—" : `${v > 0 ? "+" : ""}${formatFixed(v, 2)}%`;
 const tone = (v: number | null | undefined) =>
   v == null || v === 0 ? "flat" : v > 0 ? "up" : "down";
 

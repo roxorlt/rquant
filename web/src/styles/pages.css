@@ -966,7 +966,10 @@ svg.touch-scrub {
   .cond-row input,
   .cond-row select,
   .suffix-field input,
-  .rule-fields input,
+  .rule-fields input {
+    height: 44px;
+    min-height: 44px;
+  }
   .btn,
   .btn.sm,
   .notice .act {
