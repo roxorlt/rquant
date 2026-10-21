@@ -1,5 +1,6 @@
 import { type MouseEvent, useMemo, useState } from "react";
 import type { MacroData } from "@/api/endpoints";
+import { formatFixed } from "@/format/number";
 import { Panel, Segmented } from "@/ui";
 
 /**
@@ -43,8 +44,8 @@ const PRESETS: { label: string; keys: string[] }[] = [
   { label: "宽度", keys: ["breadth_ma60"] },
   { label: "国家队代理", keys: ["etf_share", "huijin_flow", "net_IF"] },
 ];
-const pctf = (v: number) => `${(v * 100).toFixed(1)}%`;
-const num = (v: number) => (Math.abs(v) >= 1000 ? v.toFixed(0) : v.toFixed(2));
+const pctf = (v: number) => `${formatFixed(v * 100, 1)}%`;
+const num = (v: number) => (Math.abs(v) >= 1000 ? formatFixed(v, 0) : formatFixed(v, 2));
 
 function fromCols(c: Cols | null | undefined, k: string): [string[], (number | null)[]] {
   return c ? [c.dates, c.cols[k] ?? []] : [[], []];
@@ -62,14 +63,14 @@ function buildIndicators(d: MacroData): Ind[] {
     if (src[0].length > 1) out.push({ key, label, group, dates: src[0], values: src[1], fmt });
   };
   add("buffett", "巴菲特指标", "估值", fromCols(d.buffett, "ratio"), pctf);
-  add("erp", "股债利差", "估值", fromCols(d.daily, "erp"), (v) => `${v.toFixed(2)}%`);
+  add("erp", "股债利差", "估值", fromCols(d.daily, "erp"), (v) => `${formatFixed(v, 2)}%`);
   add("pe_ttm", "沪深300 PE", "估值", fromCols(d.daily, "pe_ttm"));
   add(
     "rzrqye",
     "两融余额",
     "资金",
     fromCols(d.daily, "rzrqye"),
-    (v) => `${(v / 1e8).toFixed(0)}亿`,
+    (v) => `${formatFixed(v / 1e8, 0)}亿`,
   );
   add("fin_buy_share", "融资买入占比", "资金", fromCols(d.daily, "fin_buy_share"), pctf);
   add(
@@ -77,14 +78,14 @@ function buildIndicators(d: MacroData): Ind[] {
     "北向累计净买入(至2024-08)",
     "资金",
     fromCols(d.daily, "north_net_cum"),
-    (v) => `${(v / 100).toFixed(0)}亿`,
+    (v) => `${formatFixed(v / 100, 0)}亿`,
   );
   if (d.etf_share) {
     const e = d.etf_share;
     const tot = e.dates.map(
       (_, i) => Object.values(e.cols).reduce((s, v) => s + (v[i] ?? 0), 0) / 1e4,
     );
-    add("etf_share", "宽基ETF合计份额", "资金", [e.dates, tot], (v) => `${v.toFixed(0)}亿份`);
+    add("etf_share", "宽基ETF合计份额", "资金", [e.dates, tot], (v) => `${formatFixed(v, 0)}亿份`);
   }
   const hj = d.holders.filter((h) => h.entity === "中央汇金" && h.basis === "announce");
   const qEnd = (q: string) =>
@@ -94,7 +95,7 @@ function buildIndicators(d: MacroData): Ind[] {
     "汇金净增持(按公告季)",
     "资金",
     [hj.map((h) => qEnd(h.quarter)), hj.map((h) => h.flow ?? null)],
-    (v) => `${(v / 1e8).toFixed(0)}亿`,
+    (v) => `${formatFixed(v / 1e8, 0)}亿`,
   );
   const o3 = d.options.沪300ETF;
   add("pcr_vol_300", "300ETF PCR(量)", "情绪", fromCols(o3, "pcr_vol"));
@@ -106,12 +107,14 @@ function buildIndicators(d: MacroData): Ind[] {
   }
   for (const s of ["IF", "IM"]) {
     add(`basis_${s}`, `${s}基差`, "期权期货", fromCols(d.futures[s], "basis_pct"), pctf);
-    add(`net_${s}`, `${s}前20净多`, "期权期货", fromCols(d.futures[s], "net"), (v) => v.toFixed(0));
+    add(`net_${s}`, `${s}前20净多`, "期权期货", fromCols(d.futures[s], "net"), (v) =>
+      formatFixed(v, 0),
+    );
   }
   if (d.hk) {
     const sm = d.hk.cols.smart ?? [];
     const ma = d.hk.cols.smart_ma20 ?? [];
-    add("hk_gap", "SMARTMONEY−MA20", "港股", [
+    add("hk_gap", "聪明钱减 20 日均线", "港股", [
       d.hk.dates,
       sm.map((v, i) => (v == null || ma[i] == null ? null : v - (ma[i] as number))),
     ]);
@@ -341,7 +344,7 @@ export function MacroOverlay({ data }: { data: MacroData }) {
               fill="currentColor"
               opacity={0.7}
             >
-              {v.toFixed(0)}
+              {formatFixed(v, 0)}
             </text>
           ))}
           {xt.map((k) => (
@@ -395,7 +398,7 @@ export function MacroOverlay({ data }: { data: MacroData }) {
           >
             <div>
               <strong>{axis[hover]}</strong> {idx === "all_a" ? "中证全指" : "沪深300"}{" "}
-              {ixv[hover]?.toFixed(0) ?? "—"}
+              {formatFixed(ixv[hover], 0)}
             </div>
             {lines.map((l) => {
               const r = l.raw[hover];
@@ -403,7 +406,7 @@ export function MacroOverlay({ data }: { data: MacroData }) {
               return (
                 <div key={l.ind.key} style={{ color: l.color }}>
                   {l.ind.label}：{r == null ? "—" : l.ind.fmt(r)} · 分位{" "}
-                  {p == null ? "—" : `${(p * 100).toFixed(0)}%`}
+                  {p == null ? "—" : `${formatFixed(p * 100, 0)}%`}
                 </div>
               );
             })}

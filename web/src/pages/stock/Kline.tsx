@@ -1,17 +1,18 @@
-import { useMemo, useState } from "react";
+import { type ReactNode, useMemo, useState } from "react";
 import type { Schemas } from "@/api/client";
 import { useChips } from "@/api/endpoints";
 import { Candles, clampView } from "@/charts/Candles";
 import { boll, kdj, macd, obv, rsi, sma } from "@/charts/indicators";
 import { SubChart, type SubSeries } from "@/charts/SubChart";
+import { formatFixed } from "@/format/number";
 import { Panel } from "@/ui";
 
 type Bar = Schemas["StockProfile"]["bars"][number];
 
-const pct = (v: number) => `${(v * 100).toFixed(1)}%`;
-const band = (b: readonly number[]) => `${(b[0] ?? 0).toFixed(2)}–${(b[1] ?? 0).toFixed(2)}`;
+const pct = (v: number) => `${formatFixed(v * 100, 1)}%`;
+const band = (b: readonly number[]) => `${formatFixed(b[0] ?? 0, 2)}–${formatFixed(b[1] ?? 0, 2)}`;
 
-const fmt = (v: number | null | undefined) => (v == null ? "—" : v.toFixed(2));
+const fmt = (v: number | null | undefined) => (v == null ? "—" : formatFixed(v, 2));
 
 /**
  * Anchored VWAP from ``from`` on: volume-weighted typical price (H+L+C)/3 of the
@@ -160,7 +161,7 @@ function subSeries(
           },
         ],
         levels: [50],
-        format: (v) => v.toFixed(1),
+        format: (v) => formatFixed(v, 1),
       };
   }
 }
@@ -169,10 +170,12 @@ export function KlinePanel({
   code,
   bars,
   flow = [],
+  period,
 }: {
   code: string;
   bars: readonly Bar[];
   flow?: readonly Flow[];
+  period?: ReactNode;
 }) {
   const [view, setView] = useState<[number, number]>(() =>
     clampView(bars.length - 250, bars.length, bars.length),
@@ -222,41 +225,48 @@ export function KlinePanel({
   return (
     <Panel
       title="日K线 · 筹码"
-      sub="前复权；筹码 = 换手率衰减模型（近似）"
+      sub="前复权"
       actions={
-        <span className="qc-ctl">
-          <label>
-            <input
-              type="checkbox"
-              checked={showChips}
-              onChange={(e) => setShowChips(e.target.checked)}
-            />{" "}
-            筹码分布
-          </label>
-          <label>
-            <input
-              type="checkbox"
-              checked={showBoll}
-              onChange={(e) => setShowBoll(e.target.checked)}
-            />{" "}
-            BOLL
-          </label>
-          <label title="点击 K 线设置锚点">
-            <input
-              type="checkbox"
-              checked={showVwap}
-              onChange={(e) => setShowVwap(e.target.checked)}
-            />{" "}
-            锚定 VWAP ±1σ/2σ
-          </label>
-          <label>
-            <input type="checkbox" checked={showVp} onChange={(e) => setShowVp(e.target.checked)} />{" "}
-            成交量分布
-            {c?.profile
-              ? `（近 ${c.profile.days} 日 · ${c.profile.source === "5min" ? "5 分钟线" : "日线"}）`
-              : ""}
-          </label>
-        </span>
+        <>
+          {period}
+          <span className="qc-ctl">
+            <label>
+              <input
+                type="checkbox"
+                checked={showChips}
+                onChange={(e) => setShowChips(e.target.checked)}
+              />{" "}
+              筹码分布
+            </label>
+            <label>
+              <input
+                type="checkbox"
+                checked={showBoll}
+                onChange={(e) => setShowBoll(e.target.checked)}
+              />{" "}
+              BOLL
+            </label>
+            <label title="点击 K 线设置锚点">
+              <input
+                type="checkbox"
+                checked={showVwap}
+                onChange={(e) => setShowVwap(e.target.checked)}
+              />{" "}
+              锚定 VWAP ±1σ/2σ
+            </label>
+            <label>
+              <input
+                type="checkbox"
+                checked={showVp}
+                onChange={(e) => setShowVp(e.target.checked)}
+              />{" "}
+              成交量分布
+              {c?.profile
+                ? `（近 ${c.profile.days} 日 · ${c.profile.source === "5min" ? "5 分钟线" : "日线"}）`
+                : ""}
+            </label>
+          </span>
+        </>
       }
     >
       <Candles
@@ -348,7 +358,7 @@ export function KlinePanel({
       {chip ? (
         <div className="chip-stats">
           <span>
-            {chip.date} 平均成本 <b>{chip.avg_cost.toFixed(2)}</b>
+            {chip.date} 平均成本 <b>{formatFixed(chip.avg_cost, 2)}</b>
           </span>
           <span>
             获利比例{" "}
@@ -370,9 +380,9 @@ export function KlinePanel({
           ) : null}
           {showVp && c?.profile ? (
             <span>
-              POC <b>{c.profile.poc.toFixed(2)}</b> 价值区{" "}
+              POC <b>{formatFixed(c.profile.poc, 2)}</b> 价值区{" "}
               <b>
-                {c.profile.val.toFixed(2)}–{c.profile.vah.toFixed(2)}
+                {formatFixed(c.profile.val, 2)}–{formatFixed(c.profile.vah, 2)}
               </b>
             </span>
           ) : null}

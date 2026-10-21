@@ -8,7 +8,7 @@ export const META_POLL_MS = 15_000;
 export async function fetchMeta(): Promise<MetaEnvelope> {
   const { data, response } = await apiClient().GET("/api/v1/meta");
   if (data === undefined) {
-    throw new ApiError(response.status, `网页 API 返回 HTTP ${response.status}`);
+    throw new ApiError(response.status, "暂时读不到数据");
   }
   return data;
 }

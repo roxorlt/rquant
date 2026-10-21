@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { usePanorama } from "@/api/endpoints";
+import { boardSystemLabel } from "@/copy/publicText";
 import { formatAmount } from "@/format/number";
 import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
@@ -14,11 +15,7 @@ export default function PanoramaPage() {
   const [system, setSystem] = useState<string | null>(null);
   return (
     <>
-      <PageHeader
-        eyebrow="跟踪与告警"
-        title="市场全景"
-        note="全 A 股 3 秒快照 · 行业按 Tushare 分类"
-      />
+      <PageHeader eyebrow="跟踪与告警" title="市场全景" />
       <LivePanorama />
       <QueryView query={query}>
         {(data) => {
@@ -27,7 +24,7 @@ export default function PanoramaPage() {
           return (
             <>
               <Panel
-                title={`东财板块热力图（Serving${asOf ? ` · ${formatShanghaiDateTime(asOf)}` : ""}）`}
+                title={`板块热力图${asOf ? ` · ${formatShanghaiDateTime(asOf)}` : ""}`}
                 sub="面积 = 成交额，颜色 = 成分股涨跌幅中位数（±3% 封顶）；取成交额前 80"
                 actions={
                   systems.length > 1 ? (
@@ -35,7 +32,10 @@ export default function PanoramaPage() {
                       label="板块体系"
                       value={system ?? systems[0] ?? ""}
                       onChange={setSystem}
-                      options={systems.map((s) => ({ value: s, label: s }))}
+                      options={systems.map((s) => ({
+                        value: s,
+                        label: boardSystemLabel(s),
+                      }))}
                     />
                   ) : undefined
                 }
@@ -52,7 +52,12 @@ export default function PanoramaPage() {
                   emptyText="没有板块快照：盘中快照尚未生成（非交易时段或采集未运行），开盘后自动出现。"
                   columns={[
                     { id: "name", header: "板块", value: (row) => row.board_name },
-                    { id: "system", header: "体系", value: (row) => row.system, secondary: true },
+                    {
+                      id: "system",
+                      header: "体系",
+                      value: (row) => boardSystemLabel(row.system),
+                      secondary: true,
+                    },
                     {
                       id: "pct",
                       header: "涨幅中位",

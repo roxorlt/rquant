@@ -2368,14 +2368,18 @@ def read_alert_ack_projection_source(
         return None
     latest: dict[str, AlertAckProjectionRow] = {}
     for record in records:
-        row = AlertAckProjectionRow(
+        at = datetime.fromisoformat(record["ts"])
+        if at > observed:
+            continue
+        if record.get("action") == "unack":
+            latest.pop(record["alert_id"], None)
+            continue
+        latest[record["alert_id"]] = AlertAckProjectionRow(
             alert_id=record["alert_id"],
-            acked_at=datetime.fromisoformat(record["ts"]),
+            acked_at=at,
             actor_id=record["actor_id"],
             command_id=record["command_id"],
         )
-        if row.acked_at <= observed:
-            latest[row.alert_id] = row
     rows = tuple(sorted(latest.values(), key=lambda r: r.alert_id))
     available = max((r.acked_at for r in rows), default=observed)
     return AlertAckProjectionSource(available_at=available, rows=rows)

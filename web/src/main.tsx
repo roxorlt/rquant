@@ -6,9 +6,12 @@ import "./styles/components.css";
 import "./styles/tables.css";
 import "./styles/screener.css";
 import "./styles/pages.css";
+import { installStaticPreview } from "virtual:static-preview";
 import { createRoot } from "react-dom/client";
 import { App } from "./app/App";
 import { applyThemeMode, readStoredThemeMode } from "./theme/ThemeProvider";
+
+installStaticPreview();
 
 // Before the first render, so the first paint already uses the stored theme.
 applyThemeMode(readStoredThemeMode());

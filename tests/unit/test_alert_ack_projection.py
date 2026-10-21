@@ -40,6 +40,21 @@ def test_latest_ack_per_alert_and_future_rows_wait(tmp_path: Path) -> None:
     assert table.rows[0]["actor_id"] == "bob"
 
 
+def test_unack_drops_the_alert(tmp_path: Path) -> None:
+    log = tmp_path / "alert_acks" / "acks.jsonl"
+    log.parent.mkdir(parents=True)
+    rows = [
+        {"alert_id": "a" * 64, "ts": "2026-10-09T01:00:00+00:00", "actor_id": "alice",
+         "command_id": "1", "generation_id": "g"},
+        {"alert_id": "a" * 64, "ts": "2026-10-09T02:00:00+00:00", "actor_id": "bob",
+         "command_id": "2", "generation_id": "g", "action": "unack"},
+    ]
+    log.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    source = read_alert_ack_projection_source(log, observed=NOW)
+    assert source is not None
+    assert source.rows == ()
+
+
 def test_manual_watchlist_latest_per_code(tmp_path: Path) -> None:
     from rquant.serving_page_projection_source import read_manual_watchlist_projection_source
 

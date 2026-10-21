@@ -1,5 +1,16 @@
+import type { CSSProperties } from "react";
 import { Link } from "react-router";
 import { useAlerts, useHealth, useOverview } from "@/api/endpoints";
+import {
+  layerTitle,
+  listedStockCode,
+  presetLabel,
+  publicLine,
+  publicLines,
+  signalActionLabel,
+  signalActionTone,
+  triggerLabel,
+} from "@/copy/publicText";
 import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
 import { Button, KpiStrip, PageHeader, Panel, Pill } from "@/ui";
@@ -21,20 +32,19 @@ function Pipeline() {
     <section aria-labelledby="pipe-h">
       <div className="block-h">
         <h2 id="pipe-h">今日链路</h2>
-        <span className="hint">数据采集 → 存储 → Serving → 信号盯盘 → 研究产出 → 网页</span>
       </div>
       <ol
         className="pipe"
         aria-label="今日链路"
-        style={{ gridTemplateColumns: `repeat(${layers.length}, minmax(0, 1fr))` }}
+        style={{ "--pipe-cols": layers.length } as CSSProperties}
       >
         {layers.map((layer) => {
           const [kind, text] = STATE_PILL[layer.state];
           return (
             <li key={layer.key}>
-              <span className="pn">{layer.title}</span>
+              <span className="pn">{layerTitle(layer.title)}</span>
               <Pill kind={kind}>{text}</Pill>
-              <span className="pd">{layer.detail.slice(0, 2).join("；") || "—"}</span>
+              <span className="pd">{publicLines(layer.detail).slice(0, 2).join("；") || "—"}</span>
             </li>
           );
         })}
@@ -59,8 +69,8 @@ function Attention() {
       items.push({
         key: layer.key,
         kind: layer.state,
-        text: `${layer.title}：${layer.state === "crit" ? "异常" : "需留意"}`,
-        sub: layer.detail[0] ?? "",
+        text: `${layerTitle(layer.title)}：${layer.state === "crit" ? "异常" : "需留意"}`,
+        sub: publicLine(layer.detail[0] ?? "") ?? "",
         to: "/health",
         btn: "看健康",
       });
@@ -96,7 +106,9 @@ function Attention() {
         </ul>
       ) : (
         <p className="hint" style={{ padding: "12px 16px" }}>
-          一切正常
+          {(health.data?.layers ?? []).some((layer) => layer.state === "unknown")
+            ? "还不知道服务是否正常"
+            : "一切正常"}
         </p>
       )}
     </Panel>
@@ -105,7 +117,13 @@ function Attention() {
 
 function LatestAlerts() {
   const alerts = useAlerts();
+  const health = useHealth();
   const rows = (alerts.data?.items ?? []).slice(0, 6);
+  const monitor = (health.data?.layers ?? []).find((layer) => /盯盘|通知/.test(layer.title));
+  const empty =
+    !monitor || monitor.state === "unknown"
+      ? "今天还没有告警。还没有识别到盯盘服务。"
+      : "今天还没有告警。盯盘服务在运行，还没有触发规则。";
   return (
     <Panel
       title="最新告警"
@@ -120,7 +138,7 @@ function LatestAlerts() {
         label="最新告警"
         rows={rows}
         rowKey={(row) => row.alert_id}
-        emptyText="今天还没有告警：盯盘服务运行中且未触发规则。规则在「盯盘与告警」页调整。"
+        emptyText={empty}
         columns={[
           {
             id: "at",
@@ -134,7 +152,11 @@ function LatestAlerts() {
             value: (r) => r.code,
             cell: (r) => `${r.name ?? ""} ${r.code}`,
           },
-          { id: "type", header: "规则", value: (r) => r.trigger_type ?? r.level },
+          {
+            id: "type",
+            header: "规则",
+            value: (r) => triggerLabel(r.trigger_type ?? r.level),
+          },
           {
             id: "state",
             header: "状态",
@@ -150,6 +172,7 @@ function LatestAlerts() {
 
 export default function OverviewPage() {
   const query = useOverview();
+  const health = useHealth();
   return (
     <>
       <PageHeader
@@ -171,7 +194,14 @@ export default function OverviewPage() {
           <>
             <KpiStrip
               label="关键数字"
-              items={data.kpis.map((kpi) => ({ ...kpi, tone: kpi.tone ?? undefined }))}
+              items={data.kpis.map((kpi) => {
+                const layers = health.data?.layers ?? [];
+                const unknown = layers.some((layer) => layer.state === "unknown");
+                if (unknown && (kpi.key === "services" || kpi.label === "服务异常")) {
+                  return { ...kpi, value: "—", tone: "muted" as const };
+                }
+                return { ...kpi, tone: kpi.tone ?? undefined };
+              })}
             />
             <div className="g2">
               <LatestAlerts />
@@ -195,30 +225,27 @@ export default function OverviewPage() {
                   {
                     id: "code",
                     header: "代码",
-                    value: (row) => row.code,
-                    cell: (row) => <StockLink code={row.code} />,
+                    value: (row) => listedStockCode(row.code),
+                    cell: (row) => {
+                      const code = listedStockCode(row.code);
+                      return code ? <StockLink code={code} /> : "—";
+                    },
                   },
                   { id: "name", header: "名称", value: (row) => row.name ?? null },
-                  { id: "strategy", header: "策略", value: (row) => row.strategy_id },
+                  {
+                    id: "strategy",
+                    header: "策略",
+                    phoneLine: 2,
+                    value: (row) => presetLabel(row.strategy_id),
+                  },
                   {
                     id: "action",
                     header: "动作",
+                    phoneLine: 2,
                     value: (row) => row.action,
                     cell: (row) => (
-                      <span
-                        className={
-                          /buy|买/i.test(row.action)
-                            ? "up"
-                            : /sell|卖/i.test(row.action)
-                              ? "down"
-                              : ""
-                        }
-                      >
-                        {/buy/i.test(row.action)
-                          ? "买入"
-                          : /sell/i.test(row.action)
-                            ? "卖出"
-                            : row.action}
+                      <span className={signalActionTone(row.action) || undefined}>
+                        {signalActionLabel(row.action)}
                       </span>
                     ),
                   },

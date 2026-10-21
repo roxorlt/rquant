@@ -42,8 +42,8 @@ export function EventStudies() {
                       <td>{pct(h.mean)}</td>
                       <td>{pct(h.median)}</td>
                       <td>{pct(h.win_rate)}</td>
-                      <td>{pct(h.excess_mean?.["沪深300"])}</td>
-                      <td>{pct(h.excess_mean?.["中证1000"])}</td>
+                      <td>{pct(h.excess_mean?.沪深300)}</td>
+                      <td>{pct(h.excess_mean?.中证1000)}</td>
                     </tr>
                   ))}
                 </tbody>

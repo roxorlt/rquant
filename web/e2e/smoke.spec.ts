@@ -10,7 +10,7 @@ test("every MVP page opens from the rail", async ({ page }) => {
     ["模拟盘", "paper-main"],
     ["盯盘与告警", "breakout"],
     ["市场全景", "白酒"],
-    ["系统健康", "rquant-monitor"],
+    ["系统健康", "盘中盯盘"],
   ] as const) {
     await page.getByRole("navigation").first().getByRole("link", { name: title }).click();
     await expect(page.getByText(text).first()).toBeVisible();
@@ -20,7 +20,7 @@ test("every MVP page opens from the rail", async ({ page }) => {
 test("acknowledging an alert goes through page control", async ({ page }) => {
   await page.goto("./#/monitor");
   await page.getByRole("button", { name: "确认", exact: true }).first().click();
-  await expect(page.getByText("已确认 · owner").first()).toBeVisible();
+  await expect(page.getByText("已确认 1 条告警")).toBeVisible();
 });
 
 test("a backtest run shows its performance block", async ({ page }) => {
@@ -35,7 +35,7 @@ test("a backtest run shows its performance block", async ({ page }) => {
 
 test("a portfolio backtest shows orders and performance", async ({ page }) => {
   await page.goto("./#/strategies");
-  await expect(page.getByText("demo-breakout@1（共 1 版）")).toBeVisible();
+  await expect(page.getByText("演示突破 1（共 1 版）")).toBeVisible();
   await page.goto("./#/experiments");
   await page.getByText("演示组合回测").click();
   await expect(page.getByLabel("组合回测委托")).toBeVisible();
@@ -44,8 +44,11 @@ test("a portfolio backtest shows orders and performance", async ({ page }) => {
   await page.getByRole("button", { name: "生成解读" }).click();
   await expect(page.getByText("数字已全部核对")).toBeVisible();
   await expect(page.getByRole("table", { name: "行业暴露" })).toContainText("白酒");
-  await page.getByRole("button", { name: "加入对比" }).click();
-  await expect(page.getByText("再选一条回测")).toBeVisible();
+  await page
+    .getByRole("table", { name: "组合回测列表" })
+    .getByRole("button", { name: "加入对比" })
+    .click();
+  await expect(page.getByText("再选一条就能对比")).toBeVisible();
   await expect(page.getByRole("table", { name: "Brinson 归因" })).toContainText("现金");
 });
 
@@ -66,14 +69,14 @@ test("factor page shows IC and quantiles", async ({ page }) => {
 
 test("an alert rule saved through page control shows up", async ({ page }) => {
   await page.goto("./#/monitor");
-  await page.getByLabel("规则 ID").fill("p2-l1");
-  await page.getByLabel("规则名称").fill("二号池一档");
+  await page.getByRole("button", { name: "新建规则" }).click();
+  await page.getByLabel("规则名称").fill("早盘一档");
   await page.getByRole("button", { name: "保存规则" }).click();
-  await expect(page.getByLabel("告警规则", { exact: true })).toContainText("二号池一档");
+  await expect(page.getByLabel("告警规则", { exact: true })).toContainText("早盘一档");
   await page.goto("./#/ops");
   await expect(
     page.getByRole("grid", { name: "操作记录" }).or(page.getByRole("table", { name: "操作记录" })),
-  ).toContainText("启用告警规则 二号池一档");
+  ).toContainText("启用告警规则 早盘一档");
 });
 
 test("tdx formula translates and condition hits are listed", async ({ page }) => {
@@ -99,7 +102,7 @@ test("health page shows the six layers", async ({ page }) => {
 
 test("tasks page lists units and shows a log", async ({ page }) => {
   await page.goto("./#/tasks");
-  await page.getByText("rquant-daily.service").click();
+  await page.getByText("日线采集服务").click();
   await expect(page.getByText("ingest ok rows=5412")).toBeVisible();
 });
 

@@ -7,17 +7,22 @@ export interface PanelProps {
   /** No body padding (tables that run edge to edge). */
   flush?: boolean;
   label?: string;
+  titleId?: string;
   children: ReactNode;
 }
 
-export function Panel({ title, sub, actions, flush, label, children }: PanelProps) {
+export function Panel({ title, sub, actions, flush, label, titleId, children }: PanelProps) {
   return (
     <section className="panel" aria-label={label}>
       {title || sub || actions ? (
         <div className="panel-h">
-          {title ? <h2>{title}</h2> : null}
+          {title ? (
+            <h2 id={titleId} tabIndex={titleId ? -1 : undefined}>
+              {title}
+            </h2>
+          ) : null}
           {sub ? <span className="sub">{sub}</span> : null}
-          {actions ? <div className="row">{actions}</div> : null}
+          {actions ? <div className="tools">{actions}</div> : null}
         </div>
       ) : null}
       <div className={flush ? "panel-b flush" : "panel-b"}>{children}</div>

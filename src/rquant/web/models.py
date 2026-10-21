@@ -502,7 +502,7 @@ class BandData(BaseModel):
 
 class OperationRow(BaseModel):
     at: datetime | None
-    kind: Literal["ack_alert", "add_watchlist_item", "save_alert_rule"]
+    kind: Literal["ack_alert", "unack_alert", "add_watchlist_item", "save_alert_rule"]
     summary: str
     actor: str | None
     command_id: str
@@ -536,6 +536,33 @@ class ReportFactorsSummaryData(BaseModel):
     summary: dict[str, Any] | None
 
 
+class SurgeRules(BaseModel):
+    """Scanner thresholds from ``rquant.research.surge``. The UI renders copy from these."""
+
+    ratio_min: float
+    amount_min: float
+    acc5_min: float
+    win_amount_min: float
+    acc_ratio_min: float
+    start_m: float
+    cooldown_s: float
+
+
 class SurgeData(BaseModel):
     date: str | None
     items: list[SurgeEvent]
+    rules: SurgeRules
+
+
+class ScreenerSchemeBody(BaseModel):
+    name: str = Field(min_length=1, max_length=40)
+    filters: list[dict[str, Any]] = []
+    ranks: list[dict[str, Any]] = []
+
+
+class ScreenerSchemeRow(ScreenerSchemeBody):
+    saved_at: datetime | None = None
+
+
+class ScreenerSchemesData(BaseModel):
+    schemes: list[ScreenerSchemeRow]

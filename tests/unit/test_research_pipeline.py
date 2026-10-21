@@ -10,6 +10,18 @@ from rquant.research import daily, ingest, screens
 from rquant.research.tdx_strategy import TDX_STRATEGIES
 
 
+class _OfflinePro:
+    """Empty Tushare stand-in so the daily job never retries over the network."""
+
+    def __init__(self, token: str, pause: float = 0.13) -> None:
+        self.token = token
+        self.pause = pause
+
+    def __call__(self, api: str, **kw: object) -> pd.DataFrame:
+        del api, kw
+        return pd.DataFrame()
+
+
 def _seed(root, days=420, n=40):
     con = ingest.connect(root)
     idx = pd.bdate_range("2024-01-01", periods=days)
@@ -39,6 +51,8 @@ def _seed(root, days=420, n=40):
 
 def test_screens_and_daily_job_populate_research_root(tmp_path, monkeypatch):
     monkeypatch.setenv("RQUANT_RESEARCH_ROOT", str(tmp_path))
+    monkeypatch.setenv("TUSHARE_TOKEN", "offline-test")
+    monkeypatch.setattr(ingest, "Pro", _OfflinePro)
     idx = _seed(tmp_path)
     con = ingest.connect(tmp_path)
     assert screens.build(con, idx[150].date(), idx[-1].date()) > 0

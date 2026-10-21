@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { formatFixed } from "@/format/number";
 import { useTouchScrub } from "./useTouchScrub";
 
 export interface Candle {
@@ -186,10 +187,10 @@ export function Candles({
       {h ? (
         <div className="chart-readout">
           <span className="when">{h.date}</span>
-          <span>开 {h.open.toFixed(2)}</span>
-          <span>高 {h.high.toFixed(2)}</span>
-          <span>低 {h.low.toFixed(2)}</span>
-          <span className={h.close >= h.open ? "up" : "down"}>收 {h.close.toFixed(2)}</span>
+          <span>开 {formatFixed(h.open, 2)}</span>
+          <span>高 {formatFixed(h.high, 2)}</span>
+          <span>低 {formatFixed(h.low, 2)}</span>
+          <span className={h.close >= h.open ? "up" : "down"}>收 {formatFixed(h.close, 2)}</span>
           <span className="hint">MA5 / MA20 / MA60</span>
         </div>
       ) : null}
@@ -248,7 +249,7 @@ export function Candles({
           <g key={t}>
             <line className="chart-grid" x1={PAD.left} x2={plotR} y1={y(t)} y2={y(t)} />
             <text className="chart-axis" x={plotR + 6} y={y(t) + 3} textAnchor="start">
-              {t.toFixed(2)}
+              {formatFixed(t, 2)}
             </text>
           </g>
         ))}
@@ -353,7 +354,7 @@ export function Candles({
               height={16}
             />
             <text className="axis-tag-t" x={plotR + 5} y={y(side.avg) + 4}>
-              {side.avg.toFixed(2)}
+              {formatFixed(side.avg, 2)}
             </text>
           </g>
         ) : null}
@@ -400,7 +401,7 @@ export function Candles({
             <line className="chart-cross" x1={PAD.left} x2={plotR} y1={hy} y2={hy} />
             <rect className="axis-tag" x={plotR + 1} y={hy - 8} width={PAD.right - 2} height={16} />
             <text className="axis-tag-t" x={plotR + 5} y={hy + 4}>
-              {(hi - ((hy - PAD.top) / priceH) * (hi - lo)).toFixed(2)}
+              {formatFixed(hi - ((hy - PAD.top) / priceH) * (hi - lo), 2)}
             </text>
           </g>
         ) : null}

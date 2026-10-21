@@ -19,3 +19,22 @@ def test_surge_endpoint(tmp_path: Path):
     assert data["date"] == "2026-10-12"
     assert data["items"][0]["code"] == "000001.SZ" and data["items"][0]["ratio"] == 4.2
     assert client.get("/api/v1/surge?day=2026-10-09").json()["data"]["items"] == []
+    from rquant.research.surge import (
+        ACC5_MIN,
+        ACC_RATIO_MIN,
+        AMOUNT_MIN,
+        COOLDOWN_S,
+        RATIO_MIN,
+        START_M,
+        WIN_AMOUNT_MIN,
+    )
+
+    assert data["rules"] == {
+        "ratio_min": RATIO_MIN,
+        "amount_min": AMOUNT_MIN,
+        "acc5_min": ACC5_MIN,
+        "win_amount_min": WIN_AMOUNT_MIN,
+        "acc_ratio_min": ACC_RATIO_MIN,
+        "start_m": START_M,
+        "cooldown_s": COOLDOWN_S,
+    }

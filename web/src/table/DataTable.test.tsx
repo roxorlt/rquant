@@ -125,6 +125,48 @@ describe("DataTable", () => {
     expect(within(table).getAllByRole("row").length).toBeLessThan(100);
   });
 
+  it("starts phone secondary columns unchecked, and a check shows the column", async () => {
+    const user = userEvent.setup();
+    const original = window.matchMedia;
+    window.matchMedia = ((query: string) => ({
+      matches: query.includes("599"),
+      media: query,
+      onchange: null,
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined,
+      addListener: () => undefined,
+      removeListener: () => undefined,
+      dispatchEvent: () => false,
+    })) as typeof window.matchMedia;
+    try {
+      render(
+        <DataTable
+          rows={ROWS}
+          columns={[
+            ...COLUMNS,
+            {
+              id: "pool",
+              header: "池子",
+              value: () => "已加入",
+              secondary: true,
+            },
+          ]}
+          rowKey={(row) => row.code}
+          label="告警时间线"
+          tools
+        />,
+      );
+      expect(screen.queryByRole("columnheader", { name: "池子" })).not.toBeInTheDocument();
+      await user.click(screen.getByRole("button", { name: /列/ }));
+      const item = await screen.findByRole("menuitem", { name: "池子" });
+      expect(item).not.toHaveTextContent("✓");
+      await user.click(item);
+      expect(screen.getByRole("columnheader", { name: "池子" })).toBeInTheDocument();
+    } finally {
+      window.matchMedia = original;
+    }
+  });
+
   it("orders mixed values with nulls last", () => {
     expect([3, null, 1].sort(compareCells)).toEqual([1, 3, null]);
     expect(["乙", "甲"].sort(compareCells)).toEqual(["甲", "乙"]);

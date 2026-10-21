@@ -1,9 +1,56 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_TOP_N, fmtAmountYi, fmtTurnoverChg, layoutEndLabels, tone } from "./model";
+import {
+  colorMap,
+  DEFAULT_TOP_N,
+  fmtAmountYi,
+  fmtPct,
+  fmtRatioPct,
+  fmtSectorNet,
+  fmtTurnoverChg,
+  fmtYi,
+  layoutEndLabels,
+  placeEndLabels,
+  type Sector,
+  tone,
+} from "./model";
+
+describe("leader net is already 亿", () => {
+  it("does not divide a series value by 1e8", () => {
+    expect(fmtSectorNet(2.4)).toBe("+2.4亿");
+    expect(fmtYi(-1.2)).toBe("−1.2亿");
+    expect(fmtPct(-1.41)).toBe("−1.41%");
+    expect(fmtRatioPct(2)).toBe("2.00%");
+    expect(fmtRatioPct(-1.2)).toBe("−1.20%");
+    expect(fmtYi(2.4 / 1e8)).toBe("0.0亿");
+  });
+});
+
+describe("line colours", () => {
+  it("gives each drawn sector a different colour", () => {
+    const shown = Array.from({ length: 10 }, (_, i) => ({ name: `板块${i}` })) as Sector[];
+    const colors = [...colorMap(shown).values()];
+    expect(new Set(colors).size).toBe(colors.length);
+  });
+});
 
 describe("sectorflow defaults", () => {
   it("draws 5 inflow + 5 outflow lines by default (phone too)", () => {
     expect(DEFAULT_TOP_N).toBe(5);
+  });
+});
+
+describe("placeEndLabels", () => {
+  it("keeps a gap and stays in the gutter to the right of the lines", () => {
+    const placed = placeEndLabels(
+      [{ y: 80 }, { y: 82 }, { y: 84 }, { y: 86 }, { y: 90 }, { y: 92 }],
+      { gap: 18, top: 20, bottom: 280, plotRight: 200 },
+    );
+    expect(placed).toHaveLength(6);
+    for (const item of placed) expect(item.x).toBeGreaterThan(200);
+    expect(new Set(placed.map((item) => item.x)).size).toBe(1);
+    for (let i = 1; i < placed.length; i++) {
+      expect((placed[i]?.y ?? 0) - (placed[i - 1]?.y ?? 0)).toBeGreaterThanOrEqual(18);
+    }
   });
 });
 
@@ -33,7 +80,7 @@ describe("layoutEndLabels", () => {
 describe("两市成交额 card", () => {
   it("formats 10-19 vs 10-16 (Tushare daily totals)", () => {
     expect(fmtAmountYi(14487.919 * 1e8)).toBe("1.45万亿");
-    expect(fmtTurnoverChg(-1202.741, -7.67)).toBe("较昨 -1202.7亿（-7.7%）");
+    expect(fmtTurnoverChg(-1202.741, -7.67)).toBe("较昨 −1202.7亿（−7.7%）");
     expect(tone(-1202.741)).toBe("down");
   });
   it("shows a rise in red and hides the line when there is no previous day", () => {

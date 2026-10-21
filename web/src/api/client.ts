@@ -19,14 +19,33 @@ export function apiBaseUrl(base: string = document.baseURI): string {
   return new URL(".", base).href.replace(/\/$/, "");
 }
 
+function previewFailRequested(): boolean {
+  if (typeof window === "undefined") return false;
+  return /(?:\?|&)fail=1(?:&|#|$)/.test(`${window.location.search}${window.location.hash}`);
+}
+
 export function createApiClient(baseUrl: string = apiBaseUrl()): ApiClient {
-  return createClient<paths>({ baseUrl, headers: { Accept: "application/json" } });
+  return createClient<paths>({
+    baseUrl,
+    headers: { Accept: "application/json" },
+    fetch: (request: Request) => {
+      if (!previewFailRequested()) return fetch(request);
+      const headers = new Headers(request.headers);
+      headers.set("X-Rquant-Preview-Fail", "1");
+      return fetch(new Request(request, { headers }));
+    },
+  });
 }
 
 let sharedClient: ApiClient | null = null;
+let sharedBase = "";
 
 export function apiClient(): ApiClient {
-  sharedClient ??= createApiClient();
+  const base = apiBaseUrl();
+  if (sharedClient === null || sharedBase !== base) {
+    sharedClient = createApiClient(base);
+    sharedBase = base;
+  }
   return sharedClient;
 }
 

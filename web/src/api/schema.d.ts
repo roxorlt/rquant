@@ -56,6 +56,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/alerts/unack": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 撤销确认 */
+        post: operations["unack_alert_api_v1_alerts_unack_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/backtests": {
         parameters: {
             query?: never;
@@ -667,6 +684,25 @@ export interface paths {
         put?: never;
         post?: never;
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/screener-schemes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 选股方案 */
+        get: operations["list_screener_schemes_api_v1_screener_schemes_get"];
+        /** 保存选股方案 */
+        put: operations["save_screener_scheme_api_v1_screener_schemes_put"];
+        post?: never;
+        /** 删除选股方案 */
+        delete: operations["delete_screener_scheme_api_v1_screener_schemes_delete"];
         options?: never;
         head?: never;
         patch?: never;
@@ -1499,6 +1535,11 @@ export interface components {
             data: components["schemas"]["ScreenData"];
             serving: components["schemas"]["ServingMeta"];
         };
+        /** Envelope[ScreenerSchemesData] */
+        Envelope_ScreenerSchemesData_: {
+            data: components["schemas"]["ScreenerSchemesData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
         /** Envelope[SectorFlowData] */
         Envelope_SectorFlowData_: {
             data: components["schemas"]["SectorFlowData"];
@@ -2272,7 +2313,7 @@ export interface components {
              * Kind
              * @enum {string}
              */
-            kind: "ack_alert" | "add_watchlist_item" | "save_alert_rule";
+            kind: "ack_alert" | "unack_alert" | "add_watchlist_item" | "save_alert_rule";
             /** Summary */
             summary: string;
         };
@@ -2642,6 +2683,51 @@ export interface components {
             /** Vol Ratio */
             vol_ratio?: number | null;
         };
+        /** ScreenerSchemeBody */
+        ScreenerSchemeBody: {
+            /**
+             * Filters
+             * @default []
+             */
+            filters: {
+                [key: string]: unknown;
+            }[];
+            /** Name */
+            name: string;
+            /**
+             * Ranks
+             * @default []
+             */
+            ranks: {
+                [key: string]: unknown;
+            }[];
+        };
+        /** ScreenerSchemeRow */
+        ScreenerSchemeRow: {
+            /**
+             * Filters
+             * @default []
+             */
+            filters: {
+                [key: string]: unknown;
+            }[];
+            /** Name */
+            name: string;
+            /**
+             * Ranks
+             * @default []
+             */
+            ranks: {
+                [key: string]: unknown;
+            }[];
+            /** Saved At */
+            saved_at?: string | null;
+        };
+        /** ScreenerSchemesData */
+        ScreenerSchemesData: {
+            /** Schemes */
+            schemes: components["schemas"]["ScreenerSchemeRow"][];
+        };
         /** SectorFlowData */
         SectorFlowData: {
             /** Date */
@@ -2847,6 +2933,7 @@ export interface components {
             date: string | null;
             /** Items */
             items: components["schemas"]["SurgeEvent"][];
+            rules: components["schemas"]["SurgeRules"];
         };
         /** SurgeEvent */
         SurgeEvent: {
@@ -2872,6 +2959,26 @@ export interface components {
             ratio?: number | null;
             /** Time */
             time: string;
+        };
+        /**
+         * SurgeRules
+         * @description Scanner thresholds from ``rquant.research.surge``. The UI renders copy from these.
+         */
+        SurgeRules: {
+            /** Acc5 Min */
+            acc5_min: number;
+            /** Acc Ratio Min */
+            acc_ratio_min: number;
+            /** Amount Min */
+            amount_min: number;
+            /** Cooldown S */
+            cooldown_s: number;
+            /** Ratio Min */
+            ratio_min: number;
+            /** Start M */
+            start_m: number;
+            /** Win Amount Min */
+            win_amount_min: number;
         };
         /** TaskLog */
         TaskLog: {
@@ -3114,6 +3221,39 @@ export interface operations {
         };
     };
     ack_alert_api_v1_alerts_ack_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AckAlertRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommandReceipt"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    unack_alert_api_v1_alerts_unack_post: {
         parameters: {
             query?: never;
             header?: never;
@@ -4061,6 +4201,90 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_ScreenData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_screener_schemes_api_v1_screener_schemes_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_ScreenerSchemesData_"];
+                };
+            };
+        };
+    };
+    save_screener_scheme_api_v1_screener_schemes_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ScreenerSchemeBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommandReceipt"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    delete_screener_scheme_api_v1_screener_schemes_delete: {
+        parameters: {
+            query: {
+                name: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommandReceipt"];
                 };
             };
             /** @description Validation Error */

@@ -2,14 +2,14 @@
   --sf-card: var(--surface);
   --sf-line: var(--rule);
   --sf-sub: var(--muted);
-  --sf-mute: var(--faint);
+  --sf-mute: var(--muted);
   font-variant-numeric: tabular-nums;
 }
 .sf .up {
-  color: var(--up);
+  color: var(--up-t);
 }
 .sf .down {
-  color: var(--down);
+  color: var(--down-t);
 }
 .sf .up-bg {
   background: var(--up);
@@ -19,7 +19,7 @@
 }
 .sf-stats {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 10px;
   margin: 4px 0 12px;
 }
@@ -77,11 +77,22 @@
 .sf-ch {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   margin-bottom: 8px;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
+  min-width: 0;
+}
+.sf-ch .tools {
+  flex: 0 0 auto;
+  flex-wrap: nowrap;
+  margin-left: auto;
 }
 .sf-ch h3 {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-size: 15px;
   font-weight: 700;
   margin: 0;
@@ -90,7 +101,7 @@
   flex: 1;
 }
 .sf-pill {
-  font-size: 11px;
+  font-size: 12px;
   color: var(--sf-sub);
   border: 1px solid var(--sf-line);
   border-radius: 999px;
@@ -107,6 +118,14 @@
   display: inline-flex;
   align-items: center;
   gap: 6px;
+}
+.sf-ch .sf-sub,
+.sf-ch .sf-live,
+.sf-ch .sf-pill {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .sf-live i {
   width: 7px;
@@ -206,21 +225,15 @@
   stroke-width: 1.2;
 }
 .sf-chart .sf-tick {
-  font-size: 11px;
-  fill: var(--sf-sub);
-}
-.sf-chart .sf-tick.up {
-  fill: var(--up);
-}
-.sf-chart .sf-tick.down {
-  fill: var(--down);
+  font-size: 12px;
+  fill: var(--c-muted);
 }
 .sf-chart .sf-xtick {
-  font-size: 11px;
+  font-size: 12px;
   fill: var(--sf-sub);
 }
 .sf-chart .sf-axis-note {
-  font-size: 10px;
+  font-size: 12px;
   fill: var(--sf-mute);
 }
 .sf-chart .sf-auction {
@@ -240,7 +253,7 @@
 }
 .sf-chart .sf-now-text {
   fill: #fff;
-  font-size: 10px;
+  font-size: 12px;
   font-weight: 700;
 }
 .sf-chart .sf-cross {
@@ -283,6 +296,9 @@
 }
 .sf-chart .sf-endlab {
   cursor: pointer;
+}
+.sf-chart .sf-endlab text {
+  fill: var(--c-ink-2);
 }
 .sf-phone-tip {
   margin-top: 6px;
@@ -363,24 +379,18 @@
   font-size: 13px;
 }
 .sf-note {
-  font-size: 11px;
+  font-size: 12px;
   color: var(--sf-mute);
   margin: 8px 0 0;
   line-height: 1.6;
 }
 .sf-foot {
-  font-size: 11px;
+  font-size: 12px;
   color: var(--sf-mute);
   margin: 10px 0 0;
 }
 .sf-day {
-  font: inherit;
-  font-size: 13px;
-  padding: 5px 8px;
-  border-radius: 8px;
-  border: 1px solid var(--sf-line);
-  background: var(--surface);
-  color: var(--ink);
+  flex: 0 0 auto;
 }
 /* bars */
 .sf-bars {
@@ -452,10 +462,10 @@
 .sf-sh .rank {
   width: 20px;
   height: 20px;
-  border-radius: 6px;
-  background: var(--up-weak);
-  color: var(--up);
-  font-weight: 800;
+  border-radius: var(--r-sm);
+  background: var(--c-sunken);
+  color: var(--c-muted);
+  font-weight: 600;
   font-size: 12px;
   display: flex;
   align-items: center;
@@ -468,7 +478,7 @@
 }
 .sf-sh .sname em {
   font-style: normal;
-  color: var(--up);
+  color: var(--c-ink-2);
   margin-left: 2px;
 }
 .sf-sh .smeta {
@@ -477,11 +487,11 @@
   white-space: nowrap;
 }
 .sf .tag {
-  font-size: 10px;
+  font-size: 12px;
   padding: 1px 5px;
   border-radius: 4px;
   background: var(--up-weak);
-  color: var(--up);
+  color: var(--up-t);
   font-weight: 700;
   margin-left: 5px;
   white-space: nowrap;
@@ -505,7 +515,7 @@
   text-overflow: ellipsis;
 }
 .sf-stk .c {
-  font-size: 11px;
+  font-size: 12px;
   margin-left: 4px;
   font-weight: 400;
 }
@@ -513,13 +523,13 @@
   color: var(--sf-mute);
 }
 .sf-stk .r {
-  font-size: 11px;
-  color: var(--sf-sub);
+  font-size: 12px;
+  color: var(--c-muted);
   margin-top: 1px;
   white-space: nowrap;
 }
 .sf-stk .r b {
-  color: var(--up);
+  color: var(--c-muted);
   font-weight: 600;
 }
 .sf-stk .p {
@@ -557,11 +567,24 @@
   padding: 3px 0;
 }
 .sf-out .small {
-  font-size: 11px;
+  font-size: 12px;
+}
+.sf-plot {
+  min-width: 0;
+  max-width: 100%;
+}
+.sf-legend {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 4px;
+  min-height: 16px;
+  font-size: 12px;
+  color: var(--c-muted);
 }
 /* ---- iPhone: designed for the device, not a squeezed desktop ---- */
 .sf-phone .sf-stats {
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
   margin: 0 0 10px;
 }
@@ -585,14 +608,6 @@
 .sf-phone .sf-card {
   padding: 12px;
   border-radius: 12px;
-}
-.sf-phone .sf-seg {
-  width: 100%;
-}
-.sf-phone .sf-seg button {
-  flex: 1;
-  min-height: 34px;
-  font-size: 13px;
 }
 .sf-phone .sf-chips {
   flex-wrap: nowrap;
@@ -623,7 +638,7 @@
   grid-template-columns: 18px 92px 1fr 64px;
   font-size: 13px;
 }
-.sf-phone .sf-bar .cb {
+.sf-phone .sf-bars .sf-bar .cb {
   width: 16px;
   height: 16px;
 }
@@ -641,8 +656,41 @@
 .sf-phone {
   padding-bottom: env(safe-area-inset-bottom);
 }
+.sf-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.sf-phone .sf-ch {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  column-gap: 8px;
+  row-gap: 8px;
+}
+.sf-phone .sf-ch h3 {
+  grid-column: 1;
+  grid-row: 1;
+  max-width: none;
+}
+.sf-phone .sf-ch .sf-meta {
+  grid-column: 1 / -1;
+  grid-row: 2;
+}
+.sf-phone .sf-ch .tools {
+  display: contents;
+}
 .sf-phone .sf-day {
-  min-height: 34px;
+  grid-column: 2;
+  grid-row: 1;
+}
+.sf-phone .sf-ch .seg {
+  grid-column: 1 / -1;
+  grid-row: 3;
+  width: 100%;
+  max-width: 100%;
+  height: auto;
 }
 .sf .sf-chip button {
   appearance: none;
@@ -667,6 +715,9 @@
 .sf-phone .sf-chip button.x {
   padding: 4px 6px;
 }
+.sf-phone .sf-ch .seg button {
+  flex: 1 1 0;
+}
 .sf .sf-chart {
   overflow: hidden;
   min-width: 0;
@@ -685,6 +736,15 @@
   grid-template-columns: minmax(0, 1fr) 56px 76px;
 }
 .sf-pill.replay {
-  color: var(--accent);
-  border-color: var(--accent);
+  background: var(--c-warn-weak);
+  color: var(--c-warn);
+  border-color: transparent;
+  font-size: 12px;
+}
+.sf-hint {
+  font-size: 12px;
+  color: var(--c-muted);
+  border: 0;
+  background: none;
+  padding: 0;
 }

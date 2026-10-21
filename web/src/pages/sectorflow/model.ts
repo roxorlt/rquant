@@ -1,4 +1,5 @@
 import type { SectorFlowData } from "@/api/endpoints";
+import { formatSignedFixed, formatSignedPercent } from "@/format/number";
 
 export type Sector = SectorFlowData["sectors"][number];
 export type Mode = "net" | "ratio" | "pct";
@@ -34,16 +35,38 @@ export function seriesOf(s: Sector, mode: Mode): (number | null)[] {
 }
 
 export const fmtYi = (v: number | null | undefined, digits = 1) =>
-  v == null ? "—" : `${v > 0 ? "+" : ""}${v.toFixed(digits)}亿`;
+  v == null ? "—" : `${formatSignedFixed(v, digits)}亿`;
 export const fmtPct = (v: number | null | undefined, digits = 2) =>
-  v == null ? "—" : `${v > 0 ? "+" : ""}${v.toFixed(digits)}%`;
+  v == null ? "—" : formatSignedPercent(v, digits);
+/** A share such as 占流通: positive stays unsigned, negative uses the monitor minus. */
+export function fmtRatioPct(v: number | null | undefined, digits = 2): string {
+  if (v == null) return "—";
+  const signed = formatSignedFixed(v, digits);
+  return `${signed.startsWith("+") ? signed.slice(1) : signed}%`;
+}
 export const tone = (v: number | null | undefined) =>
   v == null || v === 0 ? "" : v > 0 ? "up" : "down";
 
-export function fmtValue(v: number | null | undefined, mode: Mode, short = false): string {
+/** Categorical hues for one chart. Assigned in draw order; none repeats inside that chart. */
+export const LINE_COLORS = [
+  "#2448D0",
+  "#C47B12",
+  "#6B4C9A",
+  "#0E7490",
+  "#9A3412",
+  "#3F6212",
+  "#BE185D",
+  "#7C3AED",
+  "#0F6E56",
+  "#B45309",
+  "#4338CA",
+  "#A16207",
+];
+
+export function fmtValue(v: number | null | undefined, mode: Mode, _short = false): string {
   if (v == null) return "—";
-  if (mode === "net") return short ? `${v > 0 ? "+" : ""}${v.toFixed(0)}` : fmtYi(v);
-  return fmtPct(v, short ? 1 : 2);
+  if (mode === "net") return fmtYi(v);
+  return fmtPct(v, 2);
 }
 
 export function fmtAmountYi(cny: number): string {
@@ -57,9 +80,8 @@ export function fmtTurnoverChg(
   pct: number | null | undefined,
 ): string | null {
   if (chg == null) return null;
-  const sign = (v: number) => (v > 0 ? "+" : "");
-  const p = pct == null ? "" : `（${sign(pct)}${pct.toFixed(1)}%）`;
-  return `较昨 ${sign(chg)}${chg.toFixed(1)}亿${p}`;
+  const p = pct == null ? "" : `（${formatSignedPercent(pct, 1)}）`;
+  return `较昨 ${formatSignedFixed(chg, 1)}亿${p}`;
 }
 
 /** Default lines: top-k inflow + top-k outflow by net now. */
@@ -72,18 +94,25 @@ export function defaultSelection(sectors: Sector[], k: number): string[] {
   return [...ins, ...outs].map((s) => s.name);
 }
 
-/** Stable colours: inflow names get warm hues, outflow cool, by rank among the shown lines. */
+/** Categorical hues in the order the lines are drawn. A chart does not reuse a colour. */
 export function colorMap(shown: Sector[]): Map<string, string> {
   const m = new Map<string, string>();
-  let i = 0;
-  let o = 0;
-  for (const s of [...shown].sort((a, b) => b.net - a.net)) {
-    if (s.net >= 0) m.set(s.name, IN_COLORS[i++ % IN_COLORS.length] ?? "#ff4d4f");
-  }
-  for (const s of [...shown].sort((a, b) => a.net - b.net)) {
-    if (s.net < 0) m.set(s.name, OUT_COLORS[o++ % OUT_COLORS.length] ?? "#1fb46a");
-  }
+  const used = new Set<string>();
+  shown.forEach((sector, index) => {
+    let color = LINE_COLORS[index];
+    if (!color || used.has(color)) {
+      const spare = LINE_COLORS.find((item) => !used.has(item));
+      color = spare ?? `hsl(${(index * 47) % 360} 45% 42%)`;
+    }
+    used.add(color);
+    m.set(sector.name, color);
+  });
   return m;
+}
+
+/** Sector series values are already 亿. Do not divide by 1e8 again. */
+export function fmtSectorNet(yi: number | null | undefined): string {
+  return fmtYi(yi);
 }
 
 /** Default number of inflow and of outflow sectors drawn on the main chart (phone and desktop). */
@@ -94,6 +123,25 @@ export const DEFAULT_TOP_N = 5;
  * push them apart to at least `gap` px and keep them within [top, bottom].
  * If they can't fit, they are spread evenly across the range.
  */
+/**
+ * End labels sit in the gutter to the right of the plot, one row each.
+ * `x` is the text start; it is always past `plotRight`, so the words are not
+ * drawn on the curves. `y` keeps at least `gap` pixels between neighbours.
+ */
+export function placeEndLabels(
+  points: readonly { y: number }[],
+  opts: { gap: number; top: number; bottom: number; plotRight: number },
+): { y: number; x: number }[] {
+  const laid = layoutEndLabels(
+    points.map((point) => point.y),
+    opts.gap,
+    opts.top,
+    opts.bottom,
+  );
+  const x = opts.plotRight + 12;
+  return laid.map((y) => ({ y, x }));
+}
+
 export function layoutEndLabels(ys: number[], gap: number, top: number, bottom: number): number[] {
   const n = ys.length;
   if (n === 0) return [];

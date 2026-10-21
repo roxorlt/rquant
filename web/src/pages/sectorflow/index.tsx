@@ -1,11 +1,11 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   inTradingHours,
   type SectorFlowData,
   useSectorFlow,
   useSectorLeadersAt,
 } from "@/api/endpoints";
-import { PageHeader } from "@/ui";
+import { HelpMark, PageHeader, Segmented } from "@/ui";
 import { StockLink } from "@/ui/StockLink";
 import { PHONE_QUERY, useMedia } from "../panorama/useMedia";
 import { FlowChart } from "./FlowChart";
@@ -15,6 +15,8 @@ import {
   defaultSelection,
   fmtAmountYi,
   fmtPct,
+  fmtRatioPct,
+  fmtSectorNet,
   fmtTurnoverChg,
   fmtValue,
   fmtYi,
@@ -36,40 +38,29 @@ const MODES: { value: Mode; label: string }[] = [
 export default function SectorFlowPage() {
   const phone = useMedia(PHONE_QUERY);
   const [day, setDay] = useState<string | null>(null);
+  const [replayAt, setReplayAt] = useState<string | null>(null);
   const q = useSectorFlow(day);
   const data = q.data;
   return (
     <div className={`sf ${phone ? "sf-phone" : ""}`}>
-      <PageHeader
-        eyebrow="跟踪与告警"
-        title="板块资金流"
-        note="行业（Tushare 分类，与市场全景一致）· 自 09:25 累计主动买卖估算"
-        actions={
-          data?.days?.length ? (
-            <select
-              className="sf-day"
-              aria-label="交易日"
-              value={day ?? ""}
-              onChange={(e) => setDay(e.target.value || null)}
-            >
-              <option value="">今天 / 最新</option>
-              {data.days.slice(1).map((d) => (
-                <option key={d} value={d}>
-                  {d}
-                </option>
-              ))}
-            </select>
-          ) : undefined
-        }
-      />
-      {q.error ? <p className="hint pad">加载失败：{String(q.error.message ?? q.error)}</p> : null}
+      <PageHeader eyebrow="跟踪与告警" title="板块资金流" />
+      {q.error ? <p className="hint pad">暂时读不到数据</p> : null}
       {!data && !q.error ? <p className="hint pad">加载中…</p> : null}
       {data?.warming ? <p className="hint pad">正在汇总当日快照（首次约 10–60 秒）…</p> : null}
       {data && !data.warming && !data.sectors.length ? (
         <p className="hint pad">今天还没有快照（09:25 集合竞价后出现）。</p>
       ) : null}
       {data && !data.warming && data.sectors.length ? (
-        <Body key={data.date} day={day} data={data} phone={phone} live={!day && inTradingHours()} />
+        <Body
+          key={data.date}
+          day={day}
+          onDay={setDay}
+          replayAt={replayAt}
+          data={data}
+          phone={phone}
+          live={!day && inTradingHours()}
+          onReplay={setReplayAt}
+        />
       ) : null}
     </div>
   );
@@ -77,14 +68,20 @@ export default function SectorFlowPage() {
 
 function Body({
   day,
+  onDay,
+  replayAt,
   data,
   phone,
   live,
+  onReplay,
 }: {
   day: string | null;
+  onDay: (day: string | null) => void;
+  replayAt: string | null;
   data: SectorFlowData;
   phone: boolean;
   live: boolean;
+  onReplay: (time: string | null) => void;
 }) {
   const [mode, setMode] = useState<Mode>("net");
   const [picked, setPicked] = useState<string[] | null>(null);
@@ -104,6 +101,11 @@ function Body({
     const cur = picked ?? sel;
     setPicked(cur.includes(name) ? cur.filter((n) => n !== name) : [...cur, name]);
   };
+  const clock = data.t[upto] ?? data.time ?? "";
+  const replay = cursor != null;
+  useEffect(() => {
+    onReplay(replay ? clock : null);
+  }, [replay, clock, onReplay]);
   const at = (s: Sector) => s.series[upto] ?? s.series[s.series.length - 1] ?? 0;
   const ranked = [...data.sectors].sort((a, b) => at(b) - at(a));
   const sm = data.summary;
@@ -140,25 +142,31 @@ function Body({
           <section className="sf-card">
             <div className="sf-ch">
               <h3>板块累计{mode === "pct" ? "涨幅" : "净流入"}</h3>
-              <span className="sf-pill">09:25 起 · 估算</span>
-              <span className={`sf-live ${live ? "on" : ""}`}>
-                {live ? <i /> : null}
-                {data.time ?? ""}
-              </span>
-              <span className="sf-sp" />
-              <div className="sf-seg" role="tablist" aria-label="口径">
-                {MODES.map((o) => (
-                  <button
-                    key={o.value}
-                    type="button"
-                    role="tab"
-                    aria-selected={mode === o.value}
-                    className={mode === o.value ? "on" : ""}
-                    onClick={() => setMode(o.value)}
+              <div className="sf-meta">
+                <span className="sf-sub">09:25 起，估算</span>
+                {replay ? <span className="sf-pill replay">回放 {clock}</span> : null}
+                <span className={`sf-live ${live && !replay ? "on" : ""}`}>
+                  {live && !replay ? <i /> : null}
+                  {replay ? clock : (data.time ?? "")}
+                </span>
+              </div>
+              <div className="tools">
+                {data.days?.length ? (
+                  <select
+                    className="select sf-day"
+                    aria-label="数据时间"
+                    value={day ?? ""}
+                    onChange={(e) => onDay(e.target.value || null)}
                   >
-                    {o.label}
-                  </button>
-                ))}
+                    <option value="">{replayAt ? `今天 · 回放 ${replayAt}` : "今天 / 最新"}</option>
+                    {data.days.slice(1).map((d) => (
+                      <option key={d} value={d}>
+                        {d}
+                      </option>
+                    ))}
+                  </select>
+                ) : null}
+                <Segmented label="口径" value={mode} onChange={setMode} options={MODES} />
               </div>
             </div>
             <div className="sf-chips">
@@ -221,11 +229,12 @@ function Body({
                 </button>
               ) : null}
             </div>
-            <p className="sf-note">
-              估算，看相对强弱：每只股票 3 秒快照间的成交额增量按“价 ≥ 前卖一记主动买、≤
-              前买一记主动卖，否则按涨跌 tick”归类；09:25
-              竞价按竞价价对昨收定方向。口径与同花顺/东财不同。
-              {live ? " 每 3 秒更新（逐轮临时值，约 30 秒正式快照落盘时对账校正）。" : ""}
+            <p className="sf-note sf-note-row">
+              估算值，看相对强弱，和同花顺、东方财富的数会不一样
+              <HelpMark label="估算口径">
+                每只股票 3 秒快照间的成交额增量按“价 ≥ 前卖一记主动买、≤ 前买一记主动卖，否则按涨跌
+                tick”归类；09:25 竞价按竞价价对昨收定方向。
+              </HelpMark>
             </p>
           </section>
           {!phone ? (
@@ -244,7 +253,8 @@ function Body({
         <Leaders
           leaders={leaders}
           asOf={cursor == null ? null : (data.t[upto] ?? null)}
-          ranked={data.sectors}
+          ranked={ranked}
+          at={at}
           phone={phone}
         />
         {phone ? (
@@ -262,7 +272,7 @@ function Body({
         ) : null}
       </div>
       <p className="sf-foot">
-        {data.date} · 数据 {data.time}
+        {data.date} · 数据 {replay ? clock : data.time}
         {mode !== "net" ? ` · 当前口径：${MODES.find((o) => o.value === mode)?.label}` : ""}
         {" · "}
         {data.t.length} 个时点
@@ -277,7 +287,7 @@ function TurnoverCard({ sm }: { sm: NonNullable<SectorFlowData["summary"]> }) {
   const yi = sm.turnover ?? sm.amount / 1e8;
   const chg = fmtTurnoverChg(sm.turnover_chg, sm.turnover_chg_pct);
   const snap = sm.turnover_source === "snapshot_last";
-  const src = snap ? "快照末笔累计（Tushare 日线未入库）" : "Tushare 日线合计";
+  const src = snap ? "快照末笔累计（日线尚未入库）" : "日线合计";
   const prev =
     sm.prev_turnover != null
       ? `；上一交易日 ${sm.prev_date ?? ""} ${sm.prev_turnover.toFixed(1)}亿`
@@ -289,7 +299,7 @@ function TurnoverCard({ sm }: { sm: NonNullable<SectorFlowData["summary"]> }) {
     >
       <span className="k">两市成交额{snap ? " · 快照" : ""}</span>
       <span className="v">{fmtAmountYi(yi * 1e8)}</span>
-      {chg ? <span className={`sf-chg ${tone(sm.turnover_chg)}`}>{chg}</span> : null}
+      {chg ? <span className="sf-chg">{chg}</span> : null}
     </div>
   );
 }
@@ -348,7 +358,7 @@ function Bars({
     <section className="sf-card">
       <div className="sf-ch">
         <h3>全部板块 · 净流入</h3>
-        <span className="sf-pill">勾选即加入上图</span>
+        <span className="sf-hint">勾选即加入上图</span>
         <span className="sf-sp" />
         <span className="sf-sub">
           {t[upto]} · 流入 {ins.length} / 流出 {outs.length}
@@ -373,8 +383,8 @@ function Bars({
   );
 }
 
-function Spark({ s, w = 88 }: { s: Stock; w?: number }) {
-  const h = 30;
+function Spark({ s, w = 64 }: { s: Stock; w?: number }) {
+  const h = 20;
   const pts = s.spark
     .map((v, i) => [i, v] as const)
     .filter((p): p is readonly [number, number] => p[1] != null);
@@ -390,16 +400,10 @@ function Spark({ s, w = 88 }: { s: Stock; w?: number }) {
     .map((p, i) => `${i ? "L" : "M"}${sx(p[0]).toFixed(1)} ${sy(p[1]).toFixed(1)}`)
     .join("");
   const up = (s.pct ?? 0) >= 0;
-  const first = pts[0] ?? [0, pre];
-  const lastP = pts[pts.length - 1] ?? first;
   return (
     <svg width={w} height={h} className="sf-spark" aria-hidden="true">
       <line x1={0} x2={w} y1={sy(pre)} y2={sy(pre)} className="sf-spark-base" />
-      <path
-        d={`${d}L${sx(lastP[0])} ${h}L${sx(first[0])} ${h}Z`}
-        className={up ? "up-fill" : "down-fill"}
-      />
-      <path d={d} fill="none" className={up ? "up-stroke" : "down-stroke"} strokeWidth={1.4} />
+      <path d={d} fill="none" className={up ? "up-stroke" : "down-stroke"} strokeWidth={1.5} />
     </svg>
   );
 }
@@ -408,33 +412,43 @@ function Leaders({
   leaders,
   asOf,
   ranked,
+  at,
   phone,
 }: {
   leaders: Leader[];
   asOf: string | null;
   ranked: Sector[];
+  at: (sector: Sector) => number;
   phone: boolean;
 }) {
-  const outs = ranked
-    .filter((s) => s.net < 0)
-    .slice(-3)
-    .reverse();
+  const netOf = (name: string, fallback: number) => {
+    const sector = ranked.find((item) => item.name === name);
+    return sector ? at(sector) : fallback;
+  };
+  const shown = [...leaders]
+    .map((leader) => ({ ...leader, net: netOf(leader.name, leader.net) }))
+    .sort((a, b) => b.net - a.net)
+    .slice(0, 3);
+  const outs = [...ranked]
+    .filter((sector) => at(sector) < 0)
+    .sort((a, b) => at(a) - at(b))
+    .slice(0, 3);
   return (
     <aside className="sf-card sf-rank">
       <div className="sf-ch">
         <h3>流入前三 · 资金领先股</h3>
-        <span className={`sf-pill ${asOf ? "replay" : ""}`}>
-          {asOf ? `回放 ${asOf}` : "净流入/流通市值"}
+        <span className={asOf ? "sf-pill replay" : "sf-sub"}>
+          {asOf ? `回放 ${asOf}` : "净流入 / 流通市值"}
         </span>
       </div>
-      {leaders.length === 0 ? <p className="sf-sub">暂无净流入板块。</p> : null}
-      {leaders.map((l, k) => (
+      {shown.length === 0 ? <p className="sf-sub">暂无净流入板块。</p> : null}
+      {shown.map((l, k) => (
         <div key={l.name} className="sf-sec">
           <div className="sf-sh">
             <span className="rank">{k + 1}</span>
             <span className="sname">
               {l.name}
-              <em>({fmtYi(l.net / 1e8)})</em>
+              <em>({fmtSectorNet(l.net)})</em>
             </span>
             <span className="smeta">
               <span className={tone(l.pct)}>{fmtPct(l.pct)}</span>
@@ -455,12 +469,12 @@ function Leaders({
                   {s.sealed ? <span className="tag">涨停</span> : null}
                 </div>
                 <div className="r">
-                  占流通 <b>{s.net_ratio == null ? "—" : `${(s.net_ratio * 100).toFixed(2)}%`}</b> ·
+                  占流通 <b>{fmtRatioPct(s.net_ratio == null ? null : s.net_ratio * 100)}</b> ·
                   净流入 {fmtYi(s.net / 1e8)}
                 </div>
               </div>
               <div className={`p ${tone(s.pct)}`}>{fmtPct(s.pct)}</div>
-              <Spark s={s} w={phone ? 76 : 88} />
+              {phone ? null : <Spark s={s} />}
             </div>
           ))}
         </div>
@@ -472,7 +486,7 @@ function Leaders({
             <span>
               {s.name} <span className={`small ${tone(s.pct)}`}>{fmtPct(s.pct)}</span>
             </span>
-            <b className="down">{fmtValue(s.net / 1e8, "net")}</b>
+            <b className="down">{fmtValue(at(s), "net")}</b>
           </div>
         ))}
       </div>
