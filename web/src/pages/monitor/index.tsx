@@ -336,7 +336,7 @@ function AlertList({
   return (
     <ul className="li2-list" aria-label="告警时间线">
       {rows.map((row) => (
-        <li key={row.alert_id} className="li2">
+        <li key={row.alert_id} className="li2 alert-row">
           <span className="t">
             <span className="name">{row.name ?? "—"}</span>
             <span className="code">

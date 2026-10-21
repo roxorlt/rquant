@@ -525,6 +525,10 @@
   font-variant-numeric: tabular-nums;
   color: var(--c-ink);
 }
+/* 390px dated rows are 2px short of a 4-character pool name. This gap is the room. */
+.li2.alert-row {
+  column-gap: 8px;
+}
 .li2 .meta.alert-meta {
   display: flex;
   align-items: baseline;
