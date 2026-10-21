@@ -516,6 +516,79 @@ def websocket_scope() -> dict[str, Any]:
         'server': ('127.0.0.1', 8771), 'subprotocols': [], 'state': {}}
 
 
+def test_websocket_releases_page_before_send_and_payload_before_next_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, websocket_network_guard: None,
+) -> None:
+    import gc
+    import weakref
+
+    from rquant.l2.cache import RawL2Cache
+    from rquant.l2.models import BatchPage
+
+    class TrackedJSON(str):
+        pass
+
+    cache = RawL2Cache(tmp_path / 'cache')
+    with cache.writer():
+        cache.append(observation())
+    app = module('api').create_app(cache.root)
+    original_read, original_dump = app.state.l2_cache.read_batches, BatchPage.model_dump_json
+    page_refs, payload_refs, reads = [], [], []
+    next_read = threading.Event()
+
+    def read(**kwargs: Any) -> BatchPage:
+        reads.append(kwargs)
+        if len(reads) == 2:
+            assert payload_refs[0]() is None
+            next_read.set()
+        page = original_read(**kwargs)
+        if page.batches:
+            page_refs.extend((weakref.ref(page), weakref.ref(page.batches[0].table)))
+        return page
+
+    def dump(page: BatchPage, *args: Any, **kwargs: Any) -> str:
+        payload = TrackedJSON(original_dump(page, *args, **kwargs))
+        payload_refs.append(weakref.ref(payload))
+        return payload
+
+    monkeypatch.setattr(app.state.l2_cache, 'read_batches', read)
+    monkeypatch.setattr(BatchPage, 'model_dump_json', dump)
+
+    async def scenario() -> None:
+        incoming, outgoing = asyncio.Queue(), asyncio.Queue()
+        blocked, release = asyncio.Event(), asyncio.Event()
+        await incoming.put({'type': 'websocket.connect'})
+
+        async def send(message: dict[str, Any]) -> None:
+            if message['type'] == 'websocket.send':
+                assert json.loads(message['text'])['next_sequence'] == 1
+                blocked.set()
+                await release.wait()
+            else:
+                await outgoing.put(message)
+
+        pending = asyncio.create_task(app(websocket_scope(), incoming.get, send))
+        try:
+            assert (await asyncio.wait_for(outgoing.get(), 1))['type'] == 'websocket.accept'
+            await asyncio.wait_for(blocked.wait(), 1)
+            await asyncio.sleep(0)
+            gc.collect()
+            assert page_refs and all(reference() is None for reference in page_refs)
+            assert payload_refs[0]() is not None
+            assert reads == [{'after_sequence': 0, 'limit': 1}]
+            release.set()
+            assert await asyncio.to_thread(next_read.wait, 1)
+            assert reads[1] == {'after_sequence': 1, 'limit': 1}
+        finally:
+            release.set()
+            await incoming.put({'type': 'websocket.disconnect', 'code': 1000})
+            await asyncio.wait_for(pending, 2)
+        assert app.state.l2_ws_connections == 0
+        assert not [task for task in asyncio.all_tasks() if task is not asyncio.current_task() and not task.done()]
+
+    asyncio.run(scenario())
+
+
 def test_websocket_slow_send_isolated_and_all_tasks_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
                                                          websocket_network_guard: None) -> None:
     from rquant.l2.cache import RawL2Cache
