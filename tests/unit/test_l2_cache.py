@@ -453,6 +453,68 @@ def test_identical_observations_remain_distinct_and_restart_sequence(tmp_path: P
     assert page.next_sequence == 3
 
 
+def test_writer_retains_only_received_at_after_caller_releases_batch(tmp_path: Path, monkeypatch):
+    import weakref
+    from rquant.l2.cache import RawL2Cache
+    from rquant.l2.models import FeedStatus, RawL2Batch
+
+    cache = RawL2Cache(tmp_path / "writer-receipt")
+    created = []
+    validate = RawL2Batch.model_validate
+    def counted(value, **kwargs):
+        batch = validate(value, **kwargs)
+        created.append(weakref.ref(batch))
+        return batch
+    monkeypatch.setattr(RawL2Batch, "model_validate", counted)
+    data = observation()
+    with cache.writer():
+        batch = cache.append(data)
+        assert created[-1]() is batch
+        assert batch.table == data.table
+        reference, table = weakref.ref(batch), weakref.ref(batch.table)
+        del batch
+        assert reference() is None and table() is None
+        assert cache._position() == (1, data.received_at)
+        cache.write_status(FeedStatus(state="connected"))
+        status = cache.read_status(now=data.received_at)
+        assert status.last_sequence == 1
+        assert status.last_market_received_at == data.received_at
+        assert cache._last_received_at == data.received_at
+    assert cache._last_received_at is None
+    assert cache._writer_fd is None and cache._highwater == 0
+    assert cache.read_status(now=data.received_at).last_market_received_at == data.received_at
+
+
+def test_writer_recovery_releases_validated_batches_and_retains_last_time(tmp_path: Path, monkeypatch):
+    import weakref
+    from rquant.l2.cache import RawL2Cache
+
+    cache = RawL2Cache(tmp_path / "recovery-receipt")
+    data = observation()
+    with cache.writer():
+        for offset in range(3):
+            cache.append(data.model_copy(update={"received_at": data.received_at + timedelta(seconds=offset)}))
+    read_batch = RawL2Cache._read_batch
+    calls, references = [], []
+    def counted(directory, expected, **kwargs):
+        batch = read_batch(directory, expected, **kwargs)
+        calls.append(expected)
+        references.append((weakref.ref(batch), weakref.ref(batch.table)))
+        return batch
+    monkeypatch.setattr(RawL2Cache, "_read_batch", staticmethod(counted))
+    recovered = RawL2Cache(cache.root)
+    last = data.received_at + timedelta(seconds=2)
+    with recovered.writer():
+        assert calls == [1, 2, 3]
+        assert all(batch() is None and table() is None for batch, table in references)
+        assert recovered._position() == (3, last)
+        status = recovered.read_status(now=last)
+        assert status.last_sequence == 3 and status.last_market_received_at == last
+        assert status.gap and status.error_code == "restart_gap"
+    assert recovered._last_received_at is None
+    assert recovered.read_status(now=last).last_market_received_at == last
+
+
 def test_prior_active_epoch_becomes_durable_gap_before_writer_yields(tmp_path: Path):
     from rquant.l2.cache import RawL2Cache
     from rquant.l2.models import FeedStatus
@@ -541,7 +603,8 @@ def test_unrequested_missing_prefix_is_rejected_on_replay_and_full_audit(tmp_pat
             pytest.fail('recovery accepted a missing historical batch')
 
 
-def test_failed_directory_commit_exposes_no_torn_batch(tmp_path: Path, monkeypatch):
+@pytest.mark.parametrize("has_previous", [False, True])
+def test_failed_directory_commit_exposes_no_torn_batch(tmp_path: Path, monkeypatch, has_previous):
     import rquant.l2.cache as module
 
     cache = module.RawL2Cache(tmp_path / "cache")
@@ -553,10 +616,17 @@ def test_failed_directory_commit_exposes_no_torn_batch(tmp_path: Path, monkeypat
         return original(src, dst)
 
     with cache.writer():
+        data = observation()
+        if has_previous:
+            cache.append(data)
         monkeypatch.setattr(module.os, "rename", fail_commit)
         with pytest.raises(module.CacheError, match="^cache_io$"):
-            cache.append(observation())
-    assert cache.read_batches().batches == ()
+            cache.append(data.model_copy(update={"received_at": data.received_at + timedelta(seconds=1)}))
+        expected = (1, data.received_at) if has_previous else (0, None)
+        assert cache._position() == expected
+        assert cache.read_status().last_market_received_at == expected[1]
+    assert cache._last_received_at is None
+    assert len(cache.read_batches().batches) == int(has_previous)
 
 
 @pytest.mark.parametrize("after,limit", [(-1, 1), (True, 1), (0, 0), (0, 129)])
@@ -741,7 +811,7 @@ def test_byte_envelope_single_large_batch_progress_and_exact_resource_boundary(t
     assert len(page.model_dump_json().encode()) < 32 << 20
     assert reader.read_batches(after_sequence=1).batches == ()
     with reader.writer():
-        assert reader._highwater == 1 and reader._last_batch == batch
+        assert reader._highwater == 1 and reader._last_received_at == batch.received_at
 
 
 def test_published_head_is_same_inode_and_append_keeps_four_fsyncs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -880,6 +950,7 @@ def test_published_failure_does_not_acknowledge_or_remove_raw_batch(tmp_path: Pa
     from rquant.l2 import cache as module
     cache = module.RawL2Cache(tmp_path / 'cache'); parent = cache.root / 'batches'
     with cache.writer():
+        data = observation()
         original_link = module.os.link; original_replace = module.os.replace; original_fsync = module._fsync_dir
         def failed_link(*args: object, **kwargs: object) -> None: raise OSError('synthetic link failure')
         def failed_replace(src: Path, dst: Path) -> None:
@@ -892,11 +963,14 @@ def test_published_failure_does_not_acknowledge_or_remove_raw_batch(tmp_path: Pa
             patch.setattr(module.os, 'link', failed_link if fault == 'link' else original_link)
             patch.setattr(module.os, 'replace', failed_replace if fault == 'replace' else original_replace)
             patch.setattr(module, '_fsync_dir', failed_fsync if fault == 'parent_fsync' else original_fsync)
-            with pytest.raises(module.CacheError): cache.append(observation())
+            with pytest.raises(module.CacheError): cache.append(data)
+        assert cache._position() == (1, data.received_at)
+        assert cache.read_status().last_market_received_at == data.received_at
         assert (parent / f'{1:020d}' / 'batch.json').is_file()
         assert list(parent.glob('.pending-head-*')) == []
     with module.RawL2Cache(cache.root).writer() as recovered:
         assert recovered.read_status().gap
+        assert recovered._position() == (1, data.received_at)
         assert os.path.samefile(parent / '.head', parent / f'{1:020d}' / 'batch.json')
 
 
@@ -1137,7 +1211,7 @@ def test_head_receipt_repeated_status_and_caught_up_reads_keep_only_scalars(tmp_
     def scalar(value):
         return isinstance(value, (str, int, datetime)) or isinstance(value, tuple) and all(scalar(v) for v in value)
     assert scalar(reader._head_receipt)
-    assert reader._last_batch is None
+    assert reader._last_received_at is None
 
 
 def test_head_receipt_concurrent_cold_readers_validate_once(tmp_path, monkeypatch):
@@ -1408,7 +1482,7 @@ def test_cold_head_model_is_not_carried_to_ineligible_selection(tmp_path, monkey
     assert page.next_sequence == (0 if mode == 'excluded' else 1)
     assert all(reference() is None for reference in references[:-1] if mode != 'excluded')
     if mode == 'excluded': assert references[0]() is None
-    assert reader._last_batch is None
+    assert reader._last_received_at is None
 
 
 @pytest.mark.parametrize('fault', ['duplicate', 'keys', 'width', 'raw', 'style', 'hash'])
