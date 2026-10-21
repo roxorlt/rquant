@@ -75,8 +75,8 @@ const PRESET_LABEL: Record<string, string> = {
   research_lowvol: "低波动",
   research_value: "低市净率",
   research_trend: "趋势",
-  "n-shape-pool1": "N形态一号池",
-  "n-shape-pool2": "N形态二号池",
+  "n-shape-pool1": "N字初筛",
+  "n-shape-pool2": "N字精选",
   "breakout55-top10": "55日新高",
 };
 
@@ -131,6 +131,37 @@ export function presetLabel(value: string | null | undefined): string {
   const known = PRESET_LABEL[slug];
   const name = known ?? (/^[a-z0-9][a-z0-9_-]*$/i.test(slug) ? "选股方案" : slug);
   return version && known ? `${name} ${version}` : name;
+}
+
+/** Alert-rule scope ids. The API values stay pool1 / pool2 / manual. */
+export const ALERT_POOL_ORDER = ["pool1", "pool2", "manual"] as const;
+
+export type AlertPoolId = (typeof ALERT_POOL_ORDER)[number];
+
+const ALERT_POOL_LABEL: Record<AlertPoolId, string> = {
+  pool1: "N字初筛",
+  pool2: "N字精选",
+  manual: "自选",
+};
+
+export const ALERT_POOL_TIP =
+  "N字初筛：每个交易日 17:00 后，按 N 字形态自动筛出的股票，每天整批更新。N字精选：从最近的 N字初筛里再筛出的股票，最多跟踪 6 个交易日，跌破止损位会提前移出。两者都自动更新，不用手动维护。";
+
+const ALERT_POOL_RANK = new Map<string, number>(ALERT_POOL_ORDER.map((id, index) => [id, index]));
+
+/** One alert's scope. Unknown ids stay off the screen. */
+export function alertPoolLabel(id: string | null | undefined): string {
+  if (!id) return "—";
+  return ALERT_POOL_LABEL[id as AlertPoolId] ?? "—";
+}
+
+/** Rule scope, in the fixed display order, joined with an ideographic comma. */
+export function alertPoolLabels(ids: readonly string[] | null | undefined): string {
+  if (!ids?.length) return "全部";
+  return [...ids]
+    .sort((a, b) => (ALERT_POOL_RANK.get(a) ?? 99) - (ALERT_POOL_RANK.get(b) ?? 99))
+    .map((id) => alertPoolLabel(id))
+    .join("、");
 }
 
 /** A pool id or preset slug shown on a pool, a profile, or a saved scheme. */

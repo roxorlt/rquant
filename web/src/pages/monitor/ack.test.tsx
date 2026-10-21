@@ -115,12 +115,13 @@ it("confirms once on a double click, replaces the toast, and matches the server 
   await waitFor(() => expect(screen.getAllByRole("status")).toHaveLength(1));
 });
 
-it("labels the pool column 池子, with 已加入 or an em dash", async () => {
+it("labels the scope column 范围, with the pool name or an em dash", async () => {
   stub();
   renderApp("/monitor");
-  expect(await screen.findByRole("columnheader", { name: "池子" })).toBeInTheDocument();
+  const table = await screen.findByRole("table", { name: "告警时间线" });
+  expect(within(table).getByRole("columnheader", { name: "范围" })).toBeInTheDocument();
   const inPool = await screen.findByRole("row", { name: /澜屿科技/ });
-  expect(within(inPool).getByText("已加入")).toBeInTheDocument();
+  expect(within(inPool).getByText("自选")).toBeInTheDocument();
   const out = screen.getByRole("row", { name: /样例电子/ });
   expect(within(out).getByText("—")).toBeInTheDocument();
 });

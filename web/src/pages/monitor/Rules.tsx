@@ -2,15 +2,31 @@ import { type FormEvent, useState } from "react";
 import type { Schemas } from "@/api/client";
 import { useAlertRules, useSaveAlertRule } from "@/api/endpoints";
 import { useReadOnlyReason } from "@/api/useMeta";
+import {
+  ALERT_POOL_ORDER,
+  ALERT_POOL_TIP,
+  type AlertPoolId,
+  alertPoolLabel,
+  alertPoolLabels,
+} from "@/copy/publicText";
 import { DataTable } from "@/table/DataTable";
-import { AppDrawer, Button, FailureNotice, Panel, Pill, useToast } from "@/ui";
+import { AppDrawer, Button, FailureNotice, Panel, Pill, Tip, useToast } from "@/ui";
 import { type FailureCopy, failureCopy } from "@/ui/failure";
 import { QueryView } from "../shared";
 
 type Rule = Schemas["AlertRuleBody"];
-const POOLS = ["pool1", "pool2", "manual"] as const;
-const POOL_LABEL: Record<string, string> = { pool1: "一号池", pool2: "二号池", manual: "自选" };
 const LEVELS = ["L1", "L2", "L3"] as const;
+
+function scopeOf(
+  current: readonly string[] | undefined,
+  id: AlertPoolId,
+  on: boolean,
+): AlertPoolId[] {
+  const selected = new Set(current ?? []);
+  if (on) selected.add(id);
+  else selected.delete(id);
+  return ALERT_POOL_ORDER.filter((item) => selected.has(item));
+}
 
 export function AlertRules() {
   const query = useAlertRules();
@@ -80,11 +96,9 @@ export function AlertRules() {
                 {
                   id: "pools",
                   header: "范围",
+                  headerTip: ALERT_POOL_TIP,
                   value: (row) => (row.pools ?? []).join(","),
-                  cell: (row) =>
-                    row.pools?.length
-                      ? row.pools.map((p) => POOL_LABEL[p] ?? p).join("、")
-                      : "全部",
+                  cell: (row) => alertPoolLabels(row.pools),
                 },
                 {
                   id: "levels",
@@ -159,22 +173,21 @@ export function AlertRules() {
             />
           </label>
           <fieldset>
-            <legend>池子</legend>
-            {POOLS.map((p) => (
-              <label key={p} className="rule-check">
+            <legend>
+              <Tip content={ALERT_POOL_TIP} className="has-tip">
+                范围
+              </Tip>
+            </legend>
+            {ALERT_POOL_ORDER.map((id) => (
+              <label key={id} className="rule-check">
                 <input
                   type="checkbox"
-                  checked={draft.pools?.includes(p) ?? false}
+                  checked={draft.pools?.includes(id) ?? false}
                   onChange={(e) =>
-                    setDraft({
-                      ...draft,
-                      pools: e.target.checked
-                        ? [...(draft.pools ?? []), p]
-                        : (draft.pools ?? []).filter((x) => x !== p),
-                    })
+                    setDraft({ ...draft, pools: scopeOf(draft.pools, id, e.target.checked) })
                   }
                 />
-                {POOL_LABEL[p]}
+                {alertPoolLabel(id)}
               </label>
             ))}
           </fieldset>

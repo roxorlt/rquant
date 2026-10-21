@@ -11,6 +11,7 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import { type KeyboardEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { readPreference, writePreference } from "@/theme/storage";
 import { DropdownMenu } from "@/ui/DropdownMenu";
+import { Tip } from "@/ui/Tip";
 
 export type CellValue = string | number | null;
 
@@ -32,6 +33,10 @@ export interface DataColumn<T> {
   secondary?: boolean;
   /** Hidden until the viewer turns the column on. Ignored once a preference is saved. */
   hiddenByDefault?: boolean;
+  /** Dotted-underline explanation on the header word. The menu and CSV keep `header`. */
+  headerTip?: ReactNode;
+  /** On a phone, this column shares the second line of its row. */
+  phoneLine?: 2;
 }
 
 export interface DataTableProps<T> {
@@ -332,12 +337,15 @@ export function DataTable<T>({
               <tr key={group.id}>
                 {group.headers.map((header) => {
                   const sorted = header.column.getIsSorted();
+                  const meta = byId.get(header.column.id);
+                  const plain = flexRender(header.column.columnDef.header, header.getContext());
                   return (
                     <th
                       key={header.id}
                       scope="col"
                       className={cellClass(header.column.id)}
                       aria-sort={sorted ? ARIA_SORT[sorted] : undefined}
+                      data-phone-line={meta?.phoneLine}
                     >
                       {header.column.getCanSort() ? (
                         <button
@@ -345,13 +353,17 @@ export function DataTable<T>({
                           className="sort"
                           onClick={header.column.getToggleSortingHandler()}
                         >
-                          {flexRender(header.column.columnDef.header, header.getContext())}
+                          {plain}
                           <span aria-hidden="true">
                             {sorted === "asc" ? "↑" : sorted === "desc" ? "↓" : "↕"}
                           </span>
                         </button>
+                      ) : meta?.headerTip ? (
+                        <Tip content={meta.headerTip} className="has-tip">
+                          {meta.header}
+                        </Tip>
                       ) : (
-                        flexRender(header.column.columnDef.header, header.getContext())
+                        plain
                       )}
                     </th>
                   );
@@ -394,7 +406,11 @@ export function DataTable<T>({
                 }
               >
                 {row.getVisibleCells().map((cell) => (
-                  <td key={cell.id} className={cellClass(cell.column.id)}>
+                  <td
+                    key={cell.id}
+                    className={cellClass(cell.column.id)}
+                    data-phone-line={byId.get(cell.column.id)?.phoneLine}
+                  >
                     {flexRender(cell.column.columnDef.cell, cell.getContext())}
                   </td>
                 ))}

@@ -5,7 +5,11 @@ import { describe, expect, it } from "vitest";
 import { QueryView } from "@/pages/shared";
 import { renderApp } from "@/test/render";
 import {
+  ALERT_POOL_ORDER,
+  ALERT_POOL_TIP,
   actorLabel,
+  alertPoolLabel,
+  alertPoolLabels,
   boardSystemLabel,
   datasetLabel,
   entryModeLabel,
@@ -80,6 +84,25 @@ describe("public copy", () => {
     expect(publicLine("日线最新 2026-10-20（落后 0 个工作日）")).toBe("日线最新 2026-10-20");
     expect(publicLine("daily_bar 缺 1 天")).toBe("日线行情缺 1 天");
     expect(presetLabel("auction-pick")).toBe("竞价选股");
+    expect(presetLabel("n-shape-pool1")).toBe("N字初筛");
+    expect(presetLabel("n-shape-pool2")).toBe("N字精选");
+    expect(alertPoolLabel("pool1")).toBe("N字初筛");
+    expect(alertPoolLabel("pool2")).toBe("N字精选");
+    expect(alertPoolLabel("manual")).toBe("自选");
+    expect(alertPoolLabel(null)).toBe("—");
+    expect(alertPoolLabel("核心观察")).toBe("—");
+    expect(alertPoolLabels(["manual", "pool1"])).toBe("N字初筛、自选");
+    expect(alertPoolLabels(["pool2", "pool1"])).toBe("N字初筛、N字精选");
+    expect(alertPoolLabels([])).toBe("全部");
+    expect(alertPoolLabels(undefined)).toBe("全部");
+    expect(ALERT_POOL_ORDER.map((id) => alertPoolLabel(id))).toEqual([
+      "N字初筛",
+      "N字精选",
+      "自选",
+    ]);
+    expect(ALERT_POOL_TIP).toBe(
+      "N字初筛：每个交易日 17:00 后，按 N 字形态自动筛出的股票，每天整批更新。N字精选：从最近的 N字初筛里再筛出的股票，最多跟踪 6 个交易日，跌破止损位会提前移出。两者都自动更新，不用手动维护。",
+    );
     expect(poolRefLabel("watch")).toBe("自选");
     expect(poolRefLabel("auction-pick")).toBe("竞价选股");
     expect(entryModeLabel("open")).toBe("开盘");

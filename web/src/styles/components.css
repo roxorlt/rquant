@@ -465,6 +465,49 @@
   border: 0;
 }
 
+/* Phone alert timeline: 类型 then 范围 share the second line.
+   Column order is 时间 代码 名称 级别 类型 触发价 范围 状态. */
+@media (max-width: 599px) {
+  table[aria-label="告警时间线"] {
+    display: grid;
+    grid-template-columns: repeat(6, max-content);
+    width: max-content;
+    min-width: 100%;
+  }
+  table[aria-label="告警时间线"] > thead,
+  table[aria-label="告警时间线"] > tbody {
+    display: grid;
+    grid-template-columns: subgrid;
+    grid-column: 1 / -1;
+  }
+  table[aria-label="告警时间线"] tr:has([data-phone-line="2"]) {
+    display: grid;
+    grid-template-columns: subgrid;
+    grid-column: 1 / -1;
+    align-items: center;
+  }
+  table[aria-label="告警时间线"] tr:not(:has([data-phone-line="2"])) {
+    display: block;
+    grid-column: 1 / -1;
+  }
+  table[aria-label="告警时间线"] tr:has([data-phone-line="2"]) > :nth-child(5) {
+    grid-column: 1;
+    grid-row: 2;
+  }
+  table[aria-label="告警时间线"] tr:has([data-phone-line="2"]) > :nth-child(6) {
+    grid-column: 5;
+    grid-row: 1;
+  }
+  table[aria-label="告警时间线"] tr:has([data-phone-line="2"]) > :nth-child(7) {
+    grid-column: 2;
+    grid-row: 2;
+  }
+  table[aria-label="告警时间线"] tr:has([data-phone-line="2"]) > :nth-child(8) {
+    grid-column: 6;
+    grid-row: 1;
+  }
+}
+
 /* ---------- form controls ---------- */
 .field {
   display: flex;

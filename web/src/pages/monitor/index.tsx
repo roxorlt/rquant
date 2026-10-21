@@ -7,8 +7,8 @@ import {
   useUnackAlert,
 } from "@/api/endpoints";
 import { useReadOnlyReason } from "@/api/useMeta";
-import { triggerLabel } from "@/copy/publicText";
-import { EMPTY, formatPrice } from "@/format/number";
+import { ALERT_POOL_TIP, alertPoolLabel, triggerLabel } from "@/copy/publicText";
+import { formatPrice } from "@/format/number";
 import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
 import {
@@ -26,10 +26,6 @@ import { StockLink } from "@/ui/StockLink";
 import { QueryView } from "../shared";
 import { AlertRules } from "./Rules";
 import { SurgePanel } from "./Surge";
-
-function poolCell(value: string | null | undefined): string {
-  return value ? "已加入" : EMPTY;
-}
 
 interface RowFailure {
   ids: string[];
@@ -195,6 +191,7 @@ export default function MonitorPage() {
                   {
                     id: "type",
                     header: "类型",
+                    phoneLine: 2,
                     value: (row) => row.trigger_type ?? null,
                     cell: (row) => triggerLabel(row.trigger_type),
                   },
@@ -207,10 +204,11 @@ export default function MonitorPage() {
                   },
                   {
                     id: "pool",
-                    header: "池子",
+                    header: "范围",
+                    headerTip: ALERT_POOL_TIP,
+                    phoneLine: 2,
                     value: (row) => row.pool ?? null,
-                    secondary: true,
-                    cell: (row) => poolCell(row.pool),
+                    cell: (row) => alertPoolLabel(row.pool),
                   },
                   {
                     id: "ack",
