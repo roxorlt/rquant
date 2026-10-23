@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useFactorCorrelation } from "@/api/endpoints";
+import { formatFixed } from "@/format/number";
 import { Panel, Segmented } from "@/ui";
 
 type Kind = "value" | "ic";
@@ -27,7 +28,7 @@ export function CorrelationPanel() {
           value={kind}
           onChange={setKind}
           options={[
-            { value: "value", label: "截面值（最新日）" },
+            { value: "value", label: "截面值" },
             { value: "ic", label: "IC 序列" },
           ]}
         />
@@ -56,7 +57,7 @@ export function CorrelationPanel() {
                     className="num"
                     style={{ background: i === j ? undefined : bg(v) }}
                   >
-                    {v == null ? "—" : v.toFixed(2)}
+                    {v == null ? "—" : formatFixed(v, 2)}
                   </td>
                 ))}
               </tr>

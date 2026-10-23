@@ -73,7 +73,7 @@ export default function PaperPage() {
           data.accounts.length === 0 ? (
             <EmptyState
               title="没有模拟账户"
-              hint="模拟盘账户由 paper 服务创建；创建并运行一次调仓后，这里显示净值与持仓。"
+              hint="模拟账户由模拟盘服务创建。创建并完成一次调仓后，这里显示净值和持仓。"
             />
           ) : (
             data.accounts.map((account) => (

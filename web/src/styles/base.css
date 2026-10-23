@@ -63,8 +63,13 @@ textarea {
   color: inherit;
 }
 :focus-visible {
-  outline: 2px solid var(--accent);
+  outline: 2px solid var(--c-focus);
   outline-offset: 2px;
+}
+/* Programmatic focus on a title (tabindex=-1) is not a keyboard stop. */
+[tabindex="-1"]:focus,
+[tabindex="-1"]:focus-visible {
+  outline: none;
 }
 svg {
   flex: none;
@@ -126,14 +131,28 @@ select {
   color: var(--ink);
 }
 textarea {
-  padding: 8px 10px;
+  padding: 8px 12px;
   font-family: var(--font-mono);
-  font-size: 13px;
+  font-size: 14px;
   line-height: 1.5;
   resize: vertical;
 }
-textarea:focus,
-select:focus {
-  border-color: var(--accent);
-  outline: none;
+input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]):not(
+  [type="color"]
+),
+select,
+textarea {
+  font-size: 14px;
+}
+input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]):not(
+  [type="color"]
+):not([type="search"]),
+select {
+  height: 32px;
+  padding-left: 12px;
+  box-sizing: border-box;
+}
+input[type="search"] {
+  height: 32px;
+  box-sizing: border-box;
 }

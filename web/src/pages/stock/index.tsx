@@ -2,8 +2,10 @@ import type { ReactNode } from "react";
 import { Link, useParams } from "react-router";
 import { useStock } from "@/api/endpoints";
 import { useUrlState } from "@/app/useUrlState";
+import { poolRefLabel, triggerLabel } from "@/copy/publicText";
+import { formatFixed } from "@/format/number";
 import { formatShanghaiDateTime } from "@/format/time";
-import { ChangeText, PageHeader, Panel, Pill } from "@/ui";
+import { ChangeText, PageHeader, Panel, Pill, Segmented } from "@/ui";
 import { QueryView } from "../shared";
 import { FlowPanel } from "./Flow";
 import { IntradayPanel } from "./Intraday";
@@ -11,33 +13,30 @@ import { KlinePanel } from "./Kline";
 import { QuoteGrid } from "./QuoteGrid";
 import { TpoPanel } from "./Tpo";
 
-const fix = (v: number | null | undefined, d = 2) => (v == null ? "—" : v.toFixed(d));
+const fix = (v: number | null | undefined, d = 2) => (v == null ? "—" : formatFixed(v, d));
 
 function ChartTabs({
   kline,
   intraday,
 }: {
-  kline: ReactNode;
-  intraday: (span: 1 | 5) => ReactNode;
+  kline: (period: ReactNode) => ReactNode;
+  intraday: (span: 1 | 5, period: ReactNode) => ReactNode;
 }) {
   const [tab, setTab] = useUrlState("chart");
   const cur = tab === "intraday" || tab === "5d" ? tab : "kline";
-  return (
-    <>
-      <div className="seg chart-tabs">
-        <button type="button" aria-pressed={cur === "kline"} onClick={() => setTab(null)}>
-          日K
-        </button>
-        <button type="button" aria-pressed={cur === "intraday"} onClick={() => setTab("intraday")}>
-          分时
-        </button>
-        <button type="button" aria-pressed={cur === "5d"} onClick={() => setTab("5d")}>
-          5日
-        </button>
-      </div>
-      {cur === "kline" ? kline : intraday(cur === "5d" ? 5 : 1)}
-    </>
+  const period = (
+    <Segmented
+      label="K线周期"
+      value={cur}
+      onChange={(next) => setTab(next === "kline" ? null : next)}
+      options={[
+        { value: "kline", label: "日K" },
+        { value: "intraday", label: "分时" },
+        { value: "5d", label: "5日" },
+      ]}
+    />
   );
+  return cur === "kline" ? kline(period) : intraday(cur === "5d" ? 5 : 1, period);
 }
 
 /** 个股档案 (F9-lite): quote, K-line, valuation, returns, fundamentals, pools, alerts. */
@@ -58,16 +57,26 @@ export default function StockPage() {
                 <span className="stock-head">
                   <span>{s.name ?? s.code}</span>
                   <span className="mono hint">{s.code}</span>
-                  {last ? <span className="px">{last.close.toFixed(2)}</span> : null}
+                  {last ? <span className="px">{formatFixed(last.close, 2)}</span> : null}
                   {last ? <ChangeText value={last.pct_chg ?? null} /> : null}
                 </span>
               }
-              note={last ? `截至 ${last.date}` : "没有行情"}
+              note={last ? null : "没有行情"}
             />
             <QuoteGrid s={s} />
             <ChartTabs
-              kline={<KlinePanel key={s.code} code={s.code} bars={s.bars} flow={s.flow} />}
-              intraday={(span) => <IntradayPanel key={s.code} code={s.code} span={span} />}
+              kline={(period) => (
+                <KlinePanel
+                  key={s.code}
+                  code={s.code}
+                  bars={s.bars}
+                  flow={s.flow}
+                  period={period}
+                />
+              )}
+              intraday={(span, period) => (
+                <IntradayPanel key={s.code} code={s.code} span={span} period={period} />
+              )}
             />
             <TpoPanel code={s.code} />
             <FlowPanel s={s} />
@@ -101,7 +110,7 @@ export default function StockPage() {
                   {s.pools.length ? (
                     s.pools.map((p) => (
                       <Link key={p} to={`/pools?pool=${encodeURIComponent(p)}`}>
-                        <Pill kind="ok">{p}</Pill>
+                        <Pill kind="ok">{poolRefLabel(p)}</Pill>
                       </Link>
                     ))
                   ) : (
@@ -117,7 +126,9 @@ export default function StockPage() {
                             {a.at ? formatShanghaiDateTime(String(a.at)) : "—"}
                           </td>
                           <td>{String(a.level ?? "")}</td>
-                          <td>{String(a.trigger_type ?? "")}</td>
+                          <td>
+                            {triggerLabel(a.trigger_type == null ? null : String(a.trigger_type))}
+                          </td>
                         </tr>
                       ))}
                     </tbody>

@@ -126,7 +126,8 @@ function RiskBlock({ nav }: { nav: BacktestPerf["nav"] }) {
   );
 }
 
-function Monthly({ monthly }: { monthly: BacktestPerf["monthly"] }) {
+function Monthly({ monthly }: { monthly: BacktestPerf["monthly"] | null | undefined }) {
+  if (!monthly?.length) return null;
   const years = [...new Set(monthly.map((m) => m.year))].sort();
   const cell = new Map(monthly.map((m) => [`${m.year}-${m.month}`, m.ret]));
   const months = Array.from({ length: 12 }, (_, i) => i + 1);

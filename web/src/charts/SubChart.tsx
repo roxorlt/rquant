@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { formatFixed } from "@/format/number";
 import { PAD } from "./Candles";
 
 export interface SubSeries {
@@ -16,7 +17,7 @@ export function SubChart({
   view,
   hover,
   height = 90,
-  format = (v) => v.toFixed(2),
+  format = (v) => formatFixed(v, 2),
   levels = [],
 }: {
   label: string;

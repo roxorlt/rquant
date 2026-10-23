@@ -10,7 +10,7 @@ import {
 import type { components } from "@/api/schema";
 import { useUrlState } from "@/app/useUrlState";
 import { TimeChart } from "@/charts/Chart";
-import { toneClass, toneOf } from "@/format/color";
+import { presetLabel } from "@/copy/publicText";
 import { formatPrice } from "@/format/number";
 import { DataTable } from "@/table/DataTable";
 import { Button, ChangeText, KpiStrip, Panel, Pill } from "@/ui";
@@ -23,7 +23,24 @@ type Perf = components["schemas"]["BacktestPerf"];
 const pct = (v: number | null | undefined) => (v == null ? "—" : `${(v * 100).toFixed(2)}%`);
 const num = (v: number | null | undefined, d = 2) => (v == null ? "—" : v.toFixed(d));
 
-const COLORS = ["var(--accent)", "var(--warn)", "var(--up)", "var(--down)", "var(--faint)"];
+const COMPARE_COLORS = ["#2448D0", "#C47B12", "#6B4C9A", "#0E7490", "#9A3412"];
+const compareColor = new Map<string, string>();
+
+function colorForRun(id: string): string {
+  const existing = compareColor.get(id);
+  if (existing) return existing;
+  const used = new Set(compareColor.values());
+  const free =
+    COMPARE_COLORS.find((color) => !used.has(color)) ??
+    COMPARE_COLORS[compareColor.size % COMPARE_COLORS.length] ??
+    "#2448D0";
+  compareColor.set(id, free);
+  return free;
+}
+
+function releaseRunColor(id: string): void {
+  compareColor.delete(id);
+}
 
 /** Up to five runs side by side: NAV overlay plus a metric table, best value highlighted. */
 function Compare({ ids, onRemove }: { ids: string[]; onRemove: (id: string) => void }) {
@@ -49,36 +66,52 @@ function Compare({ ids, onRemove }: { ids: string[]; onRemove: (id: string) => v
   // Union of dates so runs over different windows still line up.
   const dates = [...new Set(runs.flatMap((r) => r.perf?.nav.map((p) => p.date) ?? []))].sort();
   return (
-    <Panel title={`对比 · ${runs.length} 条`} sub="净值叠加；每行最优值高亮（回撤取最浅）">
+    <Panel
+      title={`对比 · ${runs.length} 条`}
+      titleId="compare-title"
+      sub="净值叠在一起。加粗并标「最优」的是这一行更好的数；回撤越小越好。"
+    >
+      <div>
+        {runs.map((r) => (
+          <span key={r.run.run_id} className="cmp-chip">
+            <i className="cmp-swatch" style={{ background: colorForRun(r.run.run_id) }} />
+            {r.run.title}
+            <button
+              type="button"
+              className="x"
+              aria-label={`移出对比：${r.run.title}`}
+              onClick={() => {
+                releaseRunColor(r.run.run_id);
+                onRemove(r.run.run_id);
+              }}
+            >
+              ×
+            </button>
+          </span>
+        ))}
+      </div>
       <TimeChart
         label="对比净值"
         dates={dates}
         baseline={1}
         format={(v) => v.toFixed(3)}
-        series={runs.map((r, k) => {
+        series={runs.map((r) => {
           const byDate = new Map(r.perf?.nav.map((p) => [p.date, p.nav]) ?? []);
           return {
             name: r.run.title,
             values: dates.map((d) => byDate.get(d) ?? null),
-            color: COLORS[k % COLORS.length] ?? "var(--accent)",
+            color: colorForRun(r.run.run_id),
           };
         })}
       />
-      <table className="tbl" aria-label="回测对比">
+      <table className="tbl compare-table" aria-label="回测对比">
         <thead>
           <tr>
             <th>指标</th>
             {runs.map((r) => (
-              <th key={r.run.run_id} className="num">
-                {r.run.title}{" "}
-                <button
-                  type="button"
-                  className="tbl-tool"
-                  aria-label={`移出对比 ${r.run.title}`}
-                  onClick={() => onRemove(r.run.run_id)}
-                >
-                  ×
-                </button>
+              <th key={r.run.run_id}>
+                <i className="cmp-swatch" style={{ background: colorForRun(r.run.run_id) }} />{" "}
+                {r.run.title}
               </th>
             ))}
           </tr>
@@ -88,7 +121,7 @@ function Compare({ ids, onRemove }: { ids: string[]; onRemove: (id: string) => v
             <td>参数</td>
             {runs.map((r) => (
               <td key={r.run.run_id} className="num">
-                {`${r.run.max_positions} 只 / 每 ${r.run.rebalance_every} 次调仓`}
+                {`持股 ${r.run.max_positions} 只 · 每 ${r.run.rebalance_every} 个交易日调仓`}
               </td>
             ))}
           </tr>
@@ -105,6 +138,7 @@ function Compare({ ids, onRemove }: { ids: string[]; onRemove: (id: string) => v
                     className={v != null && v === best && real.length > 1 ? "num best" : "num"}
                   >
                     {fmt(v)}
+                    {v != null && v === best && real.length > 1 ? " 最优" : ""}
                   </td>
                 ))}
               </tr>
@@ -129,7 +163,16 @@ function Explain({ runId }: { runId: string }) {
         </Button>
       }
     >
-      {explain.error ? <p className="sub">{`解读失败：${explain.error.message}`}</p> : null}
+      {explain.error ? (
+        <div className="notice crit" role="alert">
+          <span>解读没生成。解读服务暂时没有响应，回测数字不受影响。</span>
+          <span className="acts">
+            <button type="button" className="act" onClick={() => explain.mutate(runId)}>
+              重试
+            </button>
+          </span>
+        </div>
+      ) : null}
       {result ? (
         <>
           {result.unverified.length ? (
@@ -158,7 +201,7 @@ function Detail({ runId, onCompare }: { runId: string; onCompare: () => void }) 
             title="过拟合检查"
             sub={`同一预设已存 ${data.overfit?.trials ?? 0} 次回测，按试验数计 DSR（下限估计）`}
             actions={
-              <Button size="sm" variant="ghost" onClick={onCompare}>
+              <Button size="sm" variant="ghost" className="touch-44" onClick={onCompare}>
                 加入对比
               </Button>
             }
@@ -181,7 +224,7 @@ function Detail({ runId, onCompare }: { runId: string; onCompare: () => void }) 
           </Panel>
           <Explain runId={runId} />
           <BrinsonPanel runId={runId} />
-          {data.exposure.length ? (
+          {(data.exposure ?? []).length ? (
             <Panel title="行业暴露" sub="期末权重 vs 最后一次候选池等权" flush>
               <table className="tbl" aria-label="行业暴露">
                 <thead>
@@ -194,7 +237,7 @@ function Detail({ runId, onCompare }: { runId: string; onCompare: () => void }) 
                   </tr>
                 </thead>
                 <tbody>
-                  {data.exposure.map((row) => (
+                  {(data.exposure ?? []).map((row) => (
                     <tr key={row.industry}>
                       <td>{row.industry}</td>
                       <td className="num">{pct(row.weight)}</td>
@@ -207,10 +250,10 @@ function Detail({ runId, onCompare }: { runId: string; onCompare: () => void }) 
               </table>
             </Panel>
           ) : null}
-          <Panel title={`委托 · ${data.orders.length}`} sub="含拒单原因" flush>
+          <Panel title={`委托 · ${data.orders?.length ?? 0}`} sub="含拒单原因" flush>
             <DataTable
               label="组合回测委托"
-              rows={data.orders}
+              rows={data.orders ?? []}
               rowKey={(row) => `${row.trade_date}:${row.code}:${row.side}`}
               height={360}
               columns={[
@@ -274,17 +317,32 @@ export function PortfolioRuns() {
           <>
             <Panel
               title={`组合回测 · ${data.runs.length}`}
-              sub={
-                preset
-                  ? `只看入场池 ${preset}；新回测：python -m rquant.backtest --preset ${preset}`
-                  : "python -m rquant.backtest 产出，点一行看净值与委托"
-              }
+              sub={preset ? `只看入场池 ${presetLabel(preset)}` : "点一行看净值和委托"}
               actions={
-                preset ? (
-                  <Button size="sm" variant="ghost" onClick={() => setPreset(null)}>
-                    显示全部
-                  </Button>
-                ) : undefined
+                <>
+                  <span className="hint cmp-count">已选 {picked.length} / 5</span>
+                  {picked.length >= 2 ? (
+                    <Button
+                      size="sm"
+                      className="touch-44"
+                      onClick={() => {
+                        document
+                          .getElementById("compare-panel")
+                          ?.scrollIntoView({ block: "start" });
+                        document.getElementById("compare-title")?.focus({
+                          focusVisible: true,
+                        } as FocusOptions);
+                      }}
+                    >
+                      看对比
+                    </Button>
+                  ) : null}
+                  {preset ? (
+                    <Button size="sm" variant="ghost" onClick={() => setPreset(null)}>
+                      显示全部
+                    </Button>
+                  ) : null}
+                </>
               }
               flush
             >
@@ -295,8 +353,35 @@ export function PortfolioRuns() {
                 rowKey={(row) => row.run_id}
                 onSelect={(row) => setRunId(row.run_id)}
                 selectedKey={runId}
-                emptyText="还没有组合回测结果：用 python -m rquant.backtest 跑一次组合回测，结果会作为一条实验出现在这里。"
+                emptyText="还没有组合回测结果。"
                 columns={[
+                  {
+                    id: "cmp",
+                    header: "对比",
+                    value: () => null,
+                    cell: (row) => {
+                      const on = picked.includes(row.run_id);
+                      const full = !on && picked.length >= 5;
+                      return (
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          className="touch-44"
+                          disabled={full}
+                          aria-pressed={on}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            if (on) {
+                              releaseRunColor(row.run_id);
+                              setPicked((list) => list.filter((id) => id !== row.run_id));
+                            } else addCompare(row.run_id);
+                          }}
+                        >
+                          {on ? "已在对比" : "加入对比"}
+                        </Button>
+                      );
+                    },
+                  },
                   { id: "title", header: "名称", value: (row) => row.title },
                   { id: "strategy", header: "策略版本", value: (row) => row.strategy ?? "—" },
                   {
@@ -308,7 +393,7 @@ export function PortfolioRuns() {
                   { id: "n", header: "持股数", numeric: true, value: (row) => row.max_positions },
                   {
                     id: "every",
-                    header: "调仓间隔",
+                    header: "调仓间隔（交易日）",
                     numeric: true,
                     value: (row) => row.rebalance_every,
                   },
@@ -317,14 +402,7 @@ export function PortfolioRuns() {
                     header: "期末净值",
                     numeric: true,
                     value: (row) => row.final_nav ?? null,
-                    cell: (row) =>
-                      row.final_nav == null ? (
-                        "—"
-                      ) : (
-                        <span className={toneClass(toneOf(row.final_nav - 1))}>
-                          {row.final_nav.toFixed(4)}
-                        </span>
-                      ),
+                    cell: (row) => (row.final_nav == null ? "—" : row.final_nav.toFixed(4)),
                   },
                   {
                     id: "ret",
@@ -342,17 +420,17 @@ export function PortfolioRuns() {
                 ]}
               />
             </Panel>
+            <div id="compare-panel">
+              {picked.length >= 2 ? (
+                <Compare
+                  ids={picked}
+                  onRemove={(id) => setPicked((list) => list.filter((item) => item !== id))}
+                />
+              ) : picked.length === 1 ? (
+                <Panel title="对比">已选 1 条，再选一条就能对比，最多 5 条。</Panel>
+              ) : null}
+            </div>
             {runId ? <Detail runId={runId} onCompare={() => addCompare(runId)} /> : null}
-            {picked.length >= 2 ? (
-              <Compare
-                ids={picked}
-                onRemove={(id) => setPicked((l) => l.filter((x) => x !== id))}
-              />
-            ) : picked.length === 1 ? (
-              <Panel title="对比">已选 1 条；再选一条回测点「加入对比」（最多 5 条）</Panel>
-            ) : !runId && data.runs.length > 1 ? (
-              <p className="hint">点一行看净值与委托；再点「加入对比」，选 2–5 条即显示对比。</p>
-            ) : null}
           </>
         );
       }}
@@ -365,25 +443,22 @@ export function StrategyList() {
   return (
     <QueryView query={query}>
       {(data) => (
-        <Panel
-          title="策略版本"
-          sub="python -m rquant.backtest strategy save 保存；--strategy slug@N 复现"
-          flush
-        >
+        <Panel title="策略版本" sub="保存过的入场池和持仓规则" flush>
           <DataTable
             label="策略版本"
             rows={data.strategies}
             rowKey={(row) => row.slug}
-            emptyText="还没有保存的策略：用 python -m rquant.backtest strategy save 把一套入场池 + 持仓规则存成版本。"
+            emptyText="还没有保存的策略。"
             columns={[
               { id: "title", header: "策略", value: (row) => row.title },
               {
                 id: "ver",
                 header: "当前版本",
                 value: (row) => row.version,
-                cell: (row) => `${row.slug}@${row.version}（共 ${row.versions} 版）`,
+                cell: (row) =>
+                  `${presetLabel(`${row.slug}@${row.version}`)}（共 ${row.versions} 版）`,
               },
-              { id: "preset", header: "入场池", value: (row) => row.preset },
+              { id: "preset", header: "入场池", value: (row) => presetLabel(row.preset) },
               { id: "n", header: "持股数", numeric: true, value: (row) => row.max_positions },
               {
                 id: "method",

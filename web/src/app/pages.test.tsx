@@ -94,10 +94,46 @@ function stubApi() {
 
 afterEach(() => vi.unstubAllGlobals());
 
+describe("phone shell", () => {
+  it("puts 全景, 资金流 and 池子 on the bottom bar", async () => {
+    stubApi();
+    renderApp("/overview");
+    const bar = await screen.findByRole("navigation", { name: "常用页面" });
+    const labels = [...bar.querySelectorAll(".tab")].map((node) => node.textContent);
+    expect(labels).toEqual(["全景", "资金流", "池子", "更多"]);
+  });
+
+  it("opens pools from / on a phone and leaves a direct overview link alone", async () => {
+    const original = window.matchMedia;
+    window.matchMedia = ((query: string) => ({
+      matches: query.includes("599"),
+      media: query,
+      onchange: null,
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined,
+      addListener: () => undefined,
+      removeListener: () => undefined,
+      dispatchEvent: () => false,
+    })) as typeof window.matchMedia;
+    try {
+      stubApi();
+      const phone = renderApp("/");
+      expect(phone.router.state.location.pathname).toBe("/pools");
+      phone.unmount();
+      stubApi();
+      const direct = renderApp("/overview");
+      expect(direct.router.state.location.pathname).toBe("/overview");
+      expect((await screen.findAllByText("候选股")).length).toBeGreaterThan(0);
+    } finally {
+      window.matchMedia = original;
+    }
+  });
+});
+
 describe("MVP pages render from the API", () => {
   it.each([
     ["/overview", "候选股"],
-    ["/health", "rquant-monitor"],
+    ["/health", "盘中盯盘"],
     ["/panorama", "今天还没有快照"],
     ["/screener", "贵州茅台"],
     ["/pools", "还没有池子"],

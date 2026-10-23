@@ -12,16 +12,21 @@ input[type="text"],
 input[type="number"],
 input[type="date"],
 input:not([type]) {
-  height: 30px;
-  padding-inline: 8px;
+  height: 32px;
+  padding-inline: 12px;
   border: 1px solid var(--rule);
   border-radius: 6px;
   background: var(--surface-2);
   color: var(--ink);
 }
-input:focus {
-  border-color: var(--accent);
-  outline: none;
+.suffix-field input[type="number"] {
+  padding-right: calc(2em + 20px);
+  text-align: left;
+}
+.suffix-field input[type="number"]::-webkit-inner-spin-button,
+.suffix-field input[type="number"]::-webkit-outer-spin-button {
+  margin: 0;
+  appearance: none;
 }
 .sql-tables {
   display: flex;
@@ -54,12 +59,13 @@ input:focus {
 }
 @media (max-width: 900px) {
   .risk-block {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 .tbl td.best {
-  color: var(--accent-t);
+  color: var(--ink);
   font-weight: 600;
+  background: var(--surface-2);
 }
 .weight-bars {
   margin: 0;
@@ -69,7 +75,7 @@ input:focus {
 }
 .weight-bars li {
   display: grid;
-  grid-template-columns: 72px 1fr 52px;
+  grid-template-columns: 72px minmax(0, 1fr) 52px;
   align-items: center;
   gap: 8px;
   padding: 3px 0;
@@ -135,7 +141,7 @@ input:focus {
   align-items: center;
   justify-content: center;
   overflow: hidden;
-  border: 1px solid var(--bg);
+  border: 1px solid var(--surface);
   color: var(--ink);
   font-size: 12px;
   line-height: 1.3;
@@ -167,6 +173,28 @@ input:focus {
   grid-template-columns: 240px minmax(0, 1fr);
   gap: 16px;
   align-items: start;
+}
+@media (min-width: 901px) {
+  .query-grid {
+    grid-template-columns: minmax(240px, 280px) minmax(420px, 1fr);
+    grid-template-areas:
+      "schema main"
+      "schema history"
+      "schema results";
+  }
+  .query-schema {
+    grid-area: schema;
+  }
+  .query-main {
+    grid-area: main;
+  }
+  .query-history {
+    grid-area: history;
+    min-width: 420px;
+  }
+  .query-results {
+    grid-area: results;
+  }
 }
 @media (max-width: 900px) {
   .query-grid {
@@ -230,6 +258,28 @@ input:focus {
   font: 12px var(--font-mono);
   cursor: pointer;
 }
+.query-empty {
+  margin: 0;
+  padding: 12px 16px;
+}
+.query-fold-h {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  min-height: 44px;
+  padding: 0 16px;
+  border: 0;
+  background: var(--surface);
+  color: var(--ink);
+  font: var(--t-section);
+  text-align: left;
+  cursor: pointer;
+}
+.query-fold-h[aria-expanded="true"] {
+  border-bottom: 1px solid var(--rule);
+}
 .sql-history {
   margin: 0;
   padding: 4px 0;
@@ -239,6 +289,7 @@ input:focus {
 }
 .sql-history li {
   display: flex;
+  align-items: center;
   gap: 6px;
   padding: 2px 12px;
   font-size: 12px;
@@ -253,11 +304,21 @@ input:focus {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.sql-history button.mono {
+  flex: 1;
+  min-width: 0;
+}
 .sql-history .star {
+  flex: none;
   color: var(--faint);
 }
+.sql-history .row-err,
+.sql-history .hint {
+  flex: none;
+  white-space: nowrap;
+}
 .sql-history .star.on {
-  color: var(--warn);
+  color: var(--warn-t);
 }
 .qc-ctl {
   display: flex;
@@ -384,10 +445,20 @@ input:focus {
   white-space: nowrap;
 }
 .qg-v.up {
-  color: var(--up);
+  color: var(--up-t);
 }
 .qg-v.down {
-  color: var(--down);
+  color: var(--down-t);
+}
+@media (max-width: 599px) {
+  .quote-grid.phone {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .quote-more {
+    width: 100%;
+    min-height: 44px;
+    margin-top: 8px;
+  }
 }
 
 .candles svg.pannable {
@@ -427,7 +498,7 @@ input:focus {
 }
 
 .chart-tabs {
-  margin: 4px 0 8px;
+  margin: 0;
 }
 .intraday .chart-axis.up {
   fill: var(--up);
@@ -595,11 +666,11 @@ input:focus {
   background: var(--surface-2);
 }
 .bd-chip.up {
-  color: var(--up);
+  color: var(--up-t);
   background: var(--up-weak);
 }
 .bd-chip.down {
-  color: var(--down);
+  color: var(--down-t);
   background: var(--down-weak);
 }
 .bd-stats {
@@ -615,7 +686,7 @@ input:focus {
   font-weight: 600;
 }
 .bd-stats b.up {
-  color: var(--up);
+  color: var(--up-t);
 }
 .bd-sort {
   display: inline-flex;
@@ -667,7 +738,7 @@ input:focus {
   }
 }
 .bd-rank {
-  color: var(--faint);
+  color: var(--muted);
   font-size: 12px;
   text-align: right;
 }
@@ -698,12 +769,12 @@ input:focus {
   vertical-align: 1px;
 }
 .bd-state.up {
-  color: var(--up);
-  border-color: var(--up);
+  color: var(--up-t);
+  border-color: var(--up-t);
 }
 .bd-state.down {
-  color: var(--down);
-  border-color: var(--down);
+  color: var(--down-t);
+  border-color: var(--down-t);
 }
 .bd-pct {
   min-width: 76px;
@@ -715,12 +786,16 @@ input:focus {
   background: var(--surface-2);
 }
 .bd-pct.up {
-  color: #fff;
-  background: var(--up);
+  color: var(--up-t);
+  background: transparent;
 }
 .bd-pct.down {
-  color: #fff;
-  background: var(--down);
+  color: var(--down-t);
+  background: transparent;
+}
+.bd-pct.flat {
+  color: var(--ink-2);
+  background: transparent;
 }
 .bd-chev {
   color: var(--faint);
@@ -740,7 +815,7 @@ input:focus {
 .psheet-root {
   position: fixed;
   inset: 0;
-  z-index: 1100;
+  z-index: var(--z-drawer);
 }
 .psheet-backdrop {
   position: absolute;
@@ -841,4 +916,105 @@ fieldset.bd-sort {
 }
 svg.touch-scrub {
   touch-action: pan-y;
+}
+
+/* Shared native select. One chevron, one height, used everywhere a dropdown appears. */
+.select {
+  appearance: none;
+  -webkit-appearance: none;
+  height: 32px;
+  padding: 0 32px 0 12px;
+  border: 1px solid var(--c-rule);
+  border-radius: var(--r-sm);
+  background-color: var(--c-surface);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5l5 5 5-5' fill='none' stroke='%235e6776' stroke-width='1.6' stroke-linecap='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  background-size: 12px 8px;
+  color: var(--c-ink);
+  font-size: 14px;
+  line-height: 1.2;
+}
+[data-theme="dark"] .select {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5l5 5 5-5' fill='none' stroke='%23c5cad3' stroke-width='1.6' stroke-linecap='round'/%3E%3C/svg%3E");
+}
+.tbl-sort {
+  display: none;
+}
+
+/* Phone and coarse pointers share one control size with the buttons. */
+@media (max-width: 599px), (pointer: coarse) {
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]):not(
+    [type="color"]
+  ),
+  select,
+  textarea,
+  .search input,
+  .search-screen-input,
+  .cond-row input,
+  .cond-row select,
+  .suffix-field input,
+  .rule-fields input {
+    font-size: 16px;
+  }
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]):not(
+    [type="color"]
+  ),
+  select,
+  .search input,
+  .search-screen-input,
+  .cond-row input,
+  .cond-row select,
+  .suffix-field input,
+  .rule-fields input {
+    height: 44px;
+    min-height: 44px;
+  }
+  .btn,
+  .btn.sm,
+  .notice .act {
+    height: 44px;
+    min-height: 44px;
+    font-size: 15px;
+  }
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]):not(
+    [type="color"]
+  ):not([type="search"]),
+  select,
+  .cond-row input,
+  .suffix-field input {
+    padding-left: 16px;
+  }
+  .select {
+    height: 44px;
+    font-size: 16px;
+    padding: 0 32px 0 16px;
+  }
+  .seg {
+    height: auto;
+    min-height: 44px;
+    padding: 0;
+  }
+  .seg button {
+    height: 44px;
+    min-height: 44px;
+  }
+  .tbl thead th,
+  .tbl th button.sort {
+    height: 44px;
+    min-height: 44px;
+  }
+  .notice .act {
+    margin-block: 0;
+    min-width: 44px;
+  }
+  .tbl-sort {
+    display: inline-block;
+    width: auto;
+    max-width: 100%;
+  }
+  .scheme-chip button + button {
+    min-width: 44px;
+    min-height: 44px;
+  }
 }

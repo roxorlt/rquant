@@ -2256,6 +2256,22 @@
         "title": "Envelope[ScreenData]",
         "type": "object"
       },
+      "Envelope_ScreenerSchemesData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/ScreenerSchemesData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[ScreenerSchemesData]",
+        "type": "object"
+      },
       "Envelope_SectorFlowData_": {
         "properties": {
           "data": {
@@ -3326,6 +3342,7 @@
         "type": "object"
       },
       "FlowSummary": {
+        "description": "Top cards. No market-wide net (2026-10-20, roxor): the sum of the tick-rule estimate over all\nstocks is \"active buy - active sell since the open\", not a market net inflow, so it is no longer\nserved. See docs/数据口径核实-20261019.md §6.",
         "properties": {
           "amount": {
             "title": "Amount",
@@ -3343,9 +3360,71 @@
             "title": "Limit Up",
             "type": "integer"
           },
-          "net": {
-            "title": "Net",
-            "type": "number"
+          "prev_date": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prev Date"
+          },
+          "prev_turnover": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prev Turnover"
+          },
+          "turnover": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Turnover"
+          },
+          "turnover_chg": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Turnover Chg"
+          },
+          "turnover_chg_pct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Turnover Chg Pct"
+          },
+          "turnover_source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Turnover Source"
           },
           "up": {
             "title": "Up",
@@ -3354,7 +3433,6 @@
         },
         "required": [
           "amount",
-          "net",
           "up",
           "down",
           "limit_up",
@@ -4661,6 +4739,7 @@
           "kind": {
             "enum": [
               "ack_alert",
+              "unack_alert",
               "add_watchlist_item",
               "save_alert_rule"
             ],
@@ -5958,6 +6037,100 @@
         "title": "ScreenRow",
         "type": "object"
       },
+      "ScreenerSchemeBody": {
+        "properties": {
+          "filters": {
+            "default": [],
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Filters",
+            "type": "array"
+          },
+          "name": {
+            "maxLength": 40,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "ranks": {
+            "default": [],
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Ranks",
+            "type": "array"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "ScreenerSchemeBody",
+        "type": "object"
+      },
+      "ScreenerSchemeRow": {
+        "properties": {
+          "filters": {
+            "default": [],
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Filters",
+            "type": "array"
+          },
+          "name": {
+            "maxLength": 40,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "ranks": {
+            "default": [],
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Ranks",
+            "type": "array"
+          },
+          "saved_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Saved At"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "ScreenerSchemeRow",
+        "type": "object"
+      },
+      "ScreenerSchemesData": {
+        "properties": {
+          "schemes": {
+            "items": {
+              "$ref": "#/components/schemas/ScreenerSchemeRow"
+            },
+            "title": "Schemes",
+            "type": "array"
+          }
+        },
+        "required": [
+          "schemes"
+        ],
+        "title": "ScreenerSchemesData",
+        "type": "object"
+      },
       "SectorFlowData": {
         "properties": {
           "date": {
@@ -6624,11 +6797,15 @@
             },
             "title": "Items",
             "type": "array"
+          },
+          "rules": {
+            "$ref": "#/components/schemas/SurgeRules"
           }
         },
         "required": [
           "date",
-          "items"
+          "items",
+          "rules"
         ],
         "title": "SurgeData",
         "type": "object"
@@ -6742,6 +6919,50 @@
           "kind"
         ],
         "title": "SurgeEvent",
+        "type": "object"
+      },
+      "SurgeRules": {
+        "description": "Scanner thresholds from ``rquant.research.surge``. The UI renders copy from these.",
+        "properties": {
+          "acc5_min": {
+            "title": "Acc5 Min",
+            "type": "number"
+          },
+          "acc_ratio_min": {
+            "title": "Acc Ratio Min",
+            "type": "number"
+          },
+          "amount_min": {
+            "title": "Amount Min",
+            "type": "number"
+          },
+          "cooldown_s": {
+            "title": "Cooldown S",
+            "type": "number"
+          },
+          "ratio_min": {
+            "title": "Ratio Min",
+            "type": "number"
+          },
+          "start_m": {
+            "title": "Start M",
+            "type": "number"
+          },
+          "win_amount_min": {
+            "title": "Win Amount Min",
+            "type": "number"
+          }
+        },
+        "required": [
+          "ratio_min",
+          "amount_min",
+          "acc5_min",
+          "win_amount_min",
+          "acc_ratio_min",
+          "start_m",
+          "cooldown_s"
+        ],
+        "title": "SurgeRules",
         "type": "object"
       },
       "TaskLog": {
@@ -7369,6 +7590,44 @@
           }
         },
         "summary": "确认告警"
+      }
+    },
+    "/api/v1/alerts/unack": {
+      "post": {
+        "operationId": "unack_alert_api_v1_alerts_unack_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AckAlertRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "撤销确认"
       }
     },
     "/api/v1/backtests": {
@@ -8503,6 +8762,99 @@
           }
         },
         "summary": "选股结果与排序"
+      }
+    },
+    "/api/v1/screener-schemes": {
+      "delete": {
+        "operationId": "delete_screener_scheme_api_v1_screener_schemes_delete",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "maxLength": 40,
+              "minLength": 1,
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "删除选股方案"
+      },
+      "get": {
+        "operationId": "list_screener_schemes_api_v1_screener_schemes_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_ScreenerSchemesData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "选股方案"
+      },
+      "put": {
+        "operationId": "save_screener_scheme_api_v1_screener_schemes_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScreenerSchemeBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "保存选股方案"
       }
     },
     "/api/v1/stocks/{code}": {

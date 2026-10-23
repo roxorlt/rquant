@@ -1,6 +1,7 @@
 import "@testing-library/jest-dom/vitest";
 import { cleanup } from "@testing-library/react";
 import { afterEach } from "vitest";
+import { dismissToast } from "@/ui/Toast";
 
 function mediaQueryList(query: string): MediaQueryList {
   return {
@@ -27,6 +28,7 @@ globalThis.ResizeObserver ??= NoopResizeObserver;
 
 afterEach(() => {
   cleanup();
+  dismissToast();
   window.localStorage.clear();
   window.sessionStorage.clear();
   document.documentElement.removeAttribute("data-theme");

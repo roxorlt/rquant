@@ -7,15 +7,28 @@ function isMissing(value: number | null | undefined): value is null | undefined 
   return value === null || value === undefined || !Number.isFinite(value);
 }
 
-/** Fixed decimals with thousands separators, e.g. 12,345.60. */
+/** Fixed decimals with thousands separators, e.g. 12,345.60. Negatives use U+2212. */
 export function formatNumber(value: number | null | undefined, digits = 2): string {
   if (isMissing(value)) {
     return EMPTY;
   }
-  return value.toLocaleString("zh-CN", {
-    minimumFractionDigits: digits,
-    maximumFractionDigits: digits,
-  });
+  return value
+    .toLocaleString("zh-CN", {
+      minimumFractionDigits: digits,
+      maximumFractionDigits: digits,
+    })
+    .replaceAll("-", MINUS);
+}
+
+/**
+ * Fixed decimals without a thousands separator. Negatives use U+2212, same as
+ * fund-flow. Display only: inputs keep the ASCII hyphen.
+ */
+export function formatFixed(value: number | null | undefined, digits = 2): string {
+  if (isMissing(value)) {
+    return EMPTY;
+  }
+  return value.toFixed(digits).replaceAll("-", MINUS);
 }
 
 /** A price: always two decimals, no separators beyond the thousands. */
@@ -44,7 +57,23 @@ export function formatPercent(value: number | null | undefined, digits = 2): str
   if (isMissing(value)) {
     return EMPTY;
   }
-  return `${value.toFixed(digits)}%`;
+  return `${formatFixed(value, digits)}%`;
+}
+
+/**
+ * Fixed-point with an explicit sign and no thousands separator: +2.5, −1.2, 0.0.
+ * A value that rounds to zero drops the sign. The minus is U+2212, same as the
+ * monitor's amounts and percents.
+ */
+export function formatSignedFixed(value: number | null | undefined, digits = 2): string {
+  if (isMissing(value)) {
+    return EMPTY;
+  }
+  const fixed = Math.abs(value).toFixed(digits);
+  if (Number(fixed) === 0) {
+    return (0).toFixed(digits);
+  }
+  return `${value > 0 ? "+" : MINUS}${fixed}`;
 }
 
 /**
@@ -52,14 +81,8 @@ export function formatPercent(value: number | null | undefined, digits = 2): str
  * readable without colour: +2.50%, −1.20%, 0.00%.
  */
 export function formatSignedPercent(value: number | null | undefined, digits = 2): string {
-  if (isMissing(value)) {
-    return EMPTY;
-  }
-  const fixed = Math.abs(value).toFixed(digits);
-  if (Number(fixed) === 0) {
-    return `${(0).toFixed(digits)}%`;
-  }
-  return `${value > 0 ? "+" : MINUS}${fixed}%`;
+  const fixed = formatSignedFixed(value, digits);
+  return fixed === EMPTY ? EMPTY : `${fixed}%`;
 }
 
 /** A whole count with thousands separators, e.g. 5,556. */

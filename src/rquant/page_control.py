@@ -213,6 +213,15 @@ class AckAlert(PageControlCommand):
     actor_id: str = Field(min_length=1, max_length=256)
 
 
+class UnackAlert(PageControlCommand):
+    """Undo one acknowledgement. Appended to the same log with ``action: unack``."""
+
+    kind: Literal["unack_alert"] = "unack_alert"
+    alert_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    generation_id: str = Field(min_length=1, max_length=128)
+    actor_id: str = Field(min_length=1, max_length=256)
+
+
 class WatchlistItem(RuntimeContractModel):
     ts_code: str = Field(pattern=r"^\d{6}\.(SH|SZ|BJ)$")
     note: str = Field(default="", max_length=200)
@@ -283,6 +292,7 @@ PageControlCommandValue = Annotated[
     | ExportLabArtifactZip
     | DiscardLabArtifactZip
     | AckAlert
+    | UnackAlert
     | AddWatchlistItem
     | SaveAlertRule,
     Field(discriminator="kind"),
@@ -1579,7 +1589,7 @@ class PageControlConsumer:
             return self._lab_backend().export_zip(command.job_id)
         if isinstance(command, DiscardLabArtifactZip):
             return self._lab_backend().discard_zip(command)
-        if isinstance(command, (AckAlert, AddWatchlistItem, SaveAlertRule)):
+        if isinstance(command, (AckAlert, UnackAlert, AddWatchlistItem, SaveAlertRule)):
             return self._append_web_record(command)
         raise TypeError(f"unsupported page control command: {type(command).__name__}")
 
@@ -1635,7 +1645,7 @@ class PageControlConsumer:
                 command.name,
                 create_canvas=False,
             )
-        if isinstance(command, (AckAlert, AddWatchlistItem, SaveAlertRule)):
+        if isinstance(command, (AckAlert, UnackAlert, AddWatchlistItem, SaveAlertRule)):
             return (
                 _LocalEffectFenceTarget(
                     role="web_record_directory",
@@ -1848,7 +1858,7 @@ class PageControlConsumer:
             return self._recover_delete_result(self._user_pool_path(command.base_name))
         if isinstance(command, InitializeLabExports):
             return self._recover_lab_exports(command)
-        if isinstance(command, (AckAlert, AddWatchlistItem, SaveAlertRule)):
+        if isinstance(command, (AckAlert, UnackAlert, AddWatchlistItem, SaveAlertRule)):
             path = self._web_record_path(command)
             if _managed_jsonl_contains_command_id(path, command.command_id):
                 return {"path": str(path)}
@@ -2415,24 +2425,32 @@ class PageControlConsumer:
         _append_managed_jsonl(path, record, command_id=command.command_id)
         return {"path": str(path)}
 
-    def _web_record_path(self, command: AckAlert | AddWatchlistItem | SaveAlertRule) -> Path:
+    def _web_record_path(
+        self, command: AckAlert | UnackAlert | AddWatchlistItem | SaveAlertRule
+    ) -> Path:
         if isinstance(command, SaveAlertRule):
             return self.data_dir / ALERT_RULE_LOG
-        return self.data_dir / (ALERT_ACK_LOG if isinstance(command, AckAlert) else WATCHLIST_LOG)
+        if isinstance(command, (AckAlert, UnackAlert)):
+            return self.data_dir / ALERT_ACK_LOG
+        return self.data_dir / WATCHLIST_LOG
 
-    def _append_web_record(self, command: AckAlert | AddWatchlistItem | SaveAlertRule) -> JsonValue:
+    def _append_web_record(
+        self, command: AckAlert | UnackAlert | AddWatchlistItem | SaveAlertRule
+    ) -> JsonValue:
         """Append-only, idempotent by command_id. Later readers take the latest row per key."""
         path = self._web_record_path(command)
         record: dict[str, object] = {
             "command_id": command.command_id,
             "ts": command.requested_at.astimezone(UTC).isoformat(timespec="seconds"),
         }
-        if isinstance(command, AckAlert):
+        if isinstance(command, (AckAlert, UnackAlert)):
             record.update(
                 alert_id=command.alert_id,
                 generation_id=command.generation_id,
                 actor_id=command.actor_id,
             )
+            if isinstance(command, UnackAlert):
+                record["action"] = "unack"
         elif isinstance(command, SaveAlertRule):
             record.update(command.rule.model_dump(mode="json"))
         else:
@@ -3203,6 +3221,7 @@ def parse_page_control_command(payload: object) -> PageControlCommandValue:
 __all__ = [
     "ALERT_ACK_LOG",
     "AckAlert",
+    "UnackAlert",
     "AddWatchlistItem",
     "AppendNlQueryLog",
     "WATCHLIST_LOG",

@@ -1,7 +1,7 @@
 /* Screener condition area: filters and ranks side by side, funnel as one line. */
 .cond-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 340px), 1fr));
   gap: 6px 24px;
 }
 .cond-grid h3.sub {
@@ -16,12 +16,14 @@
   margin-bottom: 4px;
 }
 .cond-grid .cond-row > .mono {
-  color: var(--faint);
+  color: var(--muted);
   font-size: 11px;
 }
 .cond-grid .cond-row select,
 .cond-grid .cond-row input {
-  height: 28px;
+  height: 32px;
+  padding-left: 12px;
+  font-size: 14px;
   background: var(--surface-2);
   color: var(--ink);
 }
@@ -29,9 +31,112 @@
   font-family: var(--font-mono);
   text-align: right;
 }
+.formula-ai {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+.formula-ai .btn.quiet {
+  color: var(--c-muted);
+}
+.formula-ai input {
+  flex: 1;
+  min-width: 0;
+  height: 32px;
+  border: 1px solid var(--c-rule);
+  border-radius: var(--r-sm);
+  background: var(--c-surface);
+  padding-left: 12px;
+  font-size: 14px;
+}
+.formula-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 8px;
+}
+.formula-actions .btn {
+  width: auto;
+  height: 32px;
+  padding-inline: 16px;
+}
+.select,
+.cond-grid .cond-row select.select {
+  height: 32px;
+  padding: 0 32px 0 12px;
+  font-size: 14px;
+}
+.cond-pick {
+  padding: 8px 16px 0;
+}
+.cond-pick .select {
+  display: block;
+  width: 100%;
+  max-width: 28rem;
+}
+@media (max-width: 599px), (pointer: coarse) {
+  .formula-ai input,
+  .formula-actions .btn,
+  .select,
+  .cond-grid .cond-row select,
+  .cond-grid .cond-row input,
+  .schemes input {
+    height: 44px;
+    min-height: 44px;
+    font-size: 16px;
+    padding-left: 16px;
+  }
+  .scheme-chip button + button {
+    min-width: 44px;
+    min-height: 44px;
+  }
+  .formula-actions .btn {
+    width: auto;
+    min-width: 72px;
+    padding-inline: 16px;
+  }
+  .cond-grid .cond-row > :nth-child(2) {
+    grid-column: 2 / -1;
+    max-width: 100%;
+  }
+  .cond-grid .cond-row > :nth-child(3) {
+    grid-column: 2;
+  }
+  .cond-grid .cond-row > :nth-child(4) {
+    grid-column: 3 / 5;
+  }
+  .cond-grid .cond-row > :nth-child(5) {
+    grid-column: 5;
+    grid-row: 2;
+  }
+}
+.formula-result {
+  display: block;
+  margin-top: 8px;
+  background: var(--c-surface-2);
+  border-radius: var(--r-sm);
+  padding: 12px;
+}
+.formula-result-h {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.formula-result-label {
+  font-size: 12px;
+  line-height: 16px;
+  color: var(--c-muted);
+}
+.formula-result-expr {
+  margin-top: 4px;
+  font-size: 13px;
+  line-height: 20px;
+  color: var(--c-ink);
+  overflow-wrap: anywhere;
+}
 .cond-none {
   margin: 0 0 4px;
-  color: var(--faint);
+  color: var(--muted);
   font-size: 12px;
 }
 .funnel-inline {
@@ -79,7 +184,9 @@
 }
 .schemes input {
   width: 150px;
-  height: 26px;
+  height: 32px;
+  padding-left: 12px;
+  font-size: 14px;
 }
 .scheme-chip {
   display: inline-flex;
@@ -96,9 +203,12 @@
   cursor: pointer;
 }
 .scheme-chip button + button {
-  padding: 2px 6px;
+  box-sizing: border-box;
+  min-width: 32px;
+  min-height: 32px;
+  padding: 0 8px;
   border-left: 1px solid var(--rule);
-  color: var(--faint);
+  color: var(--muted);
 }
 .scheme-chip button:hover {
   color: var(--accent-t);

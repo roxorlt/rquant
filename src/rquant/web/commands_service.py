@@ -1,7 +1,8 @@
 """rquant-web-commands: the tiny write sink for the web app's commands.
 
 Accepts ``POST /v1/commands`` with the same payload ``rquant.web.page_control`` sends
-(``ack_alert``, ``add_watchlist_item``, ``save_alert_rule``, ``save_canvas``), validates it
+(``ack_alert``, ``unack_alert``, ``add_watchlist_item``, ``save_alert_rule``,
+``save_canvas``), validates it
 with page control's own command models, and appends one JSON line (idempotent by
 ``command_id``) under a fixed data directory, in page control's on-disk layout:
 
@@ -36,13 +37,16 @@ from rquant.page_control import (
     AddWatchlistItem,
     SaveAlertRule,
     SaveCanvas,
+    UnackAlert,
     _append_managed_jsonl,
 )
 
 CANVAS_SAVE_LOG = Path("canvas_saves") / "saves.jsonl"
 MAX_BODY = 64 * 1024
-WebCommand = Annotated[AckAlert | AddWatchlistItem | SaveAlertRule | SaveCanvas,
-                       Field(discriminator="kind")]
+WebCommand = Annotated[
+    AckAlert | UnackAlert | AddWatchlistItem | SaveAlertRule | SaveCanvas,
+    Field(discriminator="kind"),
+]
 _ADAPTER: TypeAdapter[Any] = TypeAdapter(WebCommand)
 _LOCK = threading.Lock()
 log = logging.getLogger("rquant-web-commands")
@@ -53,9 +57,11 @@ def record_for(command: Any) -> tuple[Path, dict[str, object]]:
         "command_id": command.command_id,
         "ts": command.requested_at.astimezone(UTC).isoformat(timespec="seconds"),
     }
-    if isinstance(command, AckAlert):
+    if isinstance(command, (AckAlert, UnackAlert)):
         record.update(alert_id=command.alert_id, generation_id=command.generation_id,
                       actor_id=command.actor_id)
+        if isinstance(command, UnackAlert):
+            record["action"] = "unack"
         return ALERT_ACK_LOG, record
     if isinstance(command, AddWatchlistItem):
         record.update(ts_code=command.item.ts_code, note=command.item.note)

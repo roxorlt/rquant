@@ -1,4 +1,5 @@
 import { useHealth } from "@/api/endpoints";
+import { layerTitle, planeLabel, publicLines, serviceLabel, statusLabel } from "@/copy/publicText";
 import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
 import { KpiStrip, PageHeader, Panel, StatusBadge } from "@/ui";
@@ -29,10 +30,10 @@ export default function HealthPage() {
                             ? "warn"
                             : (layer.state as "ok" | "warn" | "crit")
                         }
-                        label={`${layer.title}${layer.state === "unknown" ? "（未知）" : ""}`}
-                        reason={layer.detail.join("；")}
+                        label={`${layerTitle(layer.title)}${layer.state === "unknown" ? "（未知）" : ""}`}
+                        reason={publicLines(layer.detail).join("；")}
                       />
-                      <span className="sub">{layer.detail[0]}</span>
+                      <span className="sub">{publicLines(layer.detail)[0] ?? "—"}</span>
                     </li>
                   ))}
                 </ul>
@@ -44,8 +45,12 @@ export default function HealthPage() {
                 rows={data.services}
                 rowKey={(row) => row.service_id}
                 columns={[
-                  { id: "service", header: "服务", value: (row) => row.service_id },
-                  { id: "plane", header: "平面", value: (row) => row.plane },
+                  {
+                    id: "service",
+                    header: "服务",
+                    value: (row) => serviceLabel(row.service_id),
+                  },
+                  { id: "plane", header: "平面", value: (row) => planeLabel(row.plane) },
                   {
                     id: "status",
                     header: "状态",
@@ -55,7 +60,7 @@ export default function HealthPage() {
                       return (
                         <StatusBadge
                           state={bad ? "crit" : "ok"}
-                          label={row.stale ? `${row.status}（过期）` : row.status}
+                          label={statusLabel(row.status, row.stale)}
                           reason={row.last_error}
                         />
                       );

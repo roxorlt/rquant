@@ -168,8 +168,15 @@ def _seed(con: duckdb.DuckDBPyConnection, today: date) -> None:
     )
     ins("INSERT INTO dashboard_summary VALUES ('latest', ?, ?, 1000000, 120, 5000000)", [d, d])
     con.executemany(
-        "INSERT INTO signals VALUES (?, ?, 'breakout', ?, 'buy', now(), '[\"volume_surge\"]')",
-        [(i + 1, f"sig-{i}", c) for i, (c, _, _) in enumerate(stocks[:2])],
+        "INSERT INTO signals VALUES (?, ?, 'breakout', ?, ?, now(), '[\"volume_surge\"]')",
+        [
+            (1, "sig-1", "600519.SH", "watch"),
+            (2, "sig-2", "000001.SZ", "b_intent"),
+            (3, "sig-3", "300750.SZ", "reduce"),
+            (4, "sig-4", "601318.SH", "s_intent"),
+            (5, "sig-5", "600519.SH", "cancel"),
+            (6, "sig-6", f"daily-summary:{d}", "watch"),
+        ],
     )
     ins("INSERT INTO paper_accounts VALUES ('paper-main', now(), 50000, 50000, 110000, 2500, 800)")
     ins("INSERT INTO paper_holdings VALUES ('paper-main', '600519.SH', 100, 100, 1500, 1525, "
@@ -197,6 +204,11 @@ class FixtureSource:
             "INSERT INTO alert_ack VALUES (?, now(), ?, ?)",
             [payload["alert_id"], payload["actor_id"], payload["command_id"]],
         )
+        return {"command_id": payload["command_id"], "status": "succeeded"}
+
+    def record_unack(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Drop the ack row so the alert reads as unconfirmed again."""
+        self.con.execute("DELETE FROM alert_ack WHERE alert_id = ?", [payload["alert_id"]])
         return {"command_id": payload["command_id"], "status": "succeeded"}
 
     def record_rule(self, payload: dict[str, Any]) -> dict[str, Any]:
