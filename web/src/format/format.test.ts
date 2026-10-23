@@ -10,6 +10,7 @@ import {
 } from "./number";
 import {
   formatAge,
+  formatListClock,
   formatShanghaiDateTime,
   formatShanghaiTime,
   shanghaiDate,
@@ -54,6 +55,9 @@ describe("Shanghai time", () => {
     expect(formatShanghaiTime("2026-09-24T01:30:00Z")).toBe("09:30");
     expect(formatShanghaiDateTime("2026-09-24T07:31:00Z")).toBe("2026-09-24 15:31:00");
     expect(weekdayOf("2026-09-28")).toBe("周一");
+    const now = new Date("2026-10-21T08:00:00Z");
+    expect(formatListClock("2026-10-21T07:44:00Z", now)).toBe("15:44");
+    expect(formatListClock("2026-10-20T06:38:00Z", now)).toBe("10-20 14:38");
   });
 
   it("describes ages coarsely", () => {
