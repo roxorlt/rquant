@@ -154,7 +154,30 @@ export function DataTable<T>({
       return next;
     });
   const columns = useMemo(() => allColumns.filter((c) => !hidden.has(c.id)), [allColumns, hidden]);
-  const [sorting, setSorting] = useState<SortingState>(initialSort ? [initialSort] : []);
+  const sortKey = `sort.${label}`;
+  const [sorting, setSortingState] = useState<SortingState>(() => {
+    const saved = tools ? readPreference(sortKey) : null;
+    if (saved) {
+      try {
+        const parsed: unknown = JSON.parse(saved);
+        if (
+          Array.isArray(parsed) &&
+          parsed.every((s) => typeof s?.id === "string" && typeof s?.desc === "boolean") &&
+          parsed.every((s) => allColumns.some((c) => c.id === s.id))
+        )
+          return parsed as SortingState;
+      } catch {
+        // fall through to the default order
+      }
+    }
+    return initialSort ? [initialSort] : [];
+  });
+  const setSorting = (updater: SortingState | ((old: SortingState) => SortingState)) =>
+    setSortingState((old) => {
+      const next = typeof updater === "function" ? updater(old) : updater;
+      if (tools) writePreference(sortKey, JSON.stringify(next));
+      return next;
+    });
   const scrollRef = useRef<HTMLDivElement>(null);
   const [overflowing, setOverflowing] = useState(false);
   // Column count changes scrollWidth without resizing the wrap, so it is a dependency.

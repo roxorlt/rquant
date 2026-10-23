@@ -827,6 +827,24 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/ui-preferences": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 页面设置（按登录用户） */
+        get: operations["list_ui_preferences_api_v1_ui_preferences_get"];
+        /** 保存页面设置 */
+        put: operations["save_ui_preference_api_v1_ui_preferences_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/watchlist": {
         parameters: {
             query?: never;
@@ -1563,6 +1581,11 @@ export interface components {
         /** Envelope[TaskLog] */
         Envelope_TaskLog_: {
             data: components["schemas"]["TaskLog"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[UiPreferencesData] */
+        Envelope_UiPreferencesData_: {
+            data: components["schemas"]["UiPreferencesData"];
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[Union[BrinsonData, NoneType]] */
@@ -3075,6 +3098,23 @@ export interface components {
             /** Tdx */
             tdx: string;
         };
+        /** UiPreferenceBody */
+        UiPreferenceBody: {
+            /** Key */
+            key: string;
+            /** Value */
+            value?: string | null;
+        };
+        /**
+         * UiPreferencesData
+         * @description Page settings of the signed-in user (key -> text, as the page stores it).
+         */
+        UiPreferencesData: {
+            /** Prefs */
+            prefs: {
+                [key: string]: string;
+            };
+        };
         /** ValidationError */
         ValidationError: {
             /** Context */
@@ -4491,6 +4531,59 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_TaskLog_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_ui_preferences_api_v1_ui_preferences_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_UiPreferencesData_"];
+                };
+            };
+        };
+    };
+    save_ui_preference_api_v1_ui_preferences_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UiPreferenceBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommandReceipt"];
                 };
             };
             /** @description Validation Error */

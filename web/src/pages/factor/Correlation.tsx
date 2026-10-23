@@ -1,6 +1,6 @@
-import { useState } from "react";
 import { useFactorCorrelation } from "@/api/endpoints";
 import { formatFixed } from "@/format/number";
+import { oneOf, usePreference } from "@/theme/storage";
 import { Panel, Segmented } from "@/ui";
 
 type Kind = "value" | "ic";
@@ -14,7 +14,7 @@ function bg(v: number | null | undefined): string | undefined {
 /** Factor × factor correlation: latest cross-section (Spearman) or daily IC series. */
 export function CorrelationPanel() {
   const query = useFactorCorrelation();
-  const [kind, setKind] = useState<Kind>("value");
+  const [kind, setKind] = usePreference<Kind>("factor.corr", "value", oneOf("value", "ic"));
   const d = query.data;
   if (!d?.names || d.names.length < 2) return null;
   const m = kind === "value" ? d.value_corr : d.ic_corr;

@@ -566,3 +566,15 @@ class ScreenerSchemeRow(ScreenerSchemeBody):
 
 class ScreenerSchemesData(BaseModel):
     schemes: list[ScreenerSchemeRow]
+
+
+class UiPreferencesData(BaseModel):
+    """Page settings of the signed-in user (key -> text, as the page stores it)."""
+
+    prefs: dict[str, str]
+
+
+class UiPreferenceBody(BaseModel):
+    key: str = Field(min_length=1, max_length=70)
+    #: ``None`` removes the key.
+    value: str | None = Field(default=None, max_length=16_000)

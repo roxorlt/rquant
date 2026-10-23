@@ -103,6 +103,8 @@ from rquant.web.models import (
     TextToConditionRequest,
     TranslateData,
     TranslateRequest,
+    UiPreferenceBody,
+    UiPreferencesData,
 )
 from rquant.web.overfit_stats import overfit_stats, sharpe_per_period
 from rquant.web.pool_live import PoolLiveData, load_pool_live
@@ -1042,6 +1044,30 @@ def delete_screener_scheme(request: Request, name: str = Query(min_length=1, max
     if _preview_fail(request):
         raise HTTPException(503, "preview failure")
     _schemes(request).delete(name)
+    return CommandReceipt(command_id=None, status="succeeded")
+
+
+@router.get("/ui-preferences", response_model=Envelope[UiPreferencesData],
+            summary="页面设置（按登录用户）")
+def list_ui_preferences(request: Request, source: SourceDep) -> Envelope[UiPreferencesData]:
+    prefs = _schemes(request).preferences(_user(request) or "")
+    return _envelope(source, UiPreferencesData(prefs=prefs))
+
+
+@router.put("/ui-preferences", response_model=CommandReceipt, summary="保存页面设置")
+def save_ui_preference(body: UiPreferenceBody, request: Request) -> CommandReceipt:
+    from rquant.web.screener_schemes import preference_key_ok
+
+    if _role(request) != "admin":
+        raise HTTPException(403, "只读账号不能执行写操作")
+    if _preview_fail(request):
+        raise HTTPException(503, "preview failure")
+    if not preference_key_ok(body.key):
+        raise HTTPException(400, "不支持的设置项")
+    try:
+        _schemes(request).set_preference(_user(request) or "", body.key, body.value)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     return CommandReceipt(command_id=None, status="succeeded")
 
 

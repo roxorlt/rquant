@@ -5,6 +5,7 @@ import { Candles, clampView } from "@/charts/Candles";
 import { boll, kdj, macd, obv, rsi, sma } from "@/charts/indicators";
 import { SubChart, type SubSeries } from "@/charts/SubChart";
 import { formatFixed } from "@/format/number";
+import { usePreference } from "@/theme/storage";
 import { Panel } from "@/ui";
 
 type Bar = Schemas["StockProfile"]["bars"][number];
@@ -69,6 +70,9 @@ export const SUBS = {
   chip: "筹码获利",
 } as const;
 type Sub = keyof typeof SUBS;
+const isSubs = (v: unknown): v is Sub[] =>
+  Array.isArray(v) && v.length === 2 && v.every((x) => typeof x === "string" && x in SUBS);
+const isBool = (v: unknown): v is boolean => typeof v === "boolean";
 
 function subSeries(
   kind: Sub,
@@ -180,8 +184,8 @@ export function KlinePanel({
   const [view, setView] = useState<[number, number]>(() =>
     clampView(bars.length - 250, bars.length, bars.length),
   );
-  const [subs, setSubs] = useState<Sub[]>(["macd", "flow"]);
-  const [showBoll, setShowBoll] = useState(false);
+  const [subs, setSubs] = usePreference<Sub[]>("kline.subs", ["macd", "flow"], isSubs);
+  const [showBoll, setShowBoll] = usePreference("kline.boll", false, isBool);
   const zoom = (k: number) => {
     const [a, b] = view;
     const len = (b - a) * k;
@@ -189,8 +193,8 @@ export function KlinePanel({
   };
   const chips = useChips(code);
   const [hover, setHover] = useState<number | null>(null);
-  const [showChips, setShowChips] = useState(true);
-  const [showVp, setShowVp] = useState(false);
+  const [showChips, setShowChips] = usePreference("kline.chips", true, isBool);
+  const [showVp, setShowVp] = usePreference("kline.vp", false, isBool);
   const c = chips.data;
   const byDate = useMemo(() => new Map((c?.days ?? []).map((d) => [d.date, d])), [c]);
   const day = bars[hover ?? bars.length - 1];
@@ -200,7 +204,7 @@ export function KlinePanel({
     [c],
   );
   const bb = useMemo(() => boll(bars.map((b) => b.close)), [bars]);
-  const [showVwap, setShowVwap] = useState(true);
+  const [showVwap, setShowVwap] = usePreference("kline.vwap", true, isBool);
   const [anchor, setAnchor] = useState<number | null>(null);
   const a = anchor ?? Math.max(0, bars.length - 60);
   const vwap = useMemo(() => anchoredVwap(bars, a), [bars, a]);

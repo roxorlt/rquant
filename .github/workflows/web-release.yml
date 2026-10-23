@@ -48,6 +48,10 @@ jobs:
 
       - name: Build frontend
         working-directory: web
+        env:
+          # Build switches (web/src/features.ts). Saved screener schemes: on (web store
+          # sqlite on the server, approved 2026-10-23). Alert unack: off (page control rejects it).
+          VITE_FEATURE_SCREENER_SCHEMES: "1"
         run: |
           pnpm install --frozen-lockfile
           pnpm run build
