@@ -131,12 +131,14 @@ export function DataTable<T>({
   pinEnds = false,
   phoneSort = false,
 }: DataTableProps<T>) {
-  const prefKey = `cols.${label}`;
+  const narrow =
+    typeof window.matchMedia === "function" && window.matchMedia("(max-width: 599px)").matches;
+  // Phones hide secondary columns by default, so phones and computers keep separate choices
+  // (both follow the account: a phone choice shows on other phones, a desktop one on computers).
+  const prefKey = narrow ? `cols.${label}@phone` : `cols.${label}`;
   const [hidden, setHidden] = useState<Set<string>>(() => {
     const saved = tools ? readPreference(prefKey) : null;
     if (saved !== null) return new Set(saved.split(",").filter(Boolean));
-    const narrow =
-      typeof window.matchMedia === "function" && window.matchMedia("(max-width: 599px)").matches;
     return new Set(
       allColumns
         .filter((column) => column.hiddenByDefault || (narrow && column.secondary))
