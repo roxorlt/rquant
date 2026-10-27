@@ -82,7 +82,7 @@ export function toCsv<T>(columns: readonly DataColumn<T>[], rows: readonly T[]):
   return `\uFEFF${lines.join("\n")}\n`;
 }
 
-function download(name: string, text: string) {
+export function downloadCsv(name: string, text: string): void {
   const url = URL.createObjectURL(new Blob([text], { type: "text/csv;charset=utf-8" }));
   const a = document.createElement("a");
   a.href = url;
@@ -310,7 +310,7 @@ export function DataTable<T>({
         type="button"
         className="tbl-tool"
         onClick={() =>
-          download(
+          downloadCsv(
             typeof tools === "string" ? tools : label,
             toCsv(
               columns.filter((c) => c.header),

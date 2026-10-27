@@ -5,7 +5,7 @@ import {
   useSectorFlow,
   useSectorLeadersAt,
 } from "@/api/endpoints";
-import { HelpMark, PageHeader, Segmented } from "@/ui";
+import { Button, HelpMark, PageHeader, Segmented } from "@/ui";
 import { StockLink } from "@/ui/StockLink";
 import { PHONE_QUERY, useMedia } from "../panorama/useMedia";
 import { FlowChart } from "./FlowChart";
@@ -90,8 +90,12 @@ function Body({
   const [allBars, setAllBars] = useState(false);
   const last = data.t.length - 1;
   const upto = cursor == null ? last : Math.min(cursor, last);
-  const asOf = useSectorLeadersAt(day ?? data.date ?? null, cursor == null ? null : upto);
-  const leaders = cursor == null ? data.leaders : (asOf.data ?? data.leaders);
+  const replay = cursor != null;
+  const asOf = useSectorLeadersAt(day ?? data.date ?? null, replay ? upto : null);
+  const replayLoading = replay && asOf.data == null && (asOf.isLoading || asOf.isFetching);
+  const replayFailed = replay && asOf.data == null && asOf.error != null && !asOf.isFetching;
+  const leaders = replay ? (asOf.data ?? []) : data.leaders;
+  const cardState = replayFailed ? "error" : replayLoading ? "loading" : "ready";
 
   const byName = useMemo(() => new Map(data.sectors.map((s) => [s.name, s])), [data.sectors]);
   const sel = picked ?? defaultSelection(data.sectors, DEFAULT_TOP_N);
@@ -102,7 +106,6 @@ function Body({
     setPicked(cur.includes(name) ? cur.filter((n) => n !== name) : [...cur, name]);
   };
   const clock = data.t[upto] ?? data.time ?? "";
-  const replay = cursor != null;
   useEffect(() => {
     onReplay(replay ? clock : null);
   }, [replay, clock, onReplay]);
@@ -169,43 +172,59 @@ function Body({
                 <Segmented label="口径" value={mode} onChange={setMode} options={MODES} />
               </div>
             </div>
-            <div className="sf-chips">
-              {shown.map((s) => (
-                <span key={s.name} className={`sf-chip ${focus === s.name ? "hl" : ""}`}>
-                  <button
-                    type="button"
-                    className="lab"
-                    onClick={() => setFocus(focus === s.name ? null : s.name)}
-                  >
-                    <i style={{ background: colors.get(s.name) }} />
-                    {s.name}
+            {cardState === "ready" ? (
+              <div className="sf-chips">
+                {shown.map((s) => (
+                  <span key={s.name} className={`sf-chip ${focus === s.name ? "hl" : ""}`}>
+                    <button
+                      type="button"
+                      className="lab"
+                      onClick={() => setFocus(focus === s.name ? null : s.name)}
+                    >
+                      <i style={{ background: colors.get(s.name) }} />
+                      {s.name}
+                    </button>
+                    <button
+                      type="button"
+                      className="x"
+                      aria-label={`移除 ${s.name}`}
+                      onClick={() => toggle(s.name)}
+                    >
+                      ×
+                    </button>
+                  </span>
+                ))}
+                {picked ? (
+                  <button type="button" className="sf-chip more" onClick={() => setPicked(null)}>
+                    恢复默认
                   </button>
-                  <button
-                    type="button"
-                    className="x"
-                    aria-label={`移除 ${s.name}`}
-                    onClick={() => toggle(s.name)}
-                  >
-                    ×
-                  </button>
-                </span>
-              ))}
-              {picked ? (
-                <button type="button" className="sf-chip more" onClick={() => setPicked(null)}>
-                  恢复默认
-                </button>
-              ) : null}
-            </div>
-            <FlowChart
-              t={data.t}
-              shown={shown}
-              colors={colors}
-              mode={mode}
-              upto={upto}
-              phone={phone}
-              focus={focus}
-              onFocus={setFocus}
-            />
+                ) : null}
+              </div>
+            ) : null}
+            {cardState === "loading" ? (
+              <div className="skel sf-chart-skel" aria-hidden="true" />
+            ) : null}
+            {cardState === "error" ? (
+              <div className="error-block" role="alert">
+                <b>{clock} 的回放数据没加载出来</b>
+                <p>网络或服务暂时没响应。顶部的成交额、涨跌家数、涨停跌停数不受影响。</p>
+                <Button type="button" onClick={() => asOf.refetch()}>
+                  重试
+                </Button>
+              </div>
+            ) : null}
+            {cardState === "ready" ? (
+              <FlowChart
+                t={data.t}
+                shown={shown}
+                colors={colors}
+                mode={mode}
+                upto={upto}
+                phone={phone}
+                focus={focus}
+                onFocus={setFocus}
+              />
+            ) : null}
             <div className="sf-scrub">
               <span>回放</span>
               <input
@@ -229,6 +248,11 @@ function Body({
                 </button>
               ) : null}
             </div>
+            {replay && cardState !== "error" ? (
+              <p className="sf-replay-note">
+                回放时，主图和下面各卡片按回放到的那一分钟算。顶部的成交额、涨跌家数、涨停跌停数一直是最新值。
+              </p>
+            ) : null}
             <p className="sf-note sf-note-row">
               估算值，看相对强弱，和同花顺、东方财富的数会不一样
               <HelpMark label="估算口径">
@@ -239,6 +263,7 @@ function Body({
           </section>
           {!phone ? (
             <Bars
+              state={cardState}
               ranked={ranked}
               at={at}
               sel={sel}
@@ -251,7 +276,10 @@ function Body({
           ) : null}
         </div>
         <Leaders
+          state={cardState}
           leaders={leaders}
+          replay={replay}
+          upto={upto}
           asOf={cursor == null ? null : (data.t[upto] ?? null)}
           ranked={ranked}
           at={at}
@@ -259,6 +287,7 @@ function Body({
         />
         {phone ? (
           <Bars
+            state={cardState}
             ranked={ranked}
             at={at}
             sel={sel}
@@ -305,6 +334,7 @@ function TurnoverCard({ sm }: { sm: NonNullable<SectorFlowData["summary"]> }) {
 }
 
 function Bars({
+  state,
   ranked,
   at,
   sel,
@@ -316,6 +346,7 @@ function Bars({
   lim: limit = 8,
   onAll,
 }: {
+  state: "ready" | "loading" | "error";
   ranked: Sector[];
   at: (s: Sector) => number;
   sel: string[];
@@ -327,6 +358,20 @@ function Bars({
   lim?: number;
   onAll?: () => void;
 }) {
+  if (state === "loading") {
+    return (
+      <section className="sf-card" aria-busy="true" aria-label="全部板块">
+        <div className="skel sf-skel-card" />
+      </section>
+    );
+  }
+  if (state === "error") {
+    return (
+      <section className="sf-card" aria-label="全部板块">
+        <p className="sf-replay-miss">回放数据没加载出来</p>
+      </section>
+    );
+  }
   const ins = ranked.filter((s) => at(s) > 0);
   const outs = ranked.filter((s) => at(s) <= 0).reverse();
   const lim = all ? 999 : limit;
@@ -409,18 +454,39 @@ function Spark({ s, w = 64 }: { s: Stock; w?: number }) {
 }
 
 function Leaders({
+  state,
   leaders,
+  replay,
+  upto,
   asOf,
   ranked,
   at,
   phone,
 }: {
+  state: "ready" | "loading" | "error";
   leaders: Leader[];
+  replay: boolean;
+  upto: number;
   asOf: string | null;
   ranked: Sector[];
   at: (sector: Sector) => number;
   phone: boolean;
 }) {
+  if (state === "loading") {
+    return (
+      <aside className="sf-card sf-rank" aria-busy="true" aria-label="资金领先股">
+        <div className="skel sf-skel-card" />
+      </aside>
+    );
+  }
+  if (state === "error") {
+    return (
+      <aside className="sf-card sf-rank" aria-label="资金领先股">
+        <p className="sf-replay-miss">回放数据没加载出来</p>
+      </aside>
+    );
+  }
+  const pctAt = (sector: Sector) => (replay ? (sector.pct_series[upto] ?? null) : sector.pct);
   const netOf = (name: string, fallback: number) => {
     const sector = ranked.find((item) => item.name === name);
     return sector ? at(sector) : fallback;
@@ -484,15 +550,14 @@ function Leaders({
         {outs.map((s) => (
           <div key={s.name} className="row">
             <span>
-              {s.name} <span className={`small ${tone(s.pct)}`}>{fmtPct(s.pct)}</span>
+              {s.name} <span className={`small ${tone(pctAt(s))}`}>{fmtPct(pctAt(s))}</span>
             </span>
             <b className="down">{fmtValue(at(s), "net")}</b>
           </div>
         ))}
       </div>
       <p className="sf-note">
-        资金领先股门槛：流通市值 ≥30 亿且成交额 ≥1 亿；按自 09:25 净流入 ÷
-        流通市值排序；回放时按该分钟重新计算。
+        资金领先股门槛：流通市值 ≥30 亿且成交额 ≥1 亿；按自 09:25 净流入 ÷ 流通市值排序。
       </p>
     </aside>
   );
