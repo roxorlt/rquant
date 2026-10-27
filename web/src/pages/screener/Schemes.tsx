@@ -5,6 +5,7 @@ import {
   useScreenerSchemes,
 } from "@/api/endpoints";
 import { useReadOnlyReason } from "@/api/useMeta";
+import { screenerSchemesEnabled } from "@/features";
 import { readPreference, writePreference } from "@/theme/storage";
 import { Button, FailureNotice, useToast } from "@/ui";
 import { type FailureCopy, failureCopy } from "@/ui/failure";
@@ -32,8 +33,13 @@ function storeLocal(list: Scheme[]): boolean {
   return list.length === 0 || readPreference(KEY) != null;
 }
 
+export function Schemes(props: { filters: Filter[]; ranks: Rank[]; onLoad: (s: Scheme) => void }) {
+  if (!screenerSchemesEnabled()) return null;
+  return <SchemeEditor {...props} />;
+}
+
 /** Named condition schemes. The server is the copy that follows the account; this browser is only a fallback. */
-export function Schemes({
+function SchemeEditor({
   filters,
   ranks,
   onLoad,
