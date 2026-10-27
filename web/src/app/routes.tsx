@@ -3,10 +3,17 @@ import { type ComponentType, type LazyExoticComponent, lazy } from "react";
 const StockPage = lazy(() => import("@/pages/stock"));
 
 import { Navigate, type RouteObject } from "react-router";
+import { currentHomePath } from "./home";
 import { NotFound } from "./NotFound";
-import { HOME_PATH, PAGES, type PageId } from "./pages";
+import { PAGES, type PageId } from "./pages";
 import { RouteError } from "./RouteError";
 import { Shell } from "./Shell";
+
+/** Decided once, when `/` is opened. Resize does not navigate again, and `replace`
+ * drops `/` from history so Back is not bounced through the redirect. */
+function HomeRedirect() {
+  return <Navigate to={currentHomePath()} replace />;
+}
 
 type LazyPage = LazyExoticComponent<ComponentType>;
 
@@ -37,7 +44,7 @@ export const appRoutes: RouteObject[] = [
     element: <Shell />,
     errorElement: <RouteError />,
     children: [
-      { index: true, element: <Navigate to={HOME_PATH} replace /> },
+      { index: true, element: <HomeRedirect /> },
       ...PAGES.map((page) => {
         const Page = PAGE_COMPONENTS[page.id];
         return { path: page.id, element: <Page />, handle: { title: page.title } };

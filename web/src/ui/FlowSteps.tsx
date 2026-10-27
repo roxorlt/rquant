@@ -13,11 +13,6 @@ export function FlowSteps() {
     <nav className="flow-steps" aria-label="研究流程">
       {STEPS.map((step, i) => (
         <span key={step.path} className="flow-step">
-          {i > 0 ? (
-            <span className="flow-arrow" aria-hidden="true">
-              →
-            </span>
-          ) : null}
           <NavLink to={step.path}>
             <span className="flow-n">{i + 1}</span>
             {step.label}

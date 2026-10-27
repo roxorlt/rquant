@@ -1,13 +1,14 @@
 import { useFactor, useFactors } from "@/api/endpoints";
 import { useUrlState } from "@/app/useUrlState";
 import { TimeChart } from "@/charts/Chart";
+import { formatFixed } from "@/format/number";
 import { DataTable } from "@/table/DataTable";
 import { KpiStrip, PageHeader, Panel } from "@/ui";
 import { QueryView } from "../shared";
 import { CorrelationPanel } from "./Correlation";
 
-const num = (v: number | null | undefined, d = 3) => (v == null ? "—" : v.toFixed(d));
-const pct = (v: number | null | undefined) => (v == null ? "—" : `${(v * 100).toFixed(2)}%`);
+const num = (v: number | null | undefined, d = 3) => (v == null ? "—" : formatFixed(v, d));
+const pct = (v: number | null | undefined) => (v == null ? "—" : `${formatFixed(v * 100, 2)}%`);
 
 function IcBars({
   points,
@@ -23,7 +24,7 @@ function IcBars({
       bars
       baseline={0}
       height={140}
-      format={(v) => v.toFixed(3)}
+      format={(v) => formatFixed(v, 3)}
       series={[{ name: "IC", values: points.map((p) => p.ic), color: "var(--accent)" }]}
     />
   );
@@ -38,7 +39,7 @@ function Detail({ id }: { id: string }) {
           {tracking ? (
             <Panel
               title="近期跟踪"
-              sub={`${tracking.window_start} ~ ${tracking.latest_date ?? "—"}，python -m rquant.factor track 更新`}
+              sub={`${tracking.window_start} ~ ${tracking.latest_date ?? "—"}`}
             >
               <KpiStrip
                 label="跟踪指标"
@@ -173,13 +174,11 @@ function QuantilePanel({ result }: { result: TestResult }) {
           label="分组累计收益"
           dates={days.map((d) => d.date)}
           baseline={1}
-          format={(v) => v.toFixed(3)}
+          format={(v) => formatFixed(v, 3)}
           series={[...series, longShort]}
         />
       ) : (
-        <p className="hint">
-          这条检验结果产出较早，没有逐日分组数据；重跑 python -m rquant.factor 后显示。
-        </p>
+        <p className="hint">这条检验结果产出较早，没有逐日分组数据。</p>
       )}
       <div className="risk-block">
         <div>
@@ -190,7 +189,7 @@ function QuantilePanel({ result }: { result: TestResult }) {
             bars
             baseline={0}
             height={130}
-            format={(v) => v.toFixed(3)}
+            format={(v) => formatFixed(v, 3)}
             series={[
               {
                 name: "IC",
@@ -205,11 +204,11 @@ function QuantilePanel({ result }: { result: TestResult }) {
           {ics.length > 1 ? (
             <TimeChart
               label="IC 分布"
-              dates={counts.map((_, k) => (lo + (k + 0.5) * width).toFixed(2))}
+              dates={counts.map((_, k) => formatFixed(lo + (k + 0.5) * width, 2))}
               bars
               baseline={0}
               height={130}
-              format={(v) => v.toFixed(0)}
+              format={(v) => formatFixed(v, 0)}
               series={[{ name: "天数", values: counts, color: "var(--accent)", neutral: true }]}
             />
           ) : null}
@@ -227,11 +226,7 @@ export default function FactorPage() {
       <PageHeader eyebrow="研究" title="因子研究" />
       <QueryView query={query}>
         {(data) => (
-          <Panel
-            title={`因子 · ${data.factors.length}`}
-            sub="python -m rquant.factor --name … --expr … 产出"
-            flush
-          >
+          <Panel title={`因子 · ${data.factors.length}`} sub="检验结果出现在这里" flush>
             <DataTable
               label="因子列表"
               tools="因子"
@@ -239,7 +234,7 @@ export default function FactorPage() {
               rowKey={(row) => row.factor_id}
               onSelect={(row) => setId(row.factor_id)}
               selectedKey={id}
-              emptyText="还没有因子检验结果：运行 python -m rquant.factor 产出 IC / 分组检验后显示。"
+              emptyText="还没有因子检验结果。"
               columns={[
                 { id: "name", header: "名称", value: (row) => row.name },
                 { id: "expr", header: "表达式", value: (row) => row.expression },

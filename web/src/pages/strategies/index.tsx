@@ -8,7 +8,7 @@ export default function StrategiesPage() {
       <PageHeader
         eyebrow="策略与验证"
         title="策略"
-        note="版本化策略配置；回测用 --strategy 名称@版本 复现"
+        note="每条策略保留版本，回测时按名称和版本复现"
       />
       <StrategyList />
       <EventStudies />

@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { useIntraday } from "@/api/endpoints";
 import { deltas, profile, stitch } from "@/charts/orderflow";
 import { useTouchScrub } from "@/charts/useTouchScrub";
+import { formatFixed } from "@/format/number";
 import { DatePicker, Panel } from "@/ui";
 
 const P = { left: 56, right: 56, top: 8 };
@@ -11,7 +12,15 @@ const DELTA_H = 80;
 const GAP = 10;
 
 /** 分时: price & VWAP vs prior close, volume, estimated order flow (all estimates from bars). */
-export function IntradayPanel({ code, span = 1 }: { code: string; span?: 1 | 5 }) {
+export function IntradayPanel({
+  code,
+  span = 1,
+  period,
+}: {
+  code: string;
+  span?: 1 | 5;
+  period?: ReactNode;
+}) {
   const [day, setDay] = useState<string | undefined>(undefined);
   const q = useIntraday(code, day, span);
   const [bands, setBands] = useState(true);
@@ -50,7 +59,7 @@ export function IntradayPanel({ code, span = 1 }: { code: string; span?: 1 | 5 }
   useTouchScrub(svgEl, (clientX) => scrubRef.current(clientX));
   if (!d || bars.length === 0) {
     return (
-      <Panel title={span === 5 ? "5日分时" : "分时"}>
+      <Panel title={span === 5 ? "5日分时" : "分时"} actions={period}>
         <div ref={ref} />
         <p className="hint">
           {q.isLoading
@@ -122,7 +131,7 @@ export function IntradayPanel({ code, span = 1 }: { code: string; span?: 1 | 5 }
   scrubRef.current = (x) => scrub(svgEl as Element, x, true);
   const hb = bars[at];
   const hv = vw[at];
-  const pct = (v: number) => `${v >= pc ? "+" : ""}${(((v - pc) / pc) * 100).toFixed(2)}%`;
+  const pct = (v: number) => `${v >= pc ? "+" : ""}${formatFixed(((v - pc) / pc) * 100, 2)}%`;
   const tone = (v: number) => (v > pc ? "up" : v < pc ? "down" : "");
   const ticks = [-1, -0.5, 0, 0.5, 1].map((k) => pc + dev * k * 0.9);
   const times: [string, number][] = multi
@@ -140,44 +149,56 @@ export function IntradayPanel({ code, span = 1 }: { code: string; span?: 1 | 5 }
       title={span === 5 ? "5日分时" : "分时"}
       sub={`${multi ? `${sessions[0]?.date} ~ ` : ""}${d.date} · ${d.freq === "1min" ? "1 分钟线" : "5 分钟线"} · ${d.source === "intraday" ? "盘中库" : "研究库"}；黄线 = 均价(VWAP)，资金/订单流均为由 K 线估算`}
       actions={
-        <span className="qc-ctl">
-          <span className="seg" title={`共 ${d.days.length} 个交易日有分钟线`}>
-            <button type="button" disabled={di <= 0} onClick={() => go(-1)} aria-label="前一交易日">
-              ‹
-            </button>
-            <DatePicker
-              label="分时日期"
-              value={d.date}
-              allowed={d.days}
-              onChange={(x) => setDay(x)}
-            />
-            <button
-              type="button"
-              disabled={di < 0 || di >= d.days.length - 1}
-              onClick={() => go(1)}
-              aria-label="后一交易日"
-            >
-              ›
-            </button>
-            {di < d.days.length - 1 ? (
-              <button type="button" onClick={() => setDay(undefined)}>
-                最新
+        <>
+          {period}
+          <span className="qc-ctl">
+            <span className="seg" title={`共 ${d.days.length} 个交易日有分钟线`}>
+              <button
+                type="button"
+                disabled={di <= 0}
+                onClick={() => go(-1)}
+                aria-label="前一交易日"
+              >
+                ‹
               </button>
-            ) : null}
+              <DatePicker
+                label="分时日期"
+                value={d.date}
+                allowed={d.days}
+                onChange={(x) => setDay(x)}
+              />
+              <button
+                type="button"
+                disabled={di < 0 || di >= d.days.length - 1}
+                onClick={() => go(1)}
+                aria-label="后一交易日"
+              >
+                ›
+              </button>
+              {di < d.days.length - 1 ? (
+                <button type="button" onClick={() => setDay(undefined)}>
+                  最新
+                </button>
+              ) : null}
+            </span>
+            <label>
+              <input type="checkbox" checked={bands} onChange={(e) => setBands(e.target.checked)} />{" "}
+              VWAP ±1σ/2σ
+            </label>
+            <label>
+              <input
+                type="checkbox"
+                checked={showVp}
+                onChange={(e) => setShowVp(e.target.checked)}
+              />{" "}
+              成交量分布
+            </label>
+            <label>
+              <input type="checkbox" checked={marks} onChange={(e) => setMarks(e.target.checked)} />{" "}
+              异动标记
+            </label>
           </span>
-          <label>
-            <input type="checkbox" checked={bands} onChange={(e) => setBands(e.target.checked)} />{" "}
-            VWAP ±1σ/2σ
-          </label>
-          <label>
-            <input type="checkbox" checked={showVp} onChange={(e) => setShowVp(e.target.checked)} />{" "}
-            成交量分布
-          </label>
-          <label>
-            <input type="checkbox" checked={marks} onChange={(e) => setMarks(e.target.checked)} />{" "}
-            异动标记
-          </label>
-        </span>
+        </>
       }
     >
       <div ref={ref} className="intraday">
@@ -185,13 +206,13 @@ export function IntradayPanel({ code, span = 1 }: { code: string; span?: 1 | 5 }
           <div className="chart-readout">
             <span className="when">{multi ? `${hb.date.slice(5)} ${hb.t}` : hb.t}</span>
             <span className={tone(hb.close)}>
-              价 {hb.close.toFixed(2)} {pct(hb.close)}
+              价 {formatFixed(hb.close, 2)} {pct(hb.close)}
             </span>
-            <span style={{ color: "#e0a93a" }}>均价 {hv.vwap.toFixed(2)}</span>
-            <span>σ {hv.sd.toFixed(2)}</span>
-            <span>量 {(hb.vol / 100).toFixed(0)} 手</span>
+            <span style={{ color: "#e0a93a" }}>均价 {formatFixed(hv.vwap, 2)}</span>
+            <span>σ {formatFixed(hv.sd, 2)}</span>
+            <span>量 {formatFixed(hb.vol / 100, 0)} 手</span>
             <span className={(delta[at] ?? 0) >= 0 ? "up" : "down"}>
-              累计Δ(估) {(((delta[at] ?? 0) / Math.max(totalVol, 1)) * 100).toFixed(1)}% 成交量
+              累计Δ(估) {formatFixed(((delta[at] ?? 0) / Math.max(totalVol, 1)) * 100, 1)}% 成交量
             </span>
           </div>
         ) : null}
@@ -236,7 +257,7 @@ export function IntradayPanel({ code, span = 1 }: { code: string; span?: 1 | 5 }
                 y={Y(t) + 3}
                 textAnchor="end"
               >
-                {t.toFixed(2)}
+                {formatFixed(t, 2)}
               </text>
               <text className={`chart-axis ${tone(t)}`} x={plotR + 4} y={Y(t) + 3}>
                 {pct(t)}
@@ -373,12 +394,12 @@ export function IntradayPanel({ code, span = 1 }: { code: string; span?: 1 | 5 }
                         r={3.5}
                         className={upBar ? "mk up" : "mk down"}
                       >
-                        <title>{`${b.date.slice(5)} ${b.t} 大幅波动 ${((rets[i] ?? 0) * 100).toFixed(2)}%`}</title>
+                        <title>{`${b.date.slice(5)} ${b.t} 大幅波动 ${formatFixed((rets[i] ?? 0) * 100, 2)}%`}</title>
                       </circle>
                     ) : null}
                     {spike ? (
                       <path d={`M${X(i)},${volTop - 2}l-4,-7h8z`} className="mk spike">
-                        <title>{`${b.date.slice(5)} ${b.t} 放量 ${(b.vol / medVol).toFixed(1)}× 中位数`}</title>
+                        <title>{`${b.date.slice(5)} ${b.t} 放量 ${formatFixed(b.vol / medVol, 1)}× 中位数`}</title>
                       </path>
                     ) : null}
                   </g>
@@ -437,8 +458,9 @@ export function IntradayPanel({ code, span = 1 }: { code: string; span?: 1 | 5 }
             </button>
           </span>
           <span className="hint">
-            POC {prof.poc.toFixed(2)} · 价值区 {prof.val.toFixed(2)}–{prof.vah.toFixed(2)} · 昨收{" "}
-            {pc.toFixed(2)} · Δ/订单流、成交量分布均由 {d.freq} K 线估算，非逐笔数据
+            POC {formatFixed(prof.poc, 2)} · 价值区 {formatFixed(prof.val, 2)}–
+            {formatFixed(prof.vah, 2)} · 昨收 {formatFixed(pc, 2)} · Δ/订单流、成交量分布均由{" "}
+            {d.freq} K 线估算，非逐笔数据
           </span>
         </div>
       </div>

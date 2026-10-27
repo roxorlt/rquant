@@ -1,11 +1,18 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useConditions, useTextToCondition, useTranslateTdx } from "@/api/endpoints";
 import { toneClass, toneOf } from "@/format/color";
-import { formatPrice } from "@/format/number";
+import { formatFixed, formatPrice } from "@/format/number";
 import { DataTable } from "@/table/DataTable";
-import { Button, Panel } from "@/ui";
+import { Button, FailureNotice, failureCopy, Panel } from "@/ui";
 import { StockLink } from "@/ui/StockLink";
 import { QueryView } from "../shared";
+
+/** How many tokens the translator refused. One message is one miss. */
+function unrecognizedCount(error: string | null): number {
+  if (!error) return 0;
+  const hits = error.match(/不支持：|无法识别：/g);
+  return hits?.length ?? 1;
+}
 
 function TdxImport() {
   const [tdx, setTdx] = useState("C>MA(C,5) AND V>REF(V,1)*2");
@@ -13,18 +20,24 @@ function TdxImport() {
   const result = translate.data;
   const [text, setText] = useState("");
   const ai = useTextToCondition();
+  const passed = Boolean(result?.expression);
+  const misses = unrecognizedCount(result?.error ?? null);
+  const failRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!ai.error) return;
+    failRef.current?.scrollIntoView({ block: "center" });
+  }, [ai.error]);
   return (
-    <Panel title="通达信公式导入" sub="只翻译与校验；执行用 python -m rquant.factor screen --tdx">
-      <div className="cond-row">
+    <Panel title="通达信公式导入" sub="只翻译和校验">
+      <div className="formula-ai">
         <input
           aria-label="一句话条件"
           placeholder="一句话描述条件，例如：站上20日线且放量一倍"
           value={text}
           onChange={(e) => setText(e.target.value)}
-          style={{ flex: 1 }}
         />
         <Button
-          size="sm"
+          variant="quiet"
           disabled={ai.isPending || text.trim().length < 2}
           onClick={() =>
             ai.mutate(text, {
@@ -38,14 +51,24 @@ function TdxImport() {
           {ai.isPending ? "生成中…" : "一句话生成"}
         </Button>
       </div>
+      {ai.error ? (
+        <div ref={failRef}>
+          <FailureNotice
+            copy={failureCopy("条件", "生成", ai.error)}
+            onRetry={() => ai.mutate(text)}
+          />
+        </div>
+      ) : null}
       {ai.data ? (
-        <output aria-label="生成结果" className="sub">
-          {ai.data.expression
-            ? `AI 公式：${ai.data.tdx} → 表达式：${ai.data.expression}`
-            : `AI 公式未通过校验：${ai.data.error ?? ""}`}
+        <output className="formula-result" aria-label="生成结果">
+          <div className="formula-result-h">
+            <span className="formula-result-label">生成结果</span>
+            <span className={ai.data.expression ? "st ok" : "st warn"}>
+              {ai.data.expression ? "校验通过" : "有 1 处不认识"}
+            </span>
+          </div>
+          <div className="formula-result-expr">{ai.data.expression ?? ai.data.error}</div>
         </output>
-      ) : ai.error ? (
-        <output className="sub">{String(ai.error)}</output>
       ) : null}
       <textarea
         aria-label="通达信公式"
@@ -54,12 +77,24 @@ function TdxImport() {
         value={tdx}
         onChange={(e) => setTdx(e.target.value)}
       />
-      <Button size="sm" onClick={() => translate.mutate(tdx)}>
-        翻译
-      </Button>
+      <div className="formula-actions">
+        <Button onClick={() => translate.mutate(tdx)}>翻译</Button>
+      </div>
+      {translate.error ? (
+        <FailureNotice
+          copy={failureCopy("公式", "翻译", translate.error)}
+          onRetry={() => translate.mutate(tdx)}
+        />
+      ) : null}
       {result ? (
-        <output aria-label="翻译结果" className="sub">
-          {result.expression ? `表达式：${result.expression}` : `不支持：${result.error}`}
+        <output className="formula-result" aria-label="翻译结果">
+          <div className="formula-result-h">
+            <span className="formula-result-label">翻译结果</span>
+            <span className={passed ? "st ok" : "st warn"}>
+              {passed ? "校验通过" : `有 ${misses} 处不认识`}
+            </span>
+          </div>
+          <div className="formula-result-expr">{result.expression ?? result.error}</div>
         </output>
       ) : null}
     </Panel>
@@ -74,7 +109,8 @@ export function Conditions() {
       <TdxImport />
       <QueryView query={query}>
         {(data) => {
-          const run = data.runs[picked];
+          const runs = data.runs ?? [];
+          const run = runs[picked];
           return (
             <Panel
               title="条件选股"
@@ -83,21 +119,24 @@ export function Conditions() {
                   ? `${run.name} · ${run.trade_date ?? "—"} · 命中 ${run.hits.length}/${run.universe}`
                   : "还没有条件选股结果"
               }
+              actions={
+                runs.length > 1 ? (
+                  <select
+                    className="select"
+                    aria-label="演示条件"
+                    value={picked}
+                    onChange={(e) => setPicked(Number(e.target.value))}
+                  >
+                    {runs.map((r, i) => (
+                      <option key={r.run_id} value={i}>
+                        {r.name}
+                      </option>
+                    ))}
+                  </select>
+                ) : null
+              }
               flush
             >
-              {data.runs.length > 1 ? (
-                <select
-                  aria-label="选择条件"
-                  value={picked}
-                  onChange={(e) => setPicked(Number(e.target.value))}
-                >
-                  {data.runs.map((r, i) => (
-                    <option key={r.run_id} value={i}>
-                      {r.name}
-                    </option>
-                  ))}
-                </select>
-              ) : null}
               {run ? (
                 <DataTable
                   label="条件命中"
@@ -131,7 +170,7 @@ export function Conditions() {
                         ) : (
                           <span className={toneClass(toneOf(row.pct_chg))}>
                             {row.pct_chg > 0 ? "+" : ""}
-                            {row.pct_chg.toFixed(2)}
+                            {formatFixed(row.pct_chg, 2)}
                           </span>
                         ),
                     },

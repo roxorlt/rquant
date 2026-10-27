@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { PanoramaData } from "@/api/endpoints";
 import { squarify } from "@/charts/treemap";
-import { formatAmount } from "@/format/number";
+import { formatAmount, formatFixed } from "@/format/number";
 
 type Board = PanoramaData["boards"][number];
 
@@ -70,7 +70,7 @@ export function Heatmap({
               ? {
                   role: "button",
                   tabIndex: 0,
-                  "aria-label": `${b.board_name} ${b.pct_chg_median?.toFixed(2) ?? "—"}%`,
+                  "aria-label": `${b.board_name} ${b.pct_chg_median == null ? "—" : formatFixed(b.pct_chg_median, 2)}%`,
                   onClick: () => onSelect(b),
                   onKeyDown: (e: React.KeyboardEvent) => {
                     if (e.key === "Enter" || e.key === " ") {
@@ -87,7 +87,7 @@ export function Heatmap({
               height: r.h,
               background: fill(b.pct_chg_median),
             }}
-            title={`${b.board_name}  中位涨跌 ${b.pct_chg_median?.toFixed(2) ?? "—"}%  成交 ${formatAmount(b.amount)}  领涨 ${b.leading_stock ?? "—"}`}
+            title={`${b.board_name}  中位涨跌 ${b.pct_chg_median == null ? "—" : formatFixed(b.pct_chg_median, 2)}%  成交 ${formatAmount(b.amount)}  领涨 ${b.leading_stock ?? "—"}`}
           >
             {big ? (
               <>
@@ -95,7 +95,7 @@ export function Heatmap({
                 <span className="hm-pct num">
                   {b.pct_chg_median == null
                     ? "—"
-                    : `${b.pct_chg_median > 0 ? "+" : ""}${b.pct_chg_median.toFixed(2)}%`}
+                    : `${b.pct_chg_median > 0 ? "+" : ""}${formatFixed(b.pct_chg_median, 2)}%`}
                 </span>
               </>
             ) : null}

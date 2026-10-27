@@ -42,11 +42,14 @@ def main(argv: list[str] | None = None) -> None:
         def transport(payload: dict) -> dict:
             if payload["kind"] == "ack_alert":
                 return fixture.record_ack(payload)
+            if payload["kind"] == "unack_alert":
+                return fixture.record_unack(payload)
             if payload["kind"] == "save_alert_rule":
                 return fixture.record_rule(payload)
             return {"command_id": payload["command_id"], "status": "succeeded"}
 
         app.state.page_control_transport = transport
+        app.state.preview_writes = True
 
         def demo_llm(messages: list[dict]) -> str:  # no network in demo mode
             if "通达信" in messages[0]["content"]:

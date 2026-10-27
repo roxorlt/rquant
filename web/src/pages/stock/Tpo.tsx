@@ -1,6 +1,7 @@
 import { useState } from "react";
 import type { Schemas } from "@/api/client";
 import { useChips } from "@/api/endpoints";
+import { formatFixed } from "@/format/number";
 import { Panel } from "@/ui";
 
 const LETTERS = "ABCDEFGHIJKLMNOP";
@@ -48,15 +49,15 @@ export function TpoPanel({ code }: { code: string }) {
     >
       <p className="chip-stats">
         <span>
-          开 <b>{d.open.toFixed(2)}</b> 收 <b>{d.close.toFixed(2)}</b>
+          开 <b>{formatFixed(d.open, 2)}</b> 收 <b>{formatFixed(d.close, 2)}</b>
         </span>
         <span>
-          POC <b>{d.poc.toFixed(2)}</b>
+          POC <b>{formatFixed(d.poc, 2)}</b>
         </span>
         <span>
           价值区{" "}
           <b>
-            {d.val.toFixed(2)}–{d.vah.toFixed(2)}
+            {formatFixed(d.val, 2)}–{formatFixed(d.vah, 2)}
           </b>
         </span>
         <span>
@@ -69,7 +70,7 @@ export function TpoPanel({ code }: { code: string }) {
           const isPoc = Math.abs(r.price - d.poc) < 1e-6;
           return (
             <div key={r.price} className={`tpo-row${inVa ? " va" : ""}${isPoc ? " poc" : ""}`}>
-              <span className="tpo-px">{r.price.toFixed(2)}</span>
+              <span className="tpo-px">{formatFixed(r.price, 2)}</span>
               <span className="tpo-l">
                 {r.letters}
                 {isPoc ? " ◆" : ""}

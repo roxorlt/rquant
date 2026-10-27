@@ -1,6 +1,8 @@
 import { useReportFactors } from "@/api/endpoints";
 import { useUrlState } from "@/app/useUrlState";
 import { TimeChart } from "@/charts/Chart";
+import { datasetListLabel, tokenLabel } from "@/copy/publicText";
+import { formatFixed } from "@/format/number";
 import { DataTable } from "@/table/DataTable";
 import { KpiStrip, PageHeader, Panel, Pill } from "@/ui";
 import { QueryView } from "../shared";
@@ -133,7 +135,7 @@ function Recent({ sum }: { sum: WeeklySummary | null }) {
                 {n.title}
               </a>{" "}
               <Pill kind={n.status === "registered" ? "idle" : "acc"}>
-                {STATUS[n.status] ?? n.status}
+                {STATUS[n.status] ?? tokenLabel(n.status)}
               </Pill>
             </li>
           ))}
@@ -143,8 +145,9 @@ function Recent({ sum }: { sum: WeeklySummary | null }) {
   );
 }
 
-const pct = (v: number | null | undefined, d = 1) => (v == null ? "—" : `${(v * 100).toFixed(d)}%`);
-const num = (v: number | null | undefined, d = 2) => (v == null ? "—" : v.toFixed(d));
+const pct = (v: number | null | undefined, d = 1) =>
+  v == null ? "—" : `${formatFixed(v * 100, d)}%`;
+const num = (v: number | null | undefined, d = 2) => (v == null ? "—" : formatFixed(v, d));
 
 const REPL: Record<string, { label: string; kind: "ok" | "acc" | "warn" | "crit" }> = {
   daily: { label: "日线可做", kind: "ok" },
@@ -164,7 +167,7 @@ function Detail({ r, hold }: { r: FactorResult; hold: number }) {
   const s = r.series;
   return (
     <Panel
-      title={`${r.name} · ${r.data}`}
+      title={`${r.name} · ${datasetListLabel(r.data)}`}
       sub={`方向 ${r.sign > 0 ? "越大越好" : "越小越好"} · 训练/测试切分 ${r.split} · 每 ${hold} 日调仓 · 最新 ${r.latest_date}`}
     >
       <KpiStrip
@@ -187,7 +190,7 @@ function Detail({ r, hold }: { r: FactorResult; hold: number }) {
             height={150}
             dates={s.dates}
             baseline={1}
-            format={(v) => v.toFixed(3)}
+            format={(v) => formatFixed(v, 3)}
             bands={[]}
             series={[
               { name: "多空(扣费)", values: s.ls_nav_net, color: "var(--accent)" },
@@ -196,13 +199,13 @@ function Detail({ r, hold }: { r: FactorResult; hold: number }) {
           />
         </div>
         <div>
-          <h3 className="sub">五分组超额（未扣费，Q5=预期最好）</h3>
+          <h3 className="sub">五分组超额</h3>
           <TimeChart
             label="五分组"
             dates={s.dates}
             baseline={1}
             height={150}
-            format={(v) => v.toFixed(3)}
+            format={(v) => formatFixed(v, 3)}
             series={s.q_nav.map((v, k) => ({
               name: `Q${k + 1}`,
               values: v,
@@ -220,7 +223,7 @@ function Detail({ r, hold }: { r: FactorResult; hold: number }) {
             bars
             baseline={0}
             height={96}
-            format={(v) => v.toFixed(3)}
+            format={(v) => formatFixed(v, 3)}
             series={[{ name: "RankIC", values: s.rank_ic, color: "var(--accent)" }]}
           />
         </div>
@@ -232,7 +235,7 @@ function Detail({ r, hold }: { r: FactorResult; hold: number }) {
             bars
             baseline={0}
             height={96}
-            format={(v) => v.toFixed(3)}
+            format={(v) => formatFixed(v, 3)}
             series={[
               { name: "RankIC", values: Object.values(r.horizon_rank_ic), color: "var(--accent)" },
             ]}
@@ -264,7 +267,7 @@ function Body({ res, sum }: { res: Results; sum: WeeklySummary | null }) {
       <div className="card-grid">
         <Panel
           title="测试期 RankIC 一览"
-          sub={`已按训练期方向调整；>0 即样本外仍有效。成本 ${(res.cost_per_side * 100).toFixed(1)}%/单边`}
+          sub={`已按训练期方向调整；>0 即样本外仍有效。成本 ${formatFixed(res.cost_per_side * 100, 1)}%/单边`}
         >
           <TimeChart
             label="测试 RankIC"
@@ -272,7 +275,7 @@ function Body({ res, sum }: { res: Results; sum: WeeklySummary | null }) {
             bars
             baseline={0}
             height={110}
-            format={(v) => v.toFixed(3)}
+            format={(v) => formatFixed(v, 3)}
             series={[
               {
                 name: "测试RankIC",
@@ -297,7 +300,11 @@ function Body({ res, sum }: { res: Results; sum: WeeklySummary | null }) {
               onSelect={(r) => setSel(r.key)}
               columns={[
                 { id: "name", header: "因子", value: (r) => r.name },
-                { id: "data", header: "数据", value: (r) => r.data },
+                {
+                  id: "data",
+                  header: "数据",
+                  value: (r) => datasetListLabel(r.data),
+                },
                 {
                   id: "tr",
                   header: "训练RankIC",
@@ -381,7 +388,7 @@ function Body({ res, sum }: { res: Results; sum: WeeklySummary | null }) {
                   value: (c) => c.replicability,
                   cell: (c) => {
                     const m = REPL[c.replicability] ?? {
-                      label: c.replicability,
+                      label: tokenLabel(c.replicability),
                       kind: "acc" as const,
                     };
                     return <Pill kind={m.kind}>{m.label}</Pill>;
@@ -400,11 +407,7 @@ export default function ReportMiningPage() {
   const query = useReportFactors();
   return (
     <>
-      <PageHeader
-        eyebrow="研究"
-        title="研报挖掘"
-        note="复现券商金工因子：5 分钟 / 日线数据可做的已回测；3s 快照类登记待数据积累"
-      />
+      <PageHeader eyebrow="研究" title="研报挖掘" />
       <QueryView query={query}>
         {(data) =>
           data.results ? (
@@ -414,9 +417,7 @@ export default function ReportMiningPage() {
             />
           ) : (
             <Panel>
-              <p className="hint">
-                还没有研报因子结果（服务器上运行 python -m rquant.research.report_factors run）。
-              </p>
+              <p className="hint">还没有研报因子结果。</p>
             </Panel>
           )
         }

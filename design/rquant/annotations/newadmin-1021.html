@@ -1,0 +1,544 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>rQuant 新后台开发标注 · 10-21</title>
+<link rel="stylesheet" href="../system/tokens.css">
+<link rel="stylesheet" href="../system/components.css">
+<style>
+:root { --ann: #C2255C; --ann-weak: #FCE7EF; }
+body { background: var(--c-ground); }
+.doc { max-width: 1240px; margin: 0 auto; padding: 32px 32px 64px; }
+.doc > header h1 { font: 600 26px/34px var(--font-sans); }
+.doc > header .lede { margin-top: 8px; color: var(--c-ink-2); font: 400 14px/22px var(--font-sans); max-width: 760px; }
+.facts { display: flex; flex-wrap: wrap; gap: 8px 24px; margin-top: 12px; font: var(--t-label); color: var(--c-muted); }
+.facts b { color: var(--c-ink-2); font-weight: 500; }
+.toc { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+.toc a { display: inline-flex; align-items: center; gap: 8px; min-height: 44px; padding: 0 14px; border-radius: var(--r-sm); background: var(--c-surface); color: var(--c-ink); font: 500 14px/1 var(--font-sans); }
+.toc a .n { width: 22px; height: 22px; border-radius: 50%; background: var(--c-ink); color: var(--c-surface); display: grid; place-items: center; font: 600 12px/1 var(--font-num); }
+section.blk { margin-top: 40px; }
+section.blk > h2 { display: flex; align-items: center; gap: 10px; font: 600 22px/30px var(--font-sans); }
+section.blk > h2 .n { width: 28px; height: 28px; border-radius: 50%; background: var(--c-ink); color: var(--c-surface); display: grid; place-items: center; font: 600 14px/1 var(--font-num); flex: none; }
+section.blk > .sum { margin-top: 6px; color: var(--c-ink-2); font: 400 14px/22px var(--font-sans); }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.chip { display: inline-flex; flex-wrap: wrap; gap: 4px; align-items: center; min-height: 24px; max-width: 100%; padding: 2px 8px; border-radius: var(--r-xs); background: var(--c-surface); color: var(--c-ink-2); font: var(--t-label); }
+.chip code { font-family: var(--font-mono); font-size: 12px; }
+h3.sub { margin: 28px 0 10px; font: 600 16px/24px var(--font-sans); }
+.card { background: var(--c-surface); border-radius: var(--r-md); padding: 16px; }
+.cap2 { font: var(--t-label); color: var(--c-muted); margin-top: 8px; }
+code { font-family: var(--font-mono); font-size: 12px; background: var(--c-surface-2); border-radius: 3px; padding: 0 3px; color: var(--c-ink-2); }
+.figs { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; }
+.figrow { display: grid; grid-template-columns: 390px minmax(0, 1fr); gap: 24px; align-items: start; }
+figure.f { margin: 0; }
+figure.f figcaption { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; margin-bottom: 8px; font: 600 14px/20px var(--font-sans); }
+figure.f figcaption span { font: var(--t-label); color: var(--c-muted); font-weight: 400; }
+.fw { position: relative; width: 100%; overflow: hidden; border-radius: var(--r-md); box-shadow: 0 0 0 1px var(--c-rule-strong); background: var(--c-ground); }
+.fi { position: absolute; left: 0; top: 0; transform-origin: 0 0; overflow: hidden; background: var(--c-ground); transform: scale(1); }
+.legend { counter-reset: lg; display: grid; gap: 6px; font: 400 13px/20px var(--font-sans); color: var(--c-ink-2); }
+.legend li { display: grid; grid-template-columns: 22px minmax(0, 1fr); gap: 8px; align-items: start; }
+.legend li::before { counter-increment: lg; content: counter(lg); width: 20px; height: 20px; margin-top: 0; border-radius: 50%; background: var(--ann); color: #fff; display: grid; place-items: center; font: 600 11px/1 var(--font-num); }
+.legend b { color: var(--c-ink); font-weight: 600; }
+/* 标注层 */
+.mk { position: absolute; z-index: 60; width: 26px; height: 26px; border-radius: 50%; background: var(--ann); color: #fff; display: grid; place-items: center; font: 600 14px/1 var(--font-num); box-shadow: 0 0 0 3px #fff; }
+.dm { position: absolute; z-index: 59; border: 0 dashed var(--ann); }
+.dm.h { border-top-width: 2px; height: 0; }
+.dm.v { border-left-width: 2px; width: 0; }
+.dm i { position: absolute; font: 600 13px/18px var(--font-num); font-style: normal; color: #fff; background: var(--ann); padding: 1px 6px; border-radius: 4px; white-space: nowrap; }
+.dm.h i { left: 50%; top: -11px; transform: translateX(-50%); }
+.dm.v i { top: 50%; left: 6px; transform: translateY(-50%); }
+.box { position: absolute; z-index: 58; border: 2px dashed var(--ann); border-radius: 4px; pointer-events: none; }
+.box i { position: absolute; left: -2px; top: -22px; font: 600 12px/18px var(--font-sans); font-style: normal; color: #fff; background: var(--ann); padding: 1px 6px; border-radius: 4px; white-space: nowrap; }
+/* 规格表 */
+.spec { width: 100%; border-collapse: collapse; background: var(--c-surface); border-radius: var(--r-md); overflow: hidden; font: 400 13px/20px var(--font-sans); }
+.spec th, .spec td { text-align: left; vertical-align: top; padding: 9px 12px; border-bottom: 1px solid var(--c-rule); }
+.spec thead th { background: var(--c-surface-2); color: var(--c-muted); font: 500 12px/16px var(--font-sans); }
+.spec tbody th { width: 128px; color: var(--c-ink); font-weight: 600; white-space: nowrap; }
+.spec td { color: var(--c-ink-2); }
+.spec tr:last-child th, .spec tr:last-child td { border-bottom: 0; }
+.swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: -1px; margin-right: 4px; box-shadow: 0 0 0 1px var(--c-rule-strong); }
+.flow { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+.flow > div { background: var(--c-surface); border-radius: var(--r-md); padding: 12px; display: grid; gap: 8px; align-content: start; }
+.flow .t { font: 600 13px/20px var(--font-sans); }
+.flow .d { font: var(--t-label); color: var(--c-ink-2); }
+.flow .toast { position: static; transform: none; animation: none; max-width: 100%; width: max-content; }
+.heads { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.heads .hd { background: var(--c-surface); border-radius: var(--r-md); box-shadow: var(--shadow-pop); overflow: hidden; }
+.heads .hd .drawer-b { overflow: visible; }
+.checks { display: grid; gap: 4px; font: 400 13px/20px var(--font-sans); color: var(--c-ink-2); }
+.checks li { padding-left: 22px; position: relative; }
+.checks li::before { content: ""; position: absolute; left: 2px; top: 4px; width: 12px; height: 12px; border: 1.5px solid var(--c-rule-strong); border-radius: 3px; }
+
+/* ---------- 画面里的假应用 ---------- */
+.fi * { animation: none !important; transition: none !important; }
+.app2 { position: absolute; inset: 0; display: grid; }
+.f-pc { --t-title: 600 20px/28px var(--font-sans); --t-section: 600 15px/22px var(--font-sans); --t-body: 400 13px/20px var(--font-sans); --t-label: 400 12px/16px var(--font-sans); --t-caption: 400 11px/14px var(--font-sans); font: var(--t-body); }
+.f-ph { --t-title: 600 17px/24px var(--font-sans); --t-section: 600 15px/22px var(--font-sans); --t-body: 400 14px/21px var(--font-sans); --t-label: 400 12px/16px var(--font-sans); --t-caption: 400 12px/16px var(--font-sans); font: var(--t-body); }
+.f-pc .app2 { grid-template-columns: 212px 1fr; grid-template-rows: 52px 1fr; }
+.f-ph .app2 { grid-template-rows: 48px 1fr; }
+.a-top { grid-column: 1 / -1; display: flex; align-items: center; gap: 16px; padding: 0 16px 0 14px; background: var(--c-surface); border-bottom: 1px solid var(--c-rule); }
+.f-ph .a-top { gap: 4px; padding: 0 4px 0 12px; }
+.a-brand { display: flex; align-items: center; gap: 8px; width: 186px; font: 600 14px/1 var(--font-sans); }
+.f-ph .a-brand { width: auto; }
+.a-mark { width: 24px; height: 24px; border-radius: 6px; background: var(--c-ink); }
+.a-top h1 { font: var(--t-title); white-space: nowrap; }
+.a-top .grow { flex: 1; }
+.a-search { width: 240px; height: 32px; border-radius: var(--r-sm); background: var(--c-surface-2); border: 1px solid var(--c-rule); display: flex; align-items: center; padding: 0 10px; color: var(--c-muted); font: var(--t-label); }
+.a-ico { position: relative; width: 44px; height: 44px; display: grid; place-items: center; color: var(--c-ink-2); }
+.a-ico svg { width: 20px; height: 20px; }
+.a-badge { position: absolute; top: 6px; left: 23px; min-width: 16px; height: 16px; padding: 0 4px; border-radius: 999px; background: var(--c-crit); color: #fff; font: 600 11px/16px var(--font-num); text-align: center; }
+.a-hdot { width: 10px; height: 10px; border-radius: 50%; background: var(--c-ok); }
+.a-rail { background: var(--c-surface); border-right: 1px solid var(--c-rule); padding: 10px 8px; }
+.a-rail h6 { font: var(--t-caption); color: var(--c-muted); margin: 12px 10px 4px; font-weight: 400; }
+.a-rail a { display: block; padding: 0 10px; height: 30px; line-height: 30px; border-radius: var(--r-sm); color: var(--c-ink-2); font: 400 13px/30px var(--font-sans); }
+.a-rail a.on { background: var(--c-accent-weak); color: var(--c-accent); font-weight: 600; }
+.a-main { padding: 12px 16px 16px; display: flex; flex-direction: column; gap: 12px; min-width: 0; overflow: hidden; }
+.f-ph .a-main { padding: 8px 12px 0; gap: 8px; }
+.a-tab { position: absolute; left: 0; right: 0; bottom: 0; height: 90px; padding-bottom: 34px; display: grid; grid-template-columns: repeat(4, 1fr); background: color-mix(in srgb, var(--c-surface) 96%, transparent); border-top: 1px solid var(--c-rule); z-index: 5; }
+.a-tab span { display: grid; justify-items: center; align-content: center; gap: 3px; font: 12px/1 var(--font-sans); color: var(--c-muted); }
+.a-tab span i { width: 22px; height: 22px; border-radius: 5px; border: 2px solid currentColor; }
+.a-tab span.on { color: var(--c-accent); font-weight: 600; }
+.a-safe { position: absolute; left: 0; right: 0; bottom: 0; height: 34px; z-index: 6; display: grid; place-items: center; }
+.a-safe::before { content: ""; width: 134px; height: 5px; border-radius: 3px; background: var(--c-ink); }
+.f-pc .tbl td { height: 36px; }
+.f-ph .tbl td { height: 44px; }
+.f-pc .btn { --h: 32px; padding: 0 12px; font-size: 13px; }
+.f-ph .btn { --h: 44px; padding: 0 16px; font-size: 15px; }
+.f-pc .btn.quiet.sm { --h: 28px; padding: 0 8px; }
+.f-ph .seg button { height: 44px; }
+.f-pc .seg button { height: 26px; }
+.f-pc .notice, .f-ph .notice { padding: 10px 14px; }
+.fi .scrim { position: absolute; }
+.fi .drawer { position: absolute; }
+.fi .toast { position: absolute; }
+.f-pc .drawer { top: 0; right: 0; bottom: 0; left: auto; width: 400px; max-height: none; border-radius: 0; padding-bottom: 0; }
+.f-pc .drawer-grab { display: none; }
+.f-ph .drawer { top: auto; left: 0; right: 0; bottom: 0; width: 100%; max-height: 85%; border-radius: var(--r-md) var(--r-md) 0 0; padding-bottom: 34px; }
+.f-ph .drawer-grab { display: flex; justify-content: center; align-items: center; height: 20px; flex: none; }
+.f-ph .drawer-grab::before { content: ""; width: 36px; height: 4px; border-radius: 999px; background: var(--c-rule-strong); }
+.f-pc .toast { bottom: 24px; min-height: 40px; }
+.f-pc .toast .act { min-height: 40px; }
+.f-ph .toast { bottom: 102px; min-height: 44px; }
+.f-ph .toast .act { min-height: 44px; min-width: 44px; }
+.fi .li2 .t .code { font-family: var(--font-mono); }
+.fi .rowx { cursor: pointer; }
+.ack-err { font: var(--t-label); color: var(--c-crit); }
+.fld { display: grid; grid-template-columns: minmax(0, 1fr); gap: 2px; min-height: 44px; padding: 8px 0; border-top: 1px solid var(--c-surface-2); }
+.fld .t { display: flex; gap: 8px; align-items: baseline; font-weight: 500; }
+.fld .t code { background: none; padding: 0; color: var(--c-muted); }
+.sec-l { font: var(--t-label); color: var(--c-muted); margin: 12px 0 6px; }
+
+@media (max-width: 899px) {
+  .doc { padding: 20px 16px 48px; }
+  .figrow { grid-template-columns: minmax(0, 1fr); }
+  .flow { grid-template-columns: minmax(0, 1fr); }
+  .heads { grid-template-columns: minmax(0, 1fr); }
+  .spec tbody th { width: 92px; white-space: normal; }
+  .spec th, .spec td { padding: 8px 10px; }
+  .doc > header h1 { font-size: 22px; line-height: 30px; }
+  section.blk > h2 { font-size: 19px; line-height: 26px; }
+}
+</style>
+</head>
+<body>
+<div class="doc">
+<header>
+  <h1>rQuant 新后台 · 开发标注</h1>
+  <p class="lede">三项改动：行详情改抽屉、只读账号提示条、确认告警轻提示。尺寸单位为 CSS 像素；颜色、字号、动效只用变量；组件只用组件库里的，不在页面里覆盖组件样式。手机指宽度 599px 及以下，电脑指 1024px 及以上，平板 600–1023px 同电脑写法。</p>
+  <div class="facts"><span>对应规范 <b>v1.2</b></span><span>日期 <b>2026-10-21</b></span><span>画面 <b>电脑 1440 · 手机 390</b></span><span>组件 <a href="../spec/components.html#c-drawer">抽屉和底部弹层</a> · <a href="../spec/components.html#c-logview">日志块</a> · <a href="../spec/components.html#c-notice">提示条</a> · <a href="../spec/components.html#c-toast">轻提示</a></span></div>
+  <nav class="toc" aria-label="目录"><a href="#s1"><span class="n">1</span>行详情改抽屉 · 抽屉头统一</a><a href="#s2"><span class="n">2</span>只读账号提示条</a><a href="#s3"><span class="n">3</span>确认告警轻提示</a><a href="#s4"><span class="n">4</span>通用规则和验收</a></nav>
+</header>
+
+<!-- ================= 1 ================= -->
+<section class="blk" id="s1">
+  <h2><span class="n">1</span>行详情改抽屉 · 抽屉头统一</h2>
+  <p class="sum">任务与调度点一行看日志、数据中心点一个数据集看字段，详情不再在表格下方页内展开，改成抽屉：电脑从右侧滑出，手机是底部弹层。市场全景的行业成分抽屉同时按同一个抽屉头改。</p>
+  <div class="chips"><span class="chip">组件 <code>.scrim</code> <code>.drawer</code> <code>.drawer-grab</code> <code>.drawer-h</code> <code>.drawer-b</code> <code>.logview</code> <code>.meta</code> <code>.st</code></span><span class="chip">页面 任务与调度 · 数据中心 · 市场全景</span></div>
+
+  <h3 class="sub">电脑 1440 · 任务与调度，点一行看日志</h3>
+  <figure class="f"><figcaption>电脑 1440 × 900<span>右侧抽屉 400px，遮罩盖住整页含左侧导航和顶栏</span></figcaption>
+  <div class="fw" data-w="1440" data-h="900"><div class="fi f-pc" style="width:1440px;height:900px">
+    <div class="app2">
+      <div class="a-top"><div class="a-brand"><span class="a-mark"></span>rQuant</div><h1>任务与调度</h1><span class="m-l">10 个任务</span><span class="grow"></span><div class="a-search">代码 / 名称，如 999001</div></div>
+      <nav class="a-rail"><h6>数据</h6><a>数据中心</a><a>数据查询</a><h6>研究</h6><a>选股器</a><a>池子</a><a>因子研究</a><h6>跟踪与告警</h6><a>盯盘与告警</a><a>市场全景</a><a>板块资金流</a><h6>运维</h6><a class="on">任务与调度</a><a>系统健康</a></nav>
+      <main class="a-main">
+        <section class="panel"><div class="panel-h"><h2>任务 · 10</h2><span class="note">点一行看日志</span></div>
+        <div class="panel-b" style="padding:0"><table class="tbl std"><thead><tr><th style="padding-left:16px">任务</th><th>类型</th><th>状态</th><th class="r">下次运行</th><th class="r" style="padding-right:16px">上次运行</th></tr></thead><tbody>
+          <tr class="rowx" aria-selected="true"><td style="padding-left:16px">每日行情采集</td><td>定时</td><td><span class="st crit">失败</span></td><td class="r">10-21 17:30</td><td class="r" style="padding-right:16px">10-20 17:30</td></tr>
+          <tr class="rowx"><td style="padding-left:16px">宏观数据刷新</td><td>定时</td><td><span class="st ok">正常</span></td><td class="r">10-21 18:10</td><td class="r" style="padding-right:16px">10-20 18:10</td></tr>
+          <tr class="rowx"><td style="padding-left:16px">盯盘服务</td><td>常驻</td><td><span class="st ok">运行中</span></td><td class="r">—</td><td class="r" style="padding-right:16px">—</td></tr>
+          <tr class="rowx"><td style="padding-left:16px">研报因子计算</td><td>定时</td><td><span class="st ok">正常</span></td><td class="r">10-24 06:30</td><td class="r" style="padding-right:16px">10-17 06:30</td></tr>
+          <tr class="rowx"><td style="padding-left:16px">盘中快照采集</td><td>常驻</td><td><span class="st ok">运行中</span></td><td class="r">—</td><td class="r" style="padding-right:16px">—</td></tr>
+          <tr class="rowx"><td style="padding-left:16px">收盘数据核对</td><td>定时</td><td><span class="st idle">未启用</span></td><td class="r">—</td><td class="r" style="padding-right:16px">10-18 16:00</td></tr>
+          <tr class="rowx"><td style="padding-left:16px">盯盘规则检查</td><td>定时</td><td><span class="st ok">正常</span></td><td class="r">10-21 09:15</td><td class="r" style="padding-right:16px">10-20 09:15</td></tr>
+          <tr class="rowx"><td style="padding-left:16px">网页服务</td><td>常驻</td><td><span class="st ok">运行中</span></td><td class="r">—</td><td class="r" style="padding-right:16px">—</td></tr>
+        </tbody></table></div></section>
+      </main>
+    </div>
+    <div class="scrim"></div>
+    <aside class="drawer" role="dialog" aria-modal="true" aria-label="每日行情采集 日志">
+      <div class="drawer-grab" aria-hidden="true"></div>
+      <div class="drawer-h"><h2>每日行情采集</h2><span class="m-l">日志</span><button class="x" aria-label="关闭">×</button></div>
+      <div class="drawer-b">
+        <div class="meta"><span class="st crit">失败</span><span>上次运行 <b class="num">10-20 17:30</b></span><span>下次运行 <b class="num">10-21 17:30</b></span></div>
+        <p class="sec-l">最近 200 行 · 最新在上</p>
+<pre class="logview"><span class="ln err"><time>17:31:10</time> 读不到数据源：连接超时，5 分钟后重试</span><span class="ln"><time>17:31:09</time> 第 3 次重试</span><span class="ln"><time>17:31:04</time> 第 2 次重试</span><span class="ln warn"><time>17:30:59</time> 数据源响应慢，已等待 15 秒</span><span class="ln"><time>17:30:42</time> 999005 当日停牌，跳过</span><span class="ln"><time>17:30:41</time> 写入 4 行，用时 39 秒</span><span class="ln"><time>17:30:38</time> 999004 已写入</span><span class="ln"><time>17:30:30</time> 999003 已写入</span><span class="ln"><time>17:30:21</time> 999002 已写入</span><span class="ln"><time>17:30:12</time> 999001 已写入</span><span class="ln"><time>17:30:02</time> 开始采集 999001 等 5 只</span><span class="ln"><time>17:30:00</time> 任务开始，交易日 2026-10-20</span><span class="ln"><time>17:29:58</time> 检查上一次运行：10-19 17:30 成功</span><span class="ln"><time>17:29:58</time> 读取采集清单：5 只</span><span class="ln"><time>17:29:57</time> 连接本地库成功</span><span class="ln"><time>17:29:57</time> 准备运行环境</span><span class="ln"><time>17:29:56</time> 定时触发</span><span class="ln"><time>17:30:00</time> 任务开始，交易日 2026-10-19</span><span class="ln"><time>17:30:41</time> 写入 5 行，用时 41 秒</span><span class="ln"><time>17:30:42</time> 任务完成</span><span class="ln"><time>17:30:00</time> 任务开始，交易日 2026-10-16</span><span class="ln"><time>17:30:39</time> 写入 5 行，用时 39 秒</span><span class="ln"><time>17:30:40</time> 任务完成</span><span class="ln"><time>17:30:00</time> 任务开始，交易日 2026-10-15</span><span class="ln"><time>17:30:38</time> 写入 5 行，用时 38 秒</span><span class="ln"><time>17:30:39</time> 任务完成</span><span class="ln"><time>17:30:00</time> 任务开始，交易日 2026-10-14</span><span class="ln"><time>17:30:40</time> 写入 5 行，用时 40 秒</span></pre>
+      </div>
+    </aside>
+    <span class="dm h" style="left:1040px;width:400px;top:872px"><i>400</i></span>
+    <span class="mk" style="left:1004px;top:300px">1</span>
+    <span class="box" style="left:1040px;top:0;width:400px;height:53px"><i>.drawer-h 52</i></span>
+    <span class="mk" style="left:1004px;top:13px">2</span>
+    <span class="box" style="left:1392px;top:4px;width:44px;height:44px"></span>
+    <span class="mk" style="left:1404px;top:60px">3</span>
+    <span class="dm h" style="left:1040px;width:16px;top:100px"><i>16</i></span>
+    <span class="mk" style="left:1004px;top:88px">4</span>
+    <span class="box" style="left:1044px;top:56px;width:392px;height:806px"><i style="left:auto;right:-2px">.drawer-b 滚动区</i></span>
+    <span class="mk" style="left:1410px;top:440px">5</span>
+    <span class="box" style="left:228px;top:132px;width:812px;height:36px;border-color:#fff"></span>
+    <span class="mk" style="left:196px;top:137px">6</span>
+  </div></div>
+  </figure>
+
+  <div class="figrow" style="margin-top:20px">
+  <figure class="f"><figcaption>手机 390 × 844<span>数据中心，点一个数据集看字段</span></figcaption>
+  <div class="fw" data-w="390" data-h="844"><div class="fi f-ph" style="width:390px;height:844px">
+    <div class="app2">
+      <div class="a-top"><span class="a-mark"></span><h1 style="margin-left:8px">数据中心</h1><span class="grow"></span><span class="a-ico"><span class="a-hdot"></span></span><span class="a-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 8a6 6 0 1 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10 21h4"/></svg><span class="a-badge">12</span></span></div>
+      <main class="a-main">
+        <section class="panel"><div class="panel-h"><h2>数据集 · 24</h2></div>
+          <a class="li2"><span class="t">股票日线<span class="code">daily_bar</span></span><span class="meta"><span>覆盖到 10-19</span><span>11 个字段</span></span><span class="v" style="font-size:13px;font-weight:400;color:var(--c-muted)">行情</span></a>
+          <a class="li2"><span class="t">股票状态<span class="code">stock_status_daily</span></span><span class="meta"><span>覆盖到 10-19</span><span>8 个字段</span></span><span class="v" style="font-size:13px;font-weight:400;color:var(--c-muted)">行情</span></a>
+          <a class="li2"><span class="t">分钟线<span class="code">minute_bar</span></span><span class="meta"><span>覆盖到 10-20</span><span>9 个字段</span></span><span class="v" style="font-size:13px;font-weight:400;color:var(--c-muted)">行情</span></a>
+          <a class="li2"><span class="t">集合竞价<span class="code">auction_bar</span></span><span class="meta"><span>覆盖到 10-20</span><span>7 个字段</span></span><span class="v" style="font-size:13px;font-weight:400;color:var(--c-muted)">行情</span></a>
+        </section>
+      </main>
+    </div>
+    <div class="a-tab"><span><i></i>全景</span><span><i></i>资金流</span><span><i></i>池子</span><span class="on"><i></i>更多</span></div>
+    <div class="scrim"></div>
+    <aside class="drawer" role="dialog" aria-modal="true" aria-label="股票日线 字段">
+      <div class="drawer-grab" aria-hidden="true"></div>
+      <div class="drawer-h"><h2>股票日线</h2><span class="m-l num">daily_bar</span><button class="x" aria-label="关闭">×</button></div>
+      <div class="drawer-b">
+        <div class="meta"><span>覆盖到 <b class="num">2026-10-19</b></span><span><b class="num">11</b> 个字段</span><span>缺 <b class="num">0</b> 天</span></div>
+        <p class="sec-l">字段</p>
+        <div class="fld"><span class="t">股票代码<code>ts_code</code></span><span class="meta"><span>VARCHAR</span><span>例 999001.SH</span></span></div>
+        <div class="fld"><span class="t">交易日期<code>trade_date</code></span><span class="meta"><span>DATE</span></span></div>
+        <div class="fld"><span class="t">开盘价<code>open</code></span><span class="meta"><span>DOUBLE</span><span>元</span></span></div>
+        <div class="fld"><span class="t">最高价<code>high</code></span><span class="meta"><span>DOUBLE</span><span>元</span></span></div>
+        <div class="fld"><span class="t">最低价<code>low</code></span><span class="meta"><span>DOUBLE</span><span>元</span></span></div>
+        <div class="fld"><span class="t">收盘价<code>close</code></span><span class="meta"><span>DOUBLE</span><span>元</span></span></div>
+        <div class="fld"><span class="t">昨收价<code>pre_close</code></span><span class="meta"><span>DOUBLE</span><span>元</span><span>上一交易日收盘</span></span></div>
+        <div class="fld"><span class="t">涨跌额<code>change</code></span><span class="meta"><span>DOUBLE</span><span>元</span></span></div>
+        <div class="fld"><span class="t">涨跌幅<code>pct_chg</code></span><span class="meta"><span>DOUBLE</span><span>%</span></span></div>
+        <div class="fld"><span class="t">成交量<code>vol</code></span><span class="meta"><span>DOUBLE</span><span>手</span></span></div>
+        <div class="fld"><span class="t">成交额<code>amount</code></span><span class="meta"><span>DOUBLE</span><span>千元</span></span></div>
+      </div>
+    </aside>
+    <div class="a-safe"></div>
+    <span class="dm v" style="left:4px;top:127px;height:717px"><i style="top:auto;bottom:40px">最高 85%</i></span>
+    <span class="mk" style="left:350px;top:96px">1</span>
+    <span class="box" style="left:0;top:127px;width:390px;height:73px"><i>下滑区 20 + 52</i></span>
+    <span class="mk" style="left:200px;top:160px">2</span>
+    <span class="box" style="left:342px;top:151px;width:44px;height:44px"></span>
+    <span class="mk" style="left:352px;top:206px">3</span>
+    <span class="mk" style="left:350px;top:420px">5</span>
+    <span class="dm v" style="left:376px;top:810px;height:34px"></span>
+    <span class="mk" style="left:330px;top:812px">7</span>
+  </div></div>
+  </figure>
+  <div>
+    <ol class="legend">
+      <li><span><b>抽屉 <code>.drawer</code></b>：电脑宽 400px，上下贴满，圆角 0；手机占满宽，最高 85% 屏高，高度随内容，上两角 10px <code>--r-md</code>。底色 <code>--c-surface</code>，阴影 <code>--shadow-pop</code>，遮罩 <code>--c-scrim</code>。</span></li>
+      <li><span><b>抽屉头 <code>.drawer-h</code></b>：最小高 52px，内边距 0 4px 0 16px，下边线 1px <code>--c-rule</code>。手机上面多一条把手 <code>.drawer-grab</code>：区域 20px，横条 36×4px <code>--c-rule-strong</code>；把手和抽屉头合起来 72px 是下滑区。</span></li>
+      <li><span><b>关闭按钮 <code>.drawer-h .x</code></b>：44×44px，× 20px，<code>--c-ink-2</code>；悬停底色 <code>--c-surface-2</code>，圆角 6px。</span></li>
+      <li><span><b>内容区内边距</b>：12px 16px 16px；手机底部再加安全区。</span></li>
+      <li><span><b>滚动区</b>：只有 <code>.drawer-b</code> 滚动，滚到头不带动页面；抽屉头固定不动。日志块和字段列表自己不滚动。</span></li>
+      <li><span><b>触发行</b>：整行可点，悬停 <code>--c-surface-2</code>；抽屉开着时这一行 <code>aria-selected="true"</code>，底色 <code>--c-accent-weak</code>。表格下方原来的页内详情面板删掉。</span></li>
+      <li><span><b>安全区</b>：手机弹层底部留 <code>env(safe-area-inset-bottom)</code>，弹层盖住底部标签栏。</span></li>
+    </ol>
+  </div>
+  </div>
+
+  <h3 class="sub">抽屉头统一写法</h3>
+  <p class="cap2" style="margin:0 0 10px">三个抽屉用同一个抽屉头：标题 + 一个副标题 + 右侧关闭。抽屉头里不放色块和标签，摘要数字放进内容区第一行 <code>.meta</code>。</p>
+  <div class="heads">
+    <div class="hd"><div class="drawer-h"><h2>每日行情采集</h2><span class="m-l">日志</span><button class="x" aria-label="关闭">×</button></div><div class="drawer-b"><div class="meta"><span class="st crit">失败</span><span>上次运行 <b class="num">10-20 17:30</b></span><span>下次运行 <b class="num">10-21 17:30</b></span></div></div></div>
+    <div class="hd"><div class="drawer-h"><h2>股票日线</h2><span class="m-l num">daily_bar</span><button class="x" aria-label="关闭">×</button></div><div class="drawer-b"><div class="meta"><span>覆盖到 <b class="num">2026-10-19</b></span><span><b class="num">11</b> 个字段</span><span>缺 <b class="num">0</b> 天</span></div></div></div>
+    <div class="hd"><div class="drawer-h"><h2>证券</h2><span class="num down" style="font-size:13px;font-weight:500">−1.01%</span><button class="x" aria-label="关闭">×</button></div><div class="drawer-b"><div class="meta"><span>成交 <b class="num">152.11亿</b></span><span>上涨 <b class="num">31%</b></span><span>涨停 <b class="num">0</b></span><span>炸板 <b class="num">1</b></span><span><b class="num">29</b> 只</span></div>
+      <div class="li2" style="padding:8px 0;margin-top:8px"><span class="t">示例证券<span class="code">999162</span></span><span class="meta"><span>成交 7756.1万</span></span><span class="v down" style="font-size:13px">−2.35%</span></div></div></div>
+  </div>
+  <table class="spec" style="margin-top:12px"><tbody>
+    <tr><th>标题</th><td><code>.drawer-h h2</code>，<code>--t-section</code> 15px/22px 600，<code>--c-ink</code>，一行，过长省略号 <code>.ellipsis</code>。</td></tr>
+    <tr><th>副标题</th><td><code>.m-l</code> 12px/16px <code>--c-muted</code>，紧跟标题，间距 12px；代码、标识加 <code>.num</code>。行业成分的涨跌幅放这里，只用文字色 <code>.up</code> <code>--c-up</code> / <code>.down</code> <code>--c-down</code>，13px 500，不加底色。</td></tr>
+    <tr><th>摘要</th><td>内容区第一行 <code>.meta</code>，12px，项间 12px，数字 <code>b.num</code> <code>--c-ink-2</code> 500。数是 0 不上色。</td></tr>
+    <tr><th>行业成分列表</th><td>每行涨跌幅只用文字色，13px <code>.num</code> 右对齐，去掉实心红绿色块；手机每行最小 44px。</td></tr>
+  </tbody></table>
+
+  <h3 class="sub">规格</h3>
+  <table class="spec"><thead><tr><th>项</th><th>电脑 1440</th><th>手机 390</th></tr></thead><tbody>
+    <tr><th>组件</th><td><code>.scrim</code> + <code>.drawer</code>，<code>role="dialog"</code> <code>aria-modal="true"</code> <code>aria-labelledby</code> 指向标题</td><td>同左，加 <code>.drawer-grab</code> 作第一个子元素，<code>aria-hidden="true"</code></td></tr>
+    <tr><th>宽度</th><td>400px，<code>min(400px, 100%)</code>，贴右侧</td><td>100%</td></tr>
+    <tr><th>最大高度</th><td>100% 屏高，上下贴满</td><td>85% 屏高，内容少时按内容高</td></tr>
+    <tr><th>内边距</th><td>抽屉头 0 4px 0 16px；内容区 12px 16px 16px</td><td>同左；底部加安全区</td></tr>
+    <tr><th>圆角</th><td>0</td><td>上两角 10px <code>--r-md</code></td></tr>
+    <tr><th>颜色</th><td colspan="2"><span class="swatch" style="background:var(--c-surface)"></span>抽屉底 <code>--c-surface</code> · <span class="swatch" style="background:var(--c-scrim)"></span>遮罩 <code>--c-scrim</code> · 阴影 <code>--shadow-pop</code> · <span class="swatch" style="background:var(--c-rule)"></span>抽屉头下边线 <code>--c-rule</code> · <span class="swatch" style="background:var(--c-rule-strong)"></span>把手 <code>--c-rule-strong</code> · <span class="swatch" style="background:var(--c-surface-2)"></span>日志底 <code>--c-surface-2</code> · <span class="swatch" style="background:var(--c-crit)"></span>失败行 <code>--c-crit</code> · <span class="swatch" style="background:var(--c-warn)"></span>提醒行 <code>--c-warn</code></td></tr>
+    <tr><th>字号</th><td colspan="2">标题 <code>--t-section</code> 15px/22px 600；副标题、摘要 <code>--t-label</code> 12px/16px；字段名电脑 13px/20px、手机 14px/21px 500；日志 <code>.logview</code> <code>--font-mono</code> 12px/18px</td></tr>
+    <tr><th>任务日志内容</th><td colspan="2">摘要：状态点 <code>.st</code>、上次运行、下次运行。下面一行小字「最近 200 行 · 最新在上」，再接日志块 <code>.logview</code>；时间 <code>--c-muted</code>，失败行 <code>.ln.err</code>，提醒行 <code>.ln.warn</code>。长行折行，不出横向滚动。没有日志用空状态 <code>.empty</code>「这个任务还没有运行记录」。读取失败用 <code>.notice.crit</code> 带「重试」，放在内容区顶部。</td></tr>
+    <tr><th>数据集字段内容</th><td colspan="2">摘要：覆盖到、字段数、缺几天。字段列表每行两行字：第一行中文名 + 字段名 <code>--font-mono</code> 12px <code>--c-muted</code>；第二行 <code>.meta</code>：类型、单位、说明。每行最小 44px，行间 1px <code>--c-surface-2</code>，整行不可点。</td></tr>
+    <tr><th>动效</th><td>遮罩 180ms 进 / 120ms 出；抽屉从右侧平移 100% → 0，进 280ms <code>--dur-slow</code> <code>--ease-enter</code>，出 180ms <code>--dur-base</code> <code>--ease-exit</code></td><td>从底部平移 100% → 0，时长、曲线同左；下滑松手不够关闭时 180ms 弹回</td></tr>
+    <tr><th>减少动效</th><td colspan="2"><code>prefers-reduced-motion: reduce</code> 时变量归零：遮罩、抽屉直接出现和消失，不平移；手机拖动仍然跟手，松手后直接关闭或直接回位。</td></tr>
+    <tr><th>关闭方式</th><td>关闭按钮；点遮罩；Esc</td><td>关闭按钮；点遮罩；按住把手或抽屉头下滑，松手时下移超过弹层高度 25% 或速度超过 0.5px/ms 就关闭；内容区滚到顶后继续下拉也算；安卓返回键、iOS 左滑返回先关弹层，不离开页面</td></tr>
+    <tr><th>键盘焦点</th><td colspan="2">进：打开后焦点移到标题 <code>h2</code>，<code>tabindex="-1"</code>，读屏先读标题。Tab 只在抽屉内循环：关闭按钮 → 内容区里可聚焦的元素 → 回到关闭按钮；背景加 <code>inert</code>。出：任何方式关闭后，焦点回到点开它的那一行。行用 Enter 或空格打开。</td></tr>
+    <tr><th>滚动区</th><td colspan="2">只有 <code>.drawer-b</code> 滚动，<code>overscroll-behavior: contain</code>；打开时背景页面锁定不滚动，关闭后回到原来的滚动位置；每次打开从顶部开始。</td></tr>
+    <tr><th>触控区</th><td>关闭按钮 44×44px；表格行 36px，整行可点</td><td>关闭按钮 44×44px；下滑区 72px；列表行最小 44px</td></tr>
+    <tr><th>不做</th><td colspan="2">抽屉里不再开抽屉或弹窗；抽屉开着时点遮罩只关闭，不同时点到下面的行。</td></tr>
+  </tbody></table>
+</section>
+
+<!-- ================= 2 ================= -->
+<section class="blk" id="s2">
+  <h2><span class="n">2</span>只读账号提示条</h2>
+  <p class="sum">只读账号打开选股器、盯盘与告警、池子时，页面顶部放一行提示条：「当前是只读账号，可以查看，不能修改」。写按钮保持禁用灰色，每个按钮上不加说明、不加悬停提示。普通账号不显示。数据查询页不放这条提示。</p>
+  <div class="chips"><span class="chip">组件 <code>.notice</code> <code>.btn[aria-disabled="true"]</code> <code>.btn.quiet[aria-disabled="true"]</code></span><span class="chip">页面 选股器 · 盯盘与告警 · 池子</span></div>
+
+  <h3 class="sub">电脑 1440 · 盯盘与告警</h3>
+  <figure class="f"><figcaption>电脑 1440 × 900<span>提示条在内容区第一行，第一块面板之前</span></figcaption>
+  <div class="fw" data-w="1440" data-h="900"><div class="fi f-pc" style="width:1440px;height:900px">
+    <div class="app2">
+      <div class="a-top"><div class="a-brand"><span class="a-mark"></span>rQuant</div><h1>盯盘与告警</h1><span class="grow"></span><div class="a-search">代码 / 名称，如 999001</div></div>
+      <nav class="a-rail"><h6>研究</h6><a>选股器</a><a>池子</a><h6>跟踪与告警</h6><a class="on">盯盘与告警</a><a>市场全景</a><a>板块资金流</a><h6>运维</h6><a>任务与调度</a><a>系统健康</a></nav>
+      <main class="a-main">
+        <div class="notice" role="note" id="ro-pc">当前是只读账号，可以查看，不能修改</div>
+        <section class="panel"><div class="panel-h"><h2>告警时间线 · 未确认 12 / 共 29</h2><span class="note">最新在上</span><div class="tools"><div class="seg"><button aria-selected="true">全部</button><button>未确认 12</button></div></div></div>
+        <div class="panel-b" style="padding:0"><table class="tbl std"><thead><tr><th style="padding-left:16px">时间</th><th>代码</th><th>名称</th><th>级别</th><th>类型</th><th class="r">触发价</th><th style="padding-right:16px">处理</th></tr></thead><tbody>
+          <tr><td style="padding-left:16px" class="num">14:38:02</td><td class="num">999012.SZ</td><td>示例传媒</td><td>L3</td><td>跳空高开</td><td class="r">6.51</td><td><button class="btn quiet sm" aria-disabled="true" aria-describedby="ro-pc">确认</button></td></tr>
+          <tr><td style="padding-left:16px" class="num">14:28:52</td><td class="num">999034.SZ</td><td>示例有色</td><td>L2</td><td>跳空高开</td><td class="r">9.26</td><td><span class="st ok">已确认</span></td></tr>
+          <tr><td style="padding-left:16px" class="num">14:03:57</td><td class="num">999051.SH</td><td>示例证券</td><td>L1</td><td>量比放大</td><td class="r">9.65</td><td><button class="btn quiet sm" aria-disabled="true">确认</button></td></tr>
+          <tr><td style="padding-left:16px" class="num">13:56:44</td><td class="num">999067.SH</td><td>示例家电</td><td>L3</td><td>量比放大</td><td class="r">11.60</td><td><button class="btn quiet sm" aria-disabled="true">确认</button></td></tr>
+          <tr><td style="padding-left:16px" class="num">13:31:49</td><td class="num">999073.SZ</td><td>示例保险</td><td>L2</td><td>止盈</td><td class="r">18.80</td><td><span class="st ok">已确认</span></td></tr>
+          <tr><td style="padding-left:16px" class="num">13:21:39</td><td class="num">999088.SH</td><td>示例传媒</td><td>L1</td><td>止盈</td><td class="r">45.18</td><td><button class="btn quiet sm" aria-disabled="true">确认</button></td></tr>
+        </tbody></table></div></section>
+        <section class="panel"><div class="panel-h"><h2>告警规则 · 3</h2></div>
+          <div class="panel-b" style="display:flex;gap:8px;align-items:end">
+            <div class="field" style="width:220px"><label>规则名称</label><input class="input" value="核心池 L1/L2 实时推送" disabled></div>
+            <div class="field" style="width:120px"><label>冷却 分钟</label><input class="input" value="10" disabled></div>
+            <span style="flex:1"></span>
+            <button class="btn" aria-disabled="true">停用</button>
+            <button class="btn primary" aria-disabled="true">保存规则</button>
+          </div></section>
+      </main>
+    </div>
+    <span class="box" style="left:228px;top:64px;width:1196px;height:40px"><i>.notice 高 40</i></span>
+    <span class="mk" style="left:1404px;top:70px">1</span>
+    <span class="dm v" style="left:240px;top:104px;height:12px"></span>
+    <span class="mk" style="left:300px;top:106px">2</span>
+    <span class="box" style="left:1253px;top:184px;width:52px;height:36px"></span>
+    <span class="mk" style="left:1312px;top:189px">3</span>
+    <span class="box" style="left:1264px;top:467px;width:150px;height:44px"></span>
+    <span class="mk" style="left:1230px;top:476px">4</span>
+  </div></div>
+  </figure>
+
+  <div class="figrow" style="margin-top:20px">
+  <figure class="f"><figcaption>手机 390 × 844<span>选股器，提示条在页面标题条下方</span></figcaption>
+  <div class="fw" data-w="390" data-h="844"><div class="fi f-ph" style="width:390px;height:844px">
+    <div class="app2">
+      <div class="a-top"><span class="a-mark"></span><h1 style="margin-left:8px">选股器</h1><span class="grow"></span><span class="a-ico"><span class="a-hdot"></span></span><span class="a-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 8a6 6 0 1 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10 21h4"/></svg><span class="a-badge">12</span></span></div>
+      <main class="a-main">
+        <div class="pagebar"><span class="m-l">方案</span><b>低估值高股息</b><span class="spacer"></span><div class="actions"><button class="btn primary" aria-disabled="true" aria-describedby="ro-ph">保存方案</button></div></div>
+        <div class="notice" role="note" id="ro-ph">当前是只读账号，可以查看，不能修改</div>
+        <section class="panel"><div class="panel-h"><h2>结果 · 28 只</h2></div>
+          <div class="li2"><span class="t">示例科技<span class="code">999001</span></span><span class="meta"><span>市盈率 9.8</span><span>股息率 4.2%</span></span><span class="v up">+1.30%</span></div>
+          <div class="li2"><span class="t">示例银行<span class="code">999002</span></span><span class="meta"><span>市盈率 5.1</span><span>股息率 5.6%</span></span><span class="v down">−0.42%</span></div>
+          <div class="li2"><span class="t">示例电力<span class="code">999003</span></span><span class="meta"><span>市盈率 12.4</span><span>股息率 3.9%</span></span><span class="v up">+0.87%</span></div>
+          <div class="li2"><span class="t">示例高速<span class="code">999004</span></span><span class="meta"><span>市盈率 10.2</span><span>股息率 4.8%</span></span><span class="v flat">0.00%</span></div>
+          <div class="li2"><span class="t">示例煤业<span class="code">999005</span></span><span class="meta"><span>市盈率 7.6</span><span>股息率 6.1%</span></span><span class="v down">−1.12%</span></div>
+          <div style="display:flex;gap:8px;padding:12px 16px"><button class="btn" aria-disabled="true">加入自选</button><button class="btn" aria-disabled="true">加入池子</button></div>
+        </section>
+      </main>
+    </div>
+    <div class="a-tab"><span><i></i>全景</span><span><i></i>资金流</span><span><i></i>池子</span><span class="on"><i></i>更多</span></div>
+    <div class="a-safe"></div>
+    <span class="box" style="left:10px;top:108px;width:370px;height:44px"><i>.notice</i></span>
+    <span class="mk" style="left:350px;top:116px">1</span>
+    <span class="box" style="left:262px;top:56px;width:118px;height:44px"></span>
+    <span class="mk" style="left:228px;top:64px">4</span>
+  </div></div>
+  </figure>
+  <div>
+    <ol class="legend">
+      <li><span><b>提示条 <code>.notice</code></b> 中性写法：底 <code>--c-surface-2</code>，字 <code>--c-ink-2</code>，<code>--t-body</code> 电脑 13px/20px、手机 14px/21px；内边距 10px 14px，圆角 6px <code>--r-sm</code>；占内容区全宽，电脑高 40px、手机一行 41px。不带操作链接、不能关闭、不吸顶，跟页面一起滚动。</span></li>
+      <li><span><b>位置</b>：内容区第一行；和下面第一块内容间距电脑 12px、手机 8px，等于内容区原有间距。有页面标题条的页面放在标题条下方。</span></li>
+      <li><span><b>文字按钮禁用</b> <code>.btn.quiet[aria-disabled="true"]</code>：字 <code>--c-faint</code>，无底色，悬停不变色。</span></li>
+      <li><span><b>主要、次要按钮禁用</b> <code>.btn[aria-disabled="true"]</code>：底和边 <code>--c-sunken</code>，字 <code>--c-faint</code>，光标 <code>not-allowed</code>，悬停、按下不变。输入框 <code>.input[disabled]</code>。</span></li>
+    </ol>
+  </div>
+  </div>
+
+  <h3 class="sub">规格</h3>
+  <table class="spec"><thead><tr><th>项</th><th>电脑 1440</th><th>手机 390</th></tr></thead><tbody>
+    <tr><th>组件</th><td colspan="2"><code>.notice</code>，不用 <code>.warn</code> <code>.crit</code>；<code>role="note"</code>，给一个 <code>id</code></td></tr>
+    <tr><th>文案</th><td colspan="2">当前是只读账号，可以查看，不能修改</td></tr>
+    <tr><th>宽度</th><td>内容区全宽</td><td>内容区全宽，左右各留 12px</td></tr>
+    <tr><th>高度</th><td>40px，一行</td><td>41px，一行；更窄屏幕折成 2 行，不截断</td></tr>
+    <tr><th>内边距 · 圆角</th><td colspan="2">10px 14px · 6px <code>--r-sm</code></td></tr>
+    <tr><th>颜色</th><td colspan="2"><span class="swatch" style="background:var(--c-surface-2)"></span>底 <code>--c-surface-2</code> · <span class="swatch" style="background:var(--c-ink-2)"></span>字 <code>--c-ink-2</code> · 禁用按钮 <span class="swatch" style="background:var(--c-sunken)"></span><code>--c-sunken</code> / <span class="swatch" style="background:var(--c-faint)"></span><code>--c-faint</code></td></tr>
+    <tr><th>字号</th><td>13px/20px 400</td><td>14px/21px 400</td></tr>
+    <tr><th>哪些页面</th><td colspan="2">选股器、盯盘与告警、池子，以及以后其他带写按钮的页面。数据查询不放。只读账号才显示。</td></tr>
+    <tr><th>写按钮</th><td colspan="2">本页所有会改数据的按钮、开关、输入框保持禁用：例如选股器的保存方案、加入自选、加入池子；盯盘与告警的确认、保存规则、停用；池子里改成员和保存的按钮。按钮上不加说明文字、不加悬停提示、不隐藏按钮。</td></tr>
+    <tr><th>动效</th><td colspan="2">无。随页面直接出现，不淡入。减少动效设置下同样无动效。</td></tr>
+    <tr><th>关闭方式</th><td colspan="2">不能关闭，常驻。</td></tr>
+    <tr><th>键盘焦点</th><td colspan="2">提示条本身不可聚焦。写按钮用 <code>aria-disabled="true"</code>，留在 Tab 顺序里，按 Enter、空格、点击都不响应；每个禁用写按钮加 <code>aria-describedby</code> 指向提示条的 <code>id</code>，读屏读到按钮时会读出这句话。输入框用 <code>disabled</code>。</td></tr>
+    <tr><th>滚动区</th><td colspan="2">不吸顶，跟页面一起滚动。</td></tr>
+    <tr><th>触控区</th><td>按钮 32px 不变</td><td>禁用按钮仍保持 44px 高，位置不变，不因禁用变小</td></tr>
+  </tbody></table>
+</section>
+
+<!-- ================= 3 ================= -->
+<section class="blk" id="s3">
+  <h2><span class="n">3</span>确认告警轻提示</h2>
+  <p class="sum">点「确认」不弹确认弹窗，直接提交。成功后底部轻提示「已确认 1 条告警」带「撤销」，停 6 秒。点撤销后这条回到未确认，未确认数和铃铛角标加 1，操作记录里有「确认」和「撤销确认」两条。</p>
+  <div class="chips"><span class="chip">组件 <code>.toast</code> <code>.toast .act</code> <code>.btn.quiet</code> <code>.st.ok</code> <code>.badge</code></span><span class="chip">页面 盯盘与告警 · 全站顶栏铃铛</span></div>
+
+  <h3 class="sub">电脑 1440 · 盯盘与告警，刚确认一条</h3>
+  <figure class="f"><figcaption>电脑 1440 × 900<span>轻提示底部居中，距底 24px</span></figcaption>
+  <div class="fw" data-w="1440" data-h="900"><div class="fi f-pc" style="width:1440px;height:900px">
+    <div class="app2">
+      <div class="a-top"><div class="a-brand"><span class="a-mark"></span>rQuant</div><h1>盯盘与告警</h1><span class="grow"></span><div class="a-search">代码 / 名称，如 999001</div></div>
+      <nav class="a-rail"><h6>研究</h6><a>选股器</a><a>池子</a><h6>跟踪与告警</h6><a class="on">盯盘与告警</a><a>市场全景</a><a>板块资金流</a><h6>运维</h6><a>任务与调度</a><a>系统健康</a></nav>
+      <main class="a-main">
+        <section class="panel"><div class="panel-h"><h2>告警时间线 · 未确认 11 / 共 29</h2><span class="note">最新在上</span><div class="tools"><div class="seg"><button>全部</button><button aria-selected="true">未确认 11</button></div></div></div>
+        <div class="panel-b" style="padding:0"><table class="tbl std"><thead><tr><th style="padding-left:16px">时间</th><th>代码</th><th>名称</th><th>级别</th><th>类型</th><th class="r">触发价</th><th style="padding-right:16px">处理</th></tr></thead><tbody>
+          <tr><td style="padding-left:16px" class="num">14:38:02</td><td class="num">999012.SZ</td><td>示例传媒</td><td>L3</td><td>跳空高开</td><td class="r">6.51</td><td><button class="btn quiet sm">确认</button></td></tr>
+          <tr><td style="padding-left:16px" class="num">14:03:57</td><td class="num">999051.SH</td><td>示例证券</td><td>L1</td><td>量比放大</td><td class="r">9.65</td><td><span class="st ok">已确认</span></td></tr>
+          <tr><td style="padding-left:16px" class="num">13:56:44</td><td class="num">999067.SH</td><td>示例家电</td><td>L3</td><td>量比放大</td><td class="r">11.60</td><td><button class="btn quiet sm">确认</button></td></tr>
+          <tr><td style="padding-left:16px" class="num">13:21:39</td><td class="num">999088.SH</td><td>示例传媒</td><td>L1</td><td>止盈</td><td class="r">45.18</td><td><button class="btn quiet sm" aria-busy="true">确认</button></td></tr>
+          <tr><td style="padding-left:16px" class="num">11:50:41</td><td class="num">999093.SZ</td><td>示例机械</td><td>L3</td><td>止盈</td><td class="r">6.19</td><td><button class="btn quiet sm">确认</button> <span class="ack-err">没确认上：网络断开，请重试</span></td></tr>
+          <tr><td style="padding-left:16px" class="num">11:24:36</td><td class="num">999097.SH</td><td>示例电池</td><td>L1</td><td>止损</td><td class="r">19.86</td><td><button class="btn quiet sm">确认</button></td></tr>
+          <tr><td style="padding-left:16px" class="num">10:52:28</td><td class="num">999104.SZ</td><td>示例白酒</td><td>L2</td><td>止损</td><td class="r">44.85</td><td><button class="btn quiet sm">确认</button></td></tr>
+        </tbody></table></div></section>
+      </main>
+    </div>
+    <div class="toast" role="status">已确认 1 条告警<button class="act">撤销</button></div>
+    <span class="box" style="left:1340px;top:67px;width:70px;height:34px"><i style="left:auto;right:-2px">未确认 −1</i></span>
+    <span class="box" style="left:996px;top:172px;width:428px;height:34px"></span>
+    <span class="mk" style="left:1392px;top:176px">1</span>
+    <span class="mk" style="left:1060px;top:240px">2</span>
+    <span class="mk" style="left:1216px;top:280px">3</span>
+    <span class="box" style="left:634px;top:832px;width:172px;height:48px"></span>
+    <span class="mk" style="left:600px;top:843px">4</span>
+    <span class="mk" style="left:816px;top:843px">5</span>
+    <span class="dm v" style="left:720px;top:876px;height:24px"><i>24</i></span>
+  </div></div>
+  </figure>
+
+  <div class="figrow" style="margin-top:20px">
+  <figure class="f"><figcaption>手机 390 × 844<span>轻提示在底部标签栏上方 12px，不压住底栏</span></figcaption>
+  <div class="fw" data-w="390" data-h="844"><div class="fi f-ph" style="width:390px;height:844px">
+    <div class="app2">
+      <div class="a-top"><span class="a-mark"></span><h1 style="margin-left:8px">盯盘与告警</h1><span class="grow"></span><span class="a-ico"><span class="a-hdot"></span></span><span class="a-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 8a6 6 0 1 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10 21h4"/></svg><span class="a-badge">11</span></span></div>
+      <main class="a-main">
+        <section class="panel"><div class="panel-h" style="min-height:48px"><h2>告警时间线</h2><div class="tools"><div class="seg"><button>全部</button><button aria-selected="true">未确认 11</button></div></div></div>
+          <div class="li2"><span class="t">示例传媒<span class="code">999012</span></span><span class="meta"><span>14:38:02</span><span>L3 跳空高开</span><span>6.51</span></span><span style="grid-column:2;grid-row:1/span 2"><button class="btn quiet">确认</button></span></div>
+          <div class="li2"><span class="t">示例证券<span class="code">999051</span></span><span class="meta"><span>14:03:57</span><span>L1 量比放大</span><span>9.65</span></span><span style="grid-column:2;grid-row:1/span 2" class="st ok">已确认</span></div>
+          <div class="li2"><span class="t">示例家电<span class="code">999067</span></span><span class="meta"><span>13:56:44</span><span>L3 量比放大</span><span>11.60</span></span><span style="grid-column:2;grid-row:1/span 2"><button class="btn quiet">确认</button></span></div>
+          <div class="li2"><span class="t">示例传媒<span class="code">999088</span></span><span class="meta"><span>13:21:39</span><span>L1 止盈</span><span>45.18</span></span><span style="grid-column:2;grid-row:1/span 2"><button class="btn quiet">确认</button></span></div>
+          <div class="li2"><span class="t">示例机械<span class="code">999093</span></span><span class="meta"><span>11:50:41</span><span>L3 止盈</span><span>6.19</span></span><span style="grid-column:2;grid-row:1/span 2"><button class="btn quiet">确认</button></span></div>
+          <div class="li2"><span class="t">示例电池<span class="code">999097</span></span><span class="meta"><span>11:24:36</span><span>L1 止损</span><span>19.86</span></span><span style="grid-column:2;grid-row:1/span 2"><button class="btn quiet">确认</button></span></div>
+          <div class="li2"><span class="t">示例白酒<span class="code">999104</span></span><span class="meta"><span>10:52:28</span><span>L2 止损</span><span>44.85</span></span><span style="grid-column:2;grid-row:1/span 2"><button class="btn quiet">确认</button></span></div>
+          <div class="li2"><span class="t">示例煤业<span class="code">999105</span></span><span class="meta"><span>10:42:18</span><span>L1 止损</span><span>13.80</span></span><span style="grid-column:2;grid-row:1/span 2"><button class="btn quiet">确认</button></span></div>
+        </section>
+      </main>
+    </div>
+    <div class="a-tab"><span><i></i>全景</span><span><i></i>资金流</span><span><i></i>池子</span><span class="on"><i></i>更多</span></div>
+    <div class="toast" role="status">已确认 1 条告警<button class="act">撤销</button></div>
+    <div class="a-safe"></div>
+    <span class="box" style="left:342px;top:2px;width:44px;height:44px"><i style="left:auto;right:-2px">角标 −1</i></span>
+    <span class="mk" style="left:310px;top:12px">6</span>
+    <span class="dm v" style="left:194px;top:742px;height:12px"><i>12</i></span>
+    <span class="box" style="left:230px;top:698px;width:48px;height:44px"></span>
+    <span class="mk" style="left:290px;top:707px">5</span>
+    <span class="box" style="left:0;top:754px;width:390px;height:90px;border-color:var(--c-accent)"></span>
+  </div></div>
+  </figure>
+  <div>
+    <ol class="legend">
+      <li><span><b>确认成功</b>：这一行的「确认」换成状态点 <code>.st.ok</code>「已确认」；在「未确认」分段里，这一行留在原位，等轻提示消失后再从列表里移走，不播动画。</span></li>
+      <li><span><b>提交中</b>：「确认」按钮 <code>aria-busy="true"</code> 显示转圈，宽度不变，不能再点。不弹确认弹窗。</span></li>
+      <li><span><b>确认失败</b>：不出轻提示。按钮恢复「确认」，右边一行红字 <code>--c-crit</code> 12px「没确认上：网络断开，请重试」，下次点确认时清掉。计数不变。</span></li>
+      <li><span><b>轻提示 <code>.toast</code></b>：「已确认 1 条告警」+「撤销」。底 <code>--c-ink</code>，字 <code>--c-surface</code>，<code>--t-body</code>，圆角 6px，阴影 <code>--shadow-pop</code>；高 电脑 40px、手机 44px；内边距 0 4px 0 14px，字和按钮间距 8px。电脑在整个窗口底部居中，距底 24px。</span></li>
+      <li><span><b>撤销按钮 <code>.toast .act</code></b>：13px 600，颜色同提示文字，下划线偏移 3px，内边距 0 10px；高 电脑 40px，手机和触屏 44×44px 以上；悬停 12% 浅色底；焦点框 2px <code>--c-surface</code>。</span></li>
+      <li><span><b>计数</b>：确认成功后，铃铛角标 <code>.badge</code>、标题里的「未确认 N」、分段「未确认 N」、「更多」弹层告警行的未读数同时减 1；撤销成功后同时加 1。角标到 0 不显示。</span></li>
+    </ol>
+  </div>
+  </div>
+
+  <h3 class="sub">流程</h3>
+  <div class="flow">
+    <div><span class="t">1 · 点确认</span><span class="d">按钮转圈，不弹窗。失败时不出轻提示，行内一行红字。</span><button class="btn quiet" aria-busy="true">确认</button></div>
+    <div><span class="t">2 · 确认成功 · 停 6 秒</span><span class="d">行变「已确认」，计数 −1，出轻提示。悬停或焦点在提示上时暂停计时，离开后接着算剩下的时间；页面切到后台时也暂停。</span><div class="toast">已确认 1 条告警<button class="act">撤销</button></div></div>
+    <div><span class="t">3 · 点撤销</span><span class="d">轻提示马上消失。成功后这一行回到「确认」按钮，计数 +1，再出一条不带操作的轻提示，停 4 秒。撤销失败时这一行下面出一行红字「没撤销上，请重试」，计数不变。</span><div class="toast">已撤销确认</div></div>
+    <div><span class="t">4 · 连续确认</span><span class="d">6 秒内又确认另一条：旧提示直接换成新提示，不叠加、不排队、旧的不播退出动画，计时从 6 秒重新算；文案仍是「已确认 1 条告警」；撤销只对最新这一条有效，之前那条保持已确认。</span><div class="toast">已确认 1 条告警<button class="act">撤销</button></div></div>
+  </div>
+
+  <h3 class="sub">规格</h3>
+  <table class="spec"><thead><tr><th>项</th><th>电脑 1440</th><th>手机 390</th></tr></thead><tbody>
+    <tr><th>组件</th><td colspan="2"><code>.toast</code> + 一个 <code>.toast .act</code>；整站只挂一个轻提示容器，<code>role="status"</code> <code>aria-live="polite"</code></td></tr>
+    <tr><th>位置</th><td>窗口底部水平居中，<code>bottom: 24px</code></td><td>底部标签栏上方 12px：<code>bottom: calc(var(--h-tabbar-phone) + 12px + env(safe-area-inset-bottom))</code>，不压住底栏，底栏照常可点</td></tr>
+    <tr><th>宽度</th><td colspan="2">按内容宽，最大 <code>calc(100% - 32px)</code>；文字一行不换行</td></tr>
+    <tr><th>高度</th><td>40px</td><td>44px</td></tr>
+    <tr><th>内边距 · 圆角</th><td colspan="2">0 4px 0 14px，字和撤销间距 8px · 6px <code>--r-sm</code></td></tr>
+    <tr><th>颜色</th><td colspan="2"><span class="swatch" style="background:var(--c-ink)"></span>底 <code>--c-ink</code> · <span class="swatch" style="background:var(--c-surface)"></span>字和撤销 <code>--c-surface</code> · 阴影 <code>--shadow-pop</code> · 不用绿色表示成功</td></tr>
+    <tr><th>字号</th><td>提示 13px/20px 400；撤销 13px 600 下划线</td><td>提示 14px/21px 400；撤销 13px 600 下划线</td></tr>
+    <tr><th>层级</th><td colspan="2"><code>z-index: 30</code>，在页面和底栏之上；位置在底栏上方，不挡底栏</td></tr>
+    <tr><th>停留</th><td colspan="2">带撤销 6 秒；撤销后的「已撤销确认」4 秒。悬停、聚焦、页面在后台时暂停。</td></tr>
+    <tr><th>动效</th><td colspan="2">进 180ms <code>--dur-base</code> <code>--ease-enter</code>：不透明度 0 → 1，上移 8px。出 120ms <code>--dur-fast</code> <code>--ease-exit</code>：淡出下移 8px。被新提示替换时旧的直接移除。</td></tr>
+    <tr><th>减少动效</th><td colspan="2">变量归零：直接出现、直接消失，不移动。停留时间不变。</td></tr>
+    <tr><th>关闭方式</th><td>6 秒自动消失；点撤销；焦点在提示上时按 Esc</td><td>6 秒自动消失；点撤销。没有关闭按钮，不支持滑动关闭</td></tr>
+    <tr><th>键盘焦点</th><td colspan="2">鼠标、触摸点确认：焦点不动，读屏播报「已确认 1 条告警，可撤销」。键盘按 Enter 或空格确认：焦点移到「撤销」，计时暂停；按 Esc 关闭提示，焦点回到这一行的「已确认」状态格，状态格 <code>tabindex="-1"</code>；按 Tab 离开时提示继续计时，焦点去这一行之后的下一个可聚焦元素。撤销成功后焦点回到这一行的「确认」按钮。</td></tr>
+    <tr><th>滚动区</th><td colspan="2">轻提示固定在窗口，不随页面滚动；不挡住时间线最后一行：内容区底部留出提示高度 + 间距的空白，电脑 64px，手机已有底栏留白再加 56px。</td></tr>
+    <tr><th>触控区</th><td>撤销 40px 高；触屏电脑和平板 44×44px</td><td>撤销 44×44px 以上；行内「确认」按钮 44px 高</td></tr>
+    <tr><th>操作记录</th><td colspan="2">确认、撤销各记一条：「确认」「撤销确认」，带时间和告警代码。</td></tr>
+    <tr><th>只读账号</th><td colspan="2">「确认」禁用，见第 2 节，不出轻提示。</td></tr>
+  </tbody></table>
+</section>
+
+<!-- ================= 4 ================= -->
+<section class="blk" id="s4">
+  <h2><span class="n">4</span>通用规则和验收</h2>
+  <table class="spec" style="margin-top:12px"><tbody>
+    <tr><th>断点</th><td>599px 及以下用手机写法：底部弹层、轻提示在底栏上方、按钮 44px。600px 及以上用电脑写法；触屏设备按钮和撤销点按区仍补到 44px。</td></tr>
+    <tr><th>变量</th><td>只用设计变量：颜色 <code>--c-*</code>，字号 <code>--t-*</code>，圆角 <code>--r-*</code>，时长 <code>--dur-*</code>，曲线 <code>--ease-*</code>，等宽字 <code>--font-mono</code>。不写死色值和时长。</td></tr>
+    <tr><th>减少动效</th><td>系统打开减少动态效果后，时长变量都是 0ms；脚本里的计时用变量读出来的值，不写死 280ms、180ms。停留时间 6 秒、4 秒不受影响。</td></tr>
+    <tr><th>深色模式</th><td>全部用变量，深色下自动切换；轻提示在深色下是浅底深字，不另做。</td></tr>
+  </tbody></table>
+  <h3 class="sub">验收</h3>
+  <div class="card"><ul class="checks">
+    <li>任务与调度、数据中心点行后，表格下方不再出现详情面板；电脑右侧抽屉 400px，手机底部弹层最高 85%。</li>
+    <li>三个抽屉的抽屉头都是 52px，标题 15px 600，关闭按钮 44×44px 在最右；抽屉头里没有色块。</li>
+    <li>关闭按钮、点遮罩、Esc、手机下滑都能关；关闭后焦点回到原来那一行；打开时背景不滚动。</li>
+    <li>选股器、盯盘与告警、池子用只读账号打开，顶部有提示条，普通账号没有；写按钮灰色，点了没反应，按钮上没有额外说明。</li>
+    <li>点确认不弹窗；成功后轻提示停 6 秒，撤销后这一行回到未确认，铃铛角标和未确认数加 1；操作记录有两条。</li>
+    <li>手机上轻提示底边离底栏顶边 12px，底栏可点；连续确认 3 条，屏幕上始终只有 1 条提示。</li>
+    <li>打开减少动态效果，抽屉、弹层、轻提示都没有位移动画。</li>
+    <li>所有新增可点元素在 390 宽度下不小于 44×44px；页面横向不出现滚动。</li>
+  </ul></div>
+</section>
+</div>
+<script>
+(function () {
+  function fit() {
+    document.querySelectorAll('.fw').forEach(function (w) {
+      var iw = +w.dataset.w, ih = +w.dataset.h, s = Math.min(1, w.clientWidth / iw);
+      var inner = w.firstElementChild;
+      inner.style.transform = 'scale(' + s + ')';
+      w.style.height = Math.round(ih * s) + 'px';
+    });
+  }
+  fit();
+  window.addEventListener('resize', fit);
+})();
+</script>
+</body>
+</html>

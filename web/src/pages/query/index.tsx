@@ -1,7 +1,8 @@
-import { useMemo, useRef, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { ApiError } from "@/api/client";
 import { useQuerySchema, useRunQuery } from "@/api/endpoints";
-import { useReadOnlyReason } from "@/api/useMeta";
 import { TimeChart } from "@/charts/Chart";
+import { PHONE_QUERY, useMedia } from "@/pages/panorama/useMedia";
 import { DataTable } from "@/table/DataTable";
 import { readPreference, writePreference } from "@/theme/storage";
 import { Button, PageHeader, Panel } from "@/ui";
@@ -10,6 +11,8 @@ import { candidates, wordAt } from "./complete";
 interface Saved {
   sql: string;
   starred?: boolean;
+  ok?: boolean;
+  rows?: number;
 }
 
 const HKEY = "query.history";
@@ -28,13 +31,54 @@ function storeHistory(list: Saved[]) {
 }
 
 /** Starred entries stay; the rest keep the 20 most recent. */
-function remember(list: Saved[], sql: string): Saved[] {
+function remember(list: Saved[], sql: string, outcome: Pick<Saved, "ok" | "rows">): Saved[] {
   const old = list.find((h) => h.sql === sql);
   const rest = list.filter((h) => h.sql !== sql);
-  const next = [{ sql, starred: old?.starred }, ...rest];
+  const next = [{ sql, starred: old?.starred, ...outcome }, ...rest];
   const starred = next.filter((h) => h.starred);
   const plain = next.filter((h) => !h.starred).slice(0, 20);
   return [...starred, ...plain];
+}
+
+/** Desktop keeps the section open. Phone collapses it behind a 44px panel header. */
+function QuerySection({
+  title,
+  sub,
+  className,
+  children,
+}: {
+  title: string;
+  sub: string;
+  className: string;
+  children: ReactNode;
+}) {
+  const phone = useMedia(PHONE_QUERY);
+  const [open, setOpen] = useState(false);
+  if (!phone) {
+    return (
+      <div className={className}>
+        <Panel title={title} sub={sub} flush>
+          {children}
+        </Panel>
+      </div>
+    );
+  }
+  return (
+    <div className={className}>
+      <section className="panel query-fold">
+        <button
+          type="button"
+          className="query-fold-h"
+          aria-expanded={open}
+          onClick={() => setOpen((value) => !value)}
+        >
+          <span>{title}</span>
+          <span className="hint">{open ? "收起" : "展开"}</span>
+        </button>
+        {open ? <div className="panel-b flush">{children}</div> : null}
+      </section>
+    </div>
+  );
 }
 
 function QuickChart({ columns, rows }: { columns: string[]; rows: unknown[][] }) {
@@ -98,7 +142,6 @@ function QuickChart({ columns, rows }: { columns: string[]; rows: unknown[][] })
 }
 
 export default function QueryPage() {
-  const readOnly = useReadOnlyReason();
   const schema = useQuerySchema();
   const run = useRunQuery();
   const [sql, setSql] = useState("SELECT * FROM stock_basic LIMIT 50");
@@ -106,18 +149,37 @@ export default function QueryPage() {
   const [open, setOpen] = useState<string | null>(null);
   const [history, setHistory] = useState<Saved[]>(loadHistory);
   const ref = useRef<HTMLTextAreaElement>(null);
+  const resultRef = useRef<HTMLDivElement>(null);
   const result = run.data;
+  const resultRows = Array.isArray(result?.rows) ? result.rows : null;
+  const resultColumns = Array.isArray(result?.columns) ? result.columns : null;
+  const resultBroken = result != null && (resultRows == null || resultColumns == null);
   const tables = schema.data ?? {};
   const { start, word } = wordAt(sql, cursor);
   const sugg = useMemo(() => candidates(sql, word, tables), [sql, word, tables]);
 
   const exec = (text: string) => {
-    if (readOnly) return;
-    run.mutate(text);
-    const next = remember(history, text.trim());
-    setHistory(next);
-    storeHistory(next);
+    run.mutate(text, {
+      onSuccess: (data) => {
+        if (!Array.isArray(data?.rows)) return;
+        const next = remember(history, text.trim(), { ok: true, rows: data.rows.length });
+        setHistory(next);
+        storeHistory(next);
+      },
+      onError: () => {
+        const next = remember(history, text.trim(), { ok: false });
+        setHistory(next);
+        storeHistory(next);
+      },
+    });
   };
+  useEffect(() => {
+    if (run.isError) {
+      document.getElementById("query-error-title")?.focus();
+      return;
+    }
+    if (run.isSuccess) resultRef.current?.scrollIntoView({ block: "start" });
+  }, [run.isSuccess, run.isError]);
   const insert = (text: string, replaceWord = false) => {
     const from = replaceWord ? start : cursor;
     const next = sql.slice(0, from) + text + sql.slice(cursor);
@@ -137,13 +199,9 @@ export default function QueryPage() {
 
   return (
     <>
-      <PageHeader
-        eyebrow="数据"
-        title="数据查询"
-        note="只读 SQL（SELECT / WITH），最多 1000 行，读 Serving 当前代"
-      />
+      <PageHeader eyebrow="数据" title="数据查询" note="只读查询，最多 1000 行。" />
       <div className="query-grid">
-        <Panel title="表与字段" sub="点表名预览，点字段插入" flush>
+        <QuerySection title="表与字段" sub="点表名插入" className="query-schema">
           <nav className="schema-tree" aria-label="可查询的表">
             {Object.entries(tables).map(([t, cols]) => (
               <div key={t}>
@@ -184,14 +242,28 @@ export default function QueryPage() {
               </div>
             ))}
           </nav>
-        </Panel>
-        <div>
+          {schema.error ? (
+            <div className="notice crit" role="alert">
+              <span>表列表没有读到。数据服务没有响应，可以直接重试。</span>
+              <span className="acts">
+                <button type="button" className="act" onClick={() => schema.refetch()}>
+                  重试
+                </button>
+              </span>
+            </div>
+          ) : null}
+        </QuerySection>
+        <div className="query-main query-stack">
           <Panel
             title="SQL"
             sub="Ctrl+Enter 运行；Tab 补全"
             actions={
-              <Button variant="primary" onClick={() => exec(sql)} disabledReason={readOnly}>
-                运行
+              <Button
+                variant="primary"
+                aria-busy={run.isPending || undefined}
+                onClick={() => exec(sql)}
+              >
+                {run.isPending ? "运行中" : "运行"}
               </Button>
             }
           >
@@ -224,74 +296,104 @@ export default function QueryPage() {
                 </button>
               ))}
             </div>
-            {run.error ? (
-              <p className="hint" role="alert">
-                {run.error.message}
-              </p>
-            ) : null}
           </Panel>
+        </div>
+        <QuerySection title="历史与收藏" sub="收藏的语句会留在这里" className="query-history">
           {history.length ? (
-            <Panel title="历史与收藏" sub="本浏览器保存；★ 收藏不会被挤掉" flush>
-              <ul className="sql-history">
-                {history.map((h) => (
-                  <li key={h.sql}>
-                    <button
-                      type="button"
-                      className={h.starred ? "star on" : "star"}
-                      aria-label={h.starred ? "取消收藏" : "收藏"}
-                      onClick={() => toggleStar(h.sql)}
-                    >
-                      ★
-                    </button>
-                    <button
-                      type="button"
-                      className="mono"
-                      onClick={() => setSql(h.sql)}
-                      title="载入"
-                    >
-                      {h.sql}
-                    </button>
-                  </li>
-                ))}
-              </ul>
-            </Panel>
+            <ul className="sql-history">
+              {history.map((h) => (
+                <li key={h.sql}>
+                  <button
+                    type="button"
+                    className={h.starred ? "star on" : "star"}
+                    aria-pressed={!!h.starred}
+                    aria-label={h.starred ? "取消收藏" : "收藏"}
+                    onClick={() => toggleStar(h.sql)}
+                  >
+                    ★
+                  </button>
+                  <button type="button" className="mono" onClick={() => setSql(h.sql)}>
+                    {h.sql}
+                  </button>
+                  {h.ok === false ? (
+                    <span className="row-err">没运行</span>
+                  ) : h.rows != null ? (
+                    <span className="hint">{h.rows} 行</span>
+                  ) : null}
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="hint query-empty">还没有查询记录。</p>
+          )}
+        </QuerySection>
+        <div className="query-results" ref={resultRef}>
+          {run.error || resultBroken ? (
+            <div className="notice crit" role="alert">
+              <span>
+                <b id="query-error-title" tabIndex={-1}>
+                  查询没有运行
+                </b>{" "}
+                {run.error instanceof ApiError &&
+                run.error.status === 400 &&
+                !/HTTP|API/i.test(run.error.message)
+                  ? run.error.message
+                  : "数据服务没有响应，SQL 已保留，可以直接重试。"}
+              </span>
+              <span className="acts">
+                {run.error instanceof ApiError && run.error.status === 400 ? (
+                  <button type="button" className="act" onClick={() => ref.current?.focus()}>
+                    改 SQL
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    className="act"
+                    aria-busy={run.isPending || undefined}
+                    onClick={() => exec(sql)}
+                  >
+                    重试
+                  </button>
+                )}
+              </span>
+            </div>
+          ) : null}
+          {resultRows && resultColumns && !run.error ? (
+            <>
+              <Panel
+                title={`结果 · ${resultRows.length} 行${result?.truncated ? "（已截断）" : ""}`}
+                flush
+              >
+                <DataTable
+                  label="查询结果"
+                  tools="查询结果"
+                  emptyText="查询成功但 0 行：表为空，或 WHERE 条件没有匹配。"
+                  rows={resultRows.map((r, i) => ({ i, r }))}
+                  rowKey={(x) => String(x.i)}
+                  height={480}
+                  columns={resultColumns.map((c, j) => ({
+                    id: c,
+                    header: c,
+                    sortable: true,
+                    numeric:
+                      resultRows.length > 0 &&
+                      resultRows.every((r) => r[j] == null || typeof r[j] === "number"),
+                    value: (x: { r: unknown[] }) => {
+                      const v = x.r[j];
+                      return v === null || v === undefined
+                        ? null
+                        : typeof v === "number"
+                          ? v
+                          : String(v);
+                    },
+                  }))}
+                />
+              </Panel>
+              <QuickChart key={resultColumns.join(",")} columns={resultColumns} rows={resultRows} />
+            </>
           ) : null}
         </div>
       </div>
-      {result ? (
-        <>
-          <Panel
-            title={`结果 · ${result.rows.length} 行${result.truncated ? "（已截断）" : ""}`}
-            flush
-          >
-            <DataTable
-              label="查询结果"
-              tools="查询结果"
-              emptyText="查询成功但 0 行：表为空，或 WHERE 条件没有匹配。"
-              rows={result.rows.map((r, i) => ({ i, r }))}
-              rowKey={(x) => String(x.i)}
-              height={480}
-              columns={result.columns.map((c, j) => ({
-                id: c,
-                header: c,
-                sortable: true,
-                numeric:
-                  result.rows.length > 0 &&
-                  result.rows.every((r) => r[j] == null || typeof r[j] === "number"),
-                value: (x: { r: unknown[] }) => {
-                  const v = x.r[j];
-                  return v === null || v === undefined
-                    ? null
-                    : typeof v === "number"
-                      ? v
-                      : String(v);
-                },
-              }))}
-            />
-          </Panel>
-          <QuickChart key={result.columns.join(",")} columns={result.columns} rows={result.rows} />
-        </>
-      ) : null}
     </>
   );
 }

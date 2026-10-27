@@ -24,13 +24,17 @@ from rquant.runtime_contracts import RuntimeContractModel, canonical_sha256
 from rquant.signal_contracts import SignalAction, SignalEnvelopeFamily
 
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
-_ACTION_LABELS = {
-    SignalAction.WATCH: "重点观察",
-    SignalAction.B_INTENT: "买入观察",
-    SignalAction.REDUCE: "减仓观察",
-    SignalAction.S_INTENT: "卖出观察",
-    SignalAction.CANCEL: "取消信号",
-}
+# Display names for SignalAction. The web table copies this same map
+# (web/src/copy/publicText.ts signalActionLabel).
+SIGNAL_ACTION_LABELS: Mapping[SignalAction, str] = MappingProxyType(
+    {
+        SignalAction.WATCH: "重点观察",
+        SignalAction.B_INTENT: "买入观察",
+        SignalAction.REDUCE: "减仓观察",
+        SignalAction.S_INTENT: "卖出观察",
+        SignalAction.CANCEL: "取消信号",
+    }
+)
 
 
 def _require_https_endpoint(endpoint: str) -> str:
@@ -297,7 +301,7 @@ def _notification_json_value(value: object) -> object:
 def format_signal_notification(signal: SignalEnvelopeFamily) -> tuple[str, str]:
     """Render a stable, readable Markdown representation of a strategy signal."""
 
-    action_label = _ACTION_LABELS[signal.action]
+    action_label = SIGNAL_ACTION_LABELS[signal.action]
     title = f"[rQuant] {signal.candidate_id} {action_label}"
     evidence = _notification_json_value(signal.evidence)
     evidence_json = json.dumps(

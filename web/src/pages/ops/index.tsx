@@ -1,4 +1,5 @@
 import { useOperations } from "@/api/endpoints";
+import { actorLabel } from "@/copy/publicText";
 import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
 import { PageHeader, Panel } from "@/ui";
@@ -17,11 +18,7 @@ export default function OpsPage() {
       <PageHeader eyebrow="运维" title="操作记录" />
       <QueryView query={query}>
         {(data) => (
-          <Panel
-            title={`${data.items.length} 条`}
-            sub="页面写操作经 page control 落盘后的回读"
-            flush
-          >
+          <Panel title={`${data.items.length} 条`} sub="网页上的修改会记在这里，可以回头核对" flush>
             <DataTable
               label="操作记录"
               rows={data.items}
@@ -42,7 +39,11 @@ export default function OpsPage() {
                   cell: (row) => KIND[row.kind] ?? row.kind,
                 },
                 { id: "summary", header: "内容", value: (row) => row.summary },
-                { id: "actor", header: "操作人", value: (row) => row.actor ?? "—" },
+                {
+                  id: "actor",
+                  header: "操作人",
+                  value: (row) => actorLabel(row.actor),
+                },
                 { id: "cmd", header: "命令 ID", value: (row) => row.command_id },
               ]}
             />

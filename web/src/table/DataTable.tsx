@@ -8,9 +8,10 @@ import {
   useReactTable,
 } from "@tanstack/react-table";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { type KeyboardEvent, type ReactNode, useMemo, useRef, useState } from "react";
+import { type KeyboardEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { readPreference, writePreference } from "@/theme/storage";
 import { DropdownMenu } from "@/ui/DropdownMenu";
+import { Tip } from "@/ui/Tip";
 
 export type CellValue = string | number | null;
 
@@ -25,8 +26,19 @@ export interface DataColumn<T> {
   /** Long text that wraps instead of widening the table. */
   wrap?: boolean;
   sortable?: boolean;
-  /** Secondary columns are hidden on phones (≤ 760 px) to keep rows one-hand readable. */
+  /**
+   * Secondary columns start hidden on phones (≤ 599 px). The column menu is the
+   * only switch: a check shows the column. A saved preference wins over this.
+   */
   secondary?: boolean;
+  /** Hidden until the viewer turns the column on. Ignored once a preference is saved. */
+  hiddenByDefault?: boolean;
+  /** Dotted-underline explanation on the header word. The menu and CSV keep `header`. */
+  headerTip?: ReactNode;
+  /** Bubble width for `headerTip`. Omit it and the tip keeps the default width. */
+  headerTipWidth?: number;
+  /** On a phone, this column shares the second line of its row. */
+  phoneLine?: 2;
 }
 
 export interface DataTableProps<T> {
@@ -52,6 +64,10 @@ export interface DataTableProps<T> {
    * export of the visible columns in the current sort order. A string names the file.
    */
   tools?: boolean | string;
+  /** Keep the first and last columns in view while the rest scroll sideways. */
+  pinEnds?: boolean;
+  /** Phone and coarse pointers sort from a select; the header buttons stay for a mouse. */
+  phoneSort?: boolean;
 }
 
 /** CSV text (with BOM so Excel reads UTF-8) of the given columns and rows. */
@@ -112,22 +128,50 @@ export function DataTable<T>({
   virtualizeFrom = 200,
   estimatedRowHeight = 37,
   tools,
+  pinEnds = false,
+  phoneSort = false,
 }: DataTableProps<T>) {
   const prefKey = `cols.${label}`;
-  const [hidden, setHidden] = useState<Set<string>>(
-    () => new Set((tools ? (readPreference(prefKey) ?? "") : "").split(",").filter(Boolean)),
-  );
+  const [hidden, setHidden] = useState<Set<string>>(() => {
+    const saved = tools ? readPreference(prefKey) : null;
+    if (saved !== null) return new Set(saved.split(",").filter(Boolean));
+    const narrow =
+      typeof window.matchMedia === "function" && window.matchMedia("(max-width: 599px)").matches;
+    return new Set(
+      allColumns
+        .filter((column) => column.hiddenByDefault || (narrow && column.secondary))
+        .map((column) => column.id),
+    );
+  });
   const toggleColumn = (id: string) =>
     setHidden((prev) => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
       else next.add(id);
-      writePreference(prefKey, next.size ? [...next].join(",") : null);
+      // Empty string is a saved "show every column", so a phone reload does not
+      // hide the secondary columns again.
+      writePreference(prefKey, [...next].join(","));
       return next;
     });
   const columns = useMemo(() => allColumns.filter((c) => !hidden.has(c.id)), [allColumns, hidden]);
   const [sorting, setSorting] = useState<SortingState>(initialSort ? [initialSort] : []);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const [overflowing, setOverflowing] = useState(false);
+  // Column count changes scrollWidth without resizing the wrap, so it is a dependency.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: remeasure when columns or rows change
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el || !pinEnds) return;
+    const measure = () => {
+      const first = el.querySelector("tbody td");
+      if (first) el.style.setProperty("--pin-1", `${first.getBoundingClientRect().width}px`);
+      setOverflowing(el.scrollWidth > el.clientWidth + 1);
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [pinEnds, rows.length, columns.length]);
   const bodyRef = useRef<HTMLTableSectionElement>(null);
 
   const columnDefs = useMemo<ColumnDef<T>[]>(
@@ -219,6 +263,32 @@ export function DataTable<T>({
 
   const selectable = onSelect !== undefined;
 
+  const sortChoices = columns.filter(
+    (column) => (column.sortable ?? column.numeric ?? false) && column.header,
+  );
+  const sortValue = sorting[0] ? `${sorting[0].id}:${sorting[0].desc ? "desc" : "asc"}` : "";
+  const phoneSortSelect =
+    phoneSort && sortChoices.length ? (
+      <select
+        className="select tbl-sort"
+        aria-label="排序"
+        value={sortValue}
+        onChange={(event) => {
+          const [id, dir] = event.target.value.split(":");
+          if (id) setSorting([{ id, desc: dir === "desc" }]);
+        }}
+      >
+        {sortChoices.flatMap((column) => [
+          <option key={`${column.id}:desc`} value={`${column.id}:desc`}>
+            {column.header} 降序
+          </option>,
+          <option key={`${column.id}:asc`} value={`${column.id}:asc`}>
+            {column.header} 升序
+          </option>,
+        ])}
+      </select>
+    ) : null;
+
   const toolbar = tools ? (
     <div className="tbl-tools">
       <span className="tbl-count">{sortedRows.length} 行</span>
@@ -257,9 +327,10 @@ export function DataTable<T>({
   return (
     <>
       {toolbar}
+      {phoneSortSelect}
       <div
         ref={scrollRef}
-        className={height === undefined ? "tbl-wrap" : "tbl-wrap scroll"}
+        className={`tbl-wrap${height === undefined ? "" : " scroll"}${pinEnds ? " pin-cols" : ""}`}
         style={height === undefined ? undefined : { maxHeight: height }}
       >
         <table className="tbl" aria-label={label} aria-rowcount={sortedRows.length + 1}>
@@ -268,12 +339,15 @@ export function DataTable<T>({
               <tr key={group.id}>
                 {group.headers.map((header) => {
                   const sorted = header.column.getIsSorted();
+                  const meta = byId.get(header.column.id);
+                  const plain = flexRender(header.column.columnDef.header, header.getContext());
                   return (
                     <th
                       key={header.id}
                       scope="col"
                       className={cellClass(header.column.id)}
                       aria-sort={sorted ? ARIA_SORT[sorted] : undefined}
+                      data-phone-line={meta?.phoneLine}
                     >
                       {header.column.getCanSort() ? (
                         <button
@@ -281,13 +355,21 @@ export function DataTable<T>({
                           className="sort"
                           onClick={header.column.getToggleSortingHandler()}
                         >
-                          {flexRender(header.column.columnDef.header, header.getContext())}
+                          {plain}
                           <span aria-hidden="true">
                             {sorted === "asc" ? "↑" : sorted === "desc" ? "↓" : "↕"}
                           </span>
                         </button>
+                      ) : meta?.headerTip ? (
+                        <Tip
+                          content={meta.headerTip}
+                          width={meta.headerTipWidth}
+                          className="has-tip"
+                        >
+                          {meta.header}
+                        </Tip>
                       ) : (
-                        flexRender(header.column.columnDef.header, header.getContext())
+                        plain
                       )}
                     </th>
                   );
@@ -316,13 +398,25 @@ export function DataTable<T>({
                 className={selectable ? "click" : undefined}
                 aria-selected={selectable ? row.id === selectedKey : undefined}
                 tabIndex={selectable ? 0 : undefined}
-                onClick={selectable ? () => onSelect(row.original) : undefined}
+                data-row-key={row.id}
+                onClick={
+                  selectable
+                    ? (event) => {
+                        event.currentTarget.focus();
+                        onSelect(row.original);
+                      }
+                    : undefined
+                }
                 onKeyDown={
                   selectable ? (event) => onRowKeyDown(event, index, row.original) : undefined
                 }
               >
                 {row.getVisibleCells().map((cell) => (
-                  <td key={cell.id} className={cellClass(cell.column.id)}>
+                  <td
+                    key={cell.id}
+                    className={cellClass(cell.column.id)}
+                    data-phone-line={byId.get(cell.column.id)?.phoneLine}
+                  >
                     {flexRender(cell.column.columnDef.cell, cell.getContext())}
                   </td>
                 ))}
@@ -336,6 +430,7 @@ export function DataTable<T>({
           </tbody>
         </table>
       </div>
+      {pinEnds && overflowing ? <p className="tbl-scroll-hint">左右滑动查看全部列</p> : null}
     </>
   );
 }
