@@ -188,7 +188,12 @@ def test_session_metadata_rejects_unknown_or_malformed_profiles(fault: str) -> N
         body = bytearray(session_control())  # 263 bytes has one '=' padding byte.
         alphabet = module("_request").IPHONE64_ALPHABET
         body[-3] = alphabet[alphabet.index(body[-3]) | 1]
-    assert module("feed")._control_kind(bytes(body)) is None
+    if fault in {"request", "flags", "command"}:
+        # A mutated family header is an unknown page-0 family: tolerated as control,
+        # never routed to the market decoder.
+        assert module("feed")._control_kind(bytes(body)) == "control"
+    else:
+        assert module("feed")._control_kind(bytes(body)) is None
 
 
 class Provider(Socket):
@@ -861,8 +866,12 @@ def test_pending_deadline_and_total_local_resource_budgets_do_not_reset(tmp_path
     clock = Clock(); provider = ManyPushProvider(clock, count=200, missing=True)
     obj, cache, calls = collector(tmp_path, provider, clock, duration_seconds=100)
     status = obj.run()
-    assert status.error_code == 'seed_timeout' and clock.now < 120
+    assert status.error_code == 'duration_limit' and clock.now <= 201
     assert len(calls) == 1 and provider.closed
+    assert status.seed_queries == 6
+    assert 14 <= provider.business[2][0] - provider.business[1][0] <= 16
+    receipt = cache.read_subscription_status()
+    assert receipt is not None and any(stream.state == 'failed' for stream in receipt.streams)
     other = tmp_path / 'budget'; other.mkdir()
     clock = Clock(); provider = ManyPushProvider(clock)
     monkeypatch.setattr(module('feed'), 'MAX_PENDING_BYTES', 2000, raising=False)
@@ -899,3 +908,136 @@ def test_pending_frame_budget_and_stop_during_large_queue_are_finite(tmp_path, m
     assert status.error_code == 'duration_limit' and len(calls) == 1 and provider.closed
     assert len(provider.business) <= 5
     assert any(s.state == 'failed' for s in cache.read_subscription_status().streams)
+
+
+def page_zero_body(request: int, flags: int, command: int, payload: bytes) -> bytes:
+    """Page-zero frame body with the header layout observed upstream."""
+    header = struct.pack("<HIIHII", 26, request, flags, 0, len(payload), command)
+    return header + b"\x00" * 6 + payload
+
+
+def test_control_kind_recognizes_new_ack_and_event_lengths() -> None:
+    feed = module("feed")
+    assert feed._control_kind(page_zero_body(0, 6, 2202, b"x" * 2589)) == "ack"
+    assert feed._control_kind(page_zero_body(0, 6, 2201, b"x" * 887)) == "ack"
+    # Unknown page-0 families are tolerated as control instead of aborting a run;
+    # bootstrap ack still requires the exact ack family.
+    assert feed._control_kind(page_zero_body(0, 6, 2203, b"x" * 887)) == "control"
+    assert feed._control_kind(page_zero_body(0, 11, 0, b"x" * 887)) == "control"
+    assert feed._control_kind(page_zero_body(0xFFFFFFFD, 0x1234, 0, b"x" * 181)) == "control"
+    assert feed._control_kind(page_zero_body(0xFFFFFFFD, 11, 0, b"x" * 181)) == "control"
+    assert feed._control_kind(page_zero_body(0xFFFFFFFD, 11, 0, b"x" * 317)) == "control"
+    non_zero_page = struct.pack("<HIIHII", 26, 0, 6, 10117, 887, 2201) + b"\x00" * 6 + b"x" * 887
+    assert feed._control_kind(non_zero_page) is None
+    # Structurally invalid page-0 frames are still rejected and surface as errors.
+    assert feed._control_kind(struct.pack("<HIIHII", 27, 0, 6, 0, 887, 2201) + b"\x00" * 6) is None
+    assert feed._control_kind(struct.pack("<HIIHII", 26, 0, 6, 0, 999, 2201) + b"\x00" * 6) is None
+
+
+class SilentSeedProvider(Socket):
+    """Only the bootstrap ack is sent; every seed query is answered with silence."""
+
+    def __init__(self, clock: Clock) -> None:
+        super().__init__([], clock)
+
+    def sendall(self, data: bytes) -> None:
+        super().sendall(data)
+        if len(self.sent) == 1:
+            self.chunks.append(control(auth=True))
+
+
+def test_no_seed_ever_lands_is_a_status_level_seed_timeout(tmp_path: Path) -> None:
+    clock = Clock()
+    provider = SilentSeedProvider(clock)
+    obj, cache, calls = collector(tmp_path, provider, clock, duration_seconds=600)
+    status = obj.run()
+    assert len(calls) == 1 and provider.closed
+    assert status.seed_queries == 6
+    assert status.error_code == "seed_timeout" and status.state == "blocked"
+    assert status.gap and status.cache_stale
+    receipt = cache.read_subscription_status()
+    assert receipt is not None and receipt.collector_state == "blocked"
+    assert all(stream.state == "failed" for stream in receipt.streams)
+
+
+class StopAfterLastSeedProvider(Socket):
+    """Silent seeds; requests a stop once every stream has been attempted."""
+
+    def __init__(self, clock: Clock) -> None:
+        super().__init__([], clock)
+        self.obj = None
+        self.seeds = 0
+
+    def sendall(self, data: bytes) -> None:
+        super().sendall(data)
+        if len(self.sent) == 1:
+            self.chunks.append(control(auth=True))
+            return
+        self.seeds += 1
+        if self.seeds == 6 and self.obj is not None:
+            self.obj.stop_event.set()
+
+
+def test_resident_all_seed_timeouts_surface_on_signal_stop(tmp_path: Path) -> None:
+    # Production runs --resident (no duration limit), so the stop signal path must
+    # not report a normal exit when nothing ever seeded.
+    clock = Clock()
+    provider = StopAfterLastSeedProvider(clock)
+    obj, cache, _ = collector(tmp_path, provider, clock, duration_seconds=None)
+    provider.obj = obj
+    status = obj.run()
+    assert status.error_code == "seed_timeout" and status.state == "blocked"
+    receipt = cache.read_subscription_status()
+    assert receipt is not None and receipt.collector_state == "blocked"
+    assert all(stream.state == "failed" for stream in receipt.streams)
+
+
+def test_receive_path_survives_observed_page_zero_event_and_ack_geometries(tmp_path: Path) -> None:
+    feed = module("feed")
+    from rquant.l2.models import Binding
+
+    clock = Clock()
+    provider = Provider(clock)
+    obj, cache, _ = collector(tmp_path, provider, clock)
+    binding = Binding(page_id=10117, kind="vendor4013", code="603258", market=17)
+    # Same header fields and byte lengths as the two captured upstream frames
+    # (207-byte subscription event, 2615-byte ack variant); payloads stay opaque.
+    event = page_zero_body(0xFFFFFFFD, 11, 0, b"\x00" * 181)
+    ack = page_zero_body(0, 6, 2202, b"\x00" * 2589)
+    assert (len(event), len(ack)) == (207, 2615)
+    answer = response(trade=True, request_id=3, page_id=10117, code="603258")
+    obj.status = FeedStatus(state="connected", epoch_id="page-zero")
+    obj.registered[binding.page_id] = obj.issued[3] = binding
+    obj._deadline = clock() + 30
+    frames = [frame(event), frame(ack), frame(answer)]
+    obj.reader = feed.FrameReader(Socket(frames, clock), clock=clock)
+    with cache.writer():
+        result = obj._receive(clock() + feed.MAX_SECONDS, pending=3)
+        stored = cache.read_status()
+    assert result is not None and stored.last_sequence == 1
+    assert stored.control_count == 2 and stored.unknown_push_count == 0
+    assert stored.market_batch_count == 1 and stored.heartbeat_count == 0
+
+
+class SkipFirstSeedProvider(Provider):
+    def sendall(self, data: bytes) -> None:
+        before = len(self.business)
+        super().sendall(data)
+        if len(self.business) == before + 1 and len(self.business) == 1:
+            self.chunks.pop()
+
+
+def test_seed_timeout_marks_one_stream_failed_and_continues(tmp_path: Path) -> None:
+    clock = Clock()
+    provider = SkipFirstSeedProvider(clock)
+    obj, cache, calls = collector(tmp_path, provider, clock, duration_seconds=40)
+    status = obj.run()
+    receipt = cache.read_subscription_status()
+    assert receipt is not None
+    first = next(stream for stream in receipt.streams if stream.binding.page_id == 10117)
+    assert first.state == "failed"
+    assert first.request_id == 3 and first.seed_sequence is None
+    assert len(provider.business) == 6
+    assert sum(stream.seed_sequence is not None for stream in receipt.streams) == 5
+    assert 14 <= provider.business[1][0] - provider.business[0][0] <= 16
+    assert status.error_code == "duration_limit"
