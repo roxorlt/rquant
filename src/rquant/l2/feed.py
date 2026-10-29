@@ -141,14 +141,24 @@ def _control_kind(body: bytes) -> str | None:
     h, request, flags, page, size, command = struct.unpack_from("<HIIHII", body)
     if h != 26 or size != len(body) - h or page != 0:
         return None
-    if (request, flags, command, len(body)) == (0, 6, 2201, 887):
+    # Control/ack frames use page 0. Market pages are always nonzero and
+    # _market additionally requires page == binding.page_id, so a page-0 frame
+    # can never be a valid market observation. Recognize the observed families
+    # by header fields, not by payload length:
+    #   request=0, flags=6, command in {2201,2202} -> ack
+    #   request=0xFFFFFFFD, flags=11, command=0 -> subscription event
+    #   request=0xFFFFFFFD, flags=0x1000B, command=0 -> session metadata
+    # Any other structurally valid page-0 frame is an unknown vendor control
+    # family: tolerate it as control instead of aborting the run, because the
+    # 2026-10-29 outage was exactly a new ack family (2615-byte, command 2202).
+    if request == 0 and flags == 6 and command in (2201, 2202):
         return "ack"
     if request != 0xFFFFFFFD or command != 0:
-        return None
-    if flags == 11 and len(body) in {147, 131}:
         return "control"
-    if flags != 0x1000B or len(body) not in {379, 383}:
-        return None
+    if flags == 11:
+        return "control"
+    if flags != 0x1000B:
+        return "control"
     try:
         # The final carrier byte is opaque. Only this independently observed
         # JSON schema is classified; no session values leave this function.
@@ -225,6 +235,7 @@ class FeedCollector:
         self.registered: dict[int, Binding] = {}
         self.issued: dict[int, Binding] = {}
         self.validated_seed = False
+        self._epoch_seed_timeouts = 0
         self._inputs = (b"", b"", b"")
         self._last_send: float | None = None
         self._symbols: tuple[str, ...] = ()
@@ -512,8 +523,21 @@ class FeedCollector:
             self._last_send = self.clock()
             if page == 1:
                 self._transition(binding, state='sent', request_id=request_id)
-            result = self._receive(min(self._deadline, self.clock() + MAX_SECONDS), pending=request_id,
-                                   delivery='seed' if page == 1 else 'backfill')
+            try:
+                result = self._receive(
+                    min(self._deadline, self.clock() + MAX_SECONDS), pending=request_id,
+                    delivery='seed' if page == 1 else 'backfill')
+            except FeedError as error:
+                if error.code != "seed_timeout":
+                    raise
+                # Keep the issued ID: a late response may still be accepted as
+                # a candidate push for the same page.
+                if page == 1:
+                    self._epoch_seed_timeouts += 1
+                receipt = self._stream_receipts.get(binding.page_id)
+                if receipt is not None and receipt.seed_sequence is None:
+                    self._transition(binding, state='failed')
+                return
             if result is None:
                 break
             self.validated_seed = True
@@ -524,6 +548,7 @@ class FeedCollector:
     def _epoch(self) -> None:
         self.registered, self.issued = {}, {}
         self.validated_seed = False
+        self._epoch_seed_timeouts = 0
         self._last_send = None
         self._symbols, self._desired_revision, self._stream_receipts = (), 0, {}
         self._update(state="starting", epoch_id=uuid.uuid4().hex, error_code=None,
@@ -595,7 +620,13 @@ class FeedCollector:
                     except FeedError as error:
                         stopped = error.code in {"signal_stop", "duration_limit"}
                         state = "stopped" if stopped else "disconnected" if error.retryable else "blocked"
-                        self._update(state=state, gap=True, error_code=error.code)
+                        code = error.code
+                        if (code in {"duration_limit", "signal_stop"} and not self.validated_seed
+                                and self._epoch_seed_timeouts > 0):
+                            # No seed ever landed in this epoch: a normal duration or
+                            # stop end would hide that the subscription never worked.
+                            code, state = "seed_timeout", "blocked"
+                        self._update(state=state, gap=True, error_code=code)
                         self._finish_receipt()
                         if (error.retryable and self.validated_seed
                                 and self.status.reconnect_attempts < self.max_reconnects):
@@ -608,7 +639,10 @@ class FeedCollector:
                             continue
                         break
                     except KeyboardInterrupt:
-                        self._update(state="stopped", gap=True, error_code="signal_stop")
+                        if not self.validated_seed and self._epoch_seed_timeouts > 0:
+                            self._update(state="blocked", gap=True, error_code="seed_timeout")
+                        else:
+                            self._update(state="stopped", gap=True, error_code="signal_stop")
                         self._finish_receipt()
                         break
                     except Exception:

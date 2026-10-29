@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, field_validator, model_validator
+from pydantic.dataclasses import dataclass
 
 from .symbols import MAX_SYMBOLS, market_for_code, normalize_symbols
 
@@ -28,7 +29,8 @@ ErrorCode = Literal[
 class Model(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    @field_validator("*", mode="before")
+    @field_validator("received_at", "cached_at", "last_transport_received_at", "last_market_received_at",
+                     "seed_received_at", mode="before", check_fields=False)
     @classmethod
     def reject_numeric_datetime(cls, value: object, info: object) -> object:
         if isinstance(value, (int, float)) and getattr(info, "field_name", "") in {
@@ -38,7 +40,8 @@ class Model(BaseModel):
             raise ValueError("UTC timestamps require an explicit datetime")
         return value
 
-    @field_validator("*", mode="after")
+    @field_validator("received_at", "cached_at", "last_transport_received_at", "last_market_received_at",
+                     "seed_received_at", mode="after", check_fields=False)
     @classmethod
     def require_utc(cls, value: object) -> object:
         if isinstance(value, datetime) and (value.tzinfo is None or value.utcoffset() != timedelta(0)):
@@ -134,10 +137,14 @@ class SubscriptionReceipt(Model):
         return self
 
 
-class RawCell(Model):
+@dataclass(frozen=True, slots=True, config=ConfigDict(extra="forbid", revalidate_instances="always"))
+class RawCell:
     value: StrictStr | StrictInt | None
     raw_hex: HexBytes
     style: Annotated[StrictInt, Field(ge=0, le=255)]
+
+    def __init_subclass__(cls, **kwargs):
+        raise TypeError("RawCell is a closed three-field representation")
 
 
 class RawColumn(Model):
@@ -161,8 +168,8 @@ class RawTable(Model):
     source_codec: Literal["snappy"]
     source_sha256: Sha256
     row_data_sha256: Sha256
-    row_count: Annotated[StrictInt, Field(ge=0, le=4096,
-        description="Above 500 rows only for a recognized trade sentinel candidate push.")]
+    row_count: Annotated[StrictInt, Field(ge=0,
+        description="Must match the supported table geometry and rows; logical row data is at most 1048576 bytes.")]
     row_width: PositiveInt
     col_count: Annotated[StrictInt, Field(ge=1, le=32)]
     extended_header_length: Annotated[StrictInt, Field(ge=24, le=65535)]
@@ -173,23 +180,73 @@ class RawTable(Model):
     interpretation_limits: str
     rle_algorithm_reference: str | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def preflight_shape(cls, value: object) -> object:
+        if isinstance(value, RawTable):
+            shape = {name: getattr(value, name) for name in (
+                "row_count", "row_width", "col_count", "columns", "rows", "extended_header_length")}
+        elif isinstance(value, dict):
+            shape = value
+        else:
+            return value
+        rows, width, count = (shape.get(k) for k in ("row_count", "row_width", "col_count"))
+        if (type(rows) is not int or type(width) is not int or type(count) is not int
+                or rows < 0 or (count, width) not in {(8, 66), (6, 30)}
+                or rows * width > 1024 * 1024):
+            raise ValueError("table geometry exceeds byte bounds")
+        extended = shape.get("extended_header_length")
+        if type(extended) is not int or not 24 + count * 4 <= extended <= 65535:
+            raise ValueError("table shape has an invalid extended header")
+        columns, row_list = shape.get("columns"), shape.get("rows")
+        if (not isinstance(columns, (list, tuple)) or len(columns) != count
+                or not isinstance(row_list, (list, tuple)) or len(row_list) != rows):
+            raise ValueError("table shape does not match declared counts")
+        descriptor = []
+        ids = []
+        for column in columns:
+            if isinstance(column, RawColumn):
+                flags, cell_width, extra = column.flags, column.width, column.extra
+            elif isinstance(column, dict):
+                flags, cell_width, extra = (column.get(k) for k in ("flags", "width", "extra"))
+            else:
+                raise ValueError("table descriptor is invalid")
+            if (type(flags) is not int or not 0 <= flags <= 65535
+                    or type(cell_width) is not int or not 1 <= cell_width <= 255
+                    or type(extra) is not int or not 0 <= extra <= 255):
+                raise ValueError("table descriptor is invalid")
+            descriptor.append((flags, cell_width, extra))
+            ids.append(flags & 0x8FFF)
+        if len(set(ids)) != count or sum(c[1] + 1 for c in descriptor) != width:
+            raise ValueError("table descriptor widths or fields mismatch")
+        if rows > 500:
+            expected = (((0x2001, 4, 165), (0x38, 30, 165), (0x100A, 4, 165), (0x100D, 4, 165),
+                         (0x104A, 4, 165), (0x104B, 4, 165), (0xA610, 4, 165), (0x1012, 4, 165))
+                        if count == 8 else
+                        ((0x2001, 4, 220), (0x100A, 4, 220), (0x100D, 4, 220),
+                         (0x200C, 4, 220), (0x2038, 4, 220), (0xA561, 4, 220)))
+            if tuple(descriptor) != expected:
+                raise ValueError("table descriptor is unsupported for expanded rows")
+        return value
+
     @model_validator(mode="after")
     def validate_rows(self) -> RawTable:
         if (len(self.rows) != self.row_count or len(self.columns) != self.col_count
                 or sum(c.width + 1 for c in self.columns) != self.row_width
                 or self.row_count * self.row_width > 1024 * 1024):
             raise ValueError("table dimensions mismatch")
-        keys = {str(c.field_id) for c in self.columns}
+        fields = tuple((str(c.field_id), c.width) for c in self.columns)
+        keys = {key for key, _ in fields}
         if len(keys) != self.col_count:
             raise ValueError("duplicate vendor fields")
         raw = bytearray()
         for row in self.rows:
             if set(row) != keys:
                 raise ValueError("row vendor fields mismatch")
-            for column in self.columns:
-                cell = row[str(column.field_id)]
+            for key, width in fields:
+                cell = row[key]
                 data = bytes.fromhex(cell.raw_hex)
-                if len(data) != column.width:
+                if len(data) != width:
                     raise ValueError("cell width mismatch")
                 raw.extend(data)
                 raw.append(cell.style)
@@ -212,6 +269,52 @@ class MarketObservation(Model):
     granularity: Literal["granularity_unverified"] = "granularity_unverified"
     coverage: Literal["unknown_day_coverage"] = "unknown_day_coverage"
 
+    @model_validator(mode="before")
+    @classmethod
+    def preflight_market(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        table = value.get("table")
+        RawTable.preflight_shape(table)
+        if isinstance(table, RawTable):
+            rows, count, width, title, version = (getattr(table, k) for k in (
+                "row_count", "col_count", "row_width", "title", "table_version"))
+        elif isinstance(table, dict):
+            rows, count, width, title, version = (table.get(k) for k in (
+                "row_count", "col_count", "row_width", "title", "table_version"))
+        else:
+            return value
+        binding_value = value.get("binding")
+        binding = Binding.model_validate(binding_value.model_dump() if isinstance(binding_value, Binding) else binding_value)
+        kind, code = binding.kind, binding.code
+        body, raw = value.get("response_body_hex"), value.get("raw_table_hex")
+        if (not isinstance(body, str) or not 52 <= len(body) <= 2 * 1024 * 1024
+                or not isinstance(raw, str) or not 48 <= len(raw) <= 2 * 1024 * 1024):
+            raise ValueError("market byte bounds exceeded")
+        extended = table.extended_header_length if isinstance(table, RawTable) else table.get("extended_header_length")
+        if extended > len(raw) // 2:
+            raise ValueError("table shape crosses raw table bytes")
+        try:
+            header, request, flags, page, size, command = struct.unpack("<HIIHII", bytes.fromhex(body[:40]))
+        except (ValueError, struct.error):
+            raise ValueError("invalid market record") from None
+        trade = kind == "vendor4013"
+        seed_envelope = header == 32 and request != 0xFFFFFFFF
+        push_envelope = (header, request, flags) == (26, 0xFFFFFFFF, 0x1100)
+        if (not (seed_envelope or push_envelope) or request != value.get("request_id")
+                or page != binding.page_id or size != len(body) // 2 - header
+                or command not in ((2357,) if trade else (2267, 2357))
+                or flags not in ((0x1100, 0x1110, 0x1130) if trade else (0x1100,))):
+            raise ValueError("market record association mismatch")
+        if ((trade and ((count, width, title) != (8, 66, "")
+                        or not (version == "tb3.0" or header == 26 and version == "tb1.0")))
+                or (not trade and ((count, width, title, version) != (6, 30, f"{code}-逐笔委托", "tb1.0")))):
+            raise ValueError("market table kind mismatch")
+        if rows > 500 and not ((header, request, flags) == (26, 0xFFFFFFFF, 0x1100)
+                              and value.get("delivery") == "candidate_push"):
+            raise ValueError("market row count exceeds profile limit")
+        return value
+
     @model_validator(mode="after")
     def validate_market_only(self) -> MarketObservation:
         body, table = bytes.fromhex(self.response_body_hex), bytes.fromhex(self.raw_table_hex)
@@ -228,12 +331,13 @@ class MarketObservation(Model):
                 or command not in allowed_commands or flags not in allowed_flags or size != len(body) - h):
             raise ValueError("market record association mismatch")
         if self.table.row_count > 500:
-            if not (trade and push_envelope and self.delivery == "candidate_push"):
+            if not (push_envelope and self.delivery == "candidate_push"):
                 raise ValueError("market row count exceeds profile limit")
-            expected_columns = ((0x2001, 4, 165), (0x38, 30, 165), (0x100A, 4, 165), (0x100D, 4, 165),
-                                (0x104A, 4, 165), (0x104B, 4, 165), (0xA610, 4, 165), (0x1012, 4, 165))
-            if tuple((c.flags, c.width, c.extra) for c in self.table.columns) != expected_columns:
-                raise ValueError("unsupported expanded trade table schema")
+            RawTable.preflight_shape(self.table)
+            if not trade:
+                expected_side = 1 if self.binding.side == "buy" else 2
+                if any(type(row["12"].value) is not int or row["12"].value != expected_side for row in self.table.rows):
+                    raise ValueError("expanded order side mismatch")
         layout = (self.table.col_count, self.table.row_width, self.table.title)
         if trade:
             valid_table = (layout == (8, 66, "") and (self.table.table_version == "tb3.0"

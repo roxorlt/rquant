@@ -28,7 +28,7 @@ from rquant.research.snapshot_archive import R2
 PRODUCTION_PREFIX = "l2/v1/rquant"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 MAX_MANIFEST = 8 << 20
-MAX_LINE = 8 << 20
+MAX_LINE = 20 << 20
 MAX_SHARD = 32 << 20
 MAX_COMPRESSED = 33 << 20
 DEFAULT_OUTPUT_BYTES = 64 << 30

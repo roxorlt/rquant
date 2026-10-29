@@ -366,6 +366,32 @@ def test_actual_763_row_trade_push_survives_cache_http_and_websocket(
                       for p in cache.root.rglob('*') if p.is_file()}
 
 
+def test_byte_envelope_large_complete_http_and_ws_page_progress(tmp_path: Path, websocket_network_guard):
+    import hashlib
+    from rquant.l2.cache import RawL2Cache
+    from rquant.l2.models import RawL2Batch
+    from tests.unit.test_l2_cache import observation
+    obs = observation()
+    obs = obs.model_copy(update={'table': obs.table.model_copy(update={
+        'interpretation_limits': 'x' * (13 << 20)})})
+    cache = RawL2Cache(tmp_path / 'large-api')
+    with cache.writer():
+        committed = cache.append(obs)
+    canonical = committed.model_dump_json().encode()
+    assert len(canonical) > 12 << 20
+    expected = hashlib.sha256(canonical).hexdigest()
+    app = module('api').create_app(cache.root)
+    with TestClient(app) as client, client.websocket_connect('/api/v1/l2/stream?limit=1') as stream:
+        response = client.get('/api/v1/l2/batches?limit=1')
+        assert response.status_code == 200 and len(response.content) < 32 << 20
+        for page in (response.json(), stream.receive_json()):
+            assert page['next_sequence'] == 1 and len(page['batches']) == 1
+            record = RawL2Batch.model_validate(page['batches'][0])
+            assert hashlib.sha256(record.model_dump_json().encode()).hexdigest() == expected
+        assert client.get('/api/v1/l2/batches?after_sequence=1').json()['batches'] == []
+    assert app.state.l2_ws_connections == 0
+
+
 def test_websocket_independent_cursors_and_reconnect_from_client_commit(tmp_path: Path,
                                                                      websocket_network_guard: None) -> None:
     from rquant.l2.cache import RawL2Cache
@@ -488,6 +514,79 @@ def websocket_scope() -> dict[str, Any]:
         'path': '/api/v1/l2/stream', 'raw_path': b'/api/v1/l2/stream', 'root_path': '',
         'query_string': b'', 'headers': [], 'client': ('127.0.0.1', 12345),
         'server': ('127.0.0.1', 8771), 'subprotocols': [], 'state': {}}
+
+
+def test_websocket_releases_page_before_send_and_payload_before_next_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, websocket_network_guard: None,
+) -> None:
+    import gc
+    import weakref
+
+    from rquant.l2.cache import RawL2Cache
+    from rquant.l2.models import BatchPage
+
+    class TrackedJSON(str):
+        pass
+
+    cache = RawL2Cache(tmp_path / 'cache')
+    with cache.writer():
+        cache.append(observation())
+    app = module('api').create_app(cache.root)
+    original_read, original_dump = app.state.l2_cache.read_batches, BatchPage.model_dump_json
+    page_refs, payload_refs, reads = [], [], []
+    next_read = threading.Event()
+
+    def read(**kwargs: Any) -> BatchPage:
+        reads.append(kwargs)
+        if len(reads) == 2:
+            assert payload_refs[0]() is None
+            next_read.set()
+        page = original_read(**kwargs)
+        if page.batches:
+            page_refs.extend((weakref.ref(page), weakref.ref(page.batches[0].table)))
+        return page
+
+    def dump(page: BatchPage, *args: Any, **kwargs: Any) -> str:
+        payload = TrackedJSON(original_dump(page, *args, **kwargs))
+        payload_refs.append(weakref.ref(payload))
+        return payload
+
+    monkeypatch.setattr(app.state.l2_cache, 'read_batches', read)
+    monkeypatch.setattr(BatchPage, 'model_dump_json', dump)
+
+    async def scenario() -> None:
+        incoming, outgoing = asyncio.Queue(), asyncio.Queue()
+        blocked, release = asyncio.Event(), asyncio.Event()
+        await incoming.put({'type': 'websocket.connect'})
+
+        async def send(message: dict[str, Any]) -> None:
+            if message['type'] == 'websocket.send':
+                assert json.loads(message['text'])['next_sequence'] == 1
+                blocked.set()
+                await release.wait()
+            else:
+                await outgoing.put(message)
+
+        pending = asyncio.create_task(app(websocket_scope(), incoming.get, send))
+        try:
+            assert (await asyncio.wait_for(outgoing.get(), 1))['type'] == 'websocket.accept'
+            await asyncio.wait_for(blocked.wait(), 1)
+            await asyncio.sleep(0)
+            gc.collect()
+            assert page_refs and all(reference() is None for reference in page_refs)
+            assert payload_refs[0]() is not None
+            assert reads == [{'after_sequence': 0, 'limit': 1}]
+            release.set()
+            assert await asyncio.to_thread(next_read.wait, 1)
+            assert reads[1] == {'after_sequence': 1, 'limit': 1}
+        finally:
+            release.set()
+            await incoming.put({'type': 'websocket.disconnect', 'code': 1000})
+            await asyncio.wait_for(pending, 2)
+        assert app.state.l2_ws_connections == 0
+        assert not [task for task in asyncio.all_tasks() if task is not asyncio.current_task() and not task.done()]
+
+    asyncio.run(scenario())
 
 
 def test_websocket_slow_send_isolated_and_all_tasks_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -613,3 +712,14 @@ def test_websocket_is_not_exposed_by_platform_cache_router(tmp_path: Path, webso
     app = FastAPI(); app.state.l2_cache = RawL2Cache(tmp_path / 'absent'); app.include_router(router)
     with TestClient(app) as client, pytest.raises(WebSocketDisconnect):
         with client.websocket_connect('/api/v1/l2/stream'): pytest.fail('platform exposed WS')
+
+
+def test_cell_and_containing_openapi_schema_is_unchanged(tmp_path):
+    import hashlib
+
+    app = module("api").create_app(tmp_path / "schema-only")
+    schemas = app.openapi()["components"]["schemas"]
+    selected = {name: schemas[name] for name in ("RawCell", "RawTable", "RawL2Batch", "BatchPage")}
+    payload = json.dumps(selected, sort_keys=True, separators=(",", ":")).encode()
+    assert hashlib.sha256(payload).hexdigest() == "addfe6ae3e09b81a538d8a4c8720930076344bf0ebc6bafeeb5518ba31499573"
+    assert not (tmp_path / "schema-only").exists()
