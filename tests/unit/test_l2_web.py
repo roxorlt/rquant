@@ -366,6 +366,32 @@ def test_actual_763_row_trade_push_survives_cache_http_and_websocket(
                       for p in cache.root.rglob('*') if p.is_file()}
 
 
+def test_byte_envelope_large_complete_http_and_ws_page_progress(tmp_path: Path, websocket_network_guard):
+    import hashlib
+    from rquant.l2.cache import RawL2Cache
+    from rquant.l2.models import RawL2Batch
+    from tests.unit.test_l2_cache import observation
+    obs = observation()
+    obs = obs.model_copy(update={'table': obs.table.model_copy(update={
+        'interpretation_limits': 'x' * (13 << 20)})})
+    cache = RawL2Cache(tmp_path / 'large-api')
+    with cache.writer():
+        committed = cache.append(obs)
+    canonical = committed.model_dump_json().encode()
+    assert len(canonical) > 12 << 20
+    expected = hashlib.sha256(canonical).hexdigest()
+    app = module('api').create_app(cache.root)
+    with TestClient(app) as client, client.websocket_connect('/api/v1/l2/stream?limit=1') as stream:
+        response = client.get('/api/v1/l2/batches?limit=1')
+        assert response.status_code == 200 and len(response.content) < 32 << 20
+        for page in (response.json(), stream.receive_json()):
+            assert page['next_sequence'] == 1 and len(page['batches']) == 1
+            record = RawL2Batch.model_validate(page['batches'][0])
+            assert hashlib.sha256(record.model_dump_json().encode()).hexdigest() == expected
+        assert client.get('/api/v1/l2/batches?after_sequence=1').json()['batches'] == []
+    assert app.state.l2_ws_connections == 0
+
+
 def test_websocket_independent_cursors_and_reconnect_from_client_commit(tmp_path: Path,
                                                                      websocket_network_guard: None) -> None:
     from rquant.l2.cache import RawL2Cache
