@@ -390,15 +390,28 @@ def _put(
 def _source(cache: RawL2Cache, catalog: Catalog, highwater: int) -> tuple[str | None, str | None]:
     if highwater < catalog.last_sequence:
         raise ArchiveError("source_truncated")
-    first = _sha(_bytes(_batch(cache, 1))) if highwater else None
-    if catalog.source_first_batch_sha256 is not None and first != catalog.source_first_batch_sha256:
-        raise ArchiveError("source_changed")
-    if (
-        catalog.last_sequence
-        and _sha(_bytes(_batch(cache, catalog.last_sequence))) != catalog.source_last_batch_sha256
-    ):
-        raise ArchiveError("source_changed")
-    return first, _sha(_bytes(_batch(cache, highwater))) if highwater else None
+    floor = cache.floor_sequence()
+    if floor > catalog.last_sequence:
+        # The retired prefix was never archived; a later run cannot re-derive it.
+        raise ArchiveError("source_truncated")
+    if floor:
+        # Retention only prunes ranges that are already verified in this catalog,
+        # so the recorded first-batch digest is authoritative; batch 1 is gone.
+        first = catalog.source_first_batch_sha256
+    elif highwater:
+        first = _sha(_bytes(_batch(cache, 1)))
+        if catalog.source_first_batch_sha256 is not None and first != catalog.source_first_batch_sha256:
+            raise ArchiveError("source_changed")
+    else:
+        first = None
+    # The archived boundary can itself sit at the retired prefix; its digest was
+    # verified by the run that archived it, so only re-read batches still present.
+    if catalog.last_sequence and catalog.last_sequence > floor:
+        if _sha(_bytes(_batch(cache, catalog.last_sequence))) != catalog.source_last_batch_sha256:
+            raise ArchiveError("source_changed")
+    if highwater <= floor:
+        return first, None
+    return first, _sha(_bytes(_batch(cache, highwater)))
 
 
 def initialize(
