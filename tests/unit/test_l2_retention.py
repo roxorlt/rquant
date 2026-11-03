@@ -228,9 +228,12 @@ def test_plan_cold_eviction_respects_age_and_reserve(tmp_path: Path):
         )
 
     now = datetime(2026, 11, 3, 12, tzinfo=UTC)
-    old = entry("segments/old.l2c", 1, 10, now - timedelta(days=90), now - timedelta(days=90), 1000)
-    young = entry("segments/young.l2c", 11, 20, now - timedelta(days=1), now - timedelta(days=1), 1000)
-    unverified = entry("segments/unverified.l2c", 21, 30, now - timedelta(days=90), None, 1000)
+    old = entry("segments/l2cold-00000000000000000001-00000000000000000010-aaaaaaaaaaaa.l2c",
+                1, 10, now - timedelta(days=90), now - timedelta(days=90), 1000)
+    young = entry("segments/l2cold-00000000000000000011-00000000000000000020-bbbbbbbbbbbb.l2c",
+                  11, 20, now - timedelta(days=1), now - timedelta(days=1), 1000)
+    unverified = entry("segments/l2cold-00000000000000000021-00000000000000000030-cccccccccccc.l2c",
+                       21, 30, now - timedelta(days=90), None, 1000)
     module_policy = policy(cold_keep_days=30.0, cold_max_bytes=1500)
     notes: list[str] = []
     eviction = module._plan_cold_eviction(
@@ -239,7 +242,7 @@ def test_plan_cold_eviction_respects_age_and_reserve(tmp_path: Path):
         incoming_bytes=0, notes=notes,
     )
     assert eviction is not None
-    assert eviction.files == ("segments/old.l2c",)
+    assert eviction.files == (old.file,)
     assert eviction.freed_bytes == 1000
     # Unverified and young segments are never candidates, so the cap stays exceeded.
     assert any("cap still exceeded" in note for note in notes)
@@ -250,7 +253,7 @@ def test_plan_cold_eviction_respects_age_and_reserve(tmp_path: Path):
         now=now, disk=module.DiskUsage(total_bytes=10**12, free_bytes=500),
         incoming_bytes=0, notes=notes,
     )
-    assert eviction is not None and eviction.files[0] == "segments/old.l2c"
+    assert eviction is not None and eviction.files[0] == old.file
 
 
 def test_evict_cold_segments_updates_manifest(tmp_path: Path):
@@ -290,3 +293,20 @@ def test_prune_refuses_live_writer_lock(tmp_path: Path):
             module._prune_hot_prefix(cache_root, 2, reason="test", now=START)
         assert caught.value.code == "writer_active"
     assert module._writer_active(cache_root) is False
+
+
+def test_prune_cleans_interrupted_leftovers(tmp_path: Path):
+    module = retention()
+    from rquant.l2.cache import write_floor
+
+    cache_root = build_cache(tmp_path, 12)
+    # Simulate a crash after the floor marker was published but before deletion.
+    write_floor(cache_root, 5, reason="interrupted", now=START)
+    assert (cache_root / "batches" / f"{1:020d}").is_dir()
+    deleted, allocated = module._prune_hot_prefix(cache_root, 5, reason="retry", now=START)
+    assert deleted == 5
+    assert allocated > 0
+    assert not (cache_root / "batches" / f"{1:020d}").exists()
+    assert (cache_root / "batches" / f"{6:020d}").is_dir()
+    # Idempotent: running again finds nothing to delete.
+    assert module._prune_hot_prefix(cache_root, 5, reason="retry", now=START) == (0, 0)

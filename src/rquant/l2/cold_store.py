@@ -61,7 +61,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
 from .models import RawL2Batch
 from .cache import FLOOR_SCHEMA, RawL2Cache, read_floor, write_floor
@@ -262,7 +262,7 @@ class _BlockBuilder:
         )
         if not 1 <= item.request_id <= 0xFFFFFFFF or not 1 <= item.source_fd <= 2**32:
             raise ColdStoreError("invalid_batch")
-        if item.cached_offset_us < 0 or item.cached_offset_us > 86_400_000_000:
+        if abs(item.cached_offset_us) > 86_400_000_000:
             raise ColdStoreError("invalid_batch")
         self.records.append(item)
         self.body_bytes += len(body)
@@ -852,6 +852,9 @@ class _Model(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
+_SEGMENT_FILE = re.compile(r"^segments/l2cold-[0-9]{20}-[0-9]{20}-[0-9a-f]{12}\.l2c$")
+
+
 class SegmentEntry(_Model):
     file: str
     first_sequence: int = Field(ge=1)
@@ -866,6 +869,13 @@ class SegmentEntry(_Model):
     created_at: datetime
     verified_at: datetime | None = None
     source_cache_root: str
+
+    @field_validator("file")
+    @classmethod
+    def validate_file(cls, value: str) -> str:
+        if not _SEGMENT_FILE.match(value):
+            raise ValueError("invalid segment file name")
+        return value
 
 
 class ColdManifest(_Model):
@@ -1076,6 +1086,11 @@ def compact_cache(
             records=0, source_batch_bytes=0, source_removed_files=0, stored_bytes=0,
             body_bytes=0, segments=(), elapsed_seconds=0.0, verified=verify,
         )
+    existing = _load_manifest(cold_dir).segments if cold_dir.exists() else ()
+    first_needed = start + 1
+    for entry in existing:
+        if entry.first_sequence <= stop and entry.last_sequence >= first_needed:
+            raise ColdStoreError("sequence_overlap")
     lock = _lock_cold_writer(cold_dir)
     started = time.perf_counter()
     infos: list[SegmentInfo] = []
@@ -1179,6 +1194,31 @@ def read_batch(cold_root: Path, sequence: int) -> RawL2Batch:
         if entry.first_sequence <= sequence <= entry.last_sequence:
             return open_segment(path).read_batch(sequence)
     raise ColdStoreError("unknown_sequence")
+
+
+def mark_verified(cold_root: Path, files: Sequence[str], *, now: datetime | None = None) -> int:
+    """Record a successful verification for existing segments (repair path)."""
+    clock = now or datetime.now(UTC)
+    root = Path(cold_root)
+    manifest = _load_manifest(root)
+    updated = 0
+    entries = []
+    wanted = set(files)
+    for entry in manifest.segments:
+        if entry.file in wanted and entry.verified_at is None:
+            if not (root / entry.file).is_file():
+                raise ColdStoreError("missing_segment")
+            entries.append(entry.model_copy(update={"verified_at": clock}))
+            updated += 1
+        else:
+            entries.append(entry)
+    known = {entry.file for entry in manifest.segments}
+    unknown = wanted - known
+    if unknown:
+        raise ColdStoreError("unknown_segment")
+    if updated:
+        _write_manifest(root, ColdManifest(segments=tuple(entries)))
+    return updated
 
 
 def restore(
@@ -1303,6 +1343,8 @@ def _build_parser() -> argparse.ArgumentParser:
     verify = commands.add_parser("verify", help="verify segments against a cache")
     verify.add_argument("--cold-root", required=True)
     verify.add_argument("--cache-root")
+    verify.add_argument("--mark", action="store_true",
+                        help="record verified_at in the manifest for segments that pass")
 
     restore_cmd = commands.add_parser("restore", help="restore the store into a cache layout")
     restore_cmd.add_argument("--cold-root", required=True)
@@ -1336,9 +1378,13 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "verify":
             cache_root = Path(args.cache_root) if args.cache_root else None
             rows = []
+            passed = []
             for entry, path in _iter_manifest_segments(Path(args.cold_root)):
                 rows.append(verify_segment(path, cache_root=cache_root))
-            print(_canonical({"command": "verify", "segments": rows}).decode())
+                passed.append(entry.file)
+            marked = mark_verified(Path(args.cold_root), passed) if args.mark else 0
+            print(_canonical({"command": "verify", "segments": rows,
+                              "marked_verified": marked}).decode())
         elif args.command == "restore":
             result = restore(Path(args.cold_root), Path(args.destination), overwrite=args.overwrite)
             print(_canonical({

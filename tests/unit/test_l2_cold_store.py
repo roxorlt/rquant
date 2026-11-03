@@ -205,3 +205,45 @@ def test_unverified_store_is_not_eligible_for_eviction(tmp_path: Path):
     manifest = module.load_manifest(cold_root)
     assert manifest.segments[0].verified_at is None
     assert result.verified is False
+
+
+def test_unverified_segment_can_be_verified_later_and_pruned(tmp_path: Path):
+    module = cold_store()
+    retention = pytest.importorskip("rquant.l2.retention")
+    cache_root = build_cache(tmp_path, 12)
+    cold_root = tmp_path / "cold"
+    module.compact_cache(cache_root, cold_root, block_records=4, verify=False)
+    entry = module.load_manifest(cold_root).segments[0]
+    assert entry.verified_at is None
+    assert module.mark_verified(cold_root, [entry.file]) == 1
+    assert module.load_manifest(cold_root).segments[0].verified_at is not None
+    assert module.mark_verified(cold_root, [entry.file]) == 0  # already verified
+    archive_root = tmp_path / "state"
+    archive_root.mkdir()
+    (archive_root / "last-run.json").write_text(json.dumps({
+        "schema": "rquant-l2-archive-receipt-v1", "operation": "run", "status": "archived",
+        "prefix": "l2/v1/rquant", "last_sequence": 12,
+    }))
+    report = retention.run_retention(
+        cache_root, cold_root,
+        policy=retention.RetentionPolicy(reserve_free_bytes=0, hot_keep_hours=0.5,
+                                         archive_required=True),
+        archive_state_root=archive_root,
+        now=datetime(2026, 11, 3, 2, 30, tzinfo=UTC),
+    )
+    assert report.pruned_batches == 11
+    with pytest.raises(module.ColdStoreError):
+        module.mark_verified(cold_root, ["segments/l2cold-00000000000000000001-00000000000000000002-000000000000.l2c"])
+
+
+def test_manifest_rejects_path_traversal(tmp_path: Path):
+    module = cold_store()
+    cache_root = build_cache(tmp_path, 4)
+    cold_root = tmp_path / "cold"
+    module.compact_cache(cache_root, cold_root, block_records=4)
+    raw = json.loads((cold_root / "manifest.json").read_text())
+    raw["segments"][0]["file"] = "../evil.l2c"
+    (cold_root / "manifest.json").write_text(json.dumps(raw))
+    with pytest.raises(module.ColdStoreError) as caught:
+        module.load_manifest(cold_root)
+    assert caught.value.code == "invalid_manifest"

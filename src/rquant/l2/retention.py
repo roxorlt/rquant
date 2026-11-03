@@ -486,7 +486,7 @@ def _prune_hot_prefix(cache_root: Path, through: int, *, reason: str,
     root = Path(cache_root)
     batches = root / "batches"
     floor = read_floor(root)
-    if through <= floor:
+    if through < 1:
         return 0, 0
     lock = os.open(root / ".writer.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     deleted = 0
@@ -496,20 +496,27 @@ def _prune_hot_prefix(cache_root: Path, through: int, *, reason: str,
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise RetentionError("writer_active") from None
-        write_floor(root, through, reason=reason, now=now)
-        for sequence in range(floor + 1, through + 1):
-            directory = batches / f"{sequence:020d}"
-            try:
-                info = directory.lstat()
-            except FileNotFoundError:
+        if through > floor:
+            write_floor(root, through, reason=reason, now=now)
+        # Publish the floor first (crash-safe), then delete every batch directory
+        # at or below it.  A previous interrupted prune may have left some behind;
+        # delete those too so the freed space is not lost.
+        target = max(through, floor)
+        try:
+            entries = [entry for entry in os.scandir(batches)
+                       if entry.name.isdigit() and len(entry.name) == 20]
+        except OSError:
+            raise RetentionError("io_error") from None
+        for entry in entries:
+            sequence = int(entry.name)
+            if sequence > target:
                 continue
-            except OSError:
-                raise RetentionError("io_error") from None
-            if not directory.is_dir() or directory.is_symlink():
+            directory = Path(entry.path)
+            if not entry.is_dir(follow_symlinks=False) or directory.is_symlink():
                 raise RetentionError("unsafe_path")
-            with os.scandir(directory) as entries:
-                for entry in entries:
-                    allocated += entry.stat(follow_symlinks=False).st_blocks * 512
+            with os.scandir(directory) as files:
+                for item in files:
+                    allocated += item.stat(follow_symlinks=False).st_blocks * 512
             try:
                 shutil.rmtree(directory)
             except OSError:
@@ -548,6 +555,11 @@ def _evict_cold_segments(cold_root: Path, files: tuple[str, ...], *, now: dateti
     removed_files = set(files)
     remaining = tuple(entry for entry in manifest.segments if entry.file not in removed_files)
     _write_manifest(root, ColdManifest(segments=remaining))
+    directory = os.open(root / "segments", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
     return removed
 
 
