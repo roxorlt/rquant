@@ -24,6 +24,7 @@ from ._codec import (ALLOWED_ENDPOINT, MAX_BYTES, MAX_SECONDS, _validate_bootstr
 from ._request import (build_order_query, build_trade_query, decode_payload,
                        parse_request_body, parse_trade_request_body)
 from .cache import CacheError, RawL2Cache
+from .frame_tap import RawFrameTap
 from .models import Binding, FeedStatus, MarketObservation, SubscriptionReceipt, SubscriptionStream
 from .subscriptions import SubscriptionError, SubscriptionStore
 from .symbols import MAX_SYMBOLS, market_for_code, normalize_symbols
@@ -202,7 +203,8 @@ class FeedCollector:
                  connection_factory: Callable[..., Any] = socket.create_connection,
                  clock: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], None] = time.sleep,
-                 stop_event: threading.Event | None = None) -> None:
+                 stop_event: threading.Event | None = None,
+                 frame_tap: RawFrameTap | None = None) -> None:
         if duration_seconds is not None and (type(duration_seconds) not in (int, float)
                 or not math.isfinite(duration_seconds) or duration_seconds <= 0):
             raise ValueError("invalid duration")
@@ -230,6 +232,9 @@ class FeedCollector:
         self.max_reconnects, self.reconnect_delay_seconds = max_reconnects, reconnect_delay_seconds
         self.connection_factory, self.clock, self.sleep = connection_factory, clock, sleep
         self.stop_event = stop_event if stop_event is not None else threading.Event()
+        if frame_tap is not None and not isinstance(frame_tap, RawFrameTap):
+            raise ValueError("typed frame tap required")
+        self.frame_tap = frame_tap
         self.status = FeedStatus()
         self.connection: Any = None
         self.registered: dict[int, Binding] = {}
@@ -242,6 +247,10 @@ class FeedCollector:
         self._desired_revision = 0
         self._stream_receipts: dict[int, SubscriptionStream] = {}
         self._next_control_check = 0.0
+
+    def _tap_event(self, event: dict[str, Any]) -> None:
+        if self.frame_tap is not None:
+            self.frame_tap.record_event(event)
 
     def _write_receipt(self) -> None:
         if self.status.epoch_id is None:
@@ -322,6 +331,8 @@ class FeedCollector:
             raise FeedError("transport_error", retryable=True) from None
         except OSError:
             raise FeedError("transport_error") from None
+        if self.frame_tap is not None:
+            self.frame_tap.record_tx(wire)
 
     def _register(self, binding: Binding) -> None:
         if binding.page_id in self.registered:
@@ -421,6 +432,8 @@ class FeedCollector:
                 if pending is None and not await_ack:
                     return None
                 continue
+            if self.frame_tap is not None:
+                self.frame_tap.record_rx(body)
             frames += 1
             payload_bytes += len(body) + 13
             if (await_ack and frames > 32) or pending is not None and frames > MAX_PENDING_FRAMES:
@@ -554,6 +567,8 @@ class FeedCollector:
         self._update(state="starting", epoch_id=uuid.uuid4().hex, error_code=None,
                      subscription_state='requested_unverified')
         self._refresh_targets(force=True)
+        self._tap_event({"event": "epoch_start", "epoch_id": self.status.epoch_id,
+                         "symbols": list(self._symbols)})
         try:
             self._check_end(self._deadline)
             try:
@@ -586,9 +601,19 @@ class FeedCollector:
                 except Exception:
                     pass
                 self.connection = None
+            self._tap_event({"event": "epoch_end", "epoch_id": self.status.epoch_id,
+                             "state": self.status.state,
+                             "market_batch_count": self.status.market_batch_count,
+                             "seed_queries": self.status.seed_queries})
 
     def run(self) -> FeedStatus:
         self._deadline = math.inf if self.duration_seconds is None else self.clock() + self.duration_seconds
+        if self.frame_tap is not None:
+            try:
+                self.frame_tap.start()
+            except Exception:
+                # Recording must never prevent market capture.
+                self.frame_tap = None
         try:
             with self.cache.writer():
                 previous = self.cache.read_status()
@@ -655,3 +680,5 @@ class FeedCollector:
             return self.status.model_copy(update={"state": "blocked", "gap": True, "error_code": code})
         finally:
             self._inputs = (b"", b"", b"")
+            if self.frame_tap is not None:
+                self.frame_tap.close()

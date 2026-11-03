@@ -464,3 +464,20 @@ class RawL2Cache:
         return BatchPage(batches=selected,
                          next_sequence=selected[-1].local_batch_sequence if selected else after_sequence,
                          status=status)
+
+    def iter_batches(self, *, after_sequence: int = 0, limit: int | None = None
+                     ) -> Iterator[RawL2Batch]:
+        """Read committed batches in sequence order without holding the writer lock."""
+        if type(after_sequence) is not int or after_sequence < 0:
+            raise ValueError("invalid local batch cursor")
+        if limit is not None and (type(limit) is not int or limit < 0):
+            raise ValueError("invalid local batch limit")
+        directories = self._directories()
+        emitted = 0
+        for expected, directory in enumerate(directories, 1):
+            if expected <= after_sequence:
+                continue
+            if limit is not None and emitted >= limit:
+                return
+            yield self._read_batch(directory, expected)
+            emitted += 1

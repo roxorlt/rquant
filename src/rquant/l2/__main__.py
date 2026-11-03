@@ -12,6 +12,7 @@ from pathlib import Path
 from types import FrameType
 
 from rquant.l2.cache import CacheError, RawL2Cache
+from rquant.l2.frame_tap import FrameTapConfig, FrameTapError, RawFrameTap, tap_directory
 from rquant.l2.subscriptions import SubscriptionError, load_capacity_policy
 from rquant.l2.symbols import MAX_SYMBOLS, normalize_symbols
 
@@ -35,6 +36,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--order-pages", type=int, choices=(1, 2, 3), default=1)
     parser.add_argument("--max-reconnects", type=int, choices=(0, 1, 2), default=0)
     parser.add_argument("--reconnect-delay-seconds", type=float, default=60)
+    parser.add_argument("--frame-tap-dir", type=Path,
+                        help="record raw frames into a new child directory (also enabled by "
+                             "RQUANT_L2_FRAME_TAP=1 + RQUANT_L2_FRAME_TAP_DIR)")
+    parser.add_argument("--frame-tap-segment-bytes", type=int,
+                        help="tap segment size override; default 256 MiB")
     args = parser.parse_args(argv)
     if (not math.isfinite(args.duration_seconds) or not 0 < args.duration_seconds <= 21600
             or not math.isfinite(args.reconnect_delay_seconds) or args.reconnect_delay_seconds < 60):
@@ -46,6 +52,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.symbols = normalize_symbols(args.symbols)
         except ValueError:
             parser.error('invalid symbols')
+    try:
+        if args.frame_tap_dir is not None:
+            tap_options = ({"segment_bytes": args.frame_tap_segment_bytes}
+                           if args.frame_tap_segment_bytes is not None else {})
+            tap_config = FrameTapConfig(directory=tap_directory(args.frame_tap_dir),
+                                        **tap_options)
+        else:
+            tap_config = FrameTapConfig.from_env()
+            if tap_config is not None:
+                tap_config = FrameTapConfig(
+                    directory=tap_directory(tap_config.directory),
+                    segment_bytes=(args.frame_tap_segment_bytes
+                                   if args.frame_tap_segment_bytes is not None
+                                   else tap_config.segment_bytes),
+                    queue_bytes=tap_config.queue_bytes,
+                    queue_records=tap_config.queue_records,
+                    fsync_interval_seconds=tap_config.fsync_interval_seconds)
+        frame_tap = RawFrameTap(tap_config) if tap_config is not None else None
+    except FrameTapError:
+        parser.error("invalid frame tap configuration")
     stop = threading.Event()
 
     def request_stop(signum: int, frame: FrameType | None) -> None:
@@ -66,11 +92,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             order_pages=args.order_pages, max_reconnects=args.max_reconnects,
             reconnect_delay_seconds=args.reconnect_delay_seconds, stop_event=stop,
             control_root=args.control_root, max_symbols=max_symbols, symbols=args.symbols,
+            frame_tap=frame_tap,
         )
         status = collector.run()
         print(status.model_dump_json())
         return 1 if status.state in {"blocked", "disconnected"} else 0
-    except (CacheError, SubscriptionError) as error:
+    except (CacheError, SubscriptionError, FrameTapError) as error:
         print(json.dumps({"error_code": error.code}))
         return 1
     except ValueError:
@@ -82,6 +109,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     finally:
         for sig, handler in handlers.items():
             signal.signal(sig, handler)
+        if frame_tap is not None:
+            frame_tap.close()
 
 
 if __name__ == "__main__":
