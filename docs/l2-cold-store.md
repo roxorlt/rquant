@@ -185,10 +185,10 @@ Python API：`compact_cache`、`verify_segment`、`restore`、`iter_batches`、`
 ## 9. 测试
 
 ```sh
-# 新模块（32 个）
+# 新模块（35 个）
 /Users/roxor/Documents/ChatGPT/rea L2/.tools/review/run-l2-cold-store-tests.sh
 
-# L2 全量回归（564 项；不含 test_l2_web/test_storage_pool2，本机 venv 缺 duckdb）
+# L2 全量回归（567 项；不含 test_l2_web/test_storage_pool2，本机 venv 缺 duckdb）
 /Users/roxor/Documents/ChatGPT/rea L2/.tools/review/run-l2-cold-store-tests.sh \
   tests/unit/test_l2_archive.py tests/unit/test_l2_archive_deploy.py \
   tests/unit/test_l2_cache.py tests/unit/test_l2_codec.py tests/unit/test_l2_feed.py \

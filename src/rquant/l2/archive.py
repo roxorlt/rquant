@@ -410,7 +410,9 @@ def _source(cache: RawL2Cache, catalog: Catalog, highwater: int) -> tuple[str | 
         if _sha(_bytes(_batch(cache, catalog.last_sequence))) != catalog.source_last_batch_sha256:
             raise ArchiveError("source_changed")
     if highwater <= floor:
-        return first, None
+        if highwater == 0:
+            return first, None
+        raise ArchiveError("source_truncated")
     return first, _sha(_bytes(_batch(cache, highwater)))
 
 
