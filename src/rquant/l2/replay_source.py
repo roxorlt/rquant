@@ -358,6 +358,8 @@ class FaultInjection:
     withhold_seed_codes: tuple[str, ...] = ()
     stall_codes: tuple[str, ...] = ()
     withhold_bootstrap_ack: bool = False
+    seed_latency_onset_pages: int | None = None
+    seed_latency_coefficient: float | None = None
 
     def __post_init__(self) -> None:
         if self.withhold_seed_from_stock is not None:
@@ -368,11 +370,52 @@ class FaultInjection:
         object.__setattr__(self, "stall_codes", _normalized_codes(self.stall_codes))
         if type(self.withhold_bootstrap_ack) is not bool:
             raise ReplaySourceError("invalid_fault")
+        latency_set = (self.seed_latency_onset_pages is not None,
+                       self.seed_latency_coefficient is not None)
+        if latency_set[0] != latency_set[1]:
+            raise ReplaySourceError("invalid_fault")
+        if latency_set[0]:
+            onset, coefficient = self.seed_latency_onset_pages, self.seed_latency_coefficient
+            if (type(onset) is not int or not 0 <= onset <= MAX_STOCKS * 3
+                    or type(coefficient) not in (int, float)
+                    or not math.isfinite(coefficient) or not 0 < coefficient <= 100):
+                raise ReplaySourceError("invalid_fault")
+            object.__setattr__(self, "seed_latency_onset_pages", int(onset))
+            object.__setattr__(self, "seed_latency_coefficient", float(coefficient))
 
     @property
     def active(self) -> bool:
         return bool(self.withhold_seed_from_stock is not None or self.withhold_seed_codes
-                    or self.stall_codes or self.withhold_bootstrap_ack)
+                    or self.stall_codes or self.withhold_bootstrap_ack
+                    or self.seed_latency_onset_pages is not None)
+
+    def seed_delay_seconds(self, pages: int) -> float:
+        """Calibrated 2026-10-29 seed latency model: quadratic past the onset.
+
+        ``pages`` is the number of pages the connection has registered when the
+        seed request is sent.  The 2026-10-29 scale40-C receipt shows the wait
+        staying near zero through ~57 pages and crossing the 15 s guard at 73
+        pages; ``coefficient=0.0625`` reproduces that boundary (72 pages ≈
+        14.1 s, 73 pages ≈ 16.0 s).
+        """
+        onset, coefficient = self.seed_latency_onset_pages, self.seed_latency_coefficient
+        if onset is None or coefficient is None:
+            return 0.0
+        excess = max(0, pages - onset)
+        return coefficient * excess * excess
+
+    def planned_seed_phase_seconds(self, stream_count: int) -> float:
+        """Upper bound on the seed phase under the latency model, single connection."""
+        if self.seed_latency_onset_pages is None:
+            return 0.0
+        total = 0.0
+        for index in range(stream_count):
+            pages = index + 1
+            delay = self.seed_delay_seconds(pages)
+            # A timed-out seed costs the full guard, then the next request waits
+            # for the adaptive pace (ceiling) before it is even sent.
+            total += MAX_SECONDS if delay > MAX_SECONDS else max(1.0, delay)
+        return total
 
     def published(self) -> dict[str, Any]:
         return {
@@ -380,6 +423,8 @@ class FaultInjection:
             "withhold_seed_codes": list(self.withhold_seed_codes),
             "stall_codes": list(self.stall_codes),
             "withhold_bootstrap_ack": self.withhold_bootstrap_ack,
+            "seed_latency_onset_pages": self.seed_latency_onset_pages,
+            "seed_latency_coefficient": self.seed_latency_coefficient,
         }
 
 
@@ -543,6 +588,8 @@ class ReplaySourceStats:
         self.idle_timeouts = 0
         self.activations = 0
         self.family_restamped = 0
+        self.seed_delayed = 0
+        self.seed_delay_max_seconds = 0.0
 
     def published(self) -> dict[str, Any]:
         return {
@@ -559,6 +606,8 @@ class ReplaySourceStats:
             "idle_timeouts": self.idle_timeouts,
             "activations": self.activations,
             "family_restamped": self.family_restamped,
+            "seed_delayed": self.seed_delayed,
+            "seed_delay_max_seconds": round(self.seed_delay_max_seconds, 6),
         }
 
 
@@ -670,6 +719,7 @@ class L2ReplaySource:
             raise ReplaySourceError("invalid_config")
         requests = len(self._streams) * pages_per_stream
         seed_phase = requests * _COUNT_ROLLUP + self.planned_seed_withheld * MAX_SECONDS
+        seed_phase += self.config.faults.planned_seed_phase_seconds(len(self._streams))
         if self.config.speed > 0:
             window = self.config.push_window_seconds
             if window is None:
@@ -779,10 +829,18 @@ class ReplayConnection:
             self.stats.seed_unavailable += 1
             return
         self._seed_cursor[page_id] = cursor + 1
+        delay = source.config.faults.seed_delay_seconds(len(self._activated))
         for recorded in groups[cursor]:
             rewritten = self._rewrite(recorded, stream, request_id=request_id,
                                       page_id=page_id)
-            self._ready.append(wire_frame(rewritten))
+            frame = wire_frame(rewritten)
+            if delay > 0:
+                self._sequence += 1
+                heapq.heappush(self._scheduled, (self.clock() + delay, self._sequence, frame))
+                self.stats.seed_delayed += 1
+                self.stats.seed_delay_max_seconds = max(self.stats.seed_delay_max_seconds, delay)
+            else:
+                self._ready.append(frame)
             self.stats.seed_responses += 1
 
     def recv(self, size: int) -> bytes:

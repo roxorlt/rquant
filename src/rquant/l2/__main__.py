@@ -36,6 +36,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--order-pages", type=int, choices=(1, 2, 3), default=1)
     parser.add_argument("--max-reconnects", type=int, choices=(0, 1, 2), default=0)
     parser.add_argument("--reconnect-delay-seconds", type=float, default=60)
+    parser.add_argument("--connections", type=int, choices=tuple(range(1, 17)), default=1,
+                        help="batched upstream connections (contiguous stock chunks); "
+                             "1 keeps the legacy single-connection behaviour")
+    parser.add_argument("--subscribe-batch-stocks", type=int, default=0,
+                        help="subscription batch size in stocks (0 disables the batch barrier); "
+                             "a non-zero value also paces against the observed seed latency")
+    parser.add_argument("--seed-retry-limit", type=int, choices=(0, 1, 2, 3), default=0,
+                        help="deferred seed retries after the 15s guard (0 keeps legacy)")
+    parser.add_argument("--seed-retry-cooldown-seconds", type=float, default=20.0)
+    parser.add_argument("--receive-pump", action="store_true",
+                        help="decouple socket framing from decode/persist with a reader thread; "
+                             "requires the wall clock, do not use with the virtual replay clock")
+    parser.add_argument("--pump-queue-frames", type=int, default=65536)
+    parser.add_argument("--pump-priority-frames", type=int, default=4096)
     parser.add_argument("--frame-tap-dir", type=Path,
                         help="record raw frames into a new child directory (also enabled by "
                              "RQUANT_L2_FRAME_TAP=1 + RQUANT_L2_FRAME_TAP_DIR)")
@@ -93,6 +107,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             reconnect_delay_seconds=args.reconnect_delay_seconds, stop_event=stop,
             control_root=args.control_root, max_symbols=max_symbols, symbols=args.symbols,
             frame_tap=frame_tap,
+            connection_count=args.connections,
+            subscribe_batch_stocks=args.subscribe_batch_stocks,
+            seed_retry_limit=args.seed_retry_limit,
+            seed_retry_cooldown_seconds=args.seed_retry_cooldown_seconds,
+            receive_pump=args.receive_pump,
+            pump_queue_frames=args.pump_queue_frames,
+            pump_priority_frames=args.pump_priority_frames,
         )
         status = collector.run()
         print(status.model_dump_json())

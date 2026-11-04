@@ -141,6 +141,8 @@ FaultInjection(
 | `fault-seed-24of40` | 72 种子 / 24 只股票 / 48 失败流，停止状态 `stopped`+`duration_limit` |
 | `fault-single-silent` | 117 种子，仅 300006 三流未种子 |
 | `fault-single-stall` | 120 种子全成功，推送帧数少掉该股全部推送，epoch 仍健康 |
+| `fault-seed-latency-40` | 校准 2026-10-29 的「按连接页数增长的种子等待」，单连接精确回到 72/120（24/40 只） |
+| `fault-seed-latency-40-batched` | 同一故障 + 4 条连接 + 分批订阅/延迟重试，恢复到 120/120（40/40 只）且 `frames_pending_at_end=0` |
 | `determinism-40` | 同配置连跑两次，提交批次的 `(page_id, kind, code, side, delivery, response_sha256)` 序列哈希完全一致 |
 
 报告 schema `rquant-l2-replay-gate-v1`，四个卡面指标的定义：
@@ -155,7 +157,17 @@ FaultInjection(
 报告同时写入 `gate.wall_ms` 与 `gate.budget_ms`（默认 180000），把「盘后 3 分钟一轮」变成
 可回归的数字而不是口号。
 
-### 实测（2026-11-03 本机，最终一次门禁运行，全窗口未降窗）
+### 实测（2026-11-04 本机，9 场景含种子延迟流控；详见 [l2-seed-flow-control.md](l2-seed-flow-control.md)）
+
+`bash .tools/replay-packs/run_l2_replay_gate.sh` → `gate=pass`，总墙钟 **63.1 s**（预算 180 s），
+9/9 场景全部通过。两个新增场景在 10x 回放下的结果：
+
+| 场景 | 连接 | 批次 | 种子/流 | 股票 | 种子首包率 | 种子等待 max | 结束待处理帧 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `fault-seed-latency-40` | 1 | 3567 | 72/120 | 24/40 | 0.600 | 14.06 s | 0 |
+| `fault-seed-latency-40-batched` | 4 | 3572 | 120/120 | 40/40 | 1.000 | 0.00 s | 0 |
+
+### 历史实测（2026-11-03 本机，7 场景基线）
 
 `bash .tools/replay-packs/run_l2_replay_gate.sh` → `gate=pass`，总墙钟 **47.6 s**（预算 180 s），
 7/7 场景、116/116 条 expectations 全部通过：

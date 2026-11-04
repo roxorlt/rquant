@@ -47,7 +47,8 @@ def test_scale40_fault_baseline_is_wired_into_the_default_scenarios() -> None:
     by_name = {spec.name: spec for spec in replay_gate.default_scenarios()}
     assert list(by_name) == ["healthy-40", "healthy-80", "healthy-100",
                              "fault-seed-24of40", "fault-single-silent",
-                             "fault-single-stall", "determinism-40"]
+                             "fault-single-stall", "fault-seed-latency-40",
+                             "fault-seed-latency-40-batched", "determinism-40"]
     seed_baseline = replay_gate._fault_baseline(by_name["fault-seed-24of40"])
     assert seed_baseline == {"seeded_streams": 72, "seeded_stocks": 24,
                              "failed_streams": 48, "seed_queries": 120}
@@ -56,6 +57,12 @@ def test_scale40_fault_baseline_is_wired_into_the_default_scenarios() -> None:
     assert (silent_baseline["seeded_streams"], silent_baseline["failed_streams"]) == (117, 3)
     stall_baseline = replay_gate._fault_baseline(by_name["fault-single-stall"])
     assert stall_baseline is not None and stall_baseline["seeded_streams"] == 120
+    latency_baseline = by_name["fault-seed-latency-40"]
+    assert latency_baseline.connections == 1 and not latency_baseline.flow_control
+    assert replay_gate._expected_latency_seed_shape(latency_baseline) == (72, 24, 48)
+    latency_fixed = by_name["fault-seed-latency-40-batched"]
+    assert latency_fixed.connections == 4 and latency_fixed.flow_control
+    assert replay_gate._expected_latency_seed_shape(latency_fixed) == (120, 40, 0)
     assert replay_gate._expected_synthetic_streams(40) == 114
     assert replay_gate._expected_synthetic_streams(100) == 294
     assert replay_gate._expected_synthetic_streams(2) == 0
@@ -120,9 +127,12 @@ def test_gate_metric_contracts_on_a_two_stock_tier(tmp_path: Path) -> None:
     assert scenario_metrics["status"]["state"] == "stopped"
     assert scenario_metrics["status"]["error_code"] == "duration_limit"
     assert scenario["config"]["synthetic_streams"] == 0
+    assert scenario["config"]["connections"] == 1
+    assert scenario["config"]["flow_control"] is False
     assert scenario["config"]["faults"] == {
         "withhold_seed_from_stock": None, "withhold_seed_codes": [],
-        "stall_codes": [], "withhold_bootstrap_ack": False}
+        "stall_codes": [], "withhold_bootstrap_ack": False,
+        "seed_latency_onset_pages": None, "seed_latency_coefficient": None}
     assert any("合成" in note for note in report["notes"])
     assert json.loads(out.read_text(encoding="utf-8"))["gate"]["status"] == "pass"
 

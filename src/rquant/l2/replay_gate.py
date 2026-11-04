@@ -84,6 +84,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from ._codec import MAX_SECONDS
 from ._request import build_order_query, build_trade_query, encode_payload
 from .cache import CacheError, RawL2Cache
 from .feed import FeedCollector
@@ -120,7 +121,7 @@ REAL_TIER: tuple[str, ...] = tuple(
     "002733 001206 300769 000710 600789 002923 002728 002273 002913 603980".split()
 )
 SINGLE_FAULT_SYMBOL = REAL_TIER[1]
-FAULT_CHOICES = ("healthy", "seed-24of40", "single-silent", "single-stall")
+FAULT_CHOICES = ("healthy", "seed-24of40", "single-silent", "single-stall", "seed-latency")
 INPUT_FILENAMES = {
     "bootstrap": "bootstrap.bin",
     "order": "order-template.bin",
@@ -151,12 +152,20 @@ class TierSymbols:
 
 @dataclass(frozen=True)
 class ScenarioSpec:
-    """One gate scenario: a tier, an injected fault set and a repeat count."""
+    """One gate scenario: a tier, an injected fault set and a repeat count.
+
+    ``connections``/``flow_control`` exercise the batched-connection and
+    subscription-flow-control collector modes; the legacy default stays a
+    single connection with one-second pacing so the measured 2026-10-29
+    baselines remain comparable.
+    """
 
     name: str
     stocks: int
     faults: FaultInjection = field(default_factory=FaultInjection)
     runs: int = 1
+    connections: int = 1
+    flow_control: bool = False
 
     def __post_init__(self) -> None:
         if (not isinstance(self.name, str) or not self.name
@@ -168,6 +177,10 @@ class ScenarioSpec:
         if type(self.runs) is not int or not 1 <= self.runs <= 4:
             raise GateError("invalid_scenario")
         if not isinstance(self.faults, FaultInjection):
+            raise GateError("invalid_scenario")
+        if type(self.connections) is not int or not 1 <= self.connections <= 16:
+            raise GateError("invalid_scenario")
+        if type(self.flow_control) is not bool:
             raise GateError("invalid_scenario")
 
 
@@ -214,6 +227,7 @@ class _RunArtifacts:
     wall_seconds: float
     latency_samples_ns: tuple[int, ...]
     memory: dict[str, Any]
+    collector_metrics: dict[str, Any] = field(default_factory=dict)
 
 
 def tier_symbols(stocks: int) -> TierSymbols:
@@ -235,6 +249,14 @@ def tier_symbols(stocks: int) -> TierSymbols:
     return TierSymbols(symbols=tuple(symbols), real=tuple(real), synthetic=tuple(synthetic))
 
 
+# Calibrated replay model of the 2026-10-29 seed wait curve (see
+# evidence/rquant-l2-scale40-C-seed-latency-2026-11-04.json): the wait stays
+# near zero through ~57 registrable pages and reaches 14.1 s at 72 pages,
+# 16.0 s at 73 pages, which is exactly where scale40-C crossed the 15 s guard.
+SEED_LATENCY_FAULT = FaultInjection(seed_latency_onset_pages=57,
+                                    seed_latency_coefficient=0.0625)
+
+
 def default_scenarios() -> tuple[ScenarioSpec, ...]:
     """The fixed gate scenario set; ``healthy-40`` supplies the card metrics."""
     return (
@@ -247,6 +269,10 @@ def default_scenarios() -> tuple[ScenarioSpec, ...]:
                      faults=FaultInjection(withhold_seed_codes=(SINGLE_FAULT_SYMBOL,))),
         ScenarioSpec(name="fault-single-stall", stocks=SIMULATED_STOCK_UNIVERSE,
                      faults=FaultInjection(stall_codes=(SINGLE_FAULT_SYMBOL,))),
+        ScenarioSpec(name="fault-seed-latency-40", stocks=SIMULATED_STOCK_UNIVERSE,
+                     faults=SEED_LATENCY_FAULT),
+        ScenarioSpec(name="fault-seed-latency-40-batched", stocks=SIMULATED_STOCK_UNIVERSE,
+                     faults=SEED_LATENCY_FAULT, connections=4, flow_control=True),
         ScenarioSpec(name="determinism-40", stocks=SIMULATED_STOCK_UNIVERSE, runs=2),
     )
 
@@ -259,6 +285,8 @@ def fault_injection(name: str, symbols: Sequence[str]) -> FaultInjection:
         raise GateError("invalid_symbols")
     if name == "seed-24of40":
         return FaultInjection(withhold_seed_from_stock=min(24, len(symbols)))
+    if name == "seed-latency":
+        return SEED_LATENCY_FAULT
     symbol = symbols[1] if len(symbols) > 1 else symbols[0]
     if name == "single-silent":
         return FaultInjection(withhold_seed_codes=(symbol,))
@@ -336,26 +364,27 @@ def _prepare_inputs(inputs_dir: Path | str | None, root: Path) -> GateInputs:
 
 
 class _ConnectionLatencyTap:
-    """Wrap ``source.connect`` and remember the newest replay connection."""
+    """Wrap ``source.connect`` and remember every replay connection."""
 
     def __init__(self, factory: Callable[..., Any]) -> None:
         self._factory = factory
-        self.connection: Any = None
+        self.connections: list[Any] = []
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         connection = self._factory(*args, **kwargs)
-        self.connection = connection
+        self.connections.append(connection)
         return connection
 
     def last_delivery_wall_ns(self) -> int:
-        connection = self.connection
-        if connection is None:
-            return 0
-        try:
-            value = connection.last_delivery_wall_ns
-        except AttributeError:
-            return 0
-        return value if type(value) is int else 0
+        newest = 0
+        for connection in self.connections:
+            try:
+                value = connection.last_delivery_wall_ns
+            except AttributeError:
+                continue
+            if type(value) is int and value > newest:
+                newest = value
+        return newest
 
 
 class _TimedCache(RawL2Cache):
@@ -672,7 +701,8 @@ def _batch_sequence_digest(root: Path) -> str:
 
 def _execute_run(pack: Path, symbols: Sequence[str], faults: FaultInjection, *,
                  cache_root: Path, inputs: GateInputs, push_window_seconds: float | None,
-                 speed: float) -> tuple[L2ReplaySource, _RunArtifacts]:
+                 speed: float, connections: int = 1,
+                 flow_control: bool = False) -> tuple[L2ReplaySource, _RunArtifacts]:
     source = build_source(pack, symbols, speed=speed,
                           push_window_seconds=push_window_seconds, faults=faults)
     samples_ns: list[int] = []
@@ -683,7 +713,10 @@ def _execute_run(pack: Path, symbols: Sequence[str], faults: FaultInjection, *,
         trade_template_path=inputs.trade,
         duration_seconds=source.planned_duration_seconds(),
         symbols=source.config.symbols, max_symbols=len(source.config.symbols),
-        clock=source.clock, sleep=source.clock.sleep, connection_factory=tap)
+        clock=source.clock, sleep=source.clock.sleep, connection_factory=tap,
+        connection_count=connections,
+        subscribe_batch_stocks=5 if flow_control else 0,
+        seed_retry_limit=1 if flow_control else 0)
     sampler = _MemorySampler()
     sampler.start()
     started = time.perf_counter()
@@ -696,7 +729,7 @@ def _execute_run(pack: Path, symbols: Sequence[str], faults: FaultInjection, *,
         status=status, receipt=_read_receipt(cache), cache_root=cache_root,
         batches=_committed_batches(cache_root), cache_bytes=_cache_bytes(cache_root),
         wall_seconds=wall_seconds, latency_samples_ns=tuple(samples_ns),
-        memory=sampler.summary())
+        memory=sampler.summary(), collector_metrics=collector.metrics)
     return source, artifacts
 
 
@@ -713,7 +746,9 @@ def _scenario_metrics(source: L2ReplaySource, artifacts: _RunArtifacts,
     }
     return {**seed, "consumption_latency_us": latency, "disk_write": disk,
             "memory": artifacts.memory, "batches": artifacts.batches,
-            "status": _status_metrics(artifacts.status)}
+            "status": _status_metrics(artifacts.status),
+            "collector": artifacts.collector_metrics,
+            "replay": source.stats.published()}
 
 
 def _windowed_push_frames(index: PackIndex, codes: Sequence[str],
@@ -772,6 +807,46 @@ def _expected_seed_shape(spec: ScenarioSpec, tier: TierSymbols) -> tuple[int, in
     return seeded_streams, seeded_stocks, total - seeded_streams
 
 
+def _expected_latency_seed_shape(spec: ScenarioSpec) -> tuple[int, int, int]:
+    """Expected seed shape under the calibrated per-connection seed-latency fault."""
+    links = spec.connections
+    total = 3 * spec.stocks
+    pages_per_link: dict[int, int] = {index: 0 for index in range(links)}
+    seeded = 0
+    for stream_index in range(total):
+        stock = stream_index // 3
+        chunk = min(links - 1, stock * links // spec.stocks)
+        pages_per_link[chunk] += 1
+        delay = spec.faults.seed_delay_seconds(pages_per_link[chunk])
+        if delay < MAX_SECONDS:
+            seeded += 1
+    seeded_stocks = seeded // 3
+    return seeded, seeded_stocks, total - seeded
+
+
+def _latency_expectations(*, spec: ScenarioSpec, source: L2ReplaySource,
+                          artifacts: _RunArtifacts) -> list[dict[str, Any]]:
+    status = artifacts.status
+    total = len(source.streams)
+    seed = _seed_metrics(artifacts.receipt, streams=total, stocks=spec.stocks)
+    expected_streams, expected_stocks, expected_failed = _expected_latency_seed_shape(spec)
+    expected_rate = round(expected_streams / total, 6) if total else 0.0
+    return [
+        _expect("state", "stopped", status.state),
+        _expect("error_code", "duration_limit", status.error_code),
+        _expect("streams_total", total, seed["streams_total"]),
+        _expect("seeded_streams", expected_streams, seed["seeded_streams"]),
+        _expect("seeded_stocks", expected_stocks, seed["stocks_seeded"]),
+        _expect("failed_streams", expected_failed, seed["seed_timeout_streams"]),
+        _expect("seed_queries", total, status.seed_queries),
+        _expect("seed_first_packet_rate", expected_rate, seed["seed_first_packet_rate"]),
+        _expect("synthetic_streams", _expected_synthetic_streams(spec.stocks),
+                source.synthetic_streams),
+        _expect("memory_samples_positive", True, artifacts.memory["samples"] > 0),
+        _expect("cache_bytes_positive", True, artifacts.cache_bytes > 0),
+    ]
+
+
 def _expect(name: str, expected: Any, actual: Any) -> dict[str, Any]:
     return {"name": name, "expected": expected, "actual": actual, "pass": actual == expected}
 
@@ -781,6 +856,8 @@ def _scenario_expectations(*, spec: ScenarioSpec, tier: TierSymbols,
                            determinism: dict[str, Any] | None,
                            reference_push_frames: int | None,
                            push_window_seconds: float | None) -> list[dict[str, Any]]:
+    if spec.faults.seed_latency_onset_pages is not None:
+        return _latency_expectations(spec=spec, source=source, artifacts=artifacts)
     status = artifacts.status
     total = len(source.streams)
     seed = _seed_metrics(artifacts.receipt, streams=total, stocks=spec.stocks)
@@ -840,6 +917,8 @@ def _scenario_config(spec: ScenarioSpec, tier: TierSymbols, source: L2ReplaySour
         "push_window_seconds": push_window_seconds,
         "faults": spec.faults.published(),
         "runs": spec.runs,
+        "connections": spec.connections,
+        "flow_control": spec.flow_control,
         "real_symbols": list(tier.real),
         "synthetic_symbols": list(tier.synthetic),
         "synthetic_streams": source.synthetic_streams,
@@ -870,7 +949,8 @@ def run_scenario(pack: Path | str, spec: ScenarioSpec, *, work_dir: Path,
     try:
         source, artifacts = _execute_run(
             pack_path, tier.symbols, spec.faults, cache_root=cache_dir, inputs=inputs,
-            push_window_seconds=push_window_seconds, speed=speed)
+            push_window_seconds=push_window_seconds, speed=speed,
+            connections=spec.connections, flow_control=spec.flow_control)
         determinism: dict[str, Any] | None = None
         if spec.runs > 1:
             first_digest = _batch_sequence_digest(artifacts.cache_root)
@@ -879,7 +959,8 @@ def run_scenario(pack: Path | str, spec: ScenarioSpec, *, work_dir: Path,
             cache_dirs.append(second_cache)
             _second_source, second = _execute_run(
                 pack_path, tier.symbols, spec.faults, cache_root=second_cache, inputs=inputs,
-                push_window_seconds=push_window_seconds, speed=speed)
+                push_window_seconds=push_window_seconds, speed=speed,
+                connections=spec.connections, flow_control=spec.flow_control)
             second_digest = _batch_sequence_digest(second.cache_root)
             determinism = {
                 "runs": spec.runs,
@@ -1159,11 +1240,13 @@ def _push_seconds(value: str) -> float | None:
     return seconds
 
 
-def _single_scenario(stocks: int, fault: str) -> ScenarioSpec:
+def _single_scenario(stocks: int, fault: str, *, connections: int = 1,
+                     flow_control: bool = False) -> ScenarioSpec:
     tier = tier_symbols(stocks)
     name = f"healthy-{stocks}" if fault == "healthy" else f"{fault}-{stocks}"
     return ScenarioSpec(name=name, stocks=stocks,
-                        faults=fault_injection(fault, tier.symbols))
+                        faults=fault_injection(fault, tier.symbols),
+                        connections=connections, flow_control=flow_control)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -1188,7 +1271,14 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--stocks", type=int, default=SIMULATED_STOCK_UNIVERSE)
     run.add_argument("--fault", choices=FAULT_CHOICES, default="healthy",
                      help="seed-24of40 withholds seeds from stock position 24 onward "
-                          "(tiers with <=24 stocks are unaffected)")
+                          "(tiers with <=24 stocks are unaffected); seed-latency applies "
+                          "the calibrated 2026-10-29 per-connection seed wait curve")
+    run.add_argument("--connections", type=int, default=1,
+                     help="batched upstream connections (contiguous stock chunks)")
+    run.add_argument("--flow-control", action="store_true",
+                     help="enable batched subscription pacing and one deferred seed retry")
+    run.add_argument("--speed", type=float, choices=(0.0, 1.0, 10.0), default=0.0,
+                     help="replay speed; 0 is full speed (default)")
     run.add_argument("--out", type=Path, default=None, help="report JSON path")
     return parser
 
@@ -1233,8 +1323,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                               keep=args.keep, inputs_dir=args.inputs_dir)
             _print_gate_summary(report, args.out)
             return 0 if report["gate"]["status"] == "pass" else 1
-        report = run_gate(args.pack, out=args.out,
-                          scenarios=(_single_scenario(args.stocks, args.fault),))
+        report = run_gate(args.pack, out=args.out, speed=args.speed,
+                          scenarios=(_single_scenario(
+                              args.stocks, args.fault,
+                              connections=args.connections,
+                              flow_control=args.flow_control),))
         _print_run_summary(report, args.out)
         return 0 if report["gate"]["status"] == "pass" else 1
     except GateError as error:
