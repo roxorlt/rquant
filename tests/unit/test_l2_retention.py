@@ -239,21 +239,24 @@ def test_plan_cold_eviction_respects_age_and_reserve(tmp_path: Path):
     eviction = module._plan_cold_eviction(
         (old, young, unverified), policy=module_policy, now=now,
         disk=module.DiskUsage(total_bytes=10**12, free_bytes=10**11),
-        incoming_bytes=0, notes=notes,
+        incoming_bytes=0, notes=notes, hot_floor=1000,
     )
     assert eviction is not None
-    assert eviction.files == (old.file,)
-    assert eviction.freed_bytes == 1000
-    # Unverified and young segments are never candidates, so the cap stays exceeded.
-    assert any("cap still exceeded" in note for note in notes)
+    # The hard cap wins: the older segment goes first, then the young one.
+    assert eviction.files == (old.file, young.file)
+    assert eviction.freed_bytes == 2000
+    assert any("younger than cold_keep_days" in note for note in notes)
+    assert not any("cap still exceeded" in note for note in notes)
     # Reserve floor alone can also trigger eviction of the oldest eligible segment.
     eviction = module._plan_cold_eviction(
         (old, young, unverified), policy=policy(cold_keep_days=0.0, cold_max_bytes=10**12,
                                                 reserve_free_bytes=100_000),
         now=now, disk=module.DiskUsage(total_bytes=10**12, free_bytes=500),
-        incoming_bytes=0, notes=notes,
+        incoming_bytes=0, notes=notes, hot_floor=1000,
     )
     assert eviction is not None and eviction.files[0] == old.file
+    # Unverified segments were never candidates.
+    assert unverified.file not in eviction.files
 
 
 def test_evict_cold_segments_updates_manifest(tmp_path: Path):
@@ -263,6 +266,10 @@ def test_evict_cold_segments_updates_manifest(tmp_path: Path):
     cache_root = build_cache(tmp_path, 12)
     cold_root = tmp_path / "cold"
     compact_cache(cache_root, cold_root, block_records=2, segment_bytes=3_000)
+    # First retire the prefix with a normal cycle, then age the manifest.
+    state = archive_receipt(tmp_path / "state", 12)
+    module.run_retention(cache_root, cold_root, policy=policy(), archive_state_root=state,
+                         now=START + timedelta(hours=1))
     manifest = load_manifest(cold_root)
     assert len(manifest.segments) >= 2
     old = [entry.model_copy(update={"created_at": START - timedelta(days=90),
@@ -272,8 +279,8 @@ def test_evict_cold_segments_updates_manifest(tmp_path: Path):
     report = module.run_retention(
         cache_root, cold_root,
         policy=policy(cold_keep_days=30.0, cold_max_bytes=manifest.segments[0].stored_bytes),
-        archive_state_root=archive_receipt(tmp_path / "state", 12),
-        now=START + timedelta(hours=1),
+        archive_state_root=state,
+        now=START + timedelta(hours=2),
     )
     assert report.evicted_segments >= 1
     remaining = load_manifest(cold_root).segments
@@ -310,3 +317,102 @@ def test_prune_cleans_interrupted_leftovers(tmp_path: Path):
     assert (cache_root / "batches" / f"{6:020d}").is_dir()
     # Idempotent: running again finds nothing to delete.
     assert module._prune_hot_prefix(cache_root, 5, reason="retry", now=START) == (0, 0)
+
+
+def test_stale_published_head_is_never_pruned(tmp_path: Path):
+    """A crash can leave .head pointing at an older batch than the newest one."""
+    module = retention()
+    import os
+
+    from rquant.l2.cache import RawL2Cache, read_floor
+
+    cache_root = build_cache(tmp_path, 12)
+    # Publish batch 1..11 but leave batch 12 committed and unreferenced by .head.
+    head = cache_root / "batches" / ".head"
+    head.unlink()
+    os.link(cache_root / "batches" / f"{11:020d}" / "batch.json", head)
+    state = archive_receipt(tmp_path / "state", 12)
+    report = module.run_retention(
+        cache_root, tmp_path / "cold", policy=policy(), archive_state_root=state,
+        now=START + timedelta(hours=1),
+    )
+    assert report.pruned_through <= 10
+    assert read_floor(cache_root) <= 10
+    assert (cache_root / "batches" / f"{11:020d}").is_dir()
+    assert (cache_root / "batches" / f"{12:020d}").is_dir()
+    # The reader and a fresh writer both still work.
+    assert RawL2Cache(cache_root).read_batches(after_sequence=10, limit=1).batches[0].local_batch_sequence == 11
+    with RawL2Cache(cache_root).writer() as writer:
+        appended = writer.append(observations(1, start=START + timedelta(hours=2))[0])
+    assert appended.local_batch_sequence == 13
+
+
+def test_low_disk_does_not_deadlock_on_compaction(tmp_path: Path):
+    """Cold eviction runs before compaction; a refused compaction is reported."""
+    module = retention()
+    from rquant.l2.cache import write_floor
+    from rquant.l2.cold_store import compact_cache
+
+    cache_root = build_cache(tmp_path, 24)
+    cold_root = tmp_path / "cold"
+    compact_cache(cache_root, cold_root, until_sequence=10)
+    write_floor(cache_root, 10, reason="test", now=START)
+    import shutil
+
+    for sequence in range(1, 11):
+        shutil.rmtree(cache_root / "batches" / f"{sequence:020d}")
+    state = archive_receipt(tmp_path / "state", 24)
+    report = module.run_retention(
+        cache_root, cold_root,
+        policy=policy(reserve_free_bytes=1 << 62, hot_keep_hours=0.0),
+        archive_state_root=state, now=START + timedelta(hours=1),
+    )
+    assert "disk_budget" in report.plan.blockers
+    # The retired cold segment was evicted before the refused compaction write.
+    assert report.evicted_segments >= 1
+
+
+def test_missing_cold_segment_blocks_prune(tmp_path: Path):
+    module = retention()
+    from rquant.l2.cold_store import compact_cache, load_manifest
+
+    cache_root = build_cache(tmp_path, 12)
+    cold_root = tmp_path / "cold"
+    module.run_retention(cache_root, cold_root, policy=policy(),
+                         archive_state_root=archive_receipt(tmp_path / "state", 12),
+                         now=START + timedelta(hours=1))
+    # Drop the segment behind the manifest's back; coverage must shrink and the
+    # next pass must repair the manifest instead of raising sequence_overlap.
+    segment = load_manifest(cold_root).segments[0]
+    (cold_root / segment.file).unlink()
+    plan = module.plan_retention(
+        cache_root, cold_root, policy=policy(),
+        archive_state_root=archive_receipt(tmp_path / "state2", 12),
+        now=START + timedelta(hours=2),
+    )
+    assert plan.prune_hot is False
+    report = module.run_retention(
+        cache_root, cold_root, policy=policy(),
+        archive_state_root=archive_receipt(tmp_path / "state2", 12),
+        now=START + timedelta(hours=2),
+    )
+    assert report.pruned_batches == 0
+    assert (cache_root / "batches" / f"{12:020d}").is_dir()
+
+
+def test_hot_boundary_tolerates_non_monotonic_receive_times(tmp_path: Path):
+    module = retention()
+    from rquant.l2.cache import RawL2Cache
+    from tests.unit.l2_cold_fixtures import observations
+
+    cache_root = tmp_path / "cache"
+    cache = RawL2Cache(cache_root)
+    ordered = observations(10)
+    with cache.writer():
+        for index, observation in enumerate(ordered):
+            # Reverse the receive order so binary search on sequence is invalid.
+            cache.append(observation.model_copy(update={
+                "received_at": START + timedelta(seconds=10 - index)}))
+    boundary = module._hot_boundary(cache_root, START + timedelta(seconds=5))
+    # The conservative forward scan stops at the first batch newer than the cutoff.
+    assert boundary == 0

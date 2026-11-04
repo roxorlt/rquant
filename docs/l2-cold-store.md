@@ -77,7 +77,12 @@
 2. **再校验**：读回冷段与源 `batch.json` 逐批比较，通过才写 manifest；
 3. **再归档门禁**：`archived_through` 必须 ≥ 待删前缀；不足则只压缩不删除；
 4. **再删前缀**：非阻塞独占 `.writer.lock`（采集器在跑就跳过删除），先原子写 `batches/.floor`，再删目录；
-5. **最后淘汰冷段**：只淘汰“已验证且超过 `cold_keep_days`”的段，最老优先，且不得突破磁盘保留线。
+5. **先回收再压缩**：一次保留周期里的实际执行顺序是 **冷段回收 → 删热前缀 → 压缩 → 再删 → 再回收**；磁盘低于保留线时不会先用一次压缩去撞 `disk_budget`，压缩被拒也只记 blocker 不中断整轮；
+6. **只淘汰“已退役”的冷段**：`last_sequence <= floor`（对应热缓存已删掉）且已验证的段才可淘汰；仍覆盖热数据的段不淘汰（否则会让后续删除失去本地副本）。`cold_keep_days` 是软下限：只有磁盘保留线/`cold_max_bytes` 施压时才可能淘汰更年轻的已验证退役段，并在 notes 里说明。
+
+`.head` 保护：发布头是某个批次 `batch.json` 的硬链接，计划阶段会把它解析出来（`hot_usage().head_link`）并保证 `prune_through <= head_link-1`；若崩溃留下 `.head` 指向已提交但未发布的批次，写入进程重启时会校验并按最新已提交批次重建 `.head`，不会悬空。删前缀时还会二次断言，绝不删除 `.head` 指向的批次。
+
+删除是**可中断**的：先写 `.floor` 再逐个删目录；下一次运行（即使本轮没有新增可删范围）会在采集器空闲时扫一遍 ≤ floor 的残留并清掉。`batches/` 下以 `.` 开头的内部文件（`.head`、`.floor`、`.floor-*` 临时文件、`.pending-*`）不参与批次目录校验，写入恢复时会清理 `.pending-*`。
 
 `.floor` 是新增的只读标记（`batches/.floor`，JSON `{"schema":"rquant-l2-cache-floor-v1","pruned_through":N,...}`）：读路径把 ≤N 的序号视为“已主动退役”，不再报 `sequence_gap`；写入进程重启后从 `N+1` 继续编号。保留最新 1 批热数据，`.head` 硬链接永远不会悬空。
 
@@ -117,8 +122,11 @@ python -m rquant.l2.cold_store compact \
   [--after-sequence N] [--until-sequence M] [--block-records 512] \
   [--codec zlib|gzip|none] [--level 6] [--segment-bytes 67108864] [--no-verify]
 
-# 校验（有源缓存时逐批字节比较）
-python -m rquant.l2.cold_store verify --cold-root /path/cold [--cache-root /path/cache]
+# 校验（有源缓存时逐批字节比较；--mark 才能把 verified_at 写回清单）
+python -m rquant.l2.cold_store verify --cold-root /path/cold --cache-root /path/cache [--mark]
+
+# 清理孤儿段/未清理的 pending 文件（持冷存写锁，安全）
+python -m rquant.l2.cold_store cleanup --cold-root /path/cold
 
 # 还原成 cache 布局（可直接被 RawL2Cache 读取；partial 段会写 .floor）
 python -m rquant.l2.cold_store restore --cold-root /path/cold --destination /path/restored [--overwrite]
@@ -130,7 +138,7 @@ python -m rquant.l2.retention --cache-root /path/cache --cold-root /path/cold \
   --archive-state-root /path/archive-state [--dry-run]
 ```
 
-Python API：`compact_cache`、`verify_segment`、`restore`、`iter_batches`、`read_batch`、`stats`、`load_manifest`（`rquant.l2.cold_store`）；`plan_retention`、`run_retention`、`RetentionPolicy`、`hot_usage`、`archive_coverage`（`rquant.l2.retention`）。
+Python API：`compact_cache`、`verify_segment`、`restore`、`iter_batches`、`read_batch`、`stats`、`load_manifest`、`mark_verified`、`cleanup_orphans`（`rquant.l2.cold_store`）；`plan_retention`、`run_retention`、`RetentionPolicy`、`hot_usage`、`archive_coverage`（`rquant.l2.retention`）。
 
 ## 6. 实测结果（本机，2026-11-03）
 
@@ -147,6 +155,7 @@ Python API：`compact_cache`、`verify_segment`、`restore`、`iter_batches`、`
 | 无损校验 | 9,895/9,895 批 `batch.json` **字节一致**；模型序列化一致；行数一致 |
 | 吞吐 | 压缩 2,905 批/s，还原 3,402 批/s；段级校验 1.26 s |
 | 保留演练（400 批真实缓存副本） | 压缩 399 批、删除 399 批、热缓存分配下降 99.47%、冷存 20,959 B、0 失配、第二次运行 no-op、删前缀后归档 `_source` 仍通过 |
+| 异常路径回归（单测） | 陈旧 `.head` 不被删且可续写；低磁盘先回收后压缩、压缩被拒只记 blocker；缺失冷段使删除覆盖失效；中断删除残留可清；`--no-verify` 段可 repair 后再删；replay pack 对已退役区间报 `range_retired` |
 
 验收线“同数据量落盘体积下降 ≥60%”：逻辑体积 −99.0%、磁盘分配 −99.6%，**远超要求**。需要说明：这是本机真实缓存上的离线压测，不是服务器实盘；40 股实跑缓存不在本机，容量表用同一批帧的构成模型外推（与 20 分钟实跑误差 1.1%，见下）。
 
@@ -178,17 +187,21 @@ Python API：`compact_cache`、`verify_segment`、`restore`、`iter_batches`、`
 - **未在服务器实跑**：本机压测数据来自 10/16 的 2 股 6 路缓存；40/80/100 股整日容量需用真实整日缓存复核（重点：开盘 20 分钟速率是否随股数线性增长）。
 - 压缩仅在**采集器不在写同一前缀**时安全；删除前缀（prune）要求采集器停写，retention 会用 `.writer.lock` 非阻塞检测并跳过。
 - 冷存是本机中间层，不替代 R2 归档；R2 归档仍是长期权威，retention 的删除门禁依赖归档回执。
+- **归档回执只按 `last_sequence` 校验，不绑定缓存实例**：如果缓存目录被重建（序号从 1 重来）而归档 state 仍是旧实例，回执可能误覆盖新缓存。当前用“归档 state 必须与本缓存配套”作为运维约束；更严格的回执指纹（首/末批 sha 或 catalog 绑定）留待后续。
+- **删前缀与并发读者没有互斥**：删除要求采集器停写（`.writer.lock`），但正在分页的 API 读者可能瞬时读到已删目录而返回一次 `CacheError`；目前靠“停采集器 + 盘后运行”规避，未做读者重试语义。
+- **`BatchPage` 不带 `retired_through`**：消费者从 0 游标读取时会被静默钳制到 floor+1，接口没有显式提示（replay_pack 已改为对退役区间报错，其它消费者需要知情）。
 - 未安装 zstd/lz4：zlib-6 与 gzip-6 实测差距 <1%，默认 zlib；部署 venv 若以后加 `zstandard`，块头 codec 已预留。
 - 随机读按块（默认 512 批 ≈ 16–32 KiB）解码，不做段内单条随机索引；回放/还原走顺序流。
 - 冷段不自带“来源 epoch 时间范围”索引，`stats` 只汇总体积/记录/序号；跨天检索仍需 R2 catalog。
+- `--no-verify` 只用于诊断：未验证段不会触发删除；可用 `verify --cache-root ... --mark` 在源批次仍存在时补验证。
 
 ## 9. 测试
 
 ```sh
-# 新模块（35 个）
+# 新模块（44 个）
 /Users/roxor/Documents/ChatGPT/rea L2/.tools/review/run-l2-cold-store-tests.sh
 
-# L2 全量回归（567 项；不含 test_l2_web/test_storage_pool2，本机 venv 缺 duckdb）
+# L2 全量回归（576 项；不含 test_l2_web/test_storage_pool2，本机 venv 缺 duckdb）
 /Users/roxor/Documents/ChatGPT/rea L2/.tools/review/run-l2-cold-store-tests.sh \
   tests/unit/test_l2_archive.py tests/unit/test_l2_archive_deploy.py \
   tests/unit/test_l2_cache.py tests/unit/test_l2_codec.py tests/unit/test_l2_feed.py \

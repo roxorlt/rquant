@@ -36,7 +36,7 @@ import os
 import shutil
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from pydantic import BaseModel, ConfigDict, Field
@@ -146,6 +146,7 @@ class HotUsage:
     allocated_bytes: int
     logical_bytes: int
     newest_received_at: datetime | None
+    head_link: int | None
 
 
 def hot_usage(cache_root: Path) -> HotUsage:
@@ -155,11 +156,18 @@ def hot_usage(cache_root: Path) -> HotUsage:
     floor = read_floor(root)
     if not batches.is_dir():
         return HotUsage(floor=floor, head=floor, batches=0, allocated_bytes=0,
-                        logical_bytes=0, newest_received_at=None)
+                        logical_bytes=0, newest_received_at=None, head_link=None)
+    head_link_inode: tuple[int, int] | None = None
+    try:
+        head_info = (batches / ".head").lstat()
+        head_link_inode = (head_info.st_dev, head_info.st_ino)
+    except OSError:
+        head_link_inode = None
     allocated = 0
     logical = 0
     newest: datetime | None = None
     names: list[int] = []
+    head_link: int | None = None
     try:
         with os.scandir(batches) as entries:
             for entry in entries:
@@ -178,13 +186,16 @@ def hot_usage(cache_root: Path) -> HotUsage:
                         allocated += info.st_blocks * 512
                         if item.name == "batch.json":
                             logical += info.st_size
+                            if head_link_inode is not None and (
+                                    info.st_dev, info.st_ino) == head_link_inode:
+                                head_link = sequence
     except OSError:
         raise RetentionError("io_error") from None
     head = max(names, default=floor)
     if names:
         newest = _try_read_received_at(root, head)
     return HotUsage(floor=floor, head=head, batches=len(names), allocated_bytes=allocated,
-                    logical_bytes=logical, newest_received_at=newest)
+                    logical_bytes=logical, newest_received_at=newest, head_link=head_link)
 
 
 def _try_read_received_at(cache_root: Path, sequence: int) -> datetime | None:
@@ -276,6 +287,20 @@ def _covered_through(intervals: list[tuple[int, int]], floor: int, through: int)
     return cursor
 
 
+def _present_segments(cold_root: Path, segments: tuple[SegmentEntry, ...]) -> tuple[SegmentEntry, ...]:
+    """Drop manifest entries whose file is missing or whose size disagrees."""
+    root = Path(cold_root)
+    present = []
+    for entry in segments:
+        try:
+            info = (root / entry.file).stat()
+        except OSError:
+            continue
+        if info.st_size == entry.stored_bytes:
+            present.append(entry)
+    return tuple(present)
+
+
 def _writer_active(cache_root: Path) -> bool:
     root = Path(cache_root)
     lock = root / ".writer.lock"
@@ -297,25 +322,55 @@ def _writer_active(cache_root: Path) -> bool:
 
 
 def _hot_boundary(cache_root: Path, cutoff: datetime) -> int:
-    """Last committed sequence whose ``received_at`` is at or before ``cutoff``."""
+    """Last committed sequence whose ``received_at`` is at or before ``cutoff``.
+
+    The fast path is a binary search over sequence order.  If the cache does not
+    have monotonic ``received_at`` (a reconnect can interleave older receive
+    times), the search re-checks its neighbours and falls back to a forward scan
+    that stops at the first batch newer than the cutoff, which is conservative.
+    """
     cache = RawL2Cache(Path(cache_root))
     floor = cache.floor_sequence()
     head = cache.read_status().last_sequence
     if head <= floor:
         return floor
     cutoff_us = _to_us(cutoff)
+
+    def received_us(sequence: int) -> int:
+        page = cache.read_batches(after_sequence=sequence - 1, limit=1)
+        return _to_us(page.batches[0].received_at)
+
     low, high = floor + 1, head + 1
     while low < high:
         middle = (low + high) // 2
-        page = cache.read_batches(after_sequence=middle - 1, limit=1)
-        if not page.batches:
-            low = middle + 1
-            continue
-        if _to_us(page.batches[0].received_at) <= cutoff_us:
+        if received_us(middle) <= cutoff_us:
             low = middle + 1
         else:
             high = middle
-    return low - 1
+    boundary = low - 1
+    consistent = True
+    if boundary >= floor + 1:
+        if received_us(floor + 1) > cutoff_us or received_us(boundary) > cutoff_us:
+            consistent = False
+    if boundary < head:
+        if received_us(boundary + 1) <= cutoff_us or received_us(head) <= cutoff_us:
+            consistent = False
+    if consistent:
+        return boundary
+    # Forward scan: stop at the first batch newer than the cutoff.
+    sequence = floor + 1
+    last_old = floor
+    while sequence <= head:
+        limit = min(512, head - sequence + 1)
+        page = cache.read_batches(after_sequence=sequence - 1, limit=limit)
+        if not page.batches:
+            break
+        for batch in page.batches:
+            if _to_us(batch.received_at) > cutoff_us:
+                return batch.local_batch_sequence - 1
+            last_old = batch.local_batch_sequence
+        sequence = page.batches[-1].local_batch_sequence + 1
+    return last_old
 
 
 def plan_retention(
@@ -342,14 +397,18 @@ def plan_retention(
         raise RetentionError(getattr(exc, "code", "invalid_cache")) from None
     usage = hot_usage(cache_dir) if measure_hot else HotUsage(
         floor=floor, head=head, batches=0, allocated_bytes=0, logical_bytes=0,
-        newest_received_at=None,
+        newest_received_at=None, head_link=None,
     )
     floor = max(floor, usage.floor)
     head = max(head, usage.head)
+    head_link = usage.head_link
+    if head_link is not None and head_link != head:
+        notes.append("published head lags the newest committed batch")
 
     manifest = load_manifest(cold_dir) if cold_dir.exists() else None
     segments = manifest.segments if manifest is not None else ()
-    covered_any = _covered_through(_verified_intervals(segments, include_unverified=True), floor, head)
+    present = _present_segments(cold_dir, segments)
+    covered_any = _covered_through(_verified_intervals(present, include_unverified=True), floor, head)
     boundary = floor
     if head > floor:
         cutoff = clock - timedelta(hours=policy.hot_keep_hours)
@@ -380,7 +439,7 @@ def plan_retention(
     writer_busy = _writer_active(cache_dir)
     if writer_busy:
         notes.append("collector holds the writer lock; pruning will be skipped")
-    verified_covered = _covered_through(_verified_intervals(segments), floor, head)
+    verified_covered = _covered_through(_verified_intervals(present), floor, head)
     prune_through = min(verified_covered, boundary)
     if policy.archive_required:
         if archived is None:
@@ -391,10 +450,12 @@ def plan_retention(
             prune_through = min(prune_through, archived)
     if verified_covered < boundary:
         notes.append("compaction must run before pruning")
-    # The published head is a hardlink to the newest batch; keep that batch so
-    # readers and restart recovery never see a dangling .head after retiring.
-    if prune_through > head - 1:
-        prune_through = max(floor, head - 1)
+    # The published head is a hardlink to one committed batch; keep that batch
+    # (not merely the newest one) so readers and restart recovery never see a
+    # dangling .head after retiring.
+    protected = head_link if head_link is not None else head
+    if prune_through > protected - 1:
+        prune_through = max(floor, protected - 1)
         if prune_through > floor:
             notes.append("newest batch kept for the published head")
     if writer_busy:
@@ -402,9 +463,9 @@ def plan_retention(
     prune_hot = prune_through > floor and not blockers
 
     eviction = _plan_cold_eviction(
-        segments, policy=policy, now=clock, disk=disk,
+        present, policy=policy, now=clock, disk=disk,
         incoming_bytes=(compact.records * 64 if compact is not None else 0),
-        notes=notes,
+        notes=notes, hot_floor=floor,
     )
     return RetentionPlan(
         now=clock, policy=policy, disk=disk, hot_floor=floor, hot_head=head,
@@ -424,17 +485,24 @@ def _plan_cold_eviction(
     disk: DiskUsage,
     incoming_bytes: int,
     notes: list[str],
+    hot_floor: int = 0,
 ) -> ColdEviction | None:
-    """Choose the oldest verified segments to delete, respecting both caps."""
-    candidates = []
+    """Choose the oldest verified segments to delete, respecting both caps.
+
+    ``cold_keep_days`` is a soft floor: it protects segments while only the
+    reserve line demands space, but the hard ``cold_max_bytes`` cap wins and may
+    take the oldest verified segments regardless of age.
+    """
+    # Only ranges already retired from the hot cache may be evicted; a segment
+    # that still backs live hot batches is needed to make a later prune safe.
+    verified = [entry for entry in segments
+                if entry.verified_at is not None and entry.last_sequence <= hot_floor]
+    verified.sort(key=lambda entry: (entry.first_sequence, entry.file))
+    if not verified:
+        notes.append("no retired cold segment is eligible for eviction")
+        return None
     cutoff = now - timedelta(days=policy.cold_keep_days)
-    for entry in segments:
-        if entry.verified_at is None:
-            continue
-        if entry.created_at > cutoff:
-            continue
-        candidates.append(entry)
-    candidates.sort(key=lambda entry: (entry.first_sequence, entry.file))
+    aged = [entry for entry in verified if entry.created_at <= cutoff]
     total = sum(entry.stored_bytes for entry in segments)
     projected = total + incoming_bytes
     must_evict = projected > policy.cold_max_bytes
@@ -443,18 +511,33 @@ def _plan_cold_eviction(
         return None
     chosen: list[str] = []
     freed = 0
-    for entry in candidates:
-        if freed >= need and (not must_evict or projected - freed <= policy.cold_max_bytes):
+    def satisfied() -> bool:
+        return freed >= need and (not must_evict or projected - freed <= policy.cold_max_bytes)
+    # Aged segments are evicted first; under a hard cap overflow or a reserve
+    # emergency the remaining verified (but still young) segments follow, oldest
+    # first.  Unverified segments are never candidates.
+    for tier in (aged, verified):
+        for entry in tier:
+            if entry.file in chosen:
+                continue
+            if satisfied():
+                break
+            chosen.append(entry.file)
+            freed += entry.stored_bytes
+        if satisfied():
             break
-        chosen.append(entry.file)
-        freed += entry.stored_bytes
     if not chosen:
         if need > 0:
             notes.append(f"cold reserve shortfall {need} bytes with no evictable segment")
+        if must_evict:
+            notes.append("cold cap exceeded with no verified segment to evict")
         return None
-    still_over = projected - freed > policy.cold_max_bytes
-    if still_over:
-        notes.append("cold cap still exceeded after evicting young-eligible segments")
+    if any(entry.file in chosen for entry in verified if entry not in aged):
+        notes.append("cap/reserve pressure evicted a segment younger than cold_keep_days")
+    if projected - freed > policy.cold_max_bytes:
+        notes.append("cold cap still exceeded after evicting every verified segment")
+    if freed < need:
+        notes.append(f"reserve shortfall remains after evicting every verified segment")
     return ColdEviction(files=tuple(chosen), freed_bytes=freed,
                         reason="cold_budget" if must_evict else "reserve_floor")
 
@@ -496,6 +579,11 @@ def _prune_hot_prefix(cache_root: Path, through: int, *, reason: str,
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise RetentionError("writer_active") from None
+        try:
+            head_info = (batches / ".head").lstat()
+            head_inode = (head_info.st_dev, head_info.st_ino)
+        except OSError:
+            head_inode = None
         if through > floor:
             write_floor(root, through, reason=reason, now=now)
         # Publish the floor first (crash-safe), then delete every batch directory
@@ -514,6 +602,14 @@ def _prune_hot_prefix(cache_root: Path, through: int, *, reason: str,
             directory = Path(entry.path)
             if not entry.is_dir(follow_symlinks=False) or directory.is_symlink():
                 raise RetentionError("unsafe_path")
+            batch_file = directory / "batch.json"
+            if head_inode is not None:
+                try:
+                    batch_info = batch_file.lstat()
+                except OSError:
+                    raise RetentionError("io_error") from None
+                if (batch_info.st_dev, batch_info.st_ino) == head_inode:
+                    raise RetentionError("head_linked")
             with os.scandir(directory) as files:
                 for item in files:
                     allocated += item.stat(follow_symlinks=False).st_blocks * 512
@@ -533,7 +629,17 @@ def _prune_hot_prefix(cache_root: Path, through: int, *, reason: str,
 
 
 def _evict_cold_segments(cold_root: Path, files: tuple[str, ...], *, now: datetime) -> int:
+    from .cold_store import _lock_cold_writer
+
     root = Path(cold_root)
+    lock = _lock_cold_writer(root)
+    try:
+        return _evict_cold_segments_locked(root, files, now=now)
+    finally:
+        os.close(lock)
+
+
+def _evict_cold_segments_locked(root: Path, files: tuple[str, ...], *, now: datetime) -> int:
     segments_dir = (root / "segments").resolve()
     manifest = load_manifest(root)
     by_file = {entry.file: entry for entry in manifest.segments}
@@ -545,16 +651,22 @@ def _evict_cold_segments(cold_root: Path, files: tuple[str, ...], *, now: dateti
         path = (root / name).resolve()
         if segments_dir not in path.parents:
             raise RetentionError("unsafe_path")
+        removed += 1
+    removed_files = set(files)
+    remaining = tuple(entry for entry in manifest.segments if entry.file not in removed_files)
+    # Publish the shorter manifest first; a crash then leaves an orphan file and
+    # never a manifest entry without its bytes.
+    _write_manifest(root, ColdManifest(segments=remaining))
+    for name in files:
+        path = (root / name).resolve()
+        if segments_dir not in path.parents:
+            raise RetentionError("unsafe_path")
         try:
             path.unlink()
         except FileNotFoundError:
             pass
         except OSError:
             raise RetentionError("io_error") from None
-        removed += 1
-    removed_files = set(files)
-    remaining = tuple(entry for entry in manifest.segments if entry.file not in removed_files)
-    _write_manifest(root, ColdManifest(segments=remaining))
     directory = os.open(root / "segments", os.O_RDONLY | os.O_DIRECTORY)
     try:
         os.fsync(directory)
@@ -576,37 +688,92 @@ def run_retention(
     started = time.perf_counter()
     policy = policy or RetentionPolicy()
     clock = _utc(now or datetime.now(UTC))
-    plan = plan_retention(cache_root, cold_root, policy=policy,
-                          archive_state_root=archive_state_root, now=clock)
     cache_dir = Path(cache_root)
     cold_dir = Path(cold_root)
+    plan = plan_retention(cache_dir, cold_dir, policy=policy,
+                          archive_state_root=archive_state_root, now=clock)
     compacted_records = compacted_segments = compacted_stored = 0
-    if plan.compact_range is not None and not dry_run:
-        result = compact_cache(
-            cache_dir, cold_dir,
-            after_sequence=plan.compact_range.after_sequence,
-            until_sequence=plan.compact_range.until_sequence,
-            verify=policy.verify_segments,
-            reserve_bytes=policy.reserve_free_bytes,
-            now=clock,
-        )
-        compacted_records = result.records
-        compacted_segments = len(result.segments)
-        compacted_stored = result.stored_bytes
+    pruned_batches = pruned_allocated = pruned_through = 0
+    evicted = evicted_bytes = 0
+    compact_blocked: str | None = None
+
+    def refresh() -> None:
+        nonlocal plan
         plan = plan_retention(cache_dir, cold_dir, policy=policy,
                               archive_state_root=archive_state_root, now=clock)
-    pruned_batches = pruned_allocated = pruned_through = 0
+
+    # 1) Reclaim cold segments first: it is the only action that frees space
+    #    without touching the live cache, so a low-disk pass must not start with
+    #    a write (compaction) that the reserve check would refuse.
+    if plan.cold_eviction is not None and not dry_run:
+        evicted += _evict_cold_segments(cold_dir, plan.cold_eviction.files, now=clock)
+        evicted_bytes += plan.cold_eviction.freed_bytes
+        refresh()
+
+    # 2) Retire an already-verified hot prefix (frees the most space) and clean
+    #    up directories left behind by an interrupted earlier prune.
+    if not plan.writer_active and not dry_run and (plan.prune_hot or plan.hot_floor > 0):
+        target = plan.prune_through if plan.prune_hot else plan.hot_floor
+        try:
+            deleted, allocated = _prune_hot_prefix(
+                cache_dir, target,
+                reason="retention" if plan.prune_hot else "leftover_cleanup", now=clock,
+            )
+        except RetentionError as exc:
+            if exc.code in ("writer_active", "head_linked"):
+                deleted, allocated = 0, 0
+            else:
+                raise
+        pruned_batches += deleted
+        pruned_allocated += allocated
+        pruned_through = read_floor(cache_dir)
+        if plan.prune_hot or deleted:
+            refresh()
+
+    # 3) Compact whatever is still only in the hot cache. A reserve refusal is
+    #    reported and does not abort the rest of the pass.
+    if plan.compact_range is not None and not dry_run:
+        try:
+            result = compact_cache(
+                cache_dir, cold_dir,
+                after_sequence=plan.compact_range.after_sequence,
+                until_sequence=plan.compact_range.until_sequence,
+                verify=policy.verify_segments,
+                reserve_bytes=policy.reserve_free_bytes,
+                now=clock,
+            )
+        except ColdStoreError as exc:
+            if exc.code != "disk_budget":
+                raise
+            compact_blocked = "disk_budget"
+        else:
+            compacted_records = result.records
+            compacted_segments = len(result.segments)
+            compacted_stored = result.stored_bytes
+        refresh()
+
+    # 4) Retire the prefix that the new segments just made verifiable.
     if plan.prune_hot and plan.prune_through > plan.hot_floor and not dry_run:
-        pruned_batches, pruned_allocated = _prune_hot_prefix(
+        deleted, allocated = _prune_hot_prefix(
             cache_dir, plan.prune_through, reason="retention", now=clock,
         )
-        pruned_through = plan.prune_through
-    evicted = evicted_bytes = 0
+        pruned_batches += deleted
+        pruned_allocated += allocated
+        pruned_through = read_floor(cache_dir)
+        refresh()
+
+    # 5) Final cold eviction if compaction pushed the cold tier over a cap.
     if plan.cold_eviction is not None and not dry_run:
-        evicted = _evict_cold_segments(cold_dir, plan.cold_eviction.files, now=clock)
-        evicted_bytes = plan.cold_eviction.freed_bytes
-    hot_after = allocated_bytes(Path(cache_dir) / "batches") if not dry_run else plan.hot_allocated_bytes
-    cold_after = sum(entry.stored_bytes for entry in load_manifest(cold_dir).segments) if cold_dir.exists() else 0
+        evicted += _evict_cold_segments(cold_dir, plan.cold_eviction.files, now=clock)
+        evicted_bytes += plan.cold_eviction.freed_bytes
+        refresh()
+
+    if compact_blocked is not None:
+        plan = replace(plan, blockers=plan.blockers + (compact_blocked,))
+    hot_after = (allocated_bytes(Path(cache_dir) / "batches") if not dry_run
+                 else plan.hot_allocated_bytes)
+    cold_after = (sum(entry.stored_bytes for entry in load_manifest(cold_dir).segments)
+                  if cold_dir.exists() else 0)
     return RetentionReport(
         plan=plan, dry_run=dry_run,
         compacted_records=compacted_records, compacted_segments=compacted_segments,

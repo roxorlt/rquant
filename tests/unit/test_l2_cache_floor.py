@@ -119,3 +119,20 @@ def test_archive_source_tolerates_retired_prefix(tmp_path: Path):
     with pytest.raises(ArchiveError) as caught:
         _source(cache, catalog, 12)
     assert caught.value.code == "source_truncated"
+
+
+def test_dot_prefixed_leftovers_are_ignored_and_cleaned(tmp_path: Path):
+    module = cache_module()
+    cache_root = build_cache(tmp_path, 6)
+    batches = cache_root / "batches"
+    # A crashed floor publish and a crashed writer can leave dot-prefixed debris.
+    (batches / ".floor-crash").write_text("junk")
+    (batches / ".pending-crash").mkdir()
+    (batches / ".pending-crash" / "batch.json").write_text("junk")
+    reader = module.RawL2Cache(cache_root)
+    assert [batch.local_batch_sequence for batch in reader.iter_batches()] == list(range(1, 7))
+    with module.RawL2Cache(cache_root).writer():
+        pass
+    assert not (batches / ".pending-crash").exists()
+    assert [batch.local_batch_sequence
+            for batch in module.RawL2Cache(cache_root).iter_batches()] == list(range(1, 7))

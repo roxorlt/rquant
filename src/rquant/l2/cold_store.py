@@ -262,8 +262,6 @@ class _BlockBuilder:
         )
         if not 1 <= item.request_id <= 0xFFFFFFFF or not 1 <= item.source_fd <= 2**32:
             raise ColdStoreError("invalid_batch")
-        if abs(item.cached_offset_us) > 86_400_000_000:
-            raise ColdStoreError("invalid_batch")
         self.records.append(item)
         self.body_bytes += len(body)
         self.raw_bytes += len(body) + 48
@@ -319,7 +317,7 @@ class _BlockBuilder:
         return bytes(body)
 
 
-def decode_block(raw: bytes) -> list[RawL2Batch]:
+def _decode_block_impl(raw: bytes) -> list[RawL2Batch]:
     reader = _Reader(raw)
     count = reader.u32()
     base_received = reader.u64()
@@ -399,6 +397,16 @@ def decode_block(raw: bytes) -> list[RawL2Batch]:
             body=body,
         ))
     return batches
+
+
+def decode_block(raw: bytes) -> list[RawL2Batch]:
+    """Decode one raw block; any structural damage is reported as invalid_block."""
+    try:
+        return _decode_block_impl(raw)
+    except ColdStoreError:
+        raise
+    except (IndexError, KeyError, TypeError, ValueError, UnicodeDecodeError, struct.error):
+        raise ColdStoreError("invalid_block") from None
 
 
 def _batch_from_parts(
@@ -785,6 +793,7 @@ class ColdSegment:
                 remaining -= len(chunk)
         if digest.digest() != stored_sha:
             raise ColdStoreError("segment_corrupt")
+        self.content_sha256 = stored_sha.hex()
         try:
             index = json.loads(raw)
             entries = index["blocks"]
@@ -945,6 +954,8 @@ class CompactionResult:
     segments: tuple[SegmentInfo, ...]
     elapsed_seconds: float
     verified: bool
+    orphans_removed_files: int = 0
+    orphans_removed_bytes: int = 0
 
 
 def _payload_info(cache_root: Path, sequence: int) -> tuple[int, int]:
@@ -997,9 +1008,17 @@ def verify_segment(
     segment_path: Path,
     *,
     cache_root: Path | None = None,
+    expected_sha256: str | None = None,
+    expected_bytes: int | None = None,
 ) -> dict:
     """Verify a segment structurally and, when a cache is given, byte-for-byte."""
     segment = open_segment(Path(segment_path))
+    file_sha = _file_sha(segment.path)
+    file_bytes = segment.path.stat().st_size
+    if expected_sha256 is not None and segment.content_sha256 != expected_sha256:
+        raise ColdStoreError("segment_corrupt")
+    if expected_bytes is not None and file_bytes != expected_bytes:
+        raise ColdStoreError("segment_corrupt")
     first = segment.meta["first_sequence"]
     records = 0
     payload_bytes = 0
@@ -1020,8 +1039,9 @@ def verify_segment(
         "last_sequence": segment.meta["last_sequence"],
         "records": records,
         "source_payload_bytes": payload_bytes,
-        "stored_bytes": segment.path.stat().st_size,
-        "sha256": _file_sha(segment.path),
+        "stored_bytes": file_bytes,
+        "sha256": segment.content_sha256,
+        "file_sha256": file_sha,
     }
 
 
@@ -1086,11 +1106,6 @@ def compact_cache(
             records=0, source_batch_bytes=0, source_removed_files=0, stored_bytes=0,
             body_bytes=0, segments=(), elapsed_seconds=0.0, verified=verify,
         )
-    existing = _load_manifest(cold_dir).segments if cold_dir.exists() else ()
-    first_needed = start + 1
-    for entry in existing:
-        if entry.first_sequence <= stop and entry.last_sequence >= first_needed:
-            raise ColdStoreError("sequence_overlap")
     lock = _lock_cold_writer(cold_dir)
     started = time.perf_counter()
     infos: list[SegmentInfo] = []
@@ -1100,6 +1115,13 @@ def compact_cache(
     body_bytes = 0
     writer: _SegmentWriter | None = None
     try:
+        _drop_missing_entries(cold_dir)
+        existing = _load_manifest(cold_dir).segments
+        first_needed = start + 1
+        for entry in existing:
+            if entry.first_sequence <= stop and entry.last_sequence >= first_needed:
+                raise ColdStoreError("sequence_overlap")
+        orphans_files, orphans_bytes = _cleanup_orphans(cold_dir)
         if shutil.disk_usage(cold_dir).free < reserve_bytes:
             raise ColdStoreError("disk_budget")
         for batch in cache.iter_batches(after_sequence=start, limit=stop - start):
@@ -1139,13 +1161,72 @@ def compact_cache(
         source_removed_files=source_files, stored_bytes=stored,
         body_bytes=body_bytes, segments=tuple(infos),
         elapsed_seconds=time.perf_counter() - started, verified=verify,
+        orphans_removed_files=orphans_files, orphans_removed_bytes=orphans_bytes,
     )
 
 
 def _publish_segment(cold_dir: Path, info: SegmentInfo, cache_dir: Path, verify: bool) -> None:
     if verify:
-        verify_segment(info.path, cache_root=cache_dir)
+        verify_segment(info.path, cache_root=cache_dir, expected_sha256=info.sha256,
+                       expected_bytes=info.stored_bytes)
     _append_manifest(cold_dir, _segment_entry(info, datetime.now(UTC) if verify else None))
+
+
+def _drop_missing_entries(cold_root: Path) -> int:
+    """Forget manifest entries whose segment file no longer exists."""
+    root = Path(cold_root)
+    manifest = _load_manifest(root)
+    kept = tuple(entry for entry in manifest.segments if (root / entry.file).is_file())
+    dropped = len(manifest.segments) - len(kept)
+    if dropped:
+        _write_manifest(root, ColdManifest(segments=kept))
+    return dropped
+
+
+def cleanup_orphans(cold_root: Path) -> tuple[int, int]:
+    """Remove missing manifest entries and abandoned segment files (locked)."""
+    root = Path(cold_root)
+    lock = _lock_cold_writer(root)
+    try:
+        _drop_missing_entries(root)
+        return _cleanup_orphans(root)
+    finally:
+        os.close(lock)
+
+
+def _cleanup_orphans(cold_root: Path) -> tuple[int, int]:
+    """Remove abandoned pending files and unreferenced published segments.
+
+    Only called while holding the cold-store writer lock, so no other compactor
+    can be in the middle of publishing.
+    """
+    root = Path(cold_root)
+    directory = root / SEGMENTS_DIR
+    if not directory.is_dir():
+        return 0, 0
+    referenced = {Path(entry.file).name for entry in _load_manifest(root).segments}
+    removed = 0
+    removed_bytes = 0
+    try:
+        entries = list(os.scandir(directory))
+    except OSError:
+        raise ColdStoreError("io_error") from None
+    for entry in entries:
+        if entry.is_dir(follow_symlinks=False):
+            continue
+        name = entry.name
+        if not (name.startswith(".pending-") or _SEGMENT_NAME.match(name)):
+            continue
+        if _SEGMENT_NAME.match(name) and name in referenced:
+            continue
+        info = entry.stat(follow_symlinks=False)
+        try:
+            Path(entry.path).unlink()
+        except OSError:
+            raise ColdStoreError("io_error") from None
+        removed += 1
+        removed_bytes += info.st_size
+    return removed, removed_bytes
 
 
 # ------------------------------------------------------------------- restore
@@ -1236,11 +1317,15 @@ def restore(
     """
     started = time.perf_counter()
     dest = Path(destination)
+    cold_resolved = Path(cold_root).resolve()
+    dest_resolved = dest.resolve()
+    if dest_resolved == cold_resolved or cold_resolved.is_relative_to(dest_resolved):
+        raise ColdStoreError("unsafe_path")
     batches_dir = dest / "batches"
     if dest.exists() and any(dest.iterdir()):
         if not overwrite:
             raise ColdStoreError("destination_not_empty")
-        if dest.is_symlink() or dest.resolve() == Path(cold_root).resolve():
+        if dest.is_symlink():
             raise ColdStoreError("unsafe_path")
         shutil.rmtree(dest)
     dest.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1301,6 +1386,18 @@ def stats(cold_root: Path) -> dict:
     total_records = sum(entry.records for entry in segments)
     total_payload = 0
     missing = []
+    referenced = {Path(entry.file).name for entry in segments}
+    orphan_files = 0
+    orphan_bytes = 0
+    directory = Path(cold_root) / SEGMENTS_DIR
+    if directory.is_dir():
+        for entry in os.scandir(directory):
+            if entry.is_dir(follow_symlinks=False):
+                continue
+            if entry.name.startswith(".pending-") or (
+                    _SEGMENT_NAME.match(entry.name) and entry.name not in referenced):
+                orphan_files += 1
+                orphan_bytes += entry.stat(follow_symlinks=False).st_size
     for entry in segments:
         path = Path(cold_root) / entry.file
         if not path.is_file():
@@ -1317,6 +1414,8 @@ def stats(cold_root: Path) -> dict:
         "file_bytes": total_payload,
         "verified_segments": sum(1 for entry in segments if entry.verified_at is not None),
         "missing_segments": missing,
+        "orphan_files": orphan_files,
+        "orphan_bytes": orphan_bytes,
         "bytes_per_batch": (total_stored / total_records) if total_records else 0.0,
     }
 
@@ -1352,6 +1451,9 @@ def _build_parser() -> argparse.ArgumentParser:
     restore_cmd.add_argument("--overwrite", action="store_true")
 
     commands.add_parser("stats", help="print store statistics").add_argument("--cold-root", required=True)
+
+    cleanup = commands.add_parser("cleanup", help="drop missing entries and orphan segment files")
+    cleanup.add_argument("--cold-root", required=True)
     return parser
 
 
@@ -1377,10 +1479,14 @@ def main(argv: list[str] | None = None) -> int:
             }).decode())
         elif args.command == "verify":
             cache_root = Path(args.cache_root) if args.cache_root else None
+            if args.mark and cache_root is None:
+                raise ColdStoreError("source_required_for_mark")
             rows = []
             passed = []
             for entry, path in _iter_manifest_segments(Path(args.cold_root)):
-                rows.append(verify_segment(path, cache_root=cache_root))
+                rows.append(verify_segment(path, cache_root=cache_root,
+                                           expected_sha256=entry.sha256,
+                                           expected_bytes=entry.stored_bytes))
                 passed.append(entry.file)
             marked = mark_verified(Path(args.cold_root), passed) if args.mark else 0
             print(_canonical({"command": "verify", "segments": rows,
@@ -1392,6 +1498,10 @@ def main(argv: list[str] | None = None) -> int:
                 "records": result.records, "first_sequence": result.first_sequence,
                 "last_sequence": result.last_sequence, "payload_bytes": result.payload_bytes,
             }).decode())
+        elif args.command == "cleanup":
+            files, freed = cleanup_orphans(Path(args.cold_root))
+            print(_canonical({"command": "cleanup", "removed_files": files,
+                              "removed_bytes": freed}).decode())
         else:
             print(_canonical(stats(Path(args.cold_root))).decode())
     except ColdStoreError as exc:

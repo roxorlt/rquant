@@ -435,6 +435,8 @@ def initialize(
                 last_sequence=catalog.last_sequence,
             )
         else:
+            if cache.floor_sequence():
+                raise ArchiveError("source_truncated")
             first = _sha(_bytes(_batch(cache, 1))) if snapshot.last_sequence else None
             catalog = Catalog(
                 last_sequence=0,

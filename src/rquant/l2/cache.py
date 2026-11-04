@@ -34,6 +34,11 @@ FLOOR_NAME = ".floor"
 FLOOR_SCHEMA = "rquant-l2-cache-floor-v1"
 
 
+def _INTERNAL_BATCH_NAME(name: str) -> bool:
+    """Names owned by the cache itself, never treated as batch directories."""
+    return name in (".head", FLOOR_NAME) or name.startswith((".pending-", ".floor-"))
+
+
 class CacheError(RuntimeError):
     def __init__(self, code: str) -> None:
         self.code = code
@@ -96,6 +101,12 @@ def write_floor(root: Path, pruned_through: int, *, reason: str,
             os.fsync(stream.fileno())
         os.replace(temporary, batches / FLOOR_NAME)
         temporary = None
+        try:
+            for item in batches.iterdir():
+                if item.name.startswith(".floor-") and item.is_file():
+                    item.unlink(missing_ok=True)
+        except OSError:
+            pass
         _fsync_dir(batches)
     except OSError:
         raise CacheError("cache_io") from None
@@ -191,15 +202,26 @@ class RawL2Cache:
             batches = self.root / "batches"
             batches.mkdir(mode=0o700, exist_ok=True)
             _directory(batches)
+            try:
+                for item in batches.iterdir():
+                    if item.name.startswith(".pending-") and item.is_dir() and not item.is_symlink():
+                        shutil.rmtree(item, ignore_errors=True)
+            except OSError:
+                raise CacheError("cache_io") from None
             committed = self._directories()
             floor = self._floor_sequence()
             for offset, directory in enumerate(committed):
                 self._last_received_at = self._read_batch(directory, floor + 1 + offset).received_at
             self._highwater = floor + len(committed)
-            head = self._published_head()
-            if committed and (head is None or head[0] != self._highwater):
-                self._publish_head(committed[-1])
-                _fsync_dir(batches)
+            if committed:
+                try:
+                    head = self._published_head()
+                except CacheError:
+                    head = None  # a crash left .head pointing at a retired directory
+                if head is None or head[0] != self._highwater:
+                    (batches / ".head").unlink(missing_ok=True)
+                    self._publish_head(committed[-1])
+                    _fsync_dir(batches)
             previous = self.read_status()
             if previous.state in _ACTIVE or committed:
                 self.write_status(previous.model_copy(update={
@@ -238,8 +260,7 @@ class RawL2Cache:
         try:
             head = self._published_head()
             floor = self._floor_sequence()
-            names = [p.name for p in path.iterdir()
-                     if not p.name.startswith(".pending-") and p.name not in (".head", FLOOR_NAME)]
+            names = [p.name for p in path.iterdir() if not _INTERNAL_BATCH_NAME(p.name)]
             for name in names:
                 if not re.fullmatch(r"[0-9]{20}", name):
                     raise CacheError("invalid_cache")
@@ -335,8 +356,14 @@ class RawL2Cache:
                     if count >= 10**20:
                         raise CacheError("invalid_batch")
                     directory = parent / f"{count:020d}"
-                    _directory(directory)
-                    actual = (directory / "batch.json").lstat()
+                    try:
+                        _directory(directory)
+                        actual = (directory / "batch.json").lstat()
+                    except (OSError, CacheError):
+                        # A crash between the batch rename and .head publication
+                        # leaves .head pointing at a missing directory; treat it
+                        # as unpublished and let the caller audit/repair.
+                        return None
                     if (not stat.S_ISREG(actual.st_mode)
                             or (actual.st_dev, actual.st_ino) != (info.st_dev, info.st_ino)
                             or _read(directory / "sha256", 65) != digest.encode() + b"\n"):

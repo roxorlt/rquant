@@ -247,3 +247,65 @@ def test_manifest_rejects_path_traversal(tmp_path: Path):
     with pytest.raises(module.ColdStoreError) as caught:
         module.load_manifest(cold_root)
     assert caught.value.code == "invalid_manifest"
+
+
+def test_compaction_cleans_orphan_segments_and_pending_files(tmp_path: Path):
+    module = cold_store()
+    cache_root = build_cache(tmp_path, 6)
+    cold_root = tmp_path / "cold"
+    module.compact_cache(cache_root, cold_root, block_records=3)
+    segments_dir = cold_root / "segments"
+    orphan = segments_dir / "l2cold-00000000000000000007-00000000000000000009-aaaaaaaaaaaa.l2c"
+    orphan.write_bytes(b"orphan")
+    pending = segments_dir / ".pending-leftover.l2c"
+    pending.write_bytes(b"pending")
+    removed_files, removed_bytes = module.cleanup_orphans(cold_root)
+    assert removed_files == 2 and removed_bytes == len(b"orphan") + len(b"pending")
+    assert not orphan.exists() and not pending.exists()
+    stats = module.stats(cold_root)
+    assert stats["orphan_files"] == 0
+
+
+def test_restore_refuses_ancestor_of_cold_root(tmp_path: Path):
+    module = cold_store()
+    cache_root = build_cache(tmp_path, 4)
+    cold_root = tmp_path / "cold"
+    module.compact_cache(cache_root, cold_root, block_records=4)
+    with pytest.raises(module.ColdStoreError) as caught:
+        module.restore(cold_root, tmp_path, overwrite=True)
+    assert caught.value.code == "unsafe_path"
+    assert (cold_root / "manifest.json").is_file()
+
+
+def test_verify_mark_requires_a_source_cache(tmp_path: Path, capsys):
+    module = cold_store()
+    cache_root = build_cache(tmp_path, 4)
+    cold_root = tmp_path / "cold"
+    module.compact_cache(cache_root, cold_root, block_records=4, verify=False)
+    code = module.main(["verify", "--cold-root", str(cold_root), "--mark"])
+    assert code == 1
+    assert "source_required_for_mark" in capsys.readouterr().err
+    assert module.load_manifest(cold_root).segments[0].verified_at is None
+    code = module.main(["verify", "--cold-root", str(cold_root), "--cache-root",
+                        str(cache_root), "--mark"])
+    assert code == 0
+    assert module.load_manifest(cold_root).segments[0].verified_at is not None
+
+
+def test_replay_pack_refuses_a_retired_range(tmp_path: Path):
+    module = cold_store()
+    from rquant.l2.cache import write_floor
+    from rquant.l2.replay_pack import ReplayPackConfig, ReplayPackError, build_replay_pack
+
+    cache_root = build_cache(tmp_path, 8)
+    write_floor(cache_root, 4, reason="test", now=datetime(2026, 11, 3, tzinfo=UTC))
+    config = ReplayPackConfig(cache_root=cache_root, output_dir=tmp_path / "pack",
+                              start_sequence=2, end_sequence=8)
+    with pytest.raises(ReplayPackError) as caught:
+        build_replay_pack(config)
+    assert caught.value.code == "range_retired"
+    # A range that is fully present still builds.
+    config = ReplayPackConfig(cache_root=cache_root, output_dir=tmp_path / "pack2",
+                              start_sequence=5, end_sequence=8)
+    manifest = build_replay_pack(config)
+    assert manifest["range"] == {"start_sequence": 5, "end_sequence": 8}
