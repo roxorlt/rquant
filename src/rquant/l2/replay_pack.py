@@ -97,6 +97,11 @@ def build_replay_pack(config: ReplayPackConfig) -> dict[str, Any]:
                                       limit=end_sequence - config.start_sequence + 1))
     if not batches:
         raise ReplayPackError("empty_range")
+    # A retired prefix makes iter_batches start at the floor; a pack that silently
+    # relabels a different range would corrupt every replay derived from it.
+    if (batches[0].local_batch_sequence != config.start_sequence
+            or batches[-1].local_batch_sequence != end_sequence):
+        raise ReplayPackError("range_retired")
     first_wall = batches[0].received_at
     started_wall_us = _us(first_wall)
     # Segment bytes must be reproducible: keep run time out of the tap header.
