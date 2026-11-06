@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -25,6 +26,18 @@ MAX_BATCH_PAGE = 128
 MAX_BATCH_PAGE_BYTES = 24 * 1024 * 1024
 _MAX_RUNTIME_BYTES = 256 * 1024
 
+# A retired prefix of committed batches.  Cold-store retention writes this
+# marker before it deletes ``batches/1..N`` so the live reader keeps working
+# after a rolling prune; readers treat sequences at or below the floor as
+# deliberately absent rather than as a sequence gap.
+FLOOR_NAME = ".floor"
+FLOOR_SCHEMA = "rquant-l2-cache-floor-v1"
+
+
+def _INTERNAL_BATCH_NAME(name: str) -> bool:
+    """Names owned by the cache itself, never treated as batch directories."""
+    return name in (".head", FLOOR_NAME) or name.startswith((".pending-", ".floor-"))
+
 
 class CacheError(RuntimeError):
     def __init__(self, code: str) -> None:
@@ -35,6 +48,71 @@ class CacheError(RuntimeError):
 def _directory(path: Path) -> None:
     if path.is_symlink() or not path.is_dir():
         raise CacheError("unsafe_path")
+
+
+def read_floor(root: Path) -> int:
+    """Return the retired prefix length; 0 when no marker exists."""
+    root = Path(root)
+    path = root / "batches" / FLOOR_NAME
+    if root.is_symlink() or (root / "batches").is_symlink() or path.is_symlink():
+        raise CacheError("unsafe_path")
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return 0
+    except OSError:
+        raise CacheError("cache_io") from None
+    if not stat.S_ISREG(info.st_mode) or info.st_size > 4096:
+        raise CacheError("invalid_cache")
+    try:
+        payload = _read(path, 4096)
+        data = json.loads(payload)
+        value = data["pruned_through"]
+    except (OSError, ValueError, KeyError, TypeError):
+        raise CacheError("invalid_cache") from None
+    if type(value) is not int or not 0 <= value < 10**20:
+        raise CacheError("invalid_cache")
+    return value
+
+
+def write_floor(root: Path, pruned_through: int, *, reason: str,
+                now: datetime | None = None, extra: dict | None = None) -> None:
+    """Atomically publish the retired prefix marker."""
+    root = Path(root)
+    batches = root / "batches"
+    if type(pruned_through) is not int or not 1 <= pruned_through < 10**20:
+        raise ValueError("invalid pruned sequence")
+    if root.is_symlink() or batches.is_symlink():
+        raise CacheError("unsafe_path")
+    payload = json.dumps({
+        "schema": FLOOR_SCHEMA,
+        "pruned_through": pruned_through,
+        "pruned_at": (now or datetime.now(UTC)).isoformat(),
+        "reason": reason,
+        **(extra or {}),
+    }, sort_keys=True, ensure_ascii=False).encode() + b"\n"
+    temporary = None
+    try:
+        fd, name = tempfile.mkstemp(prefix=".floor-", dir=batches)
+        temporary = Path(name)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, batches / FLOOR_NAME)
+        temporary = None
+        try:
+            for item in batches.iterdir():
+                if item.name.startswith(".floor-") and item.is_file():
+                    item.unlink(missing_ok=True)
+        except OSError:
+            pass
+        _fsync_dir(batches)
+    except OSError:
+        raise CacheError("cache_io") from None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def _read(path: Path, maximum: int, *, identity: os.stat_result | None = None) -> bytes:
@@ -124,14 +202,26 @@ class RawL2Cache:
             batches = self.root / "batches"
             batches.mkdir(mode=0o700, exist_ok=True)
             _directory(batches)
+            try:
+                for item in batches.iterdir():
+                    if item.name.startswith(".pending-") and item.is_dir() and not item.is_symlink():
+                        shutil.rmtree(item, ignore_errors=True)
+            except OSError:
+                raise CacheError("cache_io") from None
             committed = self._directories()
-            for expected, directory in enumerate(committed, 1):
-                self._last_received_at = self._read_batch(directory, expected).received_at
-            self._highwater = len(committed)
-            head = self._published_head()
-            if committed and (head is None or head[0] != self._highwater):
-                self._publish_head(committed[-1])
-                _fsync_dir(batches)
+            floor = self._floor_sequence()
+            for offset, directory in enumerate(committed):
+                self._last_received_at = self._read_batch(directory, floor + 1 + offset).received_at
+            self._highwater = floor + len(committed)
+            if committed:
+                try:
+                    head = self._published_head()
+                except CacheError:
+                    head = None  # a crash left .head pointing at a retired directory
+                if head is None or head[0] != self._highwater:
+                    (batches / ".head").unlink(missing_ok=True)
+                    self._publish_head(committed[-1])
+                    _fsync_dir(batches)
             previous = self.read_status()
             if previous.state in _ACTIVE or committed:
                 self.write_status(previous.model_copy(update={
@@ -149,6 +239,13 @@ class RawL2Cache:
             if fd is not None:
                 os.close(fd)
 
+    def _floor_sequence(self) -> int:
+        return read_floor(self.root)
+
+    def floor_sequence(self) -> int:
+        """Public read of the retired-prefix marker (0 when nothing was pruned)."""
+        return self._floor_sequence()
+
     def _directories(self) -> tuple[Path, ...]:
         path = self.root / "batches"
         if self.root.is_symlink() or path.is_symlink():
@@ -162,8 +259,8 @@ class RawL2Cache:
         _directory(path)
         try:
             head = self._published_head()
-            names = [p.name for p in path.iterdir()
-                     if not p.name.startswith(".pending-") and p.name != ".head"]
+            floor = self._floor_sequence()
+            names = [p.name for p in path.iterdir() if not _INTERNAL_BATCH_NAME(p.name)]
             for name in names:
                 if not re.fullmatch(r"[0-9]{20}", name):
                     raise CacheError("invalid_cache")
@@ -173,8 +270,10 @@ class RawL2Cache:
             # renamed middle entry. Check every path within this finite bound.
             upper = max(minimum_committed, head[0] if head else 0,
                         max((int(name) for name in names), default=0))
+            if floor > upper:
+                raise CacheError("invalid_cache")
             directories = []
-            for expected in range(1, upper + 1):
+            for expected in range(floor + 1, upper + 1):
                 directory = path / f"{expected:020d}"
                 if not directory.exists() and not directory.is_symlink():
                     raise CacheError("sequence_gap")
@@ -257,8 +356,14 @@ class RawL2Cache:
                     if count >= 10**20:
                         raise CacheError("invalid_batch")
                     directory = parent / f"{count:020d}"
-                    _directory(directory)
-                    actual = (directory / "batch.json").lstat()
+                    try:
+                        _directory(directory)
+                        actual = (directory / "batch.json").lstat()
+                    except (OSError, CacheError):
+                        # A crash between the batch rename and .head publication
+                        # leaves .head pointing at a missing directory; treat it
+                        # as unpublished and let the caller audit/repair.
+                        return None
                     if (not stat.S_ISREG(actual.st_mode)
                             or (actual.st_dev, actual.st_ino) != (info.st_dev, info.st_ino)
                             or _read(directory / "sha256", 65) != digest.encode() + b"\n"):
@@ -286,16 +391,20 @@ class RawL2Cache:
     def _snapshot(self, *, after_sequence: int | None = None
                   ) -> tuple[FeedStatus, int, datetime | None, tuple[RawL2Batch, os.stat_result, str] | None]:
         status = self._stored_status()
+        floor = self._floor_sequence()
         head = self._published_head(minimum=status.last_sequence, after_sequence=after_sequence)
         if head is not None:
+            if floor > head[0]:
+                raise CacheError("invalid_cache")
             return status, *head
         # Legacy caches have no publication head. Audit every raw record before
         # exposing them; only a fully audited writer recovery may create .head.
         directories = self._directories()
+        floor = self._floor_sequence()
         last = None
-        for expected, directory in enumerate(directories, 1):
-            last = self._read_batch(directory, expected).received_at
-        return status, len(directories), last, None
+        for offset, directory in enumerate(directories):
+            last = self._read_batch(directory, floor + 1 + offset).received_at
+        return status, floor + len(directories), last, None
 
     def _position(self) -> tuple[int, datetime | None]:
         if self._writer_fd is not None:
@@ -432,6 +541,11 @@ class RawL2Cache:
         if (type(after_sequence) is not int or after_sequence < 0 or type(limit) is not int
                 or not 1 <= limit <= MAX_BATCH_PAGE):
             raise ValueError("invalid local batch cursor")
+        floor = self._floor_sequence()
+        if after_sequence < floor:
+            # The prefix was deliberately retired to cold storage; a stale cursor
+            # resumes at the oldest surviving batch instead of raising a gap.
+            after_sequence = floor
         stored_status, count, last, candidate = self._snapshot(after_sequence=after_sequence)
         if after_sequence > count:
             raise ValueError("invalid local batch cursor")
@@ -464,3 +578,22 @@ class RawL2Cache:
         return BatchPage(batches=selected,
                          next_sequence=selected[-1].local_batch_sequence if selected else after_sequence,
                          status=status)
+
+    def iter_batches(self, *, after_sequence: int = 0, limit: int | None = None
+                     ) -> Iterator[RawL2Batch]:
+        """Read committed batches in sequence order without holding the writer lock."""
+        if type(after_sequence) is not int or after_sequence < 0:
+            raise ValueError("invalid local batch cursor")
+        if limit is not None and (type(limit) is not int or limit < 0):
+            raise ValueError("invalid local batch limit")
+        directories = self._directories()
+        floor = self._floor_sequence()
+        emitted = 0
+        for offset, directory in enumerate(directories):
+            expected = floor + 1 + offset
+            if expected <= after_sequence:
+                continue
+            if limit is not None and emitted >= limit:
+                return
+            yield self._read_batch(directory, expected)
+            emitted += 1

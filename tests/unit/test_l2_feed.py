@@ -4,6 +4,7 @@ from __future__ import annotations
 import socket
 import struct
 import json
+import time
 from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
 
@@ -1041,3 +1042,152 @@ def test_seed_timeout_marks_one_stream_failed_and_continues(tmp_path: Path) -> N
     assert sum(stream.seed_sequence is not None for stream in receipt.streams) == 5
     assert 14 <= provider.business[1][0] - provider.business[0][0] <= 16
     assert status.error_code == "duration_limit"
+
+
+# --- 2026-11-04 batched connections, subscription flow control, async pump ----
+
+
+class RealClock:
+    """Wall clock with the ``clock``/``sleep`` protocol the collector expects."""
+
+    def __call__(self) -> float:
+        return time.monotonic()
+
+    def sleep(self, seconds: float) -> None:
+        time.sleep(seconds)
+
+
+def _collector_with_inputs(tmp_path: Path, provider, clock, *, cache=None, **options):
+    feed = module("feed")
+    for name, data in (("bootstrap", bootstrap()), ("order", template()), ("trade", template(True))):
+        path = tmp_path / name
+        path.write_bytes(data)
+        path.chmod(0o600)
+    from rquant.l2.cache import RawL2Cache
+    cache = cache if cache is not None else RawL2Cache(tmp_path / "cache")
+    calls = []
+    def connect(endpoint, timeout):
+        calls.append(endpoint)
+        return provider
+    obj = feed.FeedCollector(
+        cache, bootstrap_path=tmp_path / "bootstrap", order_template_path=tmp_path / "order",
+        trade_template_path=tmp_path / "trade", clock=clock, sleep=clock.sleep,
+        connection_factory=connect, **options)
+    return obj, cache, calls
+
+
+class BurstProvider(Provider):
+    """Queue a burst of valid market pushes in front of one seed response."""
+
+    def __init__(self, clock, *, burst: int, at: int) -> None:
+        super().__init__(clock)
+        self.burst, self.at = burst, at
+
+    def sendall(self, data: bytes) -> None:
+        insertion = len(self.chunks)
+        super().sendall(data)
+        if len(self.business) == self.at and self.last is not None:
+            self.chunks[insertion:insertion] = [frame(sentinel_push(self.last))] * self.burst
+
+
+def _slow_cache(delay_seconds: float):
+    from rquant.l2.cache import RawL2Cache
+
+    class SlowCache(RawL2Cache):
+        def append(self, observation: MarketObservation):
+            batch = super().append(observation)
+            time.sleep(delay_seconds)
+            return batch
+
+    return SlowCache
+
+
+@pytest.mark.parametrize("pump", [False, True])
+def test_receive_pump_prioritises_the_seed_over_queued_pushes(tmp_path: Path, pump: bool) -> None:
+    clock = RealClock()
+    provider = BurstProvider(clock, burst=200, at=1)
+    cache = _slow_cache(0.004)(tmp_path / "cache")
+    obj, cache, _ = _collector_with_inputs(
+        tmp_path, provider, clock, cache=cache, duration_seconds=4,
+        symbols=("603258",), max_symbols=1, receive_pump=pump)
+    status = obj.run()
+    receipt = cache.read_subscription_status()
+    assert receipt is not None
+    assert len([s for s in receipt.streams if s.seed_sequence is not None]) == 3
+    assert status.state == "stopped" and status.error_code == "duration_limit"
+    wait_max = obj.metrics["seed_wait_seconds"]["max"]
+    if pump:
+        assert wait_max is not None and wait_max < 0.5
+        assert obj.metrics["frames_pending_at_end"] == 0
+        assert obj.metrics["pumps"] and obj.metrics["pumps"][0]["received"] >= 150
+    else:
+        assert wait_max is not None and wait_max >= 0.6
+
+
+class DropOnceProvider(Provider):
+    """Silence one page's seed once, then answer the deferred retry."""
+
+    def __init__(self, clock, page_id: int) -> None:
+        super().__init__(clock)
+        self.page_id, self.dropped = page_id, False
+
+    def sendall(self, data: bytes) -> None:
+        insertion = len(self.chunks)
+        super().sendall(data)
+        if len(self.sent) == 1:
+            return
+        if int(self.business[-1][1]["page_id"]) == self.page_id and not self.dropped:
+            self.dropped = True
+            del self.chunks[insertion:]
+
+
+def test_deferred_seed_retry_recovers_a_transiently_silent_stream(tmp_path: Path) -> None:
+    clock = Clock()
+    provider = DropOnceProvider(clock, 10127)
+    obj, cache, calls = collector(tmp_path, provider, clock, duration_seconds=80,
+                                  seed_retry_limit=1, seed_retry_cooldown_seconds=2)
+    status = obj.run()
+    receipt = cache.read_subscription_status()
+    assert receipt is not None
+    assert len([s for s in receipt.streams if s.seed_sequence is not None]) == 6
+    stream = next(s for s in receipt.streams if s.binding.page_id == 10127)
+    assert stream.seed_sequence is not None and stream.request_id is not None
+    assert stream.request_id >= 9  # 3..8 are the first pass, 9 is the retry
+    assert obj.metrics["deferred_retries"] >= 1
+    assert status.error_code == "duration_limit" and len(calls) == 1
+
+
+def test_batched_connections_assign_contiguous_stock_chunks(tmp_path: Path) -> None:
+    from rquant.l2.models import Binding
+    from rquant.l2.replay_gate import tier_symbols
+
+    feed = module("feed")
+    clock = Clock()
+    provider = Provider(clock)
+    obj, cache, calls = collector(tmp_path, provider, clock, connection_count=4,
+                                  duration_seconds=2, max_symbols=40)
+    symbols = tier_symbols(40).symbols
+    obj._symbols = symbols
+    obj._links = [feed._Link(index) for index in range(4)]
+    from rquant.l2.symbols import market_for_code
+    def link_index(stock: int) -> int:
+        return obj._link_for(Binding(page_id=10117 + 10 * stock, kind="vendor4013",
+                                     code=symbols[stock],
+                                     market=market_for_code(symbols[stock]))).index
+    assert [link_index(stock) for stock in (0, 9, 10, 19, 20, 29, 30, 39)] == [
+        0, 0, 1, 1, 2, 2, 3, 3]
+    assert calls == []  # nothing connects before run()
+
+
+@pytest.mark.parametrize("options", [
+    {"connection_count": 0}, {"connection_count": 17}, {"subscribe_batch_stocks": -1},
+    {"seed_pace_seconds": 0.5}, {"seed_pace_max_seconds": 0.5},
+    {"seed_latency_soft_seconds": 0}, {"seed_retry_limit": 4},
+    {"seed_retry_cooldown_seconds": 0}, {"receive_pump": "yes"},
+    {"pump_queue_frames": 0}, {"pump_priority_frames": 0},
+])
+def test_flow_control_options_are_validated(tmp_path: Path, options: dict) -> None:
+    clock = Clock()
+    provider = Provider(clock)
+    with pytest.raises(ValueError):
+        collector(tmp_path, provider, clock, **options)
