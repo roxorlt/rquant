@@ -350,7 +350,8 @@ class FeedCollector:
                  seed_latency_soft_seconds: float = 2.0,
                  seed_retry_limit: int = 0, seed_retry_cooldown_seconds: float = 20.0,
                  receive_pump: bool = False, pump_queue_frames: int = 65536,
-                 pump_priority_frames: int = 4096) -> None:
+                 pump_priority_frames: int = 4096,
+                 status_flush_interval: float = 0.0) -> None:
         if duration_seconds is not None and (type(duration_seconds) not in (int, float)
                 or not math.isfinite(duration_seconds) or duration_seconds <= 0):
             raise ValueError("invalid duration")
@@ -392,6 +393,10 @@ class FeedCollector:
             raise ValueError('invalid pump queue size')
         if type(pump_priority_frames) is not int or not 1 <= pump_priority_frames <= 65536:
             raise ValueError('invalid pump priority size')
+        if (type(status_flush_interval) not in (int, float)
+                or not math.isfinite(status_flush_interval)
+                or not 0 <= status_flush_interval <= 60):
+            raise ValueError('invalid status flush interval')
         self.targets = SubscriptionStore(control_root, max_symbols=max_symbols) if control_root is not None else None
         self._configured_symbols = (normalize_symbols(symbols) if symbols is not None else
                                     () if self.targets is not None else ('603258', '300006'))
@@ -416,6 +421,11 @@ class FeedCollector:
             seed_retry_limit, seed_retry_cooldown_seconds)
         self.receive_pump = receive_pump
         self.pump_queue_frames, self.pump_priority_frames = pump_queue_frames, pump_priority_frames
+        # 0.0 keeps the historical behaviour (a status snapshot per update, i.e.
+        # per market batch).  A positive value throttles *non-transition* status
+        # snapshots to one per interval; state/error/gap changes always flush.
+        self.status_flush_interval = float(status_flush_interval)
+        self._last_status_flush: float | None = None
         self.status = FeedStatus()
         self._links: list[_Link] = [_Link(0)]
         self.validated_seed = False
@@ -568,12 +578,26 @@ class FeedCollector:
                 self._stream_receipts[page] = stream.model_copy(update={'state': 'failed'})
         self._write_receipt()
 
-    def _update(self, **changes: Any) -> None:
+    #: Status fields whose change always forces a durable status snapshot.
+    _FORCE_STATUS_KEYS = frozenset({
+        "state", "error_code", "gap", "epoch_id", "reconnect_attempts",
+        "subscription_state",
+    })
+
+    def _update(self, *, force: bool | None = None, **changes: Any) -> None:
         self.status = self.status.model_copy(update=changes)
+        if force is None:
+            force = any(key in self._FORCE_STATUS_KEYS for key in changes)
+        if not force and self.status_flush_interval > 0:
+            now = self.clock()
+            if (self._last_status_flush is not None
+                    and now - self._last_status_flush < self.status_flush_interval):
+                return
         try:
             self.cache.write_status(self.status)
         except Exception:
             raise FeedError("cache_error") from None
+        self._last_status_flush = self.clock()
 
     def _check_end(self, deadline: float) -> None:
         if self.stop_event.is_set():

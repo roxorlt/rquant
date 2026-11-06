@@ -50,12 +50,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                              "requires the wall clock, do not use with the virtual replay clock")
     parser.add_argument("--pump-queue-frames", type=int, default=65536)
     parser.add_argument("--pump-priority-frames", type=int, default=4096)
+    parser.add_argument("--commit-group", type=int, default=0,
+                        help="publish every N batches with one directory fsync (0/1 keeps the "
+                             "legacy per-batch publication); 80-stock windows should use e.g. 64")
+    parser.add_argument("--status-flush-interval", type=float, default=0.0,
+                        help="minimum seconds between non-transition status.json snapshots "
+                             "(0 keeps the legacy per-update snapshot); 80-stock windows should use 1.0")
     parser.add_argument("--frame-tap-dir", type=Path,
                         help="record raw frames into a new child directory (also enabled by "
                              "RQUANT_L2_FRAME_TAP=1 + RQUANT_L2_FRAME_TAP_DIR)")
     parser.add_argument("--frame-tap-segment-bytes", type=int,
                         help="tap segment size override; default 256 MiB")
     args = parser.parse_args(argv)
+    if type(args.commit_group) is not int or not 0 <= args.commit_group <= 1024:
+        parser.error("invalid commit group size")
+    if (not math.isfinite(args.status_flush_interval)
+            or not 0 <= args.status_flush_interval <= 60):
+        parser.error("invalid status flush interval")
     if (not math.isfinite(args.duration_seconds) or not 0 < args.duration_seconds <= 21600
             or not math.isfinite(args.reconnect_delay_seconds) or args.reconnect_delay_seconds < 60):
         parser.error("invalid duration or reconnect delay")
@@ -100,7 +111,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         from rquant.l2.feed import FeedCollector
 
         collector = FeedCollector(
-            RawL2Cache(args.cache_root), bootstrap_path=args.bootstrap_file,
+            RawL2Cache(args.cache_root, group_commit=args.commit_group),
+            bootstrap_path=args.bootstrap_file,
             order_template_path=args.order_template, trade_template_path=args.trade_template,
             duration_seconds=None if args.resident else args.duration_seconds, trade_pages=args.trade_pages,
             order_pages=args.order_pages, max_reconnects=args.max_reconnects,
@@ -114,6 +126,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             receive_pump=args.receive_pump,
             pump_queue_frames=args.pump_queue_frames,
             pump_priority_frames=args.pump_priority_frames,
+            status_flush_interval=args.status_flush_interval,
         )
         status = collector.run()
         print(status.model_dump_json())
