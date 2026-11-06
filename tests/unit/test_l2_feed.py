@@ -1312,3 +1312,42 @@ def test_throttled_status_skips_repeated_candidate_push_snapshots(tmp_path: Path
     assert throttled < legacy
     assert throttled <= 8
 
+def test_cache_failure_records_diagnostic_side_file(tmp_path: Path) -> None:
+    from rquant.l2.cache import CacheError
+    from rquant.l2.cache import RawL2Cache as _RawL2Cache
+
+    class BrokenCache(_RawL2Cache):
+        def append(self, observation):  # type: ignore[no-untyped-def]
+            raise CacheError("disk_full", "free=0 needed=1234")
+
+    clock = Clock()
+    provider = Provider(clock)
+    cache = BrokenCache(tmp_path / "broken-cache")
+    obj, _, _ = _collector_with_inputs(tmp_path, provider, clock, cache=cache)
+    status = obj.run()
+    assert status.error_code == "cache_error"
+
+    detail = json.loads((tmp_path / "broken-cache" / ".last-cache-error.json").read_text())
+    assert detail["code"] == "disk_full"
+    assert detail["detail"] == "free=0 needed=1234"
+
+
+def test_subscription_receipt_cache_failure_records_diagnostic_side_file(tmp_path: Path) -> None:
+    from rquant.l2.cache import CacheError
+    from rquant.l2.cache import RawL2Cache as _RawL2Cache
+
+    class BrokenReceiptCache(_RawL2Cache):
+        def write_subscription_status(self, receipt):  # type: ignore[no-untyped-def]
+            raise CacheError("io_error", "errno=5")
+
+    clock = Clock()
+    provider = Provider(clock)
+    cache = BrokenReceiptCache(tmp_path / "broken-receipt-cache")
+    obj, _, _ = _collector_with_inputs(tmp_path, provider, clock, cache=cache)
+    status = obj.run()
+    assert status.error_code == "cache_error"
+
+    detail = json.loads((tmp_path / "broken-receipt-cache" / ".last-cache-error.json").read_text())
+    assert detail["code"] == "io_error"
+    assert detail["detail"] == "errno=5"
+
