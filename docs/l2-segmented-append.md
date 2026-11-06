@@ -257,3 +257,33 @@ CPU 估算：4.5 KB/批 zlib-1 约 0.1 ms → 670 批/s 约 6–7% 单核，可�
 | 完整性级别 crc32 vs 链式 sha256？ | 用链式 sha256（CPU 可忽略） |
 | 导出工具是否进本卡？ | 进（回滚/迁移必需，小工具） |
 | 是否复用冷存段格式？ | 不复用 |
+
+## 12. P1 实现与实测结果（2026-11-06，分支 feat/l2-segment-log @ 7189bb08）
+
+已实现（v2 格式）：
+
+- payload = **zlib-1 压缩的 canonical JSON**（header codec 字段标识）；
+- commit 记录携带**链式 sha256**（payload 帧累计），逐 commit 校验；
+- `head.json` 暴露 `committed_offset`/`committed_records`/`index_entries`，读端按已提交字节边界截断；
+- 每次 commit 向 `.active.idx` 追加稀疏 `(first_sequence, offset)` 检查点，段关闭时 fsync/改名；
+- `feed.py` 快速模式只持久化**值真正变化**的 status 字段（修掉「每帧 candidate_push 都强制写 status」）；
+- 24 项段日志测试 + feed 节流回归；L2 全量 **889 passed**（4 个既有 `test_l2_web` duckdb 缺口）。
+
+服务器真实盘基准（`rquant-tencent`，XFS，20,000 批真实 9.3 KB 模板批，4 组 commit 配置）：
+
+| 配置（commit_every / commit_ms） | append 批/s | fsync/批 | 崩溃重开耗时 | 读回批/s |
+| --- | --- | --- | --- | --- |
+| 128 / 100ms | 3,837 | 0.0245 | 0.006 s | 2,666 |
+| 256 / 200ms（默认） | **4,245** | 0.0128 | 0.006 s | 2,489 |
+| 512 / 500ms | 4,313 | 0.0069 | 0.007 s | 2,535 |
+| 1024 / 1000ms | 4,644 | 0.0040 | 0.010 s | 2,497 |
+
+- **目标 ≥700 批/s：PASS，实测 3,837–4,644 批/s（5.5–6.6 倍余量）**；
+- 每批字节：9.3 KB 模板批 → 2,136 B（23%）；按 80 股实测均值 4,568 B/批折算 ≈ 1,050 B/批 →
+  80 股 670 批/s ≈ 0.7 MB/s ≈ 2.5 GB/h，4 小时 ≈ 10 GB，**磁盘容量问题由压缩解决**；
+- 崩溃重开 O(1)：20k 批仅 6–10 ms（对照生产 1.88M 批目录恢复 30 分钟）；
+- 读回 2,489–2,666 批/s（含解压+模型校验）；128 批 API 页 ≈ 48–51 ms，**略高于 50ms 目标**，
+  P2 通过页级缓存/减少重复校验优化。
+
+P2（下一阶段）待做：`RawL2Cache` 写入后端接入（`write_mode="segments"`、writer/append/status 集成）、
+7 处直读 `batches/` 的改造、回放门禁 segment 场景、40 股真实窗口。
