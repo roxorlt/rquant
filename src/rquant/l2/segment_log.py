@@ -913,6 +913,10 @@ class SegmentWriter:
 
     # -- accessors ------------------------------------------------------ #
     @property
+    def next_sequence(self) -> int:
+        return self._next_sequence
+
+    @property
     def committed_through(self) -> int:
         return self._committed_through
 
@@ -976,16 +980,21 @@ def load_snapshot(root: Path | str) -> SegmentSnapshot:
                            index_entries=index_entries)
 
 
-def _decode_payload(codec: int, body: bytes) -> RawL2Batch:
+def _decode_payload_bytes(codec: int, body: bytes) -> bytes:
     if codec == CODEC_ZLIB:
         try:
-            body = zlib.decompress(body)
+            return zlib.decompress(body)
         except zlib.error:
             raise SegmentError("invalid_payload_codec") from None
-    elif codec != CODEC_RAW:
+    if codec != CODEC_RAW:
         raise SegmentError("invalid_payload_codec")
+    return body
+
+
+def _decode_payload(codec: int, body: bytes) -> RawL2Batch:
+    raw = _decode_payload_bytes(codec, body)
     try:
-        return RawL2Batch.model_validate_json(body)
+        return RawL2Batch.model_validate_json(raw)
     except ValueError:
         raise SegmentError("invalid_batch") from None
 
@@ -1123,6 +1132,59 @@ def read_payload(root: Path | str, sequence: int) -> RawL2Batch | None:
         if batch.local_batch_sequence > sequence:
             return None
     return None
+
+
+def read_payload_bytes(root: Path | str, sequence: int) -> bytes | None:
+    """Stored canonical payload bytes for one committed batch (decompressed)."""
+    snapshot = load_snapshot(root)
+    if sequence < 1 or sequence > snapshot.committed_through:
+        return None
+    segments = segments_dir(root)
+    position = _segment_position(snapshot.entries, sequence)
+    if position >= 0:
+        path = segments / snapshot.entries[position].file
+        committed_offset = None
+    else:
+        path = segments / ACTIVE_NAME
+        if not path.exists():
+            return None
+        committed_offset = snapshot.committed_offset
+    start_offset, start_sequence = _checkpoint_before(path, sequence)
+    with path.open("rb") as stream:
+        raw = stream.read(HEADER_SIZE)
+        if len(raw) != HEADER_SIZE:
+            raise SegmentError("invalid_segment")
+        magic, version, codec, _index, first_sequence, _created = HEADER.unpack(raw)
+        if magic != MAGIC or version != VERSION:
+            raise SegmentError("invalid_segment")
+        current = start_sequence if start_sequence is not None else first_sequence
+        if start_offset is not None:
+            stream.seek(start_offset)
+        while True:
+            position = stream.tell()
+            if committed_offset is not None and position >= committed_offset:
+                return None
+            prefix = stream.read(PREFIX_SIZE)
+            if len(prefix) != PREFIX_SIZE:
+                return None
+            total, kind, _crc = RECORD_PREFIX.unpack(prefix)
+            if total < PREFIX_SIZE or total > MAX_RECORD_BYTES:
+                raise SegmentError("invalid_record")
+            body = stream.read(total - PREFIX_SIZE)
+            if len(body) != total - PREFIX_SIZE:
+                return None
+            if _crc32(bytes((kind,)) + body) != _crc:
+                raise SegmentError("invalid_record_crc")
+            if kind == KIND_PAYLOAD:
+                if current == sequence:
+                    return _decode_payload_bytes(codec, body)
+                current += 1
+            elif kind == KIND_COMMIT:
+                value, _wall, _records, _chain = COMMIT_BODY.unpack(body)
+                if value >= sequence and current > sequence:
+                    return None
+            else:
+                return None
 
 
 def _checkpoint_before(path: Path, sequence: int) -> tuple[int | None, int | None]:
