@@ -14,7 +14,7 @@ from rquant.l2.segment_log import (
     KIND_PAYLOAD, MAGIC, PREFIX_SIZE, RECORD_PREFIX, SegmentEntry, SegmentError,
     SegmentWriter, append_index, audit, build_header, frame_record, iter_payloads,
     load_snapshot, read_head, read_index, read_layout, read_payload, scan_segment,
-    segment_name, segments_dir, write_layout,
+    read_segment_index, segment_name, segments_dir, write_layout,
 )
 from tests.unit.test_l2_cache import observed_trade_push_data
 
@@ -327,3 +327,124 @@ def test_duplicate_closed_segment_rejected(tmp_path: Path):
     with pytest.raises(SegmentError) as failure:
         SegmentWriter(tmp_path).open()
     assert failure.value.code == "sequence_gap"
+
+
+def test_payload_records_are_zlib_compressed(tmp_path: Path):
+    writer = SegmentWriter(tmp_path, commit_every_batches=1, commit_interval_seconds=5)
+    writer.open()
+    writer.append(make_batch(1))
+    writer.commit()
+    writer.close()
+    entry = read_index(tmp_path)[0]
+    segment = segments_dir(tmp_path) / entry.file
+    payload = make_batch(1).model_dump_json().encode()
+    import zlib
+
+    compressed = zlib.compress(payload + b"\n", 1)
+    raw = segment.read_bytes()
+    assert compressed in raw or len(compressed) < len(payload) // 2
+    assert len(raw) < len(payload) + 256  # header/frames only, no raw JSON
+    assert read_payload(tmp_path, 1).model_dump_json().encode() == payload  # type: ignore[union-attr]
+
+
+def test_head_carries_committed_offset_and_records(tmp_path: Path):
+    writer = SegmentWriter(tmp_path, commit_every_batches=100, commit_interval_seconds=5)
+    writer.open()
+    write(writer, range(1, 4))
+    writer.commit()
+    head = read_head(tmp_path)
+    assert head is not None
+    assert head["committed_through"] == 3
+    assert head["committed_records"] == 3
+    assert head["committed_offset"] > HEADER_SIZE
+    committed_offset = head["committed_offset"]
+    write(writer, range(4, 7))  # uncommitted tail
+    head = read_head(tmp_path)
+    assert head is not None and head["committed_offset"] == committed_offset
+    assert [b.local_batch_sequence for b in iter_payloads(tmp_path)] == [1, 2, 3]
+    writer.close()
+
+
+def test_sparse_index_checkpoints_support_random_reads(tmp_path: Path):
+    writer = SegmentWriter(tmp_path, commit_every_batches=2, commit_interval_seconds=5,
+                           segment_bytes=64 * 1024, segment_seconds=3600)
+    writer.open()
+    write(writer, range(1, 21))
+    writer.commit()
+    writer.rotate()
+    writer.close()
+    entries = []
+    for path in segments_dir(tmp_path).glob("seg-*"):
+        entries.extend(read_segment_index(path))
+    assert entries
+    assert entries == sorted(entries)
+    for sequence in (1, 2, 5, 9, 13, 18, 20):
+        batch = read_payload(tmp_path, sequence)
+        assert batch is not None and batch.local_batch_sequence == sequence
+
+
+def test_torn_active_index_tail_is_ignored(tmp_path: Path):
+    writer = SegmentWriter(tmp_path, commit_every_batches=2, commit_interval_seconds=5)
+    writer.open()
+    write(writer, range(1, 3))
+    writer.commit()
+    index = segments_dir(tmp_path) / ".active.idx"
+    with index.open("ab") as stream:
+        stream.write(b"\x01\x02\x03")  # torn entry
+    recovered = SegmentWriter(tmp_path, commit_every_batches=2, commit_interval_seconds=5)
+    recovered.open()
+    write(recovered, range(3, 5))
+    recovered.commit()
+    assert [b.local_batch_sequence for b in iter_payloads(tmp_path)] == [1, 2, 3, 4]
+    recovered.close()
+
+
+def test_commit_chain_tamper_detected(tmp_path: Path):
+    writer = SegmentWriter(tmp_path, commit_every_batches=100, commit_interval_seconds=5)
+    writer.open()
+    write(writer, range(1, 4))
+    writer.commit()
+    writer._stream.flush()  # type: ignore[union-attr]
+    active = segments_dir(tmp_path) / ".active.l2s"
+    offset = writer._stream.tell()  # type: ignore[union-attr]
+    writer.commit = writer.commit  # noqa: PLW0127
+    writer._stream.close()  # type: ignore[union-attr]
+    writer._stream = None
+    # Rewrite the commit frame with a valid crc but a bogus chain digest.
+    data = bytearray(active.read_bytes())
+    record_offset = HEADER_SIZE
+    while True:
+        total, kind, _crc = struct.unpack("<IBI", bytes(data[record_offset:record_offset + PREFIX_SIZE]))
+        if kind == KIND_COMMIT:
+            break
+        record_offset += total
+    body_start = record_offset + PREFIX_SIZE
+    body = bytearray(data[body_start:record_offset + total])
+    body[-1] ^= 0xFF
+    framed = frame_record(KIND_COMMIT, bytes(body))
+    data[record_offset:record_offset + total] = framed
+    active.write_bytes(data)
+    recovered = SegmentWriter(tmp_path, commit_every_batches=100, commit_interval_seconds=5)
+    with pytest.raises(SegmentError) as failure:
+        recovered.open()
+    assert failure.value.code == "invalid_commit_chain"
+
+
+def test_compressed_payload_corruption_detected(tmp_path: Path):
+    writer = SegmentWriter(tmp_path, commit_every_batches=100, commit_interval_seconds=5)
+    writer.open()
+    write(writer, range(1, 3))
+    writer.commit()
+    writer._stream.flush()  # type: ignore[union-attr]
+    writer._stream.close()  # type: ignore[union-attr]
+    writer._stream = None
+    active = segments_dir(tmp_path) / ".active.l2s"
+    data = bytearray(active.read_bytes())
+    body_start = HEADER_SIZE + PREFIX_SIZE
+    body = bytearray(data[body_start:body_start + 40])
+    body[5] ^= 0xFF
+    framed = frame_record(KIND_PAYLOAD, bytes(body))
+    data[HEADER_SIZE:HEADER_SIZE + PREFIX_SIZE + 40] = framed
+    active.write_bytes(data)
+    with pytest.raises(SegmentError):
+        list(iter_payloads(tmp_path))

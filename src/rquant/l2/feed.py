@@ -610,6 +610,18 @@ class FeedCollector:
     })
 
     def _update(self, *, force: bool | None = None, **changes: Any) -> None:
+        if self.status_flush_interval > 0 and changes:
+            # Fast mode: a candidate_push sets state/subscription_state on every
+            # frame, which would otherwise force a status fsync per batch.  Only
+            # differences from the current snapshot are persisted.
+            current = self.status
+            changed = {key: value for key, value in changes.items()
+                       if getattr(current, key, None) != value}
+            if not changed:
+                return
+            if force is None:
+                force = any(key in self._FORCE_STATUS_KEYS for key in changed)
+            changes = changed
         self.status = self.status.model_copy(update=changes)
         if force is None:
             force = any(key in self._FORCE_STATUS_KEYS for key in changes)

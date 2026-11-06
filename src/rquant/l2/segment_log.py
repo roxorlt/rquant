@@ -74,13 +74,18 @@ PREFIX_SIZE = RECORD_PREFIX.size
 KIND_PAYLOAD = 1
 KIND_COMMIT = 2
 KIND_FOOTER = 3
-COMMIT_BODY = struct.Struct("<QQQ")
+COMMIT_BODY = struct.Struct("<QQQ32s")
 FOOTER_BODY = struct.Struct("<QQQ")
+CODEC_RAW = 0
+CODEC_ZLIB = 1
+ZLIB_LEVEL = 1
 DIGEST_SIZE = 32
 SEGMENTS_DIR = "segments"
 INDEX_NAME = "index.jsonl"
 HEAD_NAME = "head.json"
 ACTIVE_NAME = ".active.l2s"
+ACTIVE_INDEX_NAME = ".active.idx"
+ACTIVE_INDEX_ENTRY = struct.Struct("<QQ")
 LAYOUT_NAME = ".layout"
 LAYOUT_SCHEMA = "rquant-l2-cache-layout-v1"
 HEAD_SCHEMA = "rquant-l2-segment-head-v1"
@@ -157,8 +162,11 @@ def frame_record(kind: int, body: bytes) -> bytes:
                                _crc32(bytes((kind,)) + body)) + body)
 
 
-def build_header(segment_index: int, first_sequence: int, created_at_ns: int) -> bytes:
-    return HEADER.pack(MAGIC, VERSION, 0, segment_index, first_sequence, created_at_ns)
+def build_header(segment_index: int, first_sequence: int, created_at_ns: int,
+                 codec: int = CODEC_ZLIB) -> bytes:
+    if codec not in (CODEC_RAW, CODEC_ZLIB):
+        raise SegmentError("invalid_codec")
+    return HEADER.pack(MAGIC, VERSION, codec, segment_index, first_sequence, created_at_ns)
 
 
 def segments_dir(root: Path | str) -> Path:
@@ -281,15 +289,19 @@ def read_head(root: Path | str) -> dict[str, Any] | None:
 def _write_head(root: Path | str, *, committed_through: int,
                 last_received_at: datetime | None, segment_index: int,
                 active_first_sequence: int, active_bytes: int,
-                active_records: int) -> None:
+                active_records: int, committed_offset: int,
+                committed_records: int, index_entries: int) -> None:
     payload = json.dumps({
         "schema": HEAD_SCHEMA,
         "committed_through": committed_through,
+        "committed_offset": committed_offset,
+        "committed_records": committed_records,
         "last_received_at": (last_received_at.isoformat() if last_received_at else None),
         "segment_index": segment_index,
         "active_first_sequence": active_first_sequence,
         "active_bytes": active_bytes,
         "active_records": active_records,
+        "index_entries": index_entries,
         "updated_at": datetime.now(UTC).isoformat(),
     }, sort_keys=True).encode() + b"\n"
     _replace_synced(segments_dir(root), HEAD_NAME, payload)
@@ -343,11 +355,12 @@ def scan_segment(path: Path) -> SegmentScan:
         if len(raw) != HEADER_SIZE:
             return SegmentScan(path, None, None, 0, 0, None, None, HEADER_SIZE,
                                HEADER_SIZE, None, False, file_bytes, error="short_header")
-        magic, version, _reserved, segment_index, first_sequence, _created = (
+        magic, version, codec, segment_index, first_sequence, _created = (
             HEADER.unpack(raw))
-        if magic != MAGIC or version != VERSION:
+        if magic != MAGIC or version != VERSION or codec not in (CODEC_RAW, CODEC_ZLIB):
             raise SegmentError("invalid_segment")
         hasher = hashlib.sha256(raw)
+        chain = hashlib.sha256()
         offset = HEADER_SIZE
         payloads = 0
         committed_records = 0
@@ -384,16 +397,18 @@ def scan_segment(path: Path) -> SegmentScan:
                 payloads += 1
                 last_sequence = first_sequence + payloads - 1
                 hasher.update(frame)
+                chain.update(frame)
                 offset += total
                 continue
             if kind == KIND_COMMIT:
                 if len(body) != COMMIT_BODY.size:
                     error = "invalid_commit"
                     break
-                value, _wall, records = COMMIT_BODY.unpack(body)
+                value, _wall, records, chain_digest = COMMIT_BODY.unpack(body)
                 expected = first_sequence + payloads - 1 if payloads else first_sequence - 1
-                if value != expected or records != payloads:
-                    error = "invalid_commit"
+                if (value != expected or records != payloads
+                        or chain.digest() != chain_digest):
+                    error = "invalid_commit_chain"
                     break
                 committed = value
                 committed_records = payloads
@@ -479,12 +494,17 @@ class SegmentWriter:
         self._first_sequence = 1
         self._next_sequence = 1
         self._records = 0
+        self._since_commit = 0
         self._committed_through = 0
         self._last_commit_offset = HEADER_SIZE
         self._segment_started_at = 0.0
         self._last_commit_at = 0.0
         self._last_received_at: datetime | None = None
         self._hasher = hashlib.sha256()
+        self._payload_chain = hashlib.sha256()
+        self._active_index: list[tuple[int, int]] = []
+        self._window_first_sequence: int | None = None
+        self._window_first_offset = HEADER_SIZE
         self._closed = False
         self._startup_notes: list[str] = []
         self.recovery: WriterRecovery | None = None
@@ -530,7 +550,9 @@ class SegmentWriter:
         """
         seen: set[str] = set()
         for path in self._segments.iterdir():
-            if path.name in (INDEX_NAME, HEAD_NAME, ACTIVE_NAME):
+            if path.name in (INDEX_NAME, HEAD_NAME, ACTIVE_NAME, ACTIVE_INDEX_NAME):
+                continue
+            if path.name.endswith(".idx"):
                 continue
             ranges = parse_segment_name(path.name)
             if ranges is None:
@@ -600,29 +622,52 @@ class SegmentWriter:
         self._committed_through = committed
         self._next_sequence = committed + 1
         self._records = scan.committed_records
+        self._since_commit = 0
+        self._window_first_sequence = None
+        self._window_first_offset = HEADER_SIZE
         self._last_commit_offset = keep_through
         recovery.committed_through = committed
         self._rehash_active(active, keep_through)
         self._last_received_at = self._last_committed_received_at(active, committed)
 
     def _rehash_active(self, path: Path, keep_through: int) -> None:
+        """Recompute the raw digest and the payload chain over [0, keep_through)."""
         hasher = hashlib.sha256()
+        chain = hashlib.sha256()
         with path.open("rb") as stream:
-            remaining = keep_through
-            while remaining > 0:
-                chunk = stream.read(min(1 << 20, remaining))
-                if not chunk:
+            raw = stream.read(HEADER_SIZE)
+            if len(raw) != HEADER_SIZE:
+                raise SegmentError("invalid_segment")
+            hasher.update(raw)
+            offset = HEADER_SIZE
+            while offset < keep_through:
+                stream.seek(offset)
+                prefix = stream.read(PREFIX_SIZE)
+                if len(prefix) != PREFIX_SIZE:
                     raise SegmentError("invalid_segment")
-                hasher.update(chunk)
-                remaining -= len(chunk)
+                total, kind, _crc = RECORD_PREFIX.unpack(prefix)
+                if total < PREFIX_SIZE or offset + total > keep_through:
+                    raise SegmentError("invalid_segment")
+                body = stream.read(total - PREFIX_SIZE)
+                if len(body) != total - PREFIX_SIZE:
+                    raise SegmentError("invalid_segment")
+                frame = prefix + body
+                hasher.update(frame)
+                if kind == KIND_PAYLOAD:
+                    chain.update(frame)
+                offset += total
         self._hasher = hasher
+        self._payload_chain = chain
 
     def _last_committed_received_at(self, path: Path, committed: int) -> datetime | None:
         if committed <= 0:
             return None
         last: datetime | None = None
         with path.open("rb") as stream:
-            stream.seek(HEADER_SIZE)
+            raw = stream.read(HEADER_SIZE)
+            if len(raw) != HEADER_SIZE:
+                raise SegmentError("invalid_segment")
+            _magic, _version, codec, _index, _first, _created = HEADER.unpack(raw)
             sequence = self._first_sequence
             while True:
                 prefix = stream.read(PREFIX_SIZE)
@@ -634,10 +679,7 @@ class SegmentWriter:
                     break
                 if kind == KIND_PAYLOAD:
                     if sequence <= committed:
-                        try:
-                            last = RawL2Batch.model_validate_json(body).received_at
-                        except ValueError:
-                            raise SegmentError("invalid_batch") from None
+                        last = _decode_payload(codec, body).received_at
                     sequence += 1
                 elif kind == KIND_FOOTER:
                     break
@@ -669,15 +711,22 @@ class SegmentWriter:
         self._next_sequence = self._first_sequence
         self._segment_index = recovery.active_segment_index
         self._records = 0
+        self._since_commit = 0
+        self._window_first_sequence = None
+        self._window_first_offset = HEADER_SIZE
         self._last_commit_offset = HEADER_SIZE
         self._last_received_at = None
         self._hasher = hashlib.sha256()
+        self._payload_chain = hashlib.sha256()
+        self._active_index = []
 
     def _open_active(self) -> None:
         active = self._segments / ACTIVE_NAME
+        index = self._segments / ACTIVE_INDEX_NAME
         if active.exists():
             self._stream = active.open("r+b")
             self._stream.seek(self._last_commit_offset)
+            self._active_index = self._load_active_index()
             return
         self._stream = active.open("wb")
         header = build_header(self._segment_index, self._first_sequence, time.time_ns())
@@ -685,15 +734,45 @@ class SegmentWriter:
         self._stream.flush()
         os.fsync(self._stream.fileno())
         self._hasher = hashlib.sha256(header)
+        self._payload_chain = hashlib.sha256()
+        index.write_bytes(b"")
+        _fsync_dir(self._segments)
+        self._active_index = []
+
+    def _load_active_index(self) -> list[tuple[int, int]]:
+        path = self._segments / ACTIVE_INDEX_NAME
+        try:
+            data = path.read_bytes()
+        except FileNotFoundError:
+            return []
+        entries: list[tuple[int, int]] = []
+        view = memoryview(data)
+        usable = len(data) - (len(data) % ACTIVE_INDEX_ENTRY.size)
+        for offset in range(0, usable, ACTIVE_INDEX_ENTRY.size):
+            first, start = ACTIVE_INDEX_ENTRY.unpack(view[offset:offset + ACTIVE_INDEX_ENTRY.size])
+            if first < 1 or start < HEADER_SIZE:
+                raise SegmentError("invalid_index")
+            entries.append((first, start))
+        return entries
+
+    def _append_active_index(self, first_sequence: int, offset: int) -> None:
+        path = self._segments / ACTIVE_INDEX_NAME
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, ACTIVE_INDEX_ENTRY.pack(first_sequence, offset))
+        finally:
+            os.close(fd)
+        self._active_index.append((first_sequence, offset))
 
     # -- writing -------------------------------------------------------- #
-    def _write_frame(self, kind: int, body: bytes) -> None:
+    def _write_frame(self, kind: int, body: bytes) -> bytes:
         if self._stream is None:
             raise SegmentError("writer_required")
         frame = frame_record(kind, body)
         self._stream.write(frame)
         if kind != KIND_FOOTER:
             self._hasher.update(frame)
+        return frame
 
     def append(self, batch: RawL2Batch) -> None:
         if self._stream is None or self._closed:
@@ -702,35 +781,46 @@ class SegmentWriter:
             raise SegmentError("invalid_batch")
         if batch.local_batch_sequence != self._next_sequence:
             raise SegmentError("sequence_gap")
-        payload = batch.model_dump_json().encode() + b"\n"
+        payload = zlib.compress(batch.model_dump_json().encode() + b"\n", ZLIB_LEVEL)
         if len(payload) + PREFIX_SIZE > MAX_RECORD_BYTES:
             raise SegmentError("invalid_batch")
-        self._write_frame(KIND_PAYLOAD, payload)
+        if self._window_first_sequence is None:
+            self._window_first_sequence = batch.local_batch_sequence
+            self._window_first_offset = self._stream.tell()
+        frame = self._write_frame(KIND_PAYLOAD, payload)
+        self._payload_chain.update(frame)
         self._records += 1
+        self._since_commit += 1
         self._next_sequence += 1
         self._last_received_at = batch.received_at
         self._maybe_commit()
         self._maybe_rotate()
 
     def _maybe_commit(self, *, force: bool = False) -> None:
-        if not force and self._records == 0:
+        if not force and self._since_commit == 0:
             return
         elapsed = self.clock() - self._last_commit_at
-        if force or self._records >= self.commit_every_batches or \
+        if force or self._since_commit >= self.commit_every_batches or \
                 elapsed >= self.commit_interval_seconds:
             self.commit()
 
     def commit(self) -> int:
         if self._stream is None:
             raise SegmentError("writer_required")
-        if self._records == 0:
+        if self._since_commit == 0:
             return self._committed_through
-        body = COMMIT_BODY.pack(self._next_sequence - 1, time.time_ns(), self._records)
+        body = COMMIT_BODY.pack(self._next_sequence - 1, time.time_ns(), self._records,
+                                self._payload_chain.digest())
         self._write_frame(KIND_COMMIT, body)
+        if self._window_first_sequence is not None:
+            self._append_active_index(self._window_first_sequence,
+                                      self._window_first_offset)
+            self._window_first_sequence = None
         self._stream.flush()
         os.fsync(self._stream.fileno())
         self._last_commit_offset = self._stream.tell()
         self._committed_through = self._next_sequence - 1
+        self._since_commit = 0
         self._last_commit_at = self.clock()
         self._write_head_snapshot()
         return self._committed_through
@@ -777,10 +867,16 @@ class SegmentWriter:
         self._stream.close()
         self._stream = None
         active = self._segments / ACTIVE_NAME
+        active_index = self._segments / ACTIVE_INDEX_NAME
+        if active_index.exists():
+            with active_index.open("rb") as stream:
+                os.fsync(stream.fileno())
         target = self._segments / segment_name(first, last)
         if target.exists():
             raise SegmentError("duplicate_segment")
         os.replace(active, target)
+        if active_index.exists():
+            os.replace(active_index, target.with_name(target.name + ".idx"))
         _fsync_dir(self._segments)
         entry = SegmentEntry(file=target.name, first_sequence=first, last_sequence=last,
                              records=self._records, bytes=closed_bytes,
@@ -810,7 +906,10 @@ class SegmentWriter:
                     active_first_sequence=self._first_sequence,
                     active_bytes=(self._stream.tell() if self._stream is not None
                                   else self._last_commit_offset),
-                    active_records=self._records)
+                    active_records=self._records,
+                    committed_offset=self._last_commit_offset,
+                    committed_records=self._records - self._since_commit,
+                    index_entries=len(self._active_index))
 
     # -- accessors ------------------------------------------------------ #
     @property
@@ -831,6 +930,9 @@ class SegmentSnapshot:
     committed_through: int
     last_received_at: datetime | None
     active_first_sequence: int
+    committed_offset: int | None = HEADER_SIZE
+    committed_records: int = 0
+    index_entries: int = 0
 
 
 def load_snapshot(root: Path | str) -> SegmentSnapshot:
@@ -848,6 +950,12 @@ def load_snapshot(root: Path | str) -> SegmentSnapshot:
     except (KeyError, TypeError, ValueError):
         raise SegmentError("invalid_head") from None
     last_received = _parse_iso(head.get("last_received_at"))
+    try:
+        committed_offset = int(head.get("committed_offset", HEADER_SIZE))
+        committed_records = int(head.get("committed_records", 0))
+        index_entries = int(head.get("index_entries", 0))
+    except (TypeError, ValueError):
+        raise SegmentError("invalid_head") from None
     if entries:
         if committed < entries[-1].last_sequence:
             committed = entries[-1].last_sequence
@@ -856,9 +964,50 @@ def load_snapshot(root: Path | str) -> SegmentSnapshot:
         if committed < 0:
             raise SegmentError("invalid_head")
         active_first = committed + 1
+    closed_records = sum(entry.records for entry in entries)
+    if committed_records < closed_records or committed_offset < HEADER_SIZE:
+        # A stale head only under-reports; readers fall back to the last commit marker.
+        committed_records = closed_records
+        committed_offset = None
     return SegmentSnapshot(entries=entries, committed_through=committed,
-                           last_received_at=last_received,
-                           active_first_sequence=active_first)
+                           last_received_at=last_received, active_first_sequence=active_first,
+                           committed_offset=committed_offset,
+                           committed_records=committed_records,
+                           index_entries=index_entries)
+
+
+def _decode_payload(codec: int, body: bytes) -> RawL2Batch:
+    if codec == CODEC_ZLIB:
+        try:
+            body = zlib.decompress(body)
+        except zlib.error:
+            raise SegmentError("invalid_payload_codec") from None
+    elif codec != CODEC_RAW:
+        raise SegmentError("invalid_payload_codec")
+    try:
+        return RawL2Batch.model_validate_json(body)
+    except ValueError:
+        raise SegmentError("invalid_batch") from None
+
+
+def read_segment_index(path: Path) -> list[tuple[int, int]]:
+    """Sparse ``(first_sequence, offset)`` checkpoints for one segment (may be empty)."""
+    index = path.with_name(path.name + ".idx")
+    try:
+        data = index.read_bytes()
+    except FileNotFoundError:
+        return []
+    except OSError:
+        raise SegmentError("invalid_index") from None
+    entries: list[tuple[int, int]] = []
+    usable = len(data) - (len(data) % ACTIVE_INDEX_ENTRY.size)
+    view = memoryview(data)
+    for offset in range(0, usable, ACTIVE_INDEX_ENTRY.size):
+        first, start = ACTIVE_INDEX_ENTRY.unpack(view[offset:offset + ACTIVE_INDEX_ENTRY.size])
+        if first < 1 or start < HEADER_SIZE:
+            raise SegmentError("invalid_index")
+        entries.append((first, start))
+    return entries
 
 
 def _segment_position(entries: tuple[SegmentEntry, ...], sequence: int) -> int:
@@ -874,17 +1023,25 @@ def _segment_position(entries: tuple[SegmentEntry, ...], sequence: int) -> int:
     return -1
 
 
-def _iter_segment_payloads(path: Path, *, stop_after: int, start_after: int) -> Iterator[RawL2Batch]:
+def _iter_segment_payloads(path: Path, *, stop_after: int, start_after: int,
+                           committed_offset: int | None = None,
+                           start_offset: int | None = None,
+                           start_sequence: int | None = None) -> Iterator[RawL2Batch]:
     """Yield payload records with start_after < sequence <= stop_after."""
     with path.open("rb") as stream:
         raw = stream.read(HEADER_SIZE)
         if len(raw) != HEADER_SIZE:
             raise SegmentError("invalid_segment")
-        magic, version, _reserved, _index, first_sequence, _created = HEADER.unpack(raw)
-        if magic != MAGIC or version != VERSION:
+        magic, version, codec, _index, first_sequence, _created = HEADER.unpack(raw)
+        if magic != MAGIC or version != VERSION or codec not in (CODEC_RAW, CODEC_ZLIB):
             raise SegmentError("invalid_segment")
-        sequence = first_sequence
+        sequence = start_sequence if start_sequence is not None else first_sequence
+        if start_offset is not None:
+            stream.seek(start_offset)
         while True:
+            position = stream.tell()
+            if committed_offset is not None and position >= committed_offset:
+                return
             prefix = stream.read(PREFIX_SIZE)
             if len(prefix) != PREFIX_SIZE:
                 return
@@ -894,26 +1051,21 @@ def _iter_segment_payloads(path: Path, *, stop_after: int, start_after: int) -> 
             body = stream.read(total - PREFIX_SIZE)
             if len(body) != total - PREFIX_SIZE:
                 return
+            if _crc32(bytes((kind,)) + body) != _crc:
+                raise SegmentError("invalid_record_crc")
             if kind == KIND_PAYLOAD:
-                if _crc32(bytes((kind,)) + body) != _crc:
-                    raise SegmentError("invalid_record_crc")
                 if sequence > stop_after:
                     return
                 if sequence > start_after:
-                    try:
-                        yield RawL2Batch.model_validate_json(body)
-                    except ValueError:
-                        raise SegmentError("invalid_batch") from None
+                    yield _decode_payload(codec, body)
                 sequence += 1
             elif kind == KIND_COMMIT:
-                if _crc32(bytes((kind,)) + body) != _crc or len(body) != COMMIT_BODY.size:
+                if len(body) != COMMIT_BODY.size:
                     raise SegmentError("invalid_commit")
-                value, _wall, _records = COMMIT_BODY.unpack(body)
+                value, _wall, _records, _chain = COMMIT_BODY.unpack(body)
                 if value >= stop_after:
                     return
             else:
-                if _crc32(bytes((kind,)) + body) != _crc:
-                    raise SegmentError("invalid_footer")
                 return
 
 
@@ -936,9 +1088,10 @@ def iter_payloads(root: Path | str, *, after_sequence: int = 0,
             emitted += 1
             yield batch
     active = segments / ACTIVE_NAME
-    if active.exists():
+    if active.exists() and snapshot.committed_through > after_sequence:
         for batch in _iter_segment_payloads(active, stop_after=snapshot.committed_through,
-                                            start_after=after_sequence):
+                                            start_after=after_sequence,
+                                            committed_offset=snapshot.committed_offset):
             if limit is not None and emitted >= limit:
                 return
             emitted += 1
@@ -953,17 +1106,35 @@ def read_payload(root: Path | str, sequence: int) -> RawL2Batch | None:
     position = _segment_position(snapshot.entries, sequence)
     if position >= 0:
         path = segments / snapshot.entries[position].file
+        committed_offset = None
     else:
         path = segments / ACTIVE_NAME
         if not path.exists():
             return None
+        committed_offset = snapshot.committed_offset
+    start_offset, start_sequence = _checkpoint_before(path, sequence)
     for batch in _iter_segment_payloads(path, stop_after=snapshot.committed_through,
-                                        start_after=sequence - 1):
+                                        start_after=sequence - 1,
+                                        committed_offset=committed_offset,
+                                        start_offset=start_offset,
+                                        start_sequence=start_sequence):
         if batch.local_batch_sequence == sequence:
             return batch
         if batch.local_batch_sequence > sequence:
             return None
     return None
+
+
+def _checkpoint_before(path: Path, sequence: int) -> tuple[int | None, int | None]:
+    """Nearest sparse checkpoint at or before ``sequence`` in one segment."""
+    offsets = read_segment_index(path)
+    best: tuple[int, int] | None = None
+    for first, offset in offsets:
+        if first <= sequence:
+            best = (first, offset)
+        else:
+            break
+    return (None, None) if best is None else (best[1], best[0])
 
 
 def audit(root: Path | str) -> dict[str, Any]:

@@ -1278,3 +1278,37 @@ def test_status_carries_candidate_market_freshness_fields() -> None:
     assert payload["last_market_timestamp"].startswith("2026-10-")
     assert "last_market_timestamp" in FeedStatus.model_fields
     assert "market_time_lag_ms" in FeedStatus.model_fields
+
+
+def test_throttled_status_skips_repeated_candidate_push_snapshots(tmp_path: Path) -> None:
+    """Fast mode must not write status for every candidate_push frame.
+
+    A candidate_push sets state/subscription_state on every frame; forcing a
+    snapshot per frame would keep the batch-directory fsync cost in the write
+    path.  Only value changes may flush.
+    """
+    from rquant.l2.cache import RawL2Cache
+
+    class CountingCache(RawL2Cache):
+        writes = 0
+
+        def write_status(self, status):  # type: ignore[no-untyped-def]
+            CountingCache.writes += 1
+            return super().write_status(status)
+
+    def run(interval: float, name: str) -> int:
+        clock = Clock()
+        provider = Provider(clock)
+        cache = CountingCache(tmp_path / name)
+        obj, _, _ = _collector_with_inputs(tmp_path, provider, clock, cache=cache,
+                                           status_flush_interval=interval)
+        obj.run()
+        writes = CountingCache.writes
+        CountingCache.writes = 0
+        return writes
+
+    legacy = run(0.0, "legacy")
+    throttled = run(60.0, "throttled")
+    assert throttled < legacy
+    assert throttled <= 8
+
