@@ -82,7 +82,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("invalid segment commit size")
     if not math.isfinite(args.segment_commit_ms) or not 0 <= args.segment_commit_ms <= 5000:
         parser.error("invalid segment commit interval")
-    if not 1024 * 1024 <= args.segment_mb <= 1024:
+    if not 1 <= args.segment_mb <= 1024:
         parser.error("invalid segment size")
     if not math.isfinite(args.segment_seconds) or not 1 <= args.segment_seconds <= 3600:
         parser.error("invalid segment rotation seconds")

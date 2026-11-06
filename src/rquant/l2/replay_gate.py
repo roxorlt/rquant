@@ -626,11 +626,12 @@ def _percentiles_us(samples_ns: Sequence[int]) -> dict[str, int]:
 
 
 def _committed_batches(root: Path) -> int:
-    batches = root / "batches"
-    if not batches.is_dir():
+    from .cache import CacheError, RawL2Cache
+
+    try:
+        return RawL2Cache(Path(root)).committed_head()[0]
+    except CacheError:
         return 0
-    return sum(1 for entry in batches.iterdir()
-               if entry.is_dir() and entry.name.isdigit() and len(entry.name) == 20)
 
 
 def _cache_bytes(root: Path) -> int:
