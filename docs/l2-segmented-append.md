@@ -287,3 +287,26 @@ CPU 估算：4.5 KB/批 zlib-1 约 0.1 ms → 670 批/s 约 6–7% 单核，可�
 
 P2（下一阶段）待做：`RawL2Cache` 写入后端接入（`write_mode="segments"`、writer/append/status 集成）、
 7 处直读 `batches/` 的改造、回放门禁 segment 场景、40 股真实窗口。
+
+
+## 13. P2 接入完成（2026-11-06，分支 feat/l2-segment-log）
+
+- `RawL2Cache(write_mode="segments")`：`.layout` 自动识别、`writer()` 用 SegmentWriter
+  （O(1) 恢复、restart_gap 状态、写 status 前提交、正常退出 finalize、异常留给恢复截断）；
+  读端 `read_batches`/`iter_batches` 分派到段后端；后端中立原语
+  `committed_head()` / `read_one(seq)` / `read_payload_bytes(seq)`；
+  `.floor` 标记在段式布局下移到缓存根。
+- CLI：`--write-mode` / `--segment-commit-every` / `--segment-commit-ms` / `--segment-mb` /
+  `--segment-seconds`（默认仍走目录后端）。
+- 直读 `batches/` 的模块全部改为 layout-aware：
+  `archive._batch`（段式走 read_one）、`cold_store._payload_info/_source_payload`
+  （段式读 `read_payload_bytes`，无 sha 边车）、`retention.hot_usage/prune/hot-bytes`
+  （段式按整段向下取整删除、原子重写 index、活跃段保留、floor 在缓存根）、
+  `replay_gate._committed_batches`（committed_head）。
+- 回放门禁新增 `--write-mode segments`：**9/9 场景通过**（wall 30.5 s，batch 后端 59.6 s），
+  保留的缓存目录实测 `.layout mode=segments`、`segments/seg-*.l2s(.idx)`、`head.json`、
+  `index.jsonl` 均正常生成。
+- 新增测试：段式缓存 6 项集成 + 保留按段删除 + 冷存压缩/恢复往返（12 项新增）+
+  读模块回归；L2 全量 **895 passed**（4 个既有 test_l2_web duckdb 缺口）。
+
+剩余：40 股真实窗口验证（下一交易日）与部署/验收材料（另卡）。
