@@ -143,12 +143,20 @@ def _fsync_dir(path: Path) -> None:
         os.close(fd)
 
 
-def _write_new(path: Path, data: bytes) -> None:
+_FDATASYNC = getattr(os, "fdatasync", None)
+
+
+def _write_new(path: Path, data: bytes, *, datasync_only: bool = False) -> None:
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "wb") as stream:
         stream.write(data)
         stream.flush()
-        os.fsync(stream.fileno())
+        # The grouped path can use fdatasync for the two batch files: the batch
+        # directory is fsynced separately, so only data+size must be durable.
+        if datasync_only and _FDATASYNC is not None:
+            _FDATASYNC(stream.fileno())
+        else:
+            os.fsync(stream.fileno())
 
 
 def _replace_snapshot(root: Path, name: str, payload: bytes) -> None:
@@ -173,8 +181,17 @@ def _replace_snapshot(root: Path, name: str, payload: bytes) -> None:
 
 
 class RawL2Cache:
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, group_commit: int = 0) -> None:
         self.root = Path(root)
+        # ``group_commit >= 2`` batches the *directory* fsync of every N published
+        # batches into one: each batch keeps its own two file fsyncs plus the
+        # pending-directory fsync (crash safety), but the rename of the N batch
+        # directories is made durable with a single ``fsync(batches/)`` instead
+        # of one per batch.  0/1 keeps the legacy per-batch publication path.
+        if type(group_commit) is not int or not 0 <= group_commit <= 1024:
+            raise ValueError("invalid group commit size")
+        self._group_commit = group_commit
+        self._pending_group: list[tuple[Path, Path, RawL2Batch]] = []
         self._writer_fd: int | None = None
         self._highwater = 0
         self._last_received_at: datetime | None = None
@@ -227,7 +244,13 @@ class RawL2Cache:
                 self.write_status(previous.model_copy(update={
                     "state": "disconnected", "gap": True, "error_code": "restart_gap",
                 }))
-            yield self
+            try:
+                yield self
+            except BaseException:
+                self._discard_group()
+                raise
+            else:
+                self._flush_group()
         except CacheError:
             raise
         except OSError:
@@ -408,6 +431,9 @@ class RawL2Cache:
 
     def _position(self) -> tuple[int, datetime | None]:
         if self._writer_fd is not None:
+            # A status/receipt snapshot must never claim a batch that is still
+            # sitting in the in-memory group: publish the group first.
+            self._flush_group()
             return self._highwater, self._last_received_at
         _, count, last, _ = self._snapshot()
         return count, last
@@ -418,34 +444,33 @@ class RawL2Cache:
             raise ValueError("typed market observation required")
         batch = RawL2Batch.model_validate({
             **observation.model_dump(mode="python", serialize_as_any=True),
-            "local_batch_sequence": self._highwater + 1,
+            "local_batch_sequence": self._highwater + len(self._pending_group) + 1,
             "cached_at": datetime.now(UTC),
         })
         payload = batch.model_dump_json().encode() + b"\n"
         if len(payload) > _MAX_BATCH_BYTES:
             raise CacheError("invalid_batch")
-        try:
-            space = os.statvfs(self.root)
-            if (type(space.f_bavail) is not int or type(space.f_frsize) is not int
-                    or space.f_bavail < 0 or space.f_frsize <= 0):
-                raise CacheError("cache_io")
-            block = space.f_frsize
-            needed = 5 * 1024**3 + ((len(payload) + block - 1) // block
-                      + (65 + block - 1) // block) * block + 1024**2
-            if space.f_bavail * block < needed:
-                raise CacheError("cache_io")
-        except (OSError, AttributeError, TypeError, ValueError):
-            raise CacheError("cache_io") from None
+        self._check_disk_space(len(payload))
+        parent = self.root / "batches"
         pending: Path | None = None
+        queued = False
         try:
-            parent = self.root / "batches"
             pending = Path(tempfile.mkdtemp(prefix=".pending-", dir=parent))
-            _write_new(pending / "batch.json", payload)
-            _write_new(pending / "sha256", hashlib.sha256(payload).hexdigest().encode() + b"\n")
+            datasync_only = self._group_commit >= 2
+            _write_new(pending / "batch.json", payload, datasync_only=datasync_only)
+            _write_new(pending / "sha256",
+                       hashlib.sha256(payload).hexdigest().encode() + b"\n",
+                       datasync_only=datasync_only)
             _fsync_dir(pending)
             target = parent / f"{batch.local_batch_sequence:020d}"
             if target.exists():
                 raise CacheError("sequence_gap")
+            if self._group_commit >= 2:
+                self._pending_group.append((pending, target, batch))
+                queued = True
+                if len(self._pending_group) >= self._group_commit:
+                    self._flush_group()
+                return batch
             os.rename(pending, target)
             pending = None
             self._highwater = batch.local_batch_sequence
@@ -456,8 +481,56 @@ class RawL2Cache:
         except OSError:
             raise CacheError("cache_io") from None
         finally:
-            if pending is not None:
+            if pending is not None and not queued:
                 shutil.rmtree(pending, ignore_errors=True)
+
+    def _check_disk_space(self, payload_size: int) -> None:
+        try:
+            space = os.statvfs(self.root)
+            if (type(space.f_bavail) is not int or type(space.f_frsize) is not int
+                    or space.f_bavail < 0 or space.f_frsize <= 0):
+                raise CacheError("cache_io")
+            block = space.f_frsize
+            needed = 5 * 1024**3 + ((payload_size + block - 1) // block
+                      + (65 + block - 1) // block) * block + 1024**2
+            if space.f_bavail * block < needed:
+                raise CacheError("cache_io")
+        except (OSError, AttributeError, TypeError, ValueError):
+            raise CacheError("cache_io") from None
+
+    def _flush_group(self) -> None:
+        """Publish the buffered batch group with one directory fsync.
+
+        Each batch already fsynced its two files and its pending directory, so
+        the only crash window is the rename ordering: renames happen in sequence
+        order, so a crash leaves a contiguous prefix plus pending directories,
+        which writer recovery already cleans up.
+        """
+        if not self._pending_group:
+            return
+        group, self._pending_group = self._pending_group, []
+        parent = self.root / "batches"
+        pending_paths: list[Path] = []
+        try:
+            for pending, target, _batch in group:
+                if target.exists():
+                    raise CacheError("sequence_gap")
+                os.rename(pending, target)
+                pending_paths.append(pending)
+            self._highwater = group[-1][2].local_batch_sequence
+            self._publish_head(group[-1][1])
+            _fsync_dir(parent)
+            self._last_received_at = group[-1][2].received_at
+        except OSError:
+            raise CacheError("cache_io") from None
+        finally:
+            for pending, _target, _batch in group:
+                shutil.rmtree(pending, ignore_errors=True)
+
+    def _discard_group(self) -> None:
+        for pending, _target, _batch in self._pending_group:
+            shutil.rmtree(pending, ignore_errors=True)
+        self._pending_group = []
 
     def _stored_status(self) -> FeedStatus:
         path = self.root / "status.json"
