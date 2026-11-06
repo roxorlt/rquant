@@ -119,3 +119,48 @@ def test_status_restart_gap_is_written_for_segments(tmp_path: Path) -> None:
     with reopened.writer():
         status = reopened.read_status()
         assert status.state == "disconnected" and status.gap and status.error_code == "restart_gap"
+
+
+def test_retention_retires_whole_closed_segments(tmp_path: Path) -> None:
+    from datetime import UTC
+
+    from rquant.l2 import retention
+
+    root = tmp_path / "cache"
+    first = segments_cache(root)
+    with first.writer():
+        write_observations(first, 0, 3)
+        first.write_status(first.read_status())
+    second = segments_cache(root)
+    with second.writer():
+        write_observations(second, 3, 3)
+        second.write_status(second.read_status())
+    usage = retention.hot_usage(root)
+    assert usage.head == 6 and usage.batches == 6 and usage.allocated_bytes > 0
+    deleted, allocated = retention._prune_hot_prefix(
+        root, 3, reason="test", now=__import__("datetime").datetime.now(UTC))
+    assert deleted == 3 and allocated > 0
+    assert read_floor(root) == 3
+    page = segments_cache(root).read_batches(after_sequence=0, limit=10)
+    assert [batch.local_batch_sequence for batch in page.batches] == [4, 5, 6]
+
+
+def test_cold_store_compacts_and_restores_segmented_cache(tmp_path: Path) -> None:
+    from datetime import UTC
+
+    import rquant.l2.cold_store as cold_store
+    from tests.unit.l2_cold_fixtures import payload_bytes
+
+    root = tmp_path / "cache"
+    writer = segments_cache(root)
+    with writer.writer():
+        write_observations(writer, 0, 12)
+        writer.write_status(writer.read_status())
+    result = cold_store.compact_cache(root, tmp_path / "cold", block_records=4, verify=True)
+    assert result.records == 12 and result.verified
+    destination = tmp_path / "restored"
+    restored = cold_store.restore(tmp_path / "cold", destination)
+    assert restored.records == 12
+    reader = segments_cache(root)
+    for sequence in (1, 6, 12):
+        assert payload_bytes(destination, sequence) == reader.read_payload_bytes(sequence)
