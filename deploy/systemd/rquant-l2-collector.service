@@ -2,8 +2,11 @@
 Description=rQuant single-connection L2 collector
 After=network-online.target
 Wants=network-online.target
-StartLimitIntervalSec=60
-StartLimitBurst=1
+# 断线自愈（2026-11-06 P0）：进程非零退出/异常终止时自动重启；5 分钟内 3 次后放弃并告警，
+# 避免供应商会话抖动时无限重连。Restart=no 曾导致 09:31 peer_closed 后静默失败 8 分钟。
+StartLimitIntervalSec=300
+StartLimitBurst=3
+OnFailure=rquant-alert@%n.service
 
 [Service]
 Type=simple
@@ -16,7 +19,8 @@ ProtectSystem=strict
 PrivateTmp=yes
 ReadOnlyPaths=/home/lighthouse/rquant-l2-private /home/lighthouse/rquant-l2-state/control /home/lighthouse/rquant-l2-state/capacity.json
 ReadWritePaths=/home/lighthouse/rquant-l2-state/cache
-Restart=no
+Restart=on-failure
+RestartSec=10s
 TimeoutStopSec=30
 
 [Install]

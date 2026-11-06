@@ -1,0 +1,11 @@
+[Unit]
+Description=Trigger rQuant L2 collector watchdog every 2 min during trading hours
+
+[Timer]
+# 同 rquant-monitor-watchdog.timer 的已验证语法；脚本内再收窄到实际盘中时段
+OnCalendar=Mon..Fri *-*-* 9..15:0/2
+Persistent=false
+Unit=rquant-l2-collector-watchdog.service
+
+[Install]
+WantedBy=timers.target
