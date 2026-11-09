@@ -1,0 +1,10 @@
+[Unit]
+Description=Start the rQuant L2 collector before the trading session (Mon-Fri 09:30:10, after the open)
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 09:30:10
+Unit=rquant-l2-collector.service
+Persistent=false
+
+[Install]
+WantedBy=timers.target
