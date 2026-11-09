@@ -14,7 +14,7 @@ import uuid
 from collections import deque
 from collections.abc import Callable
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from ipaddress import IPv4Address
 from pathlib import Path
 from typing import Any
@@ -60,6 +60,17 @@ MAX_PENDING_BYTES = 64 * 1024 * 1024
 _QUANTUM_FRAMES = 32
 _QUANTUM_BYTES = 4 * 1024 * 1024
 _QUANTUM_SECONDS = 0.1
+
+# Shanghai has no DST, so a fixed offset is exact and needs no tzdata lookup.
+_SHANGHAI = timezone(timedelta(hours=8), "Asia/Shanghai")
+# Pre-open seed retries stop at 09:32 local. The vendor seed is empty before
+# the open; once the opening window has settled an empty round is a real
+# failure and the historical blocked/seed_timeout exit applies.
+_SEED_RETRY_CUTOFF = (9, 32)
+
+
+def _shanghai_now() -> datetime:
+    return datetime.now(_SHANGHAI)
 
 
 class FeedError(RuntimeError):
@@ -374,6 +385,9 @@ class FeedCollector:
                  seed_pace_seconds: float = 1.0, seed_pace_max_seconds: float = 8.0,
                  seed_latency_soft_seconds: float = 2.0,
                  seed_retry_limit: int = 0, seed_retry_cooldown_seconds: float = 20.0,
+                 seed_retry_until_open: bool = False,
+                 seed_retry_interval_seconds: float = 25.0,
+                 wall_clock: Callable[[], datetime] | None = None,
                  receive_pump: bool = False, pump_queue_frames: int = 65536,
                  pump_priority_frames: int = 4096,
                  status_flush_interval: float = 0.0) -> None:
@@ -412,6 +426,14 @@ class FeedCollector:
                 or not math.isfinite(seed_retry_cooldown_seconds)
                 or not 1 <= seed_retry_cooldown_seconds <= 600):
             raise ValueError('invalid seed retry cooldown')
+        if type(seed_retry_until_open) is not bool:
+            raise ValueError('invalid pre-open seed retry mode')
+        if (type(seed_retry_interval_seconds) not in (int, float)
+                or not math.isfinite(seed_retry_interval_seconds)
+                or not 5 <= seed_retry_interval_seconds <= 120):
+            raise ValueError('invalid pre-open seed retry interval')
+        if wall_clock is not None and not callable(wall_clock):
+            raise ValueError('invalid wall clock')
         if type(receive_pump) is not bool:
             raise ValueError('invalid receive pump mode')
         if type(pump_queue_frames) is not int or not 1 <= pump_queue_frames <= 1_048_576:
@@ -444,6 +466,9 @@ class FeedCollector:
         self.seed_latency_soft_seconds = seed_latency_soft_seconds
         self.seed_retry_limit, self.seed_retry_cooldown_seconds = (
             seed_retry_limit, seed_retry_cooldown_seconds)
+        self.seed_retry_until_open = seed_retry_until_open
+        self.seed_retry_interval_seconds = float(seed_retry_interval_seconds)
+        self.wall_clock = wall_clock if wall_clock is not None else _shanghai_now
         self.receive_pump = receive_pump
         self.pump_queue_frames, self.pump_priority_frames = pump_queue_frames, pump_priority_frames
         # 0.0 keeps the historical behaviour (a status snapshot per update, i.e.
@@ -472,6 +497,10 @@ class FeedCollector:
         self._deferred_ready_at = 0.0
         self._late_seed_pushes = 0
         self._retry_dispatched = 0
+        self._empty_table_responses = 0
+        self._empty_seed_responses = 0
+        self._empty_push_responses = 0
+        self._seed_retry_rounds = 0
 
     # Legacy single-link attributes stay reachable for callers and tests that
     # address the first socket directly; multi-link epochs keep link 0 here.
@@ -545,6 +574,11 @@ class FeedCollector:
             "deferred_retries": self._retry_dispatched,
             "deferred_pending": len(self._deferred),
             "late_seed_pushes": self._late_seed_pushes,
+            "empty_table_responses": self._empty_table_responses,
+            "empty_seed_responses": self._empty_seed_responses,
+            "empty_push_responses": self._empty_push_responses,
+            "seed_retry_until_open": self.seed_retry_until_open,
+            "seed_retry_rounds": self._seed_retry_rounds,
             "pumps": pumps,
         }
 
@@ -723,7 +757,25 @@ class FeedCollector:
         except Exception:
             raise FeedError("decode_error") from None
         if not result["table"]["rows"]:
-            raise FeedError("decode_error")
+            # A well-formed table with zero rows is not a decode failure. The
+            # vendor returns an empty seed before the open, and a confirmed-empty
+            # stream may stay empty. Count it like a data-less control frame and
+            # never restart the collector over it (2026-11-09 pre-open outage).
+            self._empty_table_responses += 1
+            self._update(control_count=self.status.control_count + 1)
+            if request == pending and delivery == 'seed':
+                # Same receipt semantics as the vendor "no data" notice: the
+                # request was answered, but no seed exists for this stream.
+                self._empty_seed_responses += 1
+                self._transition(binding, state='no_data')
+                self._tap_event({"event": "empty_seed", "page_id": binding.page_id})
+            elif request == pending:
+                # An empty bounded-history page: answered, nothing to retain.
+                self._tap_event({"event": "empty_backfill", "page_id": binding.page_id})
+            else:
+                self._empty_push_responses += 1
+                self._tap_event({"event": "empty_push", "page_id": binding.page_id})
+            return None
         if binding.kind == "vendor4027":
             expected = 1 if binding.side == "buy" else 2
             if any(type(r.get("12", {}).get("value")) is not int
@@ -945,6 +997,27 @@ class FeedCollector:
         self._issue_stream(link, binding, retry=True)
         return True
 
+    def _seed_retry_window_open(self) -> bool:
+        """True while the pre-open seed retry window (before 09:32) is open."""
+        try:
+            local = self.wall_clock().astimezone(_SHANGHAI)
+        except Exception:
+            # An unusable wall clock must not extend a pre-open retry forever.
+            return False
+        return (local.hour, local.minute) < _SEED_RETRY_CUTOFF
+
+    def _seed_round_exhausted(self) -> bool:
+        """True once every current stream was attempted and no seed landed.
+
+        A candidate push already proves the feed is alive, so it also ends the
+        retry window: re-seeding would tear down a working epoch.
+        """
+        if (self.validated_seed or self._deferred or not self._stream_receipts
+                or self.status.market_batch_count > 0):
+            return False
+        return all(stream.state not in {'queued', 'sent'}
+                   for stream in self._stream_receipts.values())
+
     def _note_issued(self) -> None:
         if self.subscribe_batch_stocks <= 0:
             return
@@ -1077,6 +1150,13 @@ class FeedCollector:
                     continue
                 if self._retry_deferred():
                     continue
+                if self.seed_retry_until_open and self._seed_round_exhausted():
+                    if not self._seed_retry_window_open():
+                        # Past 09:32 with a whole seed round still empty: the
+                        # historical terminal condition, reported honestly.
+                        raise FeedError('seed_timeout')
+                    self._seed_retry_rounds += 1
+                    raise FeedError('seed_retry', retryable=True)
                 waiting = 'seeded_waiting' if self.validated_seed else 'connected'
                 state = 'listening_candidate' if self.status.subscription_state == 'candidate_push_observed' else waiting
                 if self.status.state != state:
@@ -1145,6 +1225,31 @@ class FeedCollector:
                     try:
                         self._epoch()
                     except FeedError as error:
+                        if error.code == 'seed_retry':
+                            # Nothing seeded before the open: wait one bounded
+                            # interval and start a fresh epoch (new socket and
+                            # request IDs) instead of reporting blocked.
+                            try:
+                                self._pause(self.seed_retry_interval_seconds, self._deadline)
+                            except KeyboardInterrupt:
+                                if not self.validated_seed and self._epoch_seed_timeouts > 0:
+                                    self._update(state="blocked", gap=True, error_code="seed_timeout")
+                                else:
+                                    self._update(state="stopped", gap=True, error_code="signal_stop")
+                                self._finish_receipt()
+                                break
+                            except FeedError as stop:
+                                code = stop.code
+                                stopped = code in {"signal_stop", "duration_limit"}
+                                state = "stopped" if stopped else "blocked"
+                                if (state == "stopped" and not self.validated_seed
+                                        and self._epoch_seed_timeouts > 0):
+                                    code, state = "seed_timeout", "blocked"
+                                self._update(state=state, gap=True, error_code=code)
+                                self._finish_receipt()
+                                break
+                            self._update(state="starting", error_code=None)
+                            continue
                         stopped = error.code in {"signal_stop", "duration_limit"}
                         state = "stopped" if stopped else "disconnected" if error.retryable else "blocked"
                         code = error.code

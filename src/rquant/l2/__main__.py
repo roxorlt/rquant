@@ -45,6 +45,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--seed-retry-limit", type=int, choices=(0, 1, 2, 3), default=0,
                         help="deferred seed retries after the 15s guard (0 keeps legacy)")
     parser.add_argument("--seed-retry-cooldown-seconds", type=float, default=20.0)
+    parser.add_argument("--seed-retry-until-open", action="store_true",
+                        help="before 09:32 Asia/Shanghai, retry a whole seed round that "
+                             "returned no data (e.g. an empty pre-open seed table) every "
+                             "25s instead of exiting blocked; off by default")
     parser.add_argument("--receive-pump", action="store_true",
                         help="decouple socket framing from decode/persist with a reader thread; "
                              "requires the wall clock, do not use with the virtual replay clock")
@@ -147,6 +151,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             subscribe_batch_stocks=args.subscribe_batch_stocks,
             seed_retry_limit=args.seed_retry_limit,
             seed_retry_cooldown_seconds=args.seed_retry_cooldown_seconds,
+            seed_retry_until_open=args.seed_retry_until_open,
             receive_pump=args.receive_pump,
             pump_queue_frames=args.pump_queue_frames,
             pump_priority_frames=args.pump_priority_frames,
