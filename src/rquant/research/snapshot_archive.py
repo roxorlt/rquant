@@ -146,7 +146,7 @@ class R2:
                         # ambiguous. Surface the original error and let the
                         # caller verify the exact remote bytes.
                         assert uncertain is not None
-                        raise uncertain
+                        raise uncertain from error
                 elif _uncertain(error):
                     uncertain = error
                 if attempt == self.attempts or not _retryable(error):
