@@ -55,25 +55,63 @@ struct NotchShape: Shape {
 
 struct Sparkline: View {
     let points: [Double]
+    let minutes: [Int]?
+    let dataProgress: Double
+    let sessionProgress: Double
     let ref: Double?
+
     var body: some View {
         GeometryReader { g in
             let pts = points
-            if pts.count >= 2, let lo = (pts + [ref].compactMap { $0 }).min(), let hi = (pts + [ref].compactMap { $0 }).max() {
-                let span = max(hi - lo, 1e-9)
-                let y: (Double) -> CGFloat = { g.size.height - CGFloat(($0 - lo) / span) * g.size.height }
+            let vals = pts + [ref].compactMap { $0 }
+            if let lo = vals.min(), let hi = vals.max() {
+                let span = hi - lo
+                let y: (Double) -> CGFloat = { v in
+                    guard span > 1e-9 else { return g.size.height * 0.5 }
+                    return g.size.height - CGFloat((v - lo) / span) * g.size.height
+                }
                 ZStack {
                     if let ref {
-                        Path { p in p.move(to: CGPoint(x: 0, y: y(ref))); p.addLine(to: CGPoint(x: g.size.width, y: y(ref))) }
-                            .stroke(P.rule, style: StrokeStyle(lineWidth: 0.5, dash: [2, 2]))
-                    }
-                    Path { p in
-                        for (i, v) in pts.enumerated() {
-                            let pt = CGPoint(x: CGFloat(i) / CGFloat(pts.count - 1) * g.size.width, y: y(v))
-                            if i == 0 { p.move(to: pt) } else { p.addLine(to: pt) }
+                        Path { p in
+                            p.move(to: CGPoint(x: 0, y: y(ref)))
+                            p.addLine(to: CGPoint(x: g.size.width, y: y(ref)))
                         }
+                        .stroke(P.rule, style: StrokeStyle(lineWidth: 0.5, dash: [2, 2]))
                     }
-                    .stroke(P.pct((pts.last ?? 0) - (ref ?? pts.first ?? 0)), lineWidth: 1)
+                    if !pts.isEmpty && (pts.count >= 2 || sessionProgress > 0) {
+                        let w = g.size.width
+                        let endX = min(w, max(1.0, CGFloat(sessionProgress) * w))
+                        Path { p in
+                            if let mins = minutes, mins.count == pts.count {
+                                var lastX: CGFloat = 0
+                                for (i, v) in pts.enumerated() {
+                                    let x = min(w, max(0, CGFloat(Double(mins[i]) / SessionAxis.totalMinutes) * w))
+                                    let pt = CGPoint(x: x, y: y(v))
+                                    if i == 0 { p.move(to: pt) } else { p.addLine(to: pt) }
+                                    lastX = x
+                                }
+                                if let lastV = pts.last, endX > lastX + 0.25 {
+                                    p.addLine(to: CGPoint(x: endX, y: y(lastV)))
+                                } else if pts.count == 1, let v0 = pts.first {
+                                    p.addLine(to: CGPoint(x: min(w, max(lastX + 1.0, endX)), y: y(v0)))
+                                }
+                            } else if pts.count == 1, let v0 = pts.first {
+                                p.move(to: CGPoint(x: 0, y: y(v0)))
+                                p.addLine(to: CGPoint(x: endX, y: y(v0)))
+                            } else {
+                                let dataW = min(endX, max(1.0, CGFloat(dataProgress) * w))
+                                for (i, v) in pts.enumerated() {
+                                    let x = CGFloat(i) / CGFloat(pts.count - 1) * dataW
+                                    let pt = CGPoint(x: x, y: y(v))
+                                    if i == 0 { p.move(to: pt) } else { p.addLine(to: pt) }
+                                }
+                                if let lastV = pts.last, endX > dataW + 0.25 {
+                                    p.addLine(to: CGPoint(x: endX, y: y(lastV)))
+                                }
+                            }
+                        }
+                        .stroke(P.pct((pts.last ?? 0) - (ref ?? pts.first ?? 0)), lineWidth: 1)
+                    }
                 }
             }
         }
@@ -167,8 +205,7 @@ struct ExpandedView: View {
                         num(t.gap).frame(width: 44, alignment: .trailing)
                         num(t.pct_chg).frame(width: 44, alignment: .trailing)
                         num(t.intraday).frame(width: 44, alignment: .trailing)
-                        Sparkline(points: t.spark, ref: t.pre_close)
-                            .frame(width: 30, height: 12).frame(width: 40, alignment: .trailing)
+                        sparkline(t)
                     }
                     .frame(height: Self.rowH)
                     .contentShape(Rectangle())
@@ -182,6 +219,12 @@ struct ExpandedView: View {
                     .frame(height: Self.rowH)
             }
         }
+    }
+
+    func sparkline(_ t: Tiger) -> some View {
+        let s = SessionAxis.span(for: t, payload: store.payload, isOffline: store.error != nil)
+        return Sparkline(points: t.spark, minutes: t.spark_m, dataProgress: s.data, sessionProgress: s.session, ref: t.pre_close)
+            .frame(width: 30, height: 12).frame(width: 40, alignment: .trailing)
     }
 
     func num(_ v: Double?) -> some View {

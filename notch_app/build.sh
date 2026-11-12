@@ -39,8 +39,8 @@ cat > "$APP/Contents/Info.plist" <<'PL'
 <key>CFBundleName</key><string>RQuantNotch</string>
 <key>CFBundleExecutable</key><string>RQuantNotch</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>1.0.4</string>
-<key>CFBundleVersion</key><string>5</string>
+<key>CFBundleShortVersionString</key><string>1.0.5</string>
+<key>CFBundleVersion</key><string>6</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>LSUIElement</key><true/>
 <key>NSAppTransportSecurity</key><dict>

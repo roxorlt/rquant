@@ -23,10 +23,23 @@ BEAR = {"跌破支撑", "放量下杀", "大单压盘", "托单撤离", "主动�
 SHORT = {"压单撤离": "压单撤", "托单撤离": "托单撤", "主动买转强": "主买强", "主动卖转强": "主卖强"}
 
 
-def bias_of(t):
+def bias_of(t: str) -> str:
     if t in BULL: return "多"
     if t in BEAR: return "空"
     return "中"
+
+
+def session_min(hm: str) -> int:
+    """Map HH:MM onto the 240-minute A-share trading axis (09:30->0, 11:30/13:00->120, 15:00->240)."""
+    h, m = int(hm[:2]), int(hm[3:5])
+    x = h * 60 + m
+    if x <= 570:
+        return 0
+    if x <= 690:
+        return x - 570
+    if x <= 780:
+        return 120
+    return min(240, 120 + (x - 780))
 
 
 class State:
@@ -183,6 +196,7 @@ class State:
             if clock:
                 mins = {k: v for k, v in mins.items() if k <= clock[:5]}
                 if mins: px = mins[max(mins)]
+            keys = sorted(mins)
             rows.append({
                 "rank": p.get("rank"), "name": p.get("name"), "ts_code": c,
                 "gap": round(p["gap"] * 100, 2) if p.get("gap") is not None else None,
@@ -190,7 +204,8 @@ class State:
                 "pct_chg": round((px / pc - 1) * 100, 2) if px and pc else None,
                 "intraday": round((px / op - 1) * 100, 2) if px and op else None,
                 "tick_time": clock or s.get("time"),
-                "spark": [mins[k] for k in sorted(mins)],
+                "spark": [mins[k] for k in keys],
+                "spark_m": [session_min(k) for k in keys],
                 "bias": latest_bias.get(c),
             })
         now = dt.datetime.now()

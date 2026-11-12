@@ -14,7 +14,71 @@ struct Tiger: Codable, Identifiable, Equatable {
     let intraday: Double?
     let tick_time: String?
     let spark: [Double]
+    let spark_m: [Int]?
     let bias: String?
+}
+
+/// Maps timestamps onto the fixed 240-minute A-share session width:
+/// 09:30 -> 0.0, 11:30..13:00 (lunch) -> 0.5, 15:00+ -> 1.0.
+enum SessionAxis {
+    static let totalMinutes: Double = 240.0
+    private static let shanghaiTZ = TimeZone(identifier: "Asia/Shanghai")!
+
+    static func progress(timeString: String?) -> Double? {
+        guard let s = timeString?.trimmingCharacters(in: .whitespaces), s.count >= 5 else { return nil }
+        let parts = s.split(separator: ":")
+        guard parts.count >= 2, let h = Int(parts[0]), let m = Int(parts[1]) else { return nil }
+        let sec = parts.count >= 3 ? (Double(parts[2]) ?? 0) : 0
+        return progress(minutesSinceMidnight: Double(h * 60 + m) + sec / 60.0)
+    }
+
+    static func progress(minutesSinceMidnight m: Double) -> Double {
+        if m <= 9 * 60 + 30 { return 0 }
+        if m <= 11 * 60 + 30 { return (m - 570.0) / totalMinutes }
+        if m <= 13 * 60 { return 0.5 }
+        if m < 15 * 60 { return (120.0 + (m - 780.0)) / totalMinutes }
+        return 1.0
+    }
+
+    static func shanghaiDateAndMinutes(_ d: Date) -> (date: String, minutes: Double) {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = shanghaiTZ
+        let c = cal.dateComponents([.year, .month, .day, .hour, .minute, .second], from: d)
+        let ds = String(format: "%04d-%02d-%02d", c.year ?? 0, c.month ?? 0, c.day ?? 0)
+        let mins = Double((c.hour ?? 0) * 60 + (c.minute ?? 0)) + Double(c.second ?? 0) / 60.0
+        return (ds, mins)
+    }
+
+    /// Returns (dataProgress, sessionProgress) in [0, 1].
+    /// - dataProgress: position of the last point in `tiger.spark` on the full-day axis.
+    /// - sessionProgress: active session width at viewing/feed time (0.5 during lunch break, 1.0 after close).
+    static func span(for tiger: Tiger, payload: LivePayload?, isOffline: Bool, now: Date = Date()) -> (data: Double, session: Double) {
+        let fallbackCount = min(1.0, Double(max(0, tiger.spark.count - 1)) / totalMinutes)
+        let tickP = progress(timeString: tiger.tick_time)
+        let feedP = progress(timeString: payload?.feed_time)
+        let dataP = tickP ?? feedP ?? fallbackCount
+
+        if payload?.replay == true {
+            return (dataP, max(dataP, feedP ?? dataP))
+        }
+        let (today, nowMins) = shanghaiDateAndMinutes(now)
+        guard payload?.date == today else {
+            return (dataP, max(dataP, feedP ?? 1.0))
+        }
+        if isOffline {
+            return (dataP, max(dataP, feedP ?? dataP))
+        }
+        let wallP = progress(minutesSinceMidnight: nowMins)
+        // If upstream feed is healthy (within 5 trading minutes of wall clock, including lunch/post-close),
+        // anchor width to current viewing time; if upstream stalled mid-session, cap at feedP.
+        let liveP: Double
+        if let fp = feedP, wallP - fp > 5.0 / totalMinutes {
+            liveP = fp
+        } else {
+            liveP = max(wallP, feedP ?? 0)
+        }
+        return (dataP, max(dataP, liveP))
+    }
 }
 
 struct WuhuAlert: Codable, Identifiable, Equatable {
