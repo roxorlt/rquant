@@ -436,15 +436,18 @@ export function DataTable<T>({
                   selectable ? (event) => onRowKeyDown(event, index, row.original) : undefined
                 }
               >
-                {row.getVisibleCells().map((cell) => (
-                  <td
-                    key={cell.id}
-                    className={cellClass(cell.column.id)}
-                    data-phone-line={byId.get(cell.column.id)?.phoneLine}
-                  >
-                    {flexRender(cell.column.columnDef.cell, cell.getContext())}
-                  </td>
-                ))}
+                {row.getVisibleCells().map((cell) => {
+                  const col = byId.get(cell.column.id);
+                  return (
+                    <td
+                      key={cell.id}
+                      className={cellClass(cell.column.id)}
+                      data-phone-line={col?.phoneLine}
+                    >
+                      {col?.cell ? col.cell(row.original) : (col?.value(row.original) ?? "—")}
+                    </td>
+                  );
+                })}
               </tr>
             ))}
             {padBottom > 0 ? (

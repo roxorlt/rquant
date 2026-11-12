@@ -1,7 +1,14 @@
 import { previewWatchlistCodes } from "virtual:static-preview";
 import { useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router";
-import { type ScreenRow, useAddWatch, usePools, useSavePool, useScreen } from "@/api/endpoints";
+import {
+  type ScreenRow,
+  useAddWatch,
+  usePools,
+  useSavePool,
+  useScreen,
+  useWatchlist,
+} from "@/api/endpoints";
 import { useReadOnlyReason } from "@/api/useMeta";
 import { presetLabel } from "@/copy/publicText";
 import { formatFixed, formatPrice } from "@/format/number";
@@ -214,9 +221,15 @@ export default function ScreenerPage() {
   const [poolMode, setPoolMode] = useState<"new" | "existing">("new");
   const [poolName, setPoolName] = useState("");
   const pools = usePools();
+  const watchlist = useWatchlist();
   const [saveFail, setSaveFail] = useState<FailureCopy | null>(null);
   const [watchFails, setWatchFails] = useState<WatchFail[]>([]);
   const [inPool, setInPool] = useState<Set<string>>(currentWatch);
+  const watched = useMemo(() => {
+    const items = watchlist.data?.items;
+    const serverCodes = Array.isArray(items) ? items.map((item) => item.code) : [];
+    return new Set([...inPool, ...serverCodes]);
+  }, [inPool, watchlist.data]);
   const presets = query.data?.presets ?? [];
   const [params] = useSearchParams();
   const q = (params.get("q") ?? "").trim();
@@ -249,7 +262,13 @@ export default function ScreenerPage() {
     const name = poolName.trim();
     if (!name) return;
     savePool.mutate(
-      { name, description: "", pool_refs: preset === ALL ? presets : [preset] },
+      {
+        name,
+        description: "",
+        pool_refs: preset === ALL ? presets : [preset],
+        codes: filtered.rows.map((r) => r.code),
+        mode: poolMode,
+      },
       {
         onSuccess: () => {
           setSaveOpen(false);
@@ -462,7 +481,7 @@ export default function ScreenerPage() {
                   sortable: false,
                   value: () => null,
                   cell: (row) =>
-                    inPool.has(row.code) ? (
+                    watched.has(row.code) ? (
                       <Button size="sm" variant="quiet" className="in-watch" ariaDisabled>
                         ✓ 已在自选
                       </Button>

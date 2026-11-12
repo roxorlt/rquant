@@ -89,19 +89,34 @@ def web_commands_dir() -> Path:
 
 
 def _watchlist_log(commands_dir: Path) -> list[str]:
-    """网页「加自选」— the only place web watchlist writes are persisted (no Serving table)."""
-    path = commands_dir / "watchlist" / "items.jsonl"
-    if not path.is_file():
+    """网页「加自选」— reads ``rquant-web-commands/watchlist/items.jsonl`` (supports remove)."""
+    from rquant.web.commands_service import read_watchlist_items
+
+    return [item.code for item in read_watchlist_items(commands_dir)]
+
+
+def _saved_pool_codes(commands_dir: Path) -> list[str]:
+    from rquant.web.commands_service import read_saved_pools
+
+    return _codes(code for pool in read_saved_pools(commands_dir) for code in pool.codes)
+
+
+def _research_screen_codes(root: Path) -> list[str]:
+    db = root / "market.duckdb"
+    if not db.is_file():
         return []
-    codes = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        try:
-            rec = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(rec, dict):
-            codes.append(rec.get("ts_code") or (rec.get("item") or {}).get("ts_code"))
-    return list(reversed(_codes(codes)))  # newest first
+    try:
+        import duckdb
+
+        with duckdb.connect(str(db), read_only=True) as con:
+            rows = con.execute(
+                "SELECT DISTINCT ts_code FROM screen_result "
+                "WHERE trade_date = (SELECT max(trade_date) FROM screen_result) LIMIT 2000"
+            ).fetchall()
+        return _codes(r[0] for r in rows)
+    except Exception as exc:  # noqa: BLE001 - optional fallback
+        log.info("research screen skipped: %s", str(exc)[:160])
+        return []
 
 
 def _serving(root: str | None) -> dict[str, list[str]]:
@@ -164,14 +179,18 @@ def build_universe(cap: int = DEFAULT_CAP) -> dict[str, Any]:
     from rquant.research.auction_pool import priority_codes
 
     commands_dir = web_commands_dir()
+    root = research_root()
     serving = _serving(os.environ.get("RQUANT_SERVING_ROOT"))
+    saved_pools = _saved_pool_codes(commands_dir)
+    pools = list(dict.fromkeys([*saved_pools, *serving.get("pools", [])]))
+    screen_codes = serving.get("screen") or _research_screen_codes(root)
     sources = {
         "extra": _codes(os.environ.get("RQUANT_SNAPSHOT_EXTRA", "").split(",")),
         "auction_pool": _safe_pool(priority_codes, now().date()),
         "watchlist": _watchlist_log(commands_dir),
-        "pools": serving.get("pools", []),
-        "screen": serving.get("screen", []),
-        "condition": _condition_hits(research_root()),
+        "pools": pools,
+        "screen": screen_codes,
+        "condition": _condition_hits(root),
     }
     chosen: list[str] = []
     for codes in sources.values():

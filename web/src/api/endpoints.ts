@@ -240,7 +240,11 @@ export function useSavePool() {
       const { data, response } = await apiClient().POST("/api/v1/pools", { body });
       return unwrap(data, response);
     },
-    onSuccess: () => client.invalidateQueries({ queryKey: ["pools"] }),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ["pools"] });
+      void client.invalidateQueries({ queryKey: ["operations"] });
+      void client.invalidateQueries({ queryKey: ["stock"] });
+    },
   });
 }
 
@@ -309,13 +313,45 @@ export function useUnackAlert() {
   });
 }
 
+export function useWatchlist(): ServingQueryResult<Schemas["WatchlistData"]> {
+  return useServingQuery(["watchlist"], async () => {
+    const { data, response } = await apiClient().GET("/api/v1/watchlist");
+    return unwrap(data, response);
+  });
+}
+
 export function useAddWatch() {
+  const client = useQueryClient();
   return useMutation({
     mutationFn: async (code: string) => {
       const { data, response } = await apiClient().POST("/api/v1/watchlist", {
         body: { code, note: "" },
       });
       return unwrap(data, response);
+    },
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ["watchlist"] });
+      void client.invalidateQueries({ queryKey: ["pools"] });
+      void client.invalidateQueries({ queryKey: ["operations"] });
+      void client.invalidateQueries({ queryKey: ["stock"] });
+    },
+  });
+}
+
+export function useRemoveWatch() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async (code: string) => {
+      const { data, response } = await apiClient().DELETE("/api/v1/watchlist", {
+        params: { query: { code } },
+      });
+      return unwrap(data, response);
+    },
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ["watchlist"] });
+      void client.invalidateQueries({ queryKey: ["pools"] });
+      void client.invalidateQueries({ queryKey: ["operations"] });
+      void client.invalidateQueries({ queryKey: ["stock"] });
     },
   });
 }
@@ -399,7 +435,10 @@ export function useSaveAlertRule() {
       const { data, response } = await apiClient().POST("/api/v1/alert-rules", { body });
       return unwrap(data, response);
     },
-    onSuccess: () => client.invalidateQueries({ queryKey: ["alert-rules"] }),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ["alert-rules"] });
+      void client.invalidateQueries({ queryKey: ["operations"] });
+    },
   });
 }
 

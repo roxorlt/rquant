@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import re
 from datetime import date, datetime
 from typing import Any, Generic, Literal, TypeVar
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from rquant.backtest.band import BandPoint
 from rquant.backtest.exposure import IndustryExposure
@@ -353,10 +354,37 @@ class PaperData(BaseModel):
 # ---- the three writes -------------------------------------------------------
 
 
+_SAVE_POOL_CODE_RE = re.compile(r"^\d{6}\.(SH|SZ|BJ)$")
+
+
 class SavePoolRequest(BaseModel):
     name: str = Field(min_length=1, max_length=64)
     description: str = ""
     pool_refs: list[str] = Field(default_factory=list)
+    codes: list[str] = Field(default_factory=list, max_length=5000)
+    mode: Literal["new", "existing"] = "new"
+
+    @field_validator("name")
+    @classmethod
+    def _clean_name(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned or "/" in cleaned or "\\" in cleaned or ".." in cleaned:
+            raise ValueError("invalid pool name")
+        return cleaned
+
+    @field_validator("codes")
+    @classmethod
+    def _clean_codes(cls, values: list[str]) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        for raw in values:
+            code = raw.strip().upper()
+            if not _SAVE_POOL_CODE_RE.match(code):
+                raise ValueError(f"invalid stock code: {raw}")
+            if code not in seen:
+                seen.add(code)
+                out.append(code)
+        return out
 
 
 class AckAlertRequest(BaseModel):
@@ -383,6 +411,17 @@ class AlertRulesData(BaseModel):
 class AddWatchRequest(BaseModel):
     code: str = Field(pattern=r"^\d{6}\.(SH|SZ|BJ)$")
     note: str = ""
+
+
+class WatchlistItemRow(BaseModel):
+    code: str
+    name: str | None = None
+    note: str = ""
+    added_at: datetime | None = None
+
+
+class WatchlistData(BaseModel):
+    items: list[WatchlistItemRow]
 
 
 class CommandReceipt(BaseModel):
@@ -502,7 +541,14 @@ class BandData(BaseModel):
 
 class OperationRow(BaseModel):
     at: datetime | None
-    kind: Literal["ack_alert", "unack_alert", "add_watchlist_item", "save_alert_rule"]
+    kind: Literal[
+        "ack_alert",
+        "unack_alert",
+        "add_watchlist_item",
+        "remove_watchlist_item",
+        "save_alert_rule",
+        "save_canvas",
+    ]
     summary: str
     actor: str | None
     command_id: str

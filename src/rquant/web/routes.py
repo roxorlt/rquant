@@ -105,6 +105,8 @@ from rquant.web.models import (
     TranslateRequest,
     UiPreferenceBody,
     UiPreferencesData,
+    WatchlistData,
+    WatchlistItemRow,
 )
 from rquant.web.overfit_stats import overfit_stats, sharpe_per_period
 from rquant.web.pool_live import PoolLiveData, load_pool_live
@@ -168,7 +170,9 @@ def meta(request: Request, source: SourceDep) -> Envelope[MetaData]:
 
 
 @router.get("/overview", response_model=Envelope[OverviewData], summary="总览")
-def overview(source: SourceDep) -> Envelope[OverviewData]:
+def overview(
+    source: SourceDep, request: Request = None  # type: ignore[assignment]
+) -> Envelope[OverviewData]:
     names = _names(source)
     screen = source.query(
         "SELECT trade_date, count(*) AS n FROM screen_result "
@@ -179,16 +183,27 @@ def overview(source: SourceDep) -> Envelope[OverviewData]:
     services = source.query("SELECT status, stale FROM runtime_services LIMIT 500")
     bad = sum(1 for s in services if s["stale"] or s["status"] in {"failed", "error"})
     nav = source.query("SELECT sum(nav) AS nav FROM paper_accounts")
+    nav_val: float | None = float(nav[0]["nav"]) if nav and nav[0]["nav"] is not None else None
+    if nav_val is None and request is not None:
+        from rquant.research.paper import read as read_sim
+
+        sim_accounts = read_sim(Path(_research_root(request) or research_root()))
+        if sim_accounts:
+            nav_val = sum(a.nav for a in sim_accounts)
     signals = source.query(
         "SELECT global_sequence, available_at, candidate_id, strategy_id, action "
         "FROM signals ORDER BY global_sequence DESC LIMIT 20")
     trade_date = screen[0]["trade_date"] if screen else None
+    nav_str = (
+        "-"
+        if nav_val is None
+        else (f"{nav_val:,.2f}" if abs(nav_val) < 1000 else f"{nav_val:,.0f}")
+    )
     kpis = [
         Kpi(key="candidates", label="候选股", value=str(screen[0]["n"] if screen else 0)),
         Kpi(key="alerts", label="今日告警", value=str(alerts[0]["n"] if alerts else 0)),
         Kpi(key="services", label="服务异常", value=str(bad), tone="crit" if bad else "ok"),
-        Kpi(key="paper_nav", label="模拟净值",
-            value="-" if not nav or nav[0]["nav"] is None else f"{float(nav[0]['nav']):,.0f}"),
+        Kpi(key="paper_nav", label="模拟净值", value=nav_str),
     ]
     items = [
         SignalItem(sequence=s["global_sequence"], at=s["available_at"], code=s["candidate_id"],
@@ -299,9 +314,22 @@ def screen(request: Request, source: SourceDep, trade_date: date | None = None,
     return _envelope(source, ScreenData(trade_date=day, presets=presets, rows=items))
 
 
+def _market_names(request: Request | None) -> dict[str, str]:
+    if request is None:
+        return {}
+    root = Path(_research_root(request) or research_root())
+    with market(root) as con:
+        if con is None:
+            return {}
+        try:
+            return dict(con.execute("SELECT ts_code, name FROM stock_basic LIMIT 8000").fetchall())
+        except duckdb.Error:
+            return {}
+
+
 @router.get("/pools", response_model=Envelope[PoolsData], summary="池子")
 def pools(source: SourceDep, request: Request = None) -> Envelope[PoolsData]:  # type: ignore[assignment]
-    names = _names(source)
+    names = {**_market_names(request), **_names(source)}
     latest = source.query("SELECT max(trade_date) AS d FROM canvas_hit")
     trade_date = latest[0]["d"] if latest else None
     hits = source.query(
@@ -324,6 +352,56 @@ def pools(source: SourceDep, request: Request = None) -> Envelope[PoolsData]:  #
         members = [m for ref in refs for m in by_preset.get(ref, [])]
         out.append(PoolItem(name=c["name"], description=c["description"] or "", pool_refs=refs,
                             updated_at=c["updated_at"], members=members))
+
+    cmd_dir = _commands_dir(request) if request is not None else None
+    if cmd_dir is not None:
+        from rquant.web.commands_service import read_saved_pools
+
+        saved = read_saved_pools(cmd_dir)
+        missing_refs = {ref for sp in saved if not sp.codes for ref in sp.pool_refs
+                        if ref not in by_preset}
+        if missing_refs:
+            screen_rows = source.query(
+                "SELECT trade_date, ts_code, preset_name, name FROM screen_result "
+                "WHERE trade_date = (SELECT max(trade_date) FROM screen_result) LIMIT 5000")
+            if not screen_rows and request is not None:
+                screen_rows = _research_screen(request, None)
+            if trade_date is None and screen_rows:
+                trade_date = screen_rows[0]["trade_date"]
+            for sr in screen_rows:
+                if sr["preset_name"] in missing_refs:
+                    by_preset.setdefault(sr["preset_name"], []).append(PoolMember(
+                        code=sr["ts_code"], name=sr.get("name") or names.get(sr["ts_code"]),
+                        preset=sr["preset_name"], detail={}))
+        extra_pools: list[PoolItem] = []
+        by_existing = {p.name: idx for idx, p in enumerate(out)}
+        for sp in saved:
+            tag = sp.pool_refs[0] if len(sp.pool_refs) == 1 else "saved"
+            if sp.codes:
+                members = [PoolMember(code=code, name=names.get(code), preset=tag, detail={})
+                           for code in sp.codes]
+            else:
+                members = [m for ref in sp.pool_refs for m in by_preset.get(ref, [])]
+            item = PoolItem(name=sp.name, description=sp.description, pool_refs=sp.pool_refs,
+                            updated_at=sp.updated_at, members=members)
+            if sp.name in by_existing:
+                out[by_existing[sp.name]] = item
+            else:
+                extra_pools.append(item)
+        out = extra_pools + out
+
+    watch_items = _watchlist_rows(request, source, names) if request is not None else []
+    if watch_items and not any(p.name == "自选股" for p in out):
+        out.insert(0, PoolItem(
+            name="自选股",
+            description="选股器与个股页手动加入的自选标的",
+            pool_refs=["manual"],
+            updated_at=watch_items[0].added_at,
+            members=[PoolMember(code=w.code, name=w.name, preset="manual",
+                                detail={"note": w.note} if w.note else {})
+                     for w in watch_items],
+        ))
+
     auction = _auction_pool_item(request) if request is not None else None
     if auction is not None:
         out.insert(0, auction)
@@ -794,13 +872,24 @@ def surge_events(request: Request, source: SourceDep, day: date | None = None,
 
 
 @router.get("/alerts", response_model=Envelope[AlertsData], summary="告警时间线")
-def alerts(source: SourceDep, limit: int = 200) -> Envelope[AlertsData]:
+def alerts(source: SourceDep, limit: int = 200,
+           request: Request = None) -> Envelope[AlertsData]:  # type: ignore[assignment]
     names = _names(source)
     rows = source.query(
         "SELECT trade_date, trigger_time, ts_code, level, trigger_price, level_price, "
         "trigger_type, pool FROM monitor_event ORDER BY trigger_time DESC LIMIT ?",
         [max(1, min(limit, 1000))])
     acks = _acks(source)
+    cmd_dir = _commands_dir(request) if request is not None else None
+    if cmd_dir is not None:
+        from rquant.web.commands_service import read_ack_states
+
+        for aid, state in read_ack_states(cmd_dir).items():
+            if state is None:
+                acks.pop(aid, None)
+            else:
+                acks[aid] = {"alert_id": aid, "acked_at": state.acked_at,
+                             "actor_id": state.actor_id}
     items = []
     for r in rows:
         aid = alert_id(r)
@@ -848,7 +937,37 @@ def paper(request: Request, source: SourceDep) -> Envelope[PaperData]:
     return _envelope(source, PaperData(accounts=accounts))
 
 
-# ---- writes: all through page_control.forward --------------------------------
+# ---- writes & local/forwarded command store ----------------------------------
+
+
+def _commands_dir(request: Request, *, create_mem: bool = False) -> Path | None:
+    from rquant.web.source import FixtureSource, ResearchSource
+
+    explicit = getattr(request.app.state, "commands_dir", None)
+    if explicit is not None:
+        return Path(explicit)
+    env_dir = os.environ.get("RQUANT_WEB_COMMANDS_DIR")
+    if env_dir:
+        return Path(env_dir)
+    source = getattr(request.app.state, "source", None)
+    if isinstance(source, ResearchSource):
+        return source.commands_dir
+    if isinstance(source, FixtureSource):
+        mem = getattr(request.app.state, "_mem_commands_dir", None)
+        if mem is None and create_mem:
+            import tempfile
+
+            mem = Path(tempfile.mkdtemp(prefix="rquant-web-cmds-"))
+            request.app.state._mem_commands_dir = mem
+        return mem
+    if os.environ.get("RQUANT_PAGE_CONTROL_URL") or create_mem:
+        home_default = Path.home() / "rquant-web-commands"
+        if home_default.is_dir():
+            return home_default
+        from rquant.config import get_settings
+
+        return get_settings().data_dir / "web-commands"
+    return None
 
 
 def _user(request: Request) -> str | None:
@@ -880,19 +999,58 @@ def _send(request: Request, kind: str, fields: dict[str, Any]) -> CommandReceipt
     if _preview_fail(request):
         raise HTTPException(503, "preview failure")
     transport: Callable | None = getattr(request.app.state, "page_control_transport", None)
-    try:
-        receipt = page_control.forward(kind, fields, transport)
-    except page_control.PageControlUnavailableError as exc:
-        raise HTTPException(503, f"page control unavailable: {exc}") from exc
-    return CommandReceipt(command_id=receipt.get("command_id"),
-                          status=str(receipt.get("status", "unknown")),
-                          detail=receipt.get("detail") or receipt.get("error"))
+    if transport is not None or os.environ.get("RQUANT_PAGE_CONTROL_URL"):
+        try:
+            receipt = page_control.forward(kind, fields, transport)
+        except page_control.PageControlUnavailableError as exc:
+            raise HTTPException(503, f"page control unavailable: {exc}") from exc
+    else:
+        import uuid
+
+        from rquant.web.commands_service import handle as handle_command
+
+        cmd_dir = _commands_dir(request, create_mem=True)
+        if cmd_dir is None:
+            raise HTTPException(503, "commands store unavailable")
+        payload = {
+            "kind": kind,
+            "command_id": uuid.uuid4().hex,
+            "requested_at": datetime.now(UTC).isoformat(),
+            **fields,
+        }
+        code, receipt = handle_command(cmd_dir, payload)
+        if code >= 500:
+            raise HTTPException(503, str(receipt.get("error") or "write failed"))
+        if code >= 400:
+            raise HTTPException(422, str(receipt.get("error") or "invalid command"))
+    cmd_id = str(receipt["command_id"]) if receipt.get("command_id") else None
+    detail = (
+        str(receipt["detail"])
+        if receipt.get("detail")
+        else (str(receipt["error"]) if receipt.get("error") else None)
+    )
+    return CommandReceipt(
+        command_id=cmd_id,
+        status=str(receipt.get("status", "unknown")),
+        detail=detail,
+    )
 
 
-def _remember(request: Request, receipt: CommandReceipt, *,
-              kind: Literal["ack_alert", "unack_alert", "add_watchlist_item", "save_alert_rule"],
-              summary: str,
-              actor: str | None) -> CommandReceipt:
+def _remember(
+    request: Request,
+    receipt: CommandReceipt,
+    *,
+    kind: Literal[
+        "ack_alert",
+        "unack_alert",
+        "add_watchlist_item",
+        "remove_watchlist_item",
+        "save_alert_rule",
+        "save_canvas",
+    ],
+    summary: str,
+    actor: str | None,
+) -> CommandReceipt:
     """Keep ack and unack both visible after the ack row itself is removed."""
     if receipt.status in {"failed", "rejected"} or not receipt.command_id:
         return receipt
@@ -907,8 +1065,18 @@ def _remember(request: Request, receipt: CommandReceipt, *,
 
 @router.post("/pools", response_model=CommandReceipt, summary="保存池子")
 def save_pool(body: SavePoolRequest, request: Request) -> CommandReceipt:
-    return _send(request, "save_canvas", {"name": body.name, "description": body.description,
-                                          "pool_refs": body.pool_refs})
+    fields: dict[str, Any] = {
+        "name": body.name,
+        "description": body.description,
+        "pool_refs": body.pool_refs,
+    }
+    if body.codes:
+        fields["codes"] = body.codes
+    if body.mode != "new":
+        fields["mode"] = body.mode
+    receipt = _send(request, "save_canvas", fields)
+    return _remember(request, receipt, kind="save_canvas",
+                     summary=f"保存池子 {body.name}", actor=_user(request))
 
 
 @router.post("/alerts/ack", response_model=CommandReceipt, summary="确认告警")
@@ -946,7 +1114,7 @@ def _optional_rows(source: Source, sql: str) -> list[dict[str, Any]]:
 
 @router.get("/operations", response_model=Envelope[OperationsData], summary="操作记录")
 def operations(request: Request, source: SourceDep) -> Envelope[OperationsData]:
-    """Web writes as page control recorded them (read back from their Serving projections)."""
+    """Web writes read back from both command logs and Serving projections."""
     items = [OperationRow(at=r["acked_at"], kind="ack_alert",
                           summary=f"确认告警 {r['alert_id'][:12]}",
                           actor=r["actor_id"], command_id=r["command_id"])
@@ -963,6 +1131,14 @@ def operations(request: Request, source: SourceDep) -> Envelope[OperationsData]:
               for r in _optional_rows(source, "SELECT title, enabled, saved_at, command_id "
                                       "FROM alert_rule ORDER BY saved_at DESC LIMIT 200")]
     seen = {i.command_id for i in items}
+    cmd_dir = _commands_dir(request)
+    if cmd_dir is not None:
+        from rquant.web.commands_service import read_operations
+
+        for op in read_operations(cmd_dir):
+            if op.command_id not in seen:
+                items.append(OperationRow(**op.model_dump()))
+                seen.add(op.command_id)
     for row in getattr(request.app.state, "operation_log", []) or []:
         if row.command_id not in seen:
             items.append(row)
@@ -972,7 +1148,8 @@ def operations(request: Request, source: SourceDep) -> Envelope[OperationsData]:
 
 
 @router.get("/alert-rules", response_model=Envelope[AlertRulesData], summary="告警规则")
-def alert_rules(source: SourceDep) -> Envelope[AlertRulesData]:
+def alert_rules(source: SourceDep,
+                request: Request = None) -> Envelope[AlertRulesData]:  # type: ignore[assignment]
     try:
         rows = source.query(
             "SELECT rule_id, title, enabled, pools, levels, cooldown_minutes, saved_at "
@@ -981,21 +1158,97 @@ def alert_rules(source: SourceDep) -> Envelope[AlertRulesData]:
         if not table_missing(exc):
             raise
         rows = []
-    rules = [AlertRuleRow(**{**r, "pools": [p for p in str(r["pools"]).split(",") if p],
-                             "levels": [x for x in str(r["levels"]).split(",") if x]})
-             for r in rows]
-    return _envelope(source, AlertRulesData(rules=rules))
+    by_id: dict[str, AlertRuleRow] = {
+        r["rule_id"]: AlertRuleRow(
+            **{**r, "pools": [p for p in str(r["pools"]).split(",") if p],
+               "levels": [x for x in str(r["levels"]).split(",") if x]}
+        )
+        for r in rows
+    }
+    cmd_dir = _commands_dir(request) if request is not None else None
+    if cmd_dir is not None:
+        from rquant.web.commands_service import read_alert_rules
+
+        for rid, rec in read_alert_rules(cmd_dir).items():
+            by_id[rid] = AlertRuleRow(
+                rule_id=rec.rule_id,
+                title=rec.title,
+                enabled=rec.enabled,
+                pools=rec.pools,
+                levels=rec.levels,
+                cooldown_minutes=rec.cooldown_minutes,
+                saved_at=rec.saved_at,
+            )
+    return _envelope(source, AlertRulesData(rules=[by_id[k] for k in sorted(by_id)]))
 
 
 @router.post("/alert-rules", response_model=CommandReceipt, summary="保存告警规则")
 def save_alert_rule(body: AlertRuleBody, request: Request) -> CommandReceipt:
-    return _send(request, "save_alert_rule", {"rule": body.model_dump()})
+    receipt = _send(request, "save_alert_rule", {"rule": body.model_dump()})
+    state = "启用" if body.enabled else "停用"
+    return _remember(request, receipt, kind="save_alert_rule",
+                     summary=f"{state}告警规则 {body.title}", actor=_user(request))
+
+
+def _watchlist_rows(
+    request: Request, source: Source, names: dict[str, str]
+) -> list[WatchlistItemRow]:
+    out: dict[str, WatchlistItemRow] = {}
+    cmd_dir = _commands_dir(request)
+    removed: set[str] = set()
+    if cmd_dir is not None:
+        from rquant.web.commands_service import WATCHLIST_LOG, _iter_jsonl, read_watchlist_items
+
+        for raw in _iter_jsonl(cmd_dir / WATCHLIST_LOG):
+            code = str(raw.get("ts_code") or "").strip().upper()
+            if code and raw.get("action") == "remove":
+                removed.add(code)
+            elif code:
+                removed.discard(code)
+        for item in read_watchlist_items(cmd_dir):
+            out[item.code] = WatchlistItemRow(
+                code=item.code,
+                name=names.get(item.code),
+                note=item.note,
+                added_at=item.added_at,
+            )
+    for row in _optional_rows(
+        source,
+        "SELECT ts_code, note, added_at FROM manual_watchlist ORDER BY added_at DESC LIMIT 500",
+    ):
+        code = str(row["ts_code"]).upper()
+        if code not in out and code not in removed:
+            out[code] = WatchlistItemRow(
+                code=code,
+                name=names.get(code),
+                note=str(row.get("note") or ""),
+                added_at=row.get("added_at"),
+            )
+    return list(out.values())
+
+
+@router.get("/watchlist", response_model=Envelope[WatchlistData], summary="自选股列表")
+def list_watch(request: Request, source: SourceDep) -> Envelope[WatchlistData]:
+    names = {**_market_names(request), **_names(source)}
+    return _envelope(source, WatchlistData(items=_watchlist_rows(request, source, names)))
 
 
 @router.post("/watchlist", response_model=CommandReceipt, summary="加入自选")
 def add_watch(body: AddWatchRequest, request: Request) -> CommandReceipt:
-    return _send(request, "add_watchlist_item", {"item": {"ts_code": body.code,
-                                                           "note": body.note}})
+    receipt = _send(request, "add_watchlist_item", {"item": {"ts_code": body.code,
+                                                             "note": body.note}})
+    return _remember(request, receipt, kind="add_watchlist_item",
+                     summary=f"加自选 {body.code} {body.note}".strip(), actor=_user(request))
+
+
+@router.delete("/watchlist", response_model=CommandReceipt, summary="移出自选")
+def remove_watch(
+    request: Request,
+    code: str = Query(pattern=r"^\d{6}\.(SH|SZ|BJ)$"),
+) -> CommandReceipt:
+    receipt = _send(request, "remove_watchlist_item", {"ts_code": code})
+    return _remember(request, receipt, kind="remove_watchlist_item",
+                     summary=f"移出自选 {code}", actor=_user(request))
 
 
 def _schemes(request: Request):
@@ -1110,8 +1363,10 @@ def run_query(source: SourceDep,
 def query_schema(source: SourceDep) -> Envelope[dict[str, list[list[str]]]]:
     allowed = sql_query.allowed_tables()
     out: dict[str, list[list[str]]] = {}
-    for r in source.query("SELECT table_name, column_name, data_type FROM "
-                          "information_schema.columns ORDER BY table_name, ordinal_position"):
+    for r in source.query(
+        "SELECT table_name, column_name, data_type FROM information_schema.columns "
+        "WHERE table_catalog = current_database() ORDER BY table_name, ordinal_position"
+    ):
         if r["table_name"] in allowed:
             out.setdefault(r["table_name"], []).append([r["column_name"], r["data_type"]])
     return _envelope(source, out)
@@ -1119,7 +1374,10 @@ def query_schema(source: SourceDep) -> Envelope[dict[str, list[list[str]]]]:
 
 @router.get("/query/tables", response_model=Envelope[list[str]], summary="可查询的表")
 def query_tables(source: SourceDep) -> Envelope[list[str]]:
-    rows = source.query("SELECT table_name FROM information_schema.tables ORDER BY 1")
+    rows = source.query(
+        "SELECT DISTINCT table_name FROM information_schema.tables "
+        "WHERE table_catalog = current_database() ORDER BY 1"
+    )
     allowed = sql_query.allowed_tables()
     return _envelope(source, [r["table_name"] for r in rows if r["table_name"] in allowed])
 
@@ -1143,7 +1401,7 @@ def stock_profile(code: str, request: Request, source: SourceDep) -> Envelope[St
     in_pools = sorted({p.name for p in pools(source, request).data.pools
                        if any(m.code == code for m in p.members)})
     recent = [a.model_dump(mode="json", include={"at", "level", "trigger_type", "trigger_price"})
-              for a in alerts(source, 1000).data.items if a.code == code][:20]
+              for a in alerts(source, 1000, request).data.items if a.code == code][:20]
     if base["name"] is None:
         base["name"] = _names(source).get(code)
     if not base["bars"] and base["name"] is None and fund is None:

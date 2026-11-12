@@ -2460,6 +2460,22 @@
         "title": "Envelope[Union[IntradayData, NoneType]]",
         "type": "object"
       },
+      "Envelope_WatchlistData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/WatchlistData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[WatchlistData]",
+        "type": "object"
+      },
       "Envelope_dict_str__list_list_str____": {
         "properties": {
           "data": {
@@ -4757,7 +4773,9 @@
               "ack_alert",
               "unack_alert",
               "add_watchlist_item",
-              "save_alert_rule"
+              "remove_watchlist_item",
+              "save_alert_rule",
+              "save_canvas"
             ],
             "title": "Kind",
             "type": "string"
@@ -5737,9 +5755,26 @@
       },
       "SavePoolRequest": {
         "properties": {
+          "codes": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 5000,
+            "title": "Codes",
+            "type": "array"
+          },
           "description": {
             "default": "",
             "title": "Description",
+            "type": "string"
+          },
+          "mode": {
+            "default": "new",
+            "enum": [
+              "new",
+              "existing"
+            ],
+            "title": "Mode",
             "type": "string"
           },
           "name": {
@@ -7511,6 +7546,63 @@
         ],
         "title": "VolumeProfile",
         "type": "object"
+      },
+      "WatchlistData": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/WatchlistItemRow"
+            },
+            "title": "Items",
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "WatchlistData",
+        "type": "object"
+      },
+      "WatchlistItemRow": {
+        "properties": {
+          "added_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Added At"
+          },
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "note": {
+            "default": "",
+            "title": "Note",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code"
+        ],
+        "title": "WatchlistItemRow",
+        "type": "object"
       }
     }
   },
@@ -8072,7 +8164,7 @@
     },
     "/api/v1/operations": {
       "get": {
-        "description": "Web writes as page control recorded them (read back from their Serving projections).",
+        "description": "Web writes read back from both command logs and Serving projections.",
         "operationId": "operations_api_v1_operations_get",
         "responses": {
           "200": {
@@ -9298,6 +9390,60 @@
       }
     },
     "/api/v1/watchlist": {
+      "delete": {
+        "operationId": "remove_watch_api_v1_watchlist_delete",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "code",
+            "required": true,
+            "schema": {
+              "pattern": "^\\d{6}\\.(SH|SZ|BJ)$",
+              "title": "Code",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "移出自选"
+      },
+      "get": {
+        "operationId": "list_watch_api_v1_watchlist_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_WatchlistData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "自选股列表"
+      },
       "post": {
         "operationId": "add_watch_api_v1_watchlist_post",
         "requestBody": {

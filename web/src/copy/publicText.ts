@@ -24,6 +24,8 @@ const SERVICE_LABEL: Record<string, string> = {
   "rquant-backup": "备份",
   "rquant-page-control": "页面写入",
   "page-control": "页面写入",
+  "rquant-web-commands": "页面写入",
+  "web-commands": "页面写入",
   "rquant-snapshot-collector": "快照采集",
   "snapshot-collector": "快照采集",
   "rquant-reference-slow": "参考数据",
@@ -53,6 +55,7 @@ const LAYER_TITLE: Record<string, string> = {
 const BOARD_SYSTEM: Record<string, string> = {
   dc_industry: "行业",
   dc_concept: "概念",
+  industry: "行业",
 };
 
 const DATASET_LABEL: Record<string, string> = {
@@ -66,6 +69,7 @@ const DATASET_LABEL: Record<string, string> = {
 const PRESET_LABEL: Record<string, string> = {
   "auction-gap": "竞价高开",
   "auction-pick": "竞价选股",
+  auction_ths: "竞价选股",
   breakout: "突破",
   "volume-surge": "放量",
   volume_surge: "放量",
@@ -77,6 +81,10 @@ const PRESET_LABEL: Record<string, string> = {
   research_trend: "趋势",
   "n-shape-pool1": "N字初筛",
   "n-shape-pool2": "N字精选",
+  pool1: "N字初筛",
+  pool2: "N字精选",
+  manual: "自选",
+  saved: "自定池",
   "breakout55-top10": "55日新高",
 };
 

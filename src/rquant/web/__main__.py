@@ -36,10 +36,14 @@ def main(argv: list[str] | None = None) -> None:
         research = Path(tempfile.mkdtemp(prefix="rquant-research-"))
         write_demo_research(research)
     app = create_app(fixture, research_root=research)
-    if fixture is not None:
-        # Demo mode: acks land in the in-memory fixture (as if page control + Serving
-        # republished); other commands are accepted and dropped. Nothing touches disk.
+    if fixture is not None and research is not None:
+        from rquant.web.commands_service import handle as handle_command
+
+        cmds = research / "commands"
+        app.state.commands_dir = cmds
+
         def transport(payload: dict) -> dict:
+            handle_command(cmds, payload)
             if payload["kind"] == "ack_alert":
                 return fixture.record_ack(payload)
             if payload["kind"] == "unack_alert":

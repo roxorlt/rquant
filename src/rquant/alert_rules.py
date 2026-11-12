@@ -59,22 +59,46 @@ class AlertGate:
         return False
 
 
-def load_alert_rules(serving_root: str | Path | None = None) -> list[Rule] | None:
-    """None when the projection is not published (→ gate allows everything)."""
-    from rquant.dashboard.serving_only_page_data import ServingFrameState, query_serving_frame
-    from rquant.serving_paths import serving_root_from_env
+def load_alert_rules(
+    serving_root: str | Path | None = None,
+    commands_dir: str | Path | None = None,
+) -> list[Rule] | None:
+    """Read rules from ``rquant-web-commands/alert_rules/rules.jsonl`` first, then Serving."""
+    from rquant.research.snapshots import web_commands_dir
+    from rquant.web.commands_service import read_alert_rules
 
+    by_id: dict[str, dict[str, object]] = {}
     try:
+        from rquant.dashboard.serving_only_page_data import ServingFrameState, query_serving_frame
+        from rquant.serving_paths import serving_root_from_env
+
         result = query_serving_frame(
             serving_root or serving_root_from_env(),
             "SELECT rule_id, enabled, pools, levels, cooldown_minutes FROM alert_rule "
             "ORDER BY rule_id LIMIT 200",
             stale_after=timedelta(days=3650),
         )
+        if result.state is not ServingFrameState.UNAVAILABLE:
+            keys = ("rule_id", "enabled", "pools", "levels", "cooldown_minutes")
+            for row in result.rows:
+                rec = dict(zip(keys, row, strict=True))
+                by_id[str(rec["rule_id"])] = rec
     except Exception as exc:  # noqa: BLE001 - optional input
-        logger.info(f"告警规则不可用：{type(exc).__name__}: {exc}")
+        logger.info(f"Serving 告警规则不可用：{type(exc).__name__}: {exc}")
+
+    try:
+        cmd_path = Path(commands_dir) if commands_dir else web_commands_dir()
+        for rid, item in read_alert_rules(cmd_path).items():
+            by_id[rid] = {
+                "rule_id": item.rule_id,
+                "enabled": item.enabled,
+                "pools": ",".join(item.pools),
+                "levels": ",".join(item.levels),
+                "cooldown_minutes": item.cooldown_minutes,
+            }
+    except Exception as exc:  # noqa: BLE001 - optional input
+        logger.info(f"命令日志告警规则不可用：{type(exc).__name__}: {exc}")
+
+    if not by_id:
         return None
-    if result.state is ServingFrameState.UNAVAILABLE:
-        return None
-    keys = ("rule_id", "enabled", "pools", "levels", "cooldown_minutes")
-    return rules_from_rows([dict(zip(keys, row, strict=True)) for row in result.rows])
+    return rules_from_rows([by_id[k] for k in sorted(by_id)])

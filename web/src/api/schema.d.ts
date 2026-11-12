@@ -337,7 +337,7 @@ export interface paths {
         };
         /**
          * 操作记录
-         * @description Web writes as page control recorded them (read back from their Serving projections).
+         * @description Web writes read back from both command logs and Serving projections.
          */
         get: operations["operations_api_v1_operations_get"];
         put?: never;
@@ -852,11 +852,13 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /** 自选股列表 */
+        get: operations["list_watch_api_v1_watchlist_get"];
         put?: never;
         /** 加入自选 */
         post: operations["add_watch_api_v1_watchlist_post"];
-        delete?: never;
+        /** 移出自选 */
+        delete: operations["remove_watch_api_v1_watchlist_delete"];
         options?: never;
         head?: never;
         patch?: never;
@@ -1608,6 +1610,11 @@ export interface components {
             data: components["schemas"]["IntradayData"] | null;
             serving: components["schemas"]["ServingMeta"];
         };
+        /** Envelope[WatchlistData] */
+        Envelope_WatchlistData_: {
+            data: components["schemas"]["WatchlistData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
         /** Envelope[dict[str, list[list[str]]]] */
         Envelope_dict_str__list_list_str____: {
             /** Data */
@@ -2336,7 +2343,7 @@ export interface components {
              * Kind
              * @enum {string}
              */
-            kind: "ack_alert" | "unack_alert" | "add_watchlist_item" | "save_alert_rule";
+            kind: "ack_alert" | "unack_alert" | "add_watchlist_item" | "remove_watchlist_item" | "save_alert_rule" | "save_canvas";
             /** Summary */
             summary: string;
         };
@@ -2631,11 +2638,19 @@ export interface components {
         };
         /** SavePoolRequest */
         SavePoolRequest: {
+            /** Codes */
+            codes?: string[];
             /**
              * Description
              * @default
              */
             description: string;
+            /**
+             * Mode
+             * @default new
+             * @enum {string}
+             */
+            mode: "new" | "existing";
             /** Name */
             name: string;
             /** Pool Refs */
@@ -3166,6 +3181,25 @@ export interface components {
             vah: number;
             /** Val */
             val: number;
+        };
+        /** WatchlistData */
+        WatchlistData: {
+            /** Items */
+            items: components["schemas"]["WatchlistItemRow"][];
+        };
+        /** WatchlistItemRow */
+        WatchlistItemRow: {
+            /** Added At */
+            added_at?: string | null;
+            /** Code */
+            code: string;
+            /** Name */
+            name?: string | null;
+            /**
+             * Note
+             * @default
+             */
+            note: string;
         };
     };
     responses: never;
@@ -4597,6 +4631,26 @@ export interface operations {
             };
         };
     };
+    list_watch_api_v1_watchlist_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_WatchlistData_"];
+                };
+            };
+        };
+    };
     add_watch_api_v1_watchlist_post: {
         parameters: {
             query?: never;
@@ -4609,6 +4663,37 @@ export interface operations {
                 "application/json": components["schemas"]["AddWatchRequest"];
             };
         };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommandReceipt"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    remove_watch_api_v1_watchlist_delete: {
+        parameters: {
+            query: {
+                code: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
         responses: {
             /** @description Successful Response */
             200: {

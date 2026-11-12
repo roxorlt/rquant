@@ -7,8 +7,11 @@ import { QueryView } from "../shared";
 
 const KIND: Record<string, string> = {
   ack_alert: "确认告警",
+  unack_alert: "撤销确认",
   add_watchlist_item: "加自选",
+  remove_watchlist_item: "移出自选",
   save_alert_rule: "告警规则",
+  save_canvas: "保存池子",
 };
 
 export default function OpsPage() {
