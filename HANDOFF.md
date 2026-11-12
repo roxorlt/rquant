@@ -160,6 +160,15 @@ cd notch_app && ./build.sh && ./install.sh
 > - **验证与部署状态**：...
 > ```
 
+### 2026-11-12 · L2 行情时间新鲜度指标（P0 观测）：status.json 新增帧内行情时间戳 lag + watchdog 滞后告警（`v0.35.8`）
+- **背景/问题**：现有 `status.json` 只有本地接收时间（`last_market_received_at`/`last_transport_received_at`）与 `cache_stale`，无法区分「帧在到达但帧内事件时间变旧」和「链路正常」；P0 需要观测行情事件时间新鲜度并在盘中告警。
+- **主要变更**：
+  1. `FeedStatus` 新增两个候选字段：`last_market_timestamp`（最近已提交批次中最新的帧内行情事件时间；取自成交页表字段 `34320` 的 epoch 秒，订单页布局未携带该字段）与 `market_time_lag_ms`（接收时间 − 事件时间，毫秒、下限 0）。解码、缓存布局与既有 status 语义不变；`source_freshness` 仍为 `unknown`（字段为候选值，非交易所认证时间）。
+  2. `feed.py` 新增 `market_event_timestamp(table)` 提取函数（多行取最新、忽略展示用字符串与不合理 epoch），提交批次后仅当能解析出事件时间时更新上述字段。
+  3. `scripts/l2-collector-watchdog.sh` 新增滞后告警：交易时段内，若传输仍新鲜（`last_transport` 未超 `STALE_SECONDS`）而 `market_time_lag_ms > LAG_ALERT_MS`（默认 30000）且**连续两次** watchdog 检查（间隔 ≤6 分钟）都超限，则通过 `rquant alert` 推送（独立 dedup key + 15 分钟冷却）；恢复正常后 resolve 并清除首见状态文件，避免开盘 seed 旧数据造成瞬时假报。
+- **涉及文件**：`src/rquant/l2/models.py`、`src/rquant/l2/feed.py`、`scripts/l2-collector-watchdog.sh`、`tests/unit/test_l2_feed.py`、`docs/l2-interface.md`、`CHANGELOG.md`、`HANDOFF.md`。
+- **验证与部署状态**：`pytest tests/unit/test_l2_feed.py tests/unit/test_l2_cache.py -q` → 全部通过（新增 2 个用例：事件时间提取、状态字段序列化）；watchdog 内嵌判定逻辑用合成 status 手工验证（lag 45s：阈值 30s → LAG、阈值 60s → OK）。已随 PR 合入 main 并发布 **`v0.35.8`**（release `web-<sha8>`）。**部署**：watchdog 脚本可立即单独更新到生产（字段缺失时按 `lag=unknown` 处理）；status.json 新字段需随下一次 L2 组件部署（需新一轮 acceptance-v3 绑定新源码树）后才会出现。
+
 ### 2026-11-12 · L2 归档可靠性修复（R2 重试/失败诊断/续跑）与 v0.35.7 发布（`fix/l2-archive-reliability` → `v0.35.6`）
 - **背景/问题**：2026-11-10 的日终 R2 归档在运行 4 小时+ 后失败，仅返回 `archive_failed` 且无 traceback，远端 catalog 未推进。本机 R2 大对象实测：PUT/GET 均可用、9/9 往返无损坏，但带宽仅 ~0.7–1.3 MB/s、GET 延迟不稳（3MB 最高 24.8s、64MB 最高 70s）；判断为长串行请求中某次超时/失败而客户端无重试、异常被模块吞掉。前一次运行另被 systemd `TimeoutStartSec=2h` 超时杀掉。
 - **主要变更**：

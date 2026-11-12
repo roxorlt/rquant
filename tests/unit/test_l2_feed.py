@@ -1191,3 +1191,28 @@ def test_flow_control_options_are_validated(tmp_path: Path, options: dict) -> No
     provider = Provider(clock)
     with pytest.raises(ValueError):
         collector(tmp_path, provider, clock, **options)
+
+def test_market_event_timestamp_picks_newest_plausible_vendor_field() -> None:
+    feed = module("feed")
+    table = {"rows": [
+        {"34320": {"value": 1792047600, "style": 0}},
+        {"34320": {"value": 1792047605, "style": 0}},
+        {"34320": {"value": "1792047609", "style": 0}},  # display string is not a timestamp
+        {"34320": {"value": 1, "style": 0}},            # implausible epoch
+        {},
+        None,
+    ]}
+    assert feed.market_event_timestamp(table) == datetime.fromtimestamp(1792047605, UTC)
+    assert feed.market_event_timestamp({"rows": []}) is None
+    assert feed.market_event_timestamp({}) is None
+    assert feed.market_event_timestamp({"rows": [{"34320": {"value": True}}]}) is None
+
+
+def test_status_carries_candidate_market_freshness_fields() -> None:
+    stamp = datetime.fromtimestamp(1792047605, UTC)
+    status = FeedStatus(last_market_timestamp=stamp, market_time_lag_ms=1234)
+    payload = json.loads(status.model_dump_json(by_alias=True))
+    assert payload["market_time_lag_ms"] == 1234
+    assert payload["last_market_timestamp"].startswith("2026-10-")
+    assert "last_market_timestamp" in FeedStatus.model_fields
+    assert "market_time_lag_ms" in FeedStatus.model_fields
