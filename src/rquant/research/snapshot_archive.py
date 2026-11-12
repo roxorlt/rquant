@@ -19,6 +19,7 @@ import argparse
 import datetime as dt
 import hashlib
 import hmac
+import http.client
 import json
 import logging
 import os
@@ -32,8 +33,9 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 log = logging.getLogger("rquant.snapshot_archive")
 DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -42,6 +44,37 @@ PREFIX = "snapshots"
 #: how long a run waits for today's collector to finish compacting (unit timeout is 2h)
 WAIT_S = float(os.environ.get("SNAPSHOT_ARCHIVE_WAIT_S", 3600))
 COLLECTOR_UNIT = "rquant-snapshot-collector.service"
+#: one R2 request timeout (seconds); override with R2_TIMEOUT_S for slow links
+DEFAULT_TIMEOUT_S = 600.0
+#: total attempts per operation (first try + retries) and the waits between them
+DEFAULT_ATTEMPTS = 5
+DEFAULT_BACKOFF_S: tuple[float, ...] = (1.0, 2.0, 4.0, 8.0)
+T = TypeVar("T")
+
+
+def _retryable(error: BaseException) -> bool:
+    """Transport failures and 5xx are transient; a 4xx is a definite answer."""
+    if isinstance(error, urllib.error.HTTPError):
+        return 500 <= error.code < 600
+    return isinstance(
+        error,
+        (TimeoutError, ConnectionError, urllib.error.URLError, http.client.HTTPException),
+    )
+
+
+def _uncertain(error: BaseException) -> bool:
+    """A transport failure leaves a write's outcome unknown; the server may have committed."""
+    return _retryable(error) and not isinstance(error, urllib.error.HTTPError)
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        raise ValueError(f"invalid {name}") from None
 
 
 def _sha256_file(p: Path) -> str:
@@ -53,12 +86,35 @@ def _sha256_file(p: Path) -> str:
 
 
 class R2:
-    """Minimal SigV4 S3 client (PUT/HEAD/GET/DELETE single objects)."""
+    """Minimal SigV4 S3 client (PUT/HEAD/GET/DELETE single objects).
 
-    def __init__(self, endpoint: str, bucket: str, key_id: str, secret: str) -> None:
+    Operations retry transient failures (timeouts, connection errors, 5xx) with
+    exponential backoff: 5 attempts and 1/2/4/8s waits by default.  A 4xx is a
+    definite answer and is never retried.  Each attempt includes a fresh
+    signature and, for uploads, rewinds the body, so retries stay byte-identical.
+    """
+
+    def __init__(
+        self,
+        endpoint: str,
+        bucket: str,
+        key_id: str,
+        secret: str,
+        *,
+        timeout_s: float | None = None,
+        attempts: int = DEFAULT_ATTEMPTS,
+        backoff_s: tuple[float, ...] = DEFAULT_BACKOFF_S,
+    ) -> None:
         self.endpoint = endpoint.rstrip("/")
         self.host = urllib.parse.urlparse(self.endpoint).netloc
         self.bucket, self.key_id, self.secret = bucket, key_id, secret
+        if timeout_s is None:
+            timeout_s = _env_float("R2_TIMEOUT_S", DEFAULT_TIMEOUT_S)
+        if not timeout_s > 0 or attempts < 1 or any(delay < 0 for delay in backoff_s):
+            raise ValueError("invalid R2 retry configuration")
+        self.timeout_s = float(timeout_s)
+        self.attempts = attempts
+        self.backoff_s = tuple(float(delay) for delay in backoff_s)
 
     @classmethod
     def from_env(cls) -> R2:
@@ -69,6 +125,40 @@ class R2:
             raise SystemExit(f"missing env: {missing} (see /etc/rquant-r2.env)")
         return cls(e["R2_ENDPOINT"], e.get("R2_BUCKET", "rquant-snapshots"),
                    e["R2_ACCESS_KEY_ID"], e["R2_SECRET_ACCESS_KEY"])
+
+    def _delay(self, attempt: int) -> float:
+        if not self.backoff_s:
+            return 0.0
+        return self.backoff_s[min(attempt - 1, len(self.backoff_s) - 1)]
+
+    def _retry(self, operation: Callable[[], T], key: str, *, conditional: bool = False) -> T:
+        """Run one storage operation, retrying only transient failures."""
+        uncertain: BaseException | None = None
+        for attempt in range(1, self.attempts + 1):
+            try:
+                return operation()
+            except Exception as error:  # noqa: BLE001 - re-raised below unless retryable
+                if isinstance(error, urllib.error.HTTPError):
+                    error.close()
+                    if conditional and uncertain is not None and error.code in (409, 412):
+                        # An earlier transport failure may have committed this
+                        # conditional write, so the precondition failure is
+                        # ambiguous. Surface the original error and let the
+                        # caller verify the exact remote bytes.
+                        assert uncertain is not None
+                        raise uncertain
+                elif _uncertain(error):
+                    uncertain = error
+                if attempt == self.attempts or not _retryable(error):
+                    raise
+                delay = self._delay(attempt)
+                log.warning(
+                    "R2 %s attempt %d/%d failed (%s: %s); retry in %.1fs",
+                    key, attempt, self.attempts, type(error).__name__, error, delay,
+                )
+                if delay > 0:
+                    time.sleep(delay)
+        raise AssertionError("unreachable")
 
     def _request(self, method: str, key: str, *, body: Any = None, payload_sha: str | None = None,
                  headers: dict[str, str] | None = None, now: dt.datetime | None = None):
@@ -93,7 +183,7 @@ class R2:
                               f"SignedHeaders={';'.join(names)}, Signature={sig}")
         del h["host"]
         req = urllib.request.Request(self.endpoint + path, data=body, method=method, headers=h)
-        return urllib.request.urlopen(req, timeout=600)
+        return urllib.request.urlopen(req, timeout=self.timeout_s)
 
     def put_file(self, key: str, src: Path, sha: str, *, if_match: str | None = None,
                  if_none_match: str | None = None) -> None:
@@ -110,16 +200,18 @@ class R2:
             headers["if-match"] = if_match
         if if_none_match is not None:
             headers["if-none-match"] = if_none_match
-        with src.open("rb") as f:
-            try:
-                self._request("PUT", key, body=f, payload_sha=sha, headers=headers).close()
-            except urllib.error.HTTPError as error:
-                error.close()
-                raise
+        with src.open("rb") as stream:
+            def send() -> None:
+                stream.seek(0)
+                self._request("PUT", key, body=stream, payload_sha=sha, headers=headers).close()
+
+            self._retry(
+                send, key, conditional=if_match is not None or if_none_match is not None
+            )
 
     def head(self, key: str, *, include_etag: bool = False) -> dict[str, Any] | None:
         try:
-            with self._request("HEAD", key) as r:
+            with self._retry(lambda: self._request("HEAD", key), key) as r:
                 result = {"size": int(r.headers["Content-Length"]),
                           "sha256": r.headers.get("x-amz-meta-sha256")}
                 if include_etag:
@@ -132,28 +224,29 @@ class R2:
             raise
 
     def get_file(self, key: str, dest: Path, *, maximum_bytes: int | None = None) -> None:
-        if maximum_bytes is None:
-            with self._request("GET", key) as r, dest.open("wb") as f:
-                shutil.copyfileobj(r, f, 1 << 20)
-            return
-        if type(maximum_bytes) is not int or maximum_bytes < 0:
+        if maximum_bytes is not None and (type(maximum_bytes) is not int or maximum_bytes < 0):
             raise ValueError("invalid download bound")
-        try:
-            with self._request("GET", key) as r, dest.open("wb") as f:
-                remaining = maximum_bytes
-                while chunk := r.read(min(1 << 20, remaining + 1)):
-                    if len(chunk) > remaining:
-                        raise ValueError("download exceeds bound")
-                    f.write(chunk)
-                    remaining -= len(chunk)
-        except BaseException as error:
-            if isinstance(error, urllib.error.HTTPError):
-                error.close()
-            dest.unlink(missing_ok=True)
-            raise
+
+        def download() -> None:
+            try:
+                with self._request("GET", key) as r, dest.open("wb") as f:
+                    if maximum_bytes is None:
+                        shutil.copyfileobj(r, f, 1 << 20)
+                        return
+                    remaining = maximum_bytes
+                    while chunk := r.read(min(1 << 20, remaining + 1)):
+                        if len(chunk) > remaining:
+                            raise ValueError("download exceeds bound")
+                        f.write(chunk)
+                        remaining -= len(chunk)
+            except BaseException:
+                dest.unlink(missing_ok=True)
+                raise
+
+        self._retry(download, key)
 
     def delete(self, key: str) -> None:
-        self._request("DELETE", key).close()
+        self._retry(lambda: self._request("DELETE", key).close(), key)
 
 
 def object_key(day: str) -> str:

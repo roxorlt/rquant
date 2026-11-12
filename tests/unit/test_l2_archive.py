@@ -7,9 +7,12 @@ import gzip
 import hashlib
 import importlib
 import json
+import os
 import re
 import shutil
 import socket
+import subprocess
+import sys
 import urllib.error
 from pathlib import Path
 from types import ModuleType
@@ -36,6 +39,7 @@ class FakeR2:
     def __init__(self) -> None:
         self.objects: dict[str, bytes] = {}
         self.puts: list[tuple[str, str | None, str | None]] = []
+        self.gets: list[str] = []
         self.generation: dict[str, int] = {}
         self.on_put = None
         self.after_get = None
@@ -82,6 +86,7 @@ class FakeR2:
         assert maximum_bytes is not None
         if len(data) > maximum_bytes:
             raise ValueError("size limit")
+        self.gets.append(key)
         dest.write_bytes(data)
         if self.after_get:
             self.after_get(key)
@@ -696,3 +701,194 @@ def test_catalog_requires_single_strong_etag_before_conditional_put(
 @pytest.mark.parametrize("token", ['"opaque-generation-4"', '""', '"a,b"', '"back\\slash"'])
 def test_single_strong_etag_is_preserved_without_hash_interpretation(token: str) -> None:
     assert archive()._etag({"etag": token}) == token
+
+
+def _interrupted_run(
+    a: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    cache: RawL2Cache,
+    state: Path,
+    client: FakeR2,
+) -> None:
+    """Upload chunks and manifests, then fail before the catalog commit."""
+    original = a._put
+
+    def failing(client_arg: Any, key: str, path: Path, temporary: Path, **kwargs: Any) -> str:
+        if key.endswith("/catalog.json"):
+            raise a.ArchiveError("synthetic_commit_failure")
+        return original(client_arg, key, path, temporary, **kwargs)
+
+    monkeypatch.setattr(a, "_put", failing)
+    with pytest.raises(a.ArchiveError, match="synthetic_commit_failure"):
+        a.run_archive(cache, state, client=client, prefix=PREFIX, now=NOW)
+    monkeypatch.setattr(a, "_put", original)
+
+
+def test_restart_reuses_uploaded_chunks_with_one_verification_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    a, client, cache, state = setup_archive(tmp_path)
+    _interrupted_run(a, monkeypatch, cache, state, client)
+    chunk_puts = [key for key, _, _ in client.puts if key.endswith(".jsonl.gz")]
+    assert len(chunk_puts) == len(set(chunk_puts)) == 2
+    assert json.loads(client.objects[PREFIX + "/catalog.json"])["last_sequence"] == 0
+
+    client.gets.clear()
+    capsys.readouterr()
+    receipt = a.run_archive(cache, state, client=client, prefix=PREFIX, now=NOW)
+    assert receipt.status == "archived" and receipt.last_sequence == 4
+    assert [key for key, _, _ in client.puts if key.endswith(".jsonl.gz")] == chunk_puts
+    assert [key for key in client.gets if key.endswith(".jsonl.gz")] == chunk_puts
+    assert capsys.readouterr().err.count("reuse verified remote chunk") == 2
+    assert a.check_archive(client=client, prefix=PREFIX).last_sequence == 4
+
+
+def test_existing_chunk_with_mismatched_bytes_is_not_overwritten(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    a, client, cache, state = setup_archive(tmp_path)
+    _interrupted_run(a, monkeypatch, cache, state, client)
+    chunk_key = next(key for key in client.objects if key.endswith(".jsonl.gz"))
+    corrupted = bytearray(client.objects[chunk_key])
+    corrupted[-1] ^= 0xFF
+    client.objects[chunk_key] = bytes(corrupted)
+    with pytest.raises(a.ArchiveError, match="immutable_conflict"):
+        a.run_archive(cache, state, client=client, prefix=PREFIX, now=NOW)
+    assert client.objects[chunk_key] == bytes(corrupted)
+    assert json.loads(client.objects[PREFIX + "/catalog.json"])["last_sequence"] == 0
+
+
+def test_failure_receipt_and_artifact_record_chunk_progress(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    a, client, cache, state = setup_archive(tmp_path)
+    original = client.put_file
+
+    def failing(key: str, src: Path, sha: str, **kwargs: Any) -> None:
+        if key.endswith(".jsonl.gz"):
+            raise TimeoutError("synthetic R2 timeout")
+        return original(key, src, sha, **kwargs)
+
+    client.put_file = failing
+    with pytest.raises(a.ArchiveError) as info:
+        a.run_archive(cache, state, client=client, prefix=PREFIX, now=NOW)
+    receipt = a._failure_receipt("run", PREFIX, state, info.value)
+    captured = capsys.readouterr()
+    artifact = json.loads((state / a.ERROR_ARTIFACT).read_text())
+    assert receipt.status == "failed" and receipt.code == "archive_failed"
+    assert "publication_uncertain" in str(receipt.error)
+    assert "TimeoutError" in str(receipt.error) and "synthetic R2 timeout" in str(receipt.error)
+    assert "synthetic R2 timeout" in captured.err
+    assert artifact["schema"] == "rquant-l2-archive-error-v1"
+    assert artifact["operation"] == "run" and artifact["error_type"] == "ArchiveError"
+    assert artifact["stage"] == "chunk_upload" and artifact["first_sequence"] == 1
+    assert artifact["error"] == receipt.error
+    assert receipt.error_artifact == str(state / a.ERROR_ARTIFACT)
+
+
+def test_main_reports_exhausted_r2_retries_in_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from rquant.research import snapshot_archive as sa
+
+    a, cache = archive(), source(tmp_path)
+    state = tmp_path / "state"
+    calls: list[float] = []
+
+    def urlopen(request: Any, timeout: float) -> Any:
+        calls.append(timeout)
+        raise ConnectionResetError("synthetic R2 reset")
+
+    monkeypatch.setattr(sa.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(sa.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(
+        a.R2,
+        "from_env",
+        classmethod(lambda cls: sa.R2("https://synthetic.invalid", "b", "k", "s")),
+    )
+    assert a.main(["init", "--cache-root", str(cache.root), "--state-root", str(state)]) == 1
+    captured = capsys.readouterr()
+    receipt = json.loads(captured.out)
+    assert receipt["schema"] == "rquant-l2-archive-receipt-v1"
+    assert receipt["operation"] == "init" and receipt["status"] == "failed"
+    assert receipt["code"] == "archive_failed"
+    assert "ConnectionResetError" in receipt["error"]
+    assert "synthetic R2 reset" in captured.err
+    assert len(calls) == sa.DEFAULT_ATTEMPTS
+    artifact = json.loads((state / a.ERROR_ARTIFACT).read_text())
+    assert artifact["operation"] == "init" and artifact["error_type"] == "ConnectionResetError"
+
+
+def test_successful_run_clears_stale_error_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    a, client, cache = archive(), FakeR2(), source(tmp_path)
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / a.ERROR_ARTIFACT).write_text("{}")
+    monkeypatch.setattr(a.R2, "from_env", classmethod(lambda cls: client))
+    assert a.main(["init", "--cache-root", str(cache.root), "--state-root", str(state)]) == 0
+    assert not (state / a.ERROR_ARTIFACT).exists()
+
+
+def test_failure_diagnostics_redact_r2_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    a = archive()
+    monkeypatch.setenv("R2_SECRET_ACCESS_KEY", "synthetic-secret-value")
+    receipt = a._failure_receipt(
+        "run", PREFIX, tmp_path / "state", RuntimeError("lost synthetic-secret-value")
+    )
+    captured = capsys.readouterr()
+    assert "synthetic-secret-value" not in captured.err
+    assert "synthetic-secret-value" not in str(receipt.error)
+    artifact = json.loads((tmp_path / "state" / a.ERROR_ARTIFACT).read_text())
+    assert "synthetic-secret-value" not in json.dumps(artifact)
+    assert "***" in str(receipt.error)
+
+
+def test_byte_budgets_are_environment_overridable() -> None:
+    root = Path(__file__).resolve().parents[2]
+    code = "import rquant.l2.archive as module; print(module.MAX_SHARD, module.MAX_LINE)"
+
+    def budgets(overrides: dict[str, str]) -> list[int]:
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key not in ("RQUANT_ARCHIVE_SHARD_BYTES", "RQUANT_ARCHIVE_LINE_BYTES")
+        }
+        env.update(overrides)
+        env["PYTHONPATH"] = os.pathsep.join([str(root / "src"), str(root)])
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=root,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return [int(value) for value in result.stdout.split()]
+
+    assert budgets({}) == [32 << 20, 20 << 20]
+    assert budgets(
+        {
+            "RQUANT_ARCHIVE_SHARD_BYTES": str(1 << 20),
+            "RQUANT_ARCHIVE_LINE_BYTES": str(128 << 10),
+        }
+    ) == [1 << 20, 128 << 10]
+
+
+def test_error_artifact_never_writes_inside_source_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    a, client, cache = archive(), FakeR2(), source(tmp_path)
+    receipt = a._failure_receipt(
+        "init", PREFIX, cache.root, a.ArchiveError("unsafe_state"), cache_root=cache.root
+    )
+    assert receipt.error_artifact is None
+    assert not (cache.root / a.ERROR_ARTIFACT).exists()
+
+    monkeypatch.setattr(a.R2, "from_env", classmethod(lambda cls: client))
+    assert a.main(["init", "--cache-root", str(cache.root), "--state-root", str(cache.root)]) == 1
+    assert not (cache.root / a.ERROR_ARTIFACT).exists()
+    capsys.readouterr()

@@ -2,11 +2,28 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import http.client
+import io
 import json
+import urllib.error
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from rquant.research import snapshot_archive as sa
+
+
+class Response(io.BytesIO):
+    """Minimal urlopen() replacement for error/retry tests."""
+
+    def __init__(self, data: bytes = b"", headers: dict[str, str] | None = None) -> None:
+        super().__init__(data)
+        self.headers = headers or {}
+
+
+def _client(**kwargs: Any) -> sa.R2:
+    return sa.R2("https://synthetic.invalid", "b", "k", "s", **kwargs)
 
 
 class FakeR2:
@@ -183,3 +200,156 @@ def test_r2_bounded_and_conditional_http_errors_close_response(
         with pytest.raises(urllib.error.HTTPError):
             call()
     assert all(handle.closed for handle in handles)
+
+
+def test_r2_retries_transient_failures_with_exponential_backoff(monkeypatch: Any) -> None:
+    calls: list[float] = []
+    sleeps: list[float] = []
+
+    def urlopen(request: Any, timeout: float) -> Response:
+        calls.append(timeout)
+        if len(calls) < 3:
+            raise TimeoutError("synthetic timeout")
+        return Response(b"", {"Content-Length": "3", "x-amz-meta-sha256": "a" * 64})
+
+    monkeypatch.setattr(sa.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(sa.time, "sleep", sleeps.append)
+    client = _client()
+    assert client.head("x") == {"size": 3, "sha256": "a" * 64}
+    assert len(calls) == 3 and sleeps == [1.0, 2.0]
+    assert calls == [client.timeout_s, client.timeout_s, client.timeout_s]
+
+
+def test_r2_does_not_retry_4xx(monkeypatch: Any) -> None:
+    calls: list[int] = []
+    sleeps: list[float] = []
+
+    def urlopen(request: Any, timeout: float) -> Response:
+        calls.append(1)
+        raise urllib.error.HTTPError(request.full_url, 403, "denied", {}, io.BytesIO(b""))
+
+    monkeypatch.setattr(sa.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(sa.time, "sleep", sleeps.append)
+    with pytest.raises(urllib.error.HTTPError) as info:
+        _client().head("x")
+    assert info.value.code == 403 and len(calls) == 1 and sleeps == []
+
+
+def test_r2_retries_5xx(monkeypatch: Any) -> None:
+    calls: list[int] = []
+
+    def urlopen(request: Any, timeout: float) -> Response:
+        calls.append(1)
+        if len(calls) == 1:
+            raise urllib.error.HTTPError(request.full_url, 503, "slow down", {}, io.BytesIO(b""))
+        return Response(b"", {"Content-Length": "0", "x-amz-meta-sha256": "a" * 64})
+
+    monkeypatch.setattr(sa.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(sa.time, "sleep", lambda _seconds: None)
+    assert _client().head("x") == {"size": 0, "sha256": "a" * 64}
+    assert len(calls) == 2
+
+
+def test_r2_retry_exhaustion_uses_five_attempts_and_full_backoff(monkeypatch: Any) -> None:
+    calls: list[int] = []
+    sleeps: list[float] = []
+
+    def urlopen(request: Any, timeout: float) -> Response:
+        calls.append(1)
+        raise ConnectionResetError("synthetic reset")
+
+    monkeypatch.setattr(sa.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(sa.time, "sleep", sleeps.append)
+    with pytest.raises(ConnectionResetError, match="synthetic reset"):
+        _client().head("x")
+    assert len(calls) == sa.DEFAULT_ATTEMPTS == 5
+    assert sleeps == [1.0, 2.0, 4.0, 8.0]
+
+
+def test_r2_put_retry_rewinds_the_file_body(tmp_path: Path, monkeypatch: Any) -> None:
+    payload = b"x" * 4096
+    src = tmp_path / "src"
+    src.write_bytes(payload)
+    bodies: list[bytes] = []
+
+    def urlopen(request: Any, timeout: float) -> Response:
+        bodies.append(request.data.read())
+        if len(bodies) == 1:
+            raise TimeoutError("synthetic timeout")
+        return Response()
+
+    monkeypatch.setattr(sa.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(sa.time, "sleep", lambda _seconds: None)
+    _client(attempts=2, backoff_s=(0.0,)).put_file(
+        "x", src, hashlib.sha256(payload).hexdigest()
+    )
+    assert bodies == [payload, payload]
+
+
+def test_r2_conditional_put_ambiguity_surfaces_transport_error(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    src = tmp_path / "src"
+    src.write_bytes(b"abc")
+    calls: list[int] = []
+
+    def urlopen(request: Any, timeout: float) -> Response:
+        calls.append(1)
+        if len(calls) == 1:
+            raise TimeoutError("unknown outcome")
+        raise urllib.error.HTTPError(request.full_url, 412, "precondition", {}, io.BytesIO(b""))
+
+    monkeypatch.setattr(sa.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(sa.time, "sleep", lambda _seconds: None)
+    with pytest.raises(TimeoutError, match="unknown outcome"):
+        _client(attempts=3, backoff_s=(0.0, 0.0)).put_file(
+            "x", src, hashlib.sha256(b"abc").hexdigest(), if_none_match="*"
+        )
+    assert len(calls) == 2
+
+
+def test_r2_get_retries_interrupted_response_body(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    payload = b"z" * 1000
+
+    class Broken(io.BytesIO):
+        def read(self, size: int = -1) -> bytes:
+            raise http.client.IncompleteRead(b"partial")
+
+    responses = [Broken(payload), Response(payload)]
+
+    def urlopen(request: Any, timeout: float) -> Response:
+        return responses.pop(0)
+
+    monkeypatch.setattr(sa.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(sa.time, "sleep", lambda _seconds: None)
+    dest = tmp_path / "out"
+    _client(attempts=2, backoff_s=(0.0,)).get_file("x", dest)
+    assert dest.read_bytes() == payload
+
+
+def test_r2_get_exhaustion_removes_partial_download(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    class Broken(io.BytesIO):
+        def read(self, size: int = -1) -> bytes:
+            raise ConnectionResetError("synthetic reset")
+
+    monkeypatch.setattr(sa.urllib.request, "urlopen", lambda request, timeout: Broken(b"abc"))
+    monkeypatch.setattr(sa.time, "sleep", lambda _seconds: None)
+    dest = tmp_path / "out"
+    with pytest.raises(ConnectionResetError):
+        _client(attempts=2, backoff_s=(0.0,)).get_file("x", dest)
+    assert not dest.exists()
+
+
+def test_r2_timeout_is_configurable_via_environment(monkeypatch: Any) -> None:
+    monkeypatch.delenv("R2_TIMEOUT_S", raising=False)
+    assert _client().timeout_s == sa.DEFAULT_TIMEOUT_S == 600.0
+    monkeypatch.setenv("R2_TIMEOUT_S", "12.5")
+    assert _client().timeout_s == 12.5
+    assert _client(timeout_s=3.0).timeout_s == 3.0
+    monkeypatch.setenv("R2_TIMEOUT_S", "not-a-number")
+    with pytest.raises(ValueError, match="R2_TIMEOUT_S"):
+        _client()
