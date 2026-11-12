@@ -1,7 +1,11 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup } from "@testing-library/react";
+import { cleanup, configure } from "@testing-library/react";
 import { afterEach } from "vitest";
 import { dismissToast } from "@/ui/Toast";
+
+// 2026-11-12: default asyncUtilTimeout (1s) is too tight on shared CI runners;
+// the poolScope tests occasionally timed out without a real assertion failure.
+configure({ asyncUtilTimeout: 5000 });
 
 function mediaQueryList(query: string): MediaQueryList {
   return {
