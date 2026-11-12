@@ -160,6 +160,14 @@ cd notch_app && ./build.sh && ./install.sh
 > - **验证与部署状态**：...
 > ```
 
+### 2026-11-12 · 修复阻塞发版的 CI flaky 测试（L2 feed 种子优先级 + web poolScope 等待）
+- **背景/问题**：`test_receive_pump_prioritises_the_seed_over_queued_pushes` 用墙钟阈值（`seed_wait < 0.5s`、固定 4s 时长）与批次顺序断言，在共享 CI 负载下偶发 0.51s 超限、种子回执数不足，连续阻塞 PR #450/#451/#452 的 main push；`web/src/pages/monitor/poolScope.test.tsx` 的 `waitFor` 使用默认 1s 超时，偶发超时失败。
+- **主要变更**：
+  1. L2 集成用例改为功能性断言（放宽等待阈值到 2s、待处理帧余量、pumps.received 下限），并新增确定性用例 `test_frame_pump_serves_response_frames_before_queued_pushes`：用脚本化 reader 在 pump 前排队 200 个 push 帧 + 1 个响应帧，断言响应帧先被返回、push backlog 仍在队列中——直接验证优先通道，不再依赖墙钟。
+  2. web 测试 setup 增加 `configure({ asyncUtilTimeout: 5000 })`，避免 CI 下 `waitFor` 默认 1s 过紧造成假失败。
+- **涉及文件**：`tests/unit/test_l2_feed.py`、`web/src/test/setup.ts`、`HANDOFF.md`。
+- **验证与部署状态**：`pytest tests/unit/test_l2_feed.py tests/unit/test_l2_cache.py -q` → 299 passed（新增用例连跑 3 次稳定）；改动仅测试与测试配置，不影响运行时与生产部署；CI 验证后合入 main。
+
 ### 2026-11-12 · L2 行情时间新鲜度指标（P0 观测）：status.json 新增帧内行情时间戳 lag + watchdog 滞后告警（`v0.35.8`）
 - **背景/问题**：现有 `status.json` 只有本地接收时间（`last_market_received_at`/`last_transport_received_at`）与 `cache_stale`，无法区分「帧在到达但帧内事件时间变旧」和「链路正常」；P0 需要观测行情事件时间新鲜度并在盘中告警。
 - **主要变更**：
