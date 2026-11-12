@@ -30,6 +30,31 @@ from .models import Binding, FeedStatus, MarketObservation, SubscriptionReceipt,
 from .subscriptions import SubscriptionError, SubscriptionStore
 from .symbols import MAX_SYMBOLS, market_for_code, normalize_symbols
 
+#: Vendor table field carrying the market event time.  Observed as epoch
+#: seconds (e.g. 09:36:01 CST -> 1794274561) in trade pages; the order
+#: page layout tested here does not carry it.
+MARKET_TIME_FIELD_ID = "34320"
+_MARKET_TIME_MIN = 1_400_000_000
+_MARKET_TIME_MAX = 2_200_000_000
+
+
+def market_event_timestamp(table: dict[str, Any]) -> datetime | None:
+    """Newest plausible market event timestamp in one decoded table."""
+    rows = table.get("rows") if isinstance(table, dict) else None
+    if not isinstance(rows, list):
+        return None
+    newest: int | None = None
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        cell = row.get(MARKET_TIME_FIELD_ID)
+        value = cell.get("value") if isinstance(cell, dict) else None
+        if type(value) is not int or not _MARKET_TIME_MIN <= value <= _MARKET_TIME_MAX:
+            continue
+        if newest is None or value > newest:
+            newest = value
+    return datetime.fromtimestamp(newest, UTC) if newest is not None else None
+
 MAX_PENDING_FRAMES = 65536
 MAX_PENDING_BYTES = 64 * 1024 * 1024
 _QUANTUM_FRAMES = 32
@@ -706,6 +731,11 @@ class FeedCollector:
             raise FeedError("cache_error") from None
         changes: dict[str, Any] = {"last_market_received_at": received_at,
                                   "market_batch_count": self.status.market_batch_count + 1}
+        market_timestamp = market_event_timestamp(result["table"])
+        if market_timestamp is not None:
+            changes["last_market_timestamp"] = market_timestamp
+            changes["market_time_lag_ms"] = max(
+                0, int((received_at - market_timestamp).total_seconds() * 1000))
         if actual_delivery == "candidate_push":
             changes["subscription_state"] = "candidate_push_observed"
             changes["state"] = "listening_candidate"

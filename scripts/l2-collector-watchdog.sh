@@ -6,6 +6,8 @@
 #   1) unit failed → reset-failed + 拉起一次，并告警（兜住 Restart 策略放弃的情况）
 #   2) unit 不活跃（非 failed，例如被手工停）→ 只告警，不擅自拉起
 #   3) 活跃但行情不新鲜（status.json last_transport 超 STALE_SECONDS）→ 告警
+#   4) 活跃且仍有数据，但帧内行情时间戳滞后（status.json market_time_lag_ms 超
+#      LAG_ALERT_MS，连续两次检查都高才告警，避免开盘 seed 旧数据的瞬时假报）→ 告警
 # 告警走 rquant alert（PushDeer），带 dedup key + 15 分钟冷却，避免每 2 分钟刷屏。
 set -uo pipefail
 
@@ -15,8 +17,11 @@ UNIT="rquant-l2-collector.service"
 STATUS_FILE="${STATUS_FILE:-/home/lighthouse/rquant-l2-state/cache/status.json}"
 LOG_FILE="${PROJECT_DIR}/logs/l2-collector-watchdog-$(date +%F).log"
 STALE_SECONDS="${STALE_SECONDS:-300}"
+LAG_ALERT_MS="${LAG_ALERT_MS:-30000}"
+LAG_STATE_FILE="${LAG_STATE_FILE:-/home/lighthouse/rquant-l2-state/logs/l2-collector-lag.state}"
 DEDUP_FAIL="service:${UNIT}"
 DEDUP_FRESH="service:rquant-l2-collector-freshness"
+DEDUP_LAG="service:rquant-l2-collector-lag"
 
 mkdir -p "${PROJECT_DIR}/logs" /home/lighthouse/rquant-l2-state/logs 2>/dev/null || true
 mkdir -p /home/lighthouse/rquant-l2-state/logs 2>/dev/null || true
@@ -101,10 +106,10 @@ if ! sudo systemctl is-active --quiet "${UNIT}"; then
     exit 0
 fi
 
-# 3) 活跃：检查行情新鲜度
-VERDICT=$(python3 - "${STATUS_FILE}" "${STALE_SECONDS}" <<'PY'
-import json, sys, datetime
-path, stale = sys.argv[1], float(sys.argv[2])
+# 3) 活跃：检查行情新鲜度 + 帧内行情时间戳滞后
+VERDICT=$(python3 - "${STATUS_FILE}" "${STALE_SECONDS}" "${LAG_ALERT_MS}" <<'PY'
+import json, sys, datetime, time
+path, stale, lag_limit = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
 try:
     with open(path, 'r', encoding='utf-8') as fh:
         st = json.load(fh)
@@ -120,16 +125,49 @@ if not last:
     print(f"STALE state={state} age=unknown")
     raise SystemExit(0)
 ts = datetime.datetime.fromisoformat(last.replace("Z", "+00:00")).timestamp()
-age = time_now = __import__("time").time() - ts
+age = time.time() - ts
+lag = st.get("market_time_lag_ms")
+lag_text = "lag=unknown" if type(lag) is not int or lag < 0 else f"lag={lag}ms"
 if age > stale:
-    print(f"STALE state={state} age={int(age)}s")
+    print(f"STALE state={state} age={int(age)}s {lag_text}")
+elif type(lag) is int and lag > lag_limit:
+    print(f"LAG state={state} age={int(age)}s {lag_text}")
 else:
-    print(f"OK state={state} age={int(age)}s")
+    print(f"OK state={state} age={int(age)}s {lag_text}")
 PY
 )
 case "${VERDICT}" in
-  OK*) log_event "fresh ${VERDICT}"; resolve "${DEDUP_FRESH}" ;;
+  OK*) log_event "fresh ${VERDICT}"; resolve "${DEDUP_FRESH}"; rm -f "${LAG_STATE_FILE}" ;;
   IDLE*) log_event "idle ${VERDICT}" ;;
+  LAG*)
+    log_event "lag ${VERDICT}"
+    FIRST_SEEN=$(cat "${LAG_STATE_FILE}" 2>/dev/null || true)
+    NOW_S=$(date +%s)
+    if [ -n "${FIRST_SEEN}" ] && [ $((NOW_S - FIRST_SEEN)) -le 360 ]; then
+        alert "${DEDUP_LAG}" \
+          "🚨 [RQ] L2 行情时间戳滞后：${VERDICT}" \
+          "## L2 market event timestamps are lagging
+
+| item | value |
+|---|---|
+| unit | \`${UNIT}\` |
+| verdict | \`${VERDICT}\` |
+| threshold | ${LAG_ALERT_MS} ms |
+| host | $(hostname) |
+| time | $(date '+%F %T') |
+
+帧在持续到达（传输新鲜），但帧内行情时间戳与接收时间的差持续超过阈值；已连续两次 watchdog 检查超限。
+请确认是供应商延迟、分页数据旧，还是本地处理积压：
+
+\`\`\`bash
+curl -s http://127.0.0.1:8771/api/v1/l2/status
+sudo journalctl -u ${UNIT} -n 50 --no-pager
+\`\`\`"
+    else
+        printf '%s' "${NOW_S}" > "${LAG_STATE_FILE}"
+        log_event "lag-first-seen ${VERDICT}"
+    fi
+    ;;
   STALE*)
     log_event "STALE ${VERDICT}"
     alert "${DEDUP_FRESH}" \

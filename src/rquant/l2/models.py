@@ -365,6 +365,14 @@ class FeedStatus(Model):
     subscription_state: Literal["requested_unverified", "candidate_push_observed"] = "requested_unverified"
     last_transport_received_at: datetime | None = None
     last_market_received_at: datetime | None = None
+    # Market event timestamp of the newest committed raw row (candidate value:
+    # vendor field 0xA610 / "34320", observed as epoch seconds in trade pages).
+    last_market_timestamp: datetime | None = None
+    # receive time minus that market event timestamp, clamped at zero.  A
+    # growing value means the upstream stream is delivering stale events
+    # even though frames keep arriving.  Candidate metric; not certified as
+    # exchange time.
+    market_time_lag_ms: Annotated[int, Field(ge=0)] | None = None
     heartbeat_count: Count = 0
     control_count: Count = 0
     market_batch_count: Count = 0
