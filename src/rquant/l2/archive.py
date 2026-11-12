@@ -10,6 +10,7 @@ import json
 import os
 import re
 import stat
+import sys
 import tempfile
 import urllib.error
 from collections.abc import Iterator
@@ -28,13 +29,44 @@ from rquant.research.snapshot_archive import R2
 PRODUCTION_PREFIX = "l2/v1/rquant"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 MAX_MANIFEST = 8 << 20
-MAX_LINE = 20 << 20
-MAX_SHARD = 32 << 20
 MAX_COMPRESSED = 33 << 20
+DEFAULT_MAX_LINE = 20 << 20
+DEFAULT_MAX_SHARD = 32 << 20
 DEFAULT_OUTPUT_BYTES = 64 << 30
+ERROR_ARTIFACT = "archive-error.json"
+MAX_ERROR_TEXT = 500
 Count = Annotated[StrictInt, Field(ge=0, le=2**63 - 1)]
 Positive = Annotated[StrictInt, Field(ge=1, le=2**63 - 1)]
 Day = Annotated[str, Field(pattern=r"^\d{4}-\d{2}-\d{2}$")]
+
+#: Current chunk/sequence for failure diagnostics. Populated by init/run and read
+#: by ``main`` after a failure; never part of the catalog or receipt success path.
+_PROGRESS: dict[str, object] = {}
+
+
+def _env_bytes(name: str, default: int) -> int:
+    """Diagnostic override for a byte budget; production defaults apply when unset."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(f"invalid {name}") from None
+    if value <= 0:
+        raise ValueError(f"invalid {name}")
+    return value
+
+
+MAX_LINE = _env_bytes("RQUANT_ARCHIVE_LINE_BYTES", DEFAULT_MAX_LINE)
+MAX_SHARD = _env_bytes("RQUANT_ARCHIVE_SHARD_BYTES", DEFAULT_MAX_SHARD)
+if MAX_LINE > MAX_SHARD:
+    raise ValueError("RQUANT_ARCHIVE_LINE_BYTES must not exceed RQUANT_ARCHIVE_SHARD_BYTES")
+
+
+def _stage(name: str, **fields: object) -> None:
+    _PROGRESS.clear()
+    _PROGRESS.update({"stage": name, **fields})
 
 
 class ArchiveError(RuntimeError):
@@ -155,6 +187,8 @@ class ArchiveReceipt(Model):
     day_manifest_sha256: Sha256 | None = None
     shard_sha256: tuple[Sha256, ...] = ()
     sequence_ranges: tuple[tuple[Positive, Positive], ...] = ()
+    error: str | None = None
+    error_artifact: str | None = None
 
 
 def _prefix(value: str) -> str:
@@ -255,6 +289,99 @@ def _write_receipt(root: Path, receipt: ArchiveReceipt) -> None:
             os.close(directory)
     finally:
         Path(name).unlink(missing_ok=True)
+
+
+def _redact(text: str) -> str:
+    """Keep credentials out of local diagnostics and receipts."""
+    for name in ("R2_SECRET_ACCESS_KEY", "R2_ACCESS_KEY_ID"):
+        value = os.environ.get(name)
+        if value:
+            text = text.replace(value, "***")
+    return text[:MAX_ERROR_TEXT]
+
+
+def _error_text(error: BaseException) -> str:
+    """Exception type/message plus up to two causes, truncated to 500 characters."""
+    parts: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and len(parts) < 3 and id(current) not in seen:
+        seen.add(id(current))
+        message = str(current).strip()
+        parts.append(
+            f"{type(current).__name__}: {message}" if message else type(current).__name__
+        )
+        current = current.__cause__ or current.__context__
+    return _redact(" <- ".join(parts))
+
+
+def _write_error_artifact(
+    root: Path, detail: dict[str, object], *, cache_root: Path | None = None
+) -> Path | None:
+    """Best-effort failure log under the state root; never masks the original error."""
+    try:
+        if root.is_symlink():
+            return None
+        if cache_root is not None:
+            source, state = cache_root.resolve(), root.resolve()
+            if source == state or source in state.parents or state in source.parents:
+                # Never touch the read-only source cache, even on misconfiguration.
+                return None
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd, name = tempfile.mkstemp(prefix=".archive-error-", dir=root)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(json.dumps(detail, sort_keys=True).encode() + b"\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(name, root / ERROR_ARTIFACT)
+        finally:
+            Path(name).unlink(missing_ok=True)
+        return root / ERROR_ARTIFACT
+    except (OSError, TypeError):
+        return None
+
+
+def _clear_error_artifact(root: Path) -> None:
+    try:
+        (root / ERROR_ARTIFACT).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _failure_receipt(
+    operation: Literal["init", "run", "check", "list", "fetch"],
+    prefix: str,
+    state_root: Path | None,
+    error: BaseException,
+    *,
+    cache_root: Path | None = None,
+) -> ArchiveReceipt:
+    detail: dict[str, object] = {
+        "schema": "rquant-l2-archive-error-v1",
+        "at": datetime.now(UTC).isoformat(timespec="seconds"),
+        "operation": operation,
+        "error_type": type(error).__name__,
+        "error": _error_text(error),
+    }
+    detail.update(_PROGRESS)
+    artifact = (
+        _write_error_artifact(state_root, detail, cache_root=cache_root)
+        if state_root is not None
+        else None
+    )
+    message = str(detail["error"])
+    print(f"archive {operation} failed: {message}", file=sys.stderr)
+    if artifact is not None:
+        print(f"archive {operation} error artifact: {artifact}", file=sys.stderr)
+    return ArchiveReceipt(
+        operation=operation,
+        status="failed",
+        prefix=prefix,
+        code="archive_failed",
+        error=message,
+        error_artifact=None if artifact is None else str(artifact),
+    )
 
 
 def _head(client: R2, key: str, maximum: int) -> dict | None:
@@ -421,11 +548,15 @@ def initialize(
 ) -> ArchiveReceipt:
     prefix = _prefix(prefix)
     _separate_state(cache, state_root)
+    _PROGRESS.clear()
     with _job_lock(state_root), tempfile.TemporaryDirectory(dir=state_root) as work:
         temporary, snapshot = Path(work), cache.read_status()
+        _stage("catalog_check")
         if client.head(prefix + "/catalog.json") is not None:
+            _stage("index_verify")
             catalog, digest, _ = _load_catalog(client, prefix, temporary)
             _index(client, prefix, catalog, temporary)
+            _stage("source_verify")
             _source(cache, catalog, snapshot.last_sequence)
             receipt = ArchiveReceipt(
                 operation="init",
@@ -437,6 +568,7 @@ def initialize(
         else:
             if cache.floor_sequence():
                 raise ArchiveError("source_truncated")
+            _stage("catalog_commit")
             first = _sha(_bytes(_batch(cache, 1))) if snapshot.last_sequence else None
             catalog = Catalog(
                 last_sequence=0,
@@ -454,6 +586,7 @@ def initialize(
                 prefix=prefix,
                 catalog_sha256=_file_sha(path),
             )
+        _stage("receipt_write")
         _write_receipt(state_root, receipt)
         return receipt
 
@@ -501,11 +634,13 @@ def _new_chunks(
         first, day, total, epochs = sequence, None, 0, set()
         content = hashlib.sha256()
         path = temporary / f"chunk-{first}"
+        _stage("chunk_build", first_sequence=first)
         with (
             path.open("wb") as raw,
             gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as stream,
         ):
             while sequence <= highwater:
+                _PROGRESS["sequence"] = sequence
                 record = _batch(cache, sequence)
                 current_day = record.received_at.astimezone(SHANGHAI).date().isoformat()
                 line = _bytes(record)
@@ -532,8 +667,29 @@ def _new_chunks(
             epochs=tuple(sorted(epochs)),
         )
         chunk = chunk.model_copy(update={"key": _chunk_key(prefix, chunk)})
-        _put(client, chunk.key, path, temporary, immutable=True)
-        # Uploaded bytes must also pass the same typed restore path.
+        # An earlier interrupted run may already have uploaded this immutable
+        # chunk. Skip the PUT when HEAD matches, but still run the typed restore
+        # read below: reused bytes must pass the same verification as new bytes.
+        _stage(
+            "chunk_upload",
+            first_sequence=chunk.first_sequence,
+            last_sequence=chunk.last_sequence,
+            chunk=chunk.key,
+        )
+        remote = _head(client, chunk.key, MAX_COMPRESSED)
+        if remote is None or (remote["size"], remote["sha256"]) != (
+            chunk.compressed_bytes,
+            chunk.sha256,
+        ):
+            _put(client, chunk.key, path, temporary, immutable=True)
+        else:
+            print(f"archive: reuse verified remote chunk {chunk.key}", file=sys.stderr)
+        _stage(
+            "chunk_verify",
+            first_sequence=chunk.first_sequence,
+            last_sequence=chunk.last_sequence,
+            chunk=chunk.key,
+        )
         for _ in _chunk_lines(client, chunk, temporary):
             pass
         chunks.append(chunk)
@@ -556,11 +712,15 @@ def run_archive(
     if local.weekday() < 5 and (7, 0) <= (local.hour, local.minute) <= (16, 30):
         return ArchiveReceipt(operation="run", status="deferred_market_hours", prefix=prefix)
     _separate_state(cache, state_root)
+    _PROGRESS.clear()
     with _job_lock(state_root), tempfile.TemporaryDirectory(dir=state_root) as work:
         temporary, snapshot = Path(work), cache.read_status()
         highwater = snapshot.last_sequence
+        _stage("catalog_load")
         catalog, digest, token = _load_catalog(client, prefix, temporary)
+        _stage("index_verify")
         manifests = _index(client, prefix, catalog, temporary)
+        _stage("source_verify")
         first, last = _source(cache, catalog, highwater)
         days = dict(catalog.days)
         new = _new_chunks(cache, catalog.last_sequence + 1, highwater, client, prefix, temporary)
@@ -569,6 +729,7 @@ def run_archive(
             manifest = DayManifest(
                 received_date=day, chunks=prior + tuple(c for c in new if c.received_date == day)
             )
+            _stage("manifest_upload", day=day)
             path = temporary / f"day-{day}"
             path.write_bytes(_bytes(manifest))
             if path.stat().st_size > MAX_MANIFEST:
@@ -590,6 +751,7 @@ def run_archive(
             days=dict(sorted(days.items())),
         )
         if updated != catalog:
+            _stage("catalog_commit", last_sequence=highwater)
             _index(client, prefix, updated, temporary)
             path = temporary / "catalog"
             path.write_bytes(_bytes(updated))
@@ -602,6 +764,7 @@ def run_archive(
             catalog_sha256=digest,
             last_sequence=highwater,
         )
+        _stage("receipt_write")
         _write_receipt(state_root, receipt)
         return receipt
 
@@ -710,6 +873,9 @@ def main(argv: list[str] | None = None) -> int:
             sub.add_argument("--dest", type=Path, required=True)
             sub.add_argument("--maximum-output-bytes", type=int, default=DEFAULT_OUTPUT_BYTES)
     args = parser.parse_args(argv)
+    _PROGRESS.clear()
+    prefix = args.prefix
+    state_root: Path | None = getattr(args, "state_root", None)
     try:
         prefix = _prefix(args.prefix)
         # Defer before constructing a credentialed client or accessing cache/state.
@@ -740,11 +906,17 @@ def main(argv: list[str] | None = None) -> int:
                 client=client, prefix=prefix
             )
         print(result.model_dump_json(by_alias=True))
+        if state_root is not None:
+            _clear_error_artifact(state_root)
         return 0
-    except (OSError, ValueError, RuntimeError, SystemExit, RecursionError):
+    except (OSError, ValueError, RuntimeError, SystemExit, RecursionError) as error:
         print(
-            ArchiveReceipt(
-                operation=args.operation, status="failed", prefix=args.prefix, code="archive_failed"
+            _failure_receipt(
+                args.operation,
+                prefix,
+                state_root,
+                error,
+                cache_root=getattr(args, "cache_root", None),
             ).model_dump_json(by_alias=True)
         )
         return 1
