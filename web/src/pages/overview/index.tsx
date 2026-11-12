@@ -1,4 +1,4 @@
-import { type CSSProperties, useState } from "react";
+import type { CSSProperties } from "react";
 import { Link } from "react-router";
 import { useAlerts, useHealth, useOverview } from "@/api/endpoints";
 import {
@@ -14,6 +14,7 @@ import {
 import { formatListClock, formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
 import { SortMenu } from "@/table/SortMenu";
+import { usePreference } from "@/theme/storage";
 import { Button, KpiStrip, PageHeader, Panel, Pill } from "@/ui";
 import { StockLink } from "@/ui/StockLink";
 import { PHONE_QUERY, useMedia } from "../panorama/useMedia";
@@ -228,7 +229,11 @@ export default function OverviewPage() {
   const query = useOverview();
   const health = useHealth();
   const phone = useMedia(PHONE_QUERY);
-  const [signalSort, setSignalSort] = useState("at:desc");
+  const [signalSort, setSignalSort] = usePreference(
+    "overview.signalSort",
+    "at:desc",
+    (v: unknown): v is string => typeof v === "string",
+  );
   return (
     <>
       <PageHeader

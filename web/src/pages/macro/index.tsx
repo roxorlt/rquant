@@ -1,9 +1,10 @@
-import { useMemo, useState } from "react";
+import { useMemo } from "react";
 import { type MacroData, useMacro } from "@/api/endpoints";
 import { type LineSeries, TimeChart } from "@/charts/Chart";
 import { studyLabel } from "@/copy/publicText";
 import { formatFixed } from "@/format/number";
 import { DataTable } from "@/table/DataTable";
+import { oneOf, usePreference } from "@/theme/storage";
 import { EmptyState, KpiStrip, PageHeader, Panel, Segmented } from "@/ui";
 import { QueryView } from "../shared";
 import { MacroOverlay } from "./Overlay";
@@ -72,8 +73,16 @@ function IndexChart({ c, k = "csi300", name = "沪深300" }: { c: Cols; k?: stri
 }
 
 function Holders({ data }: { data: MacroData }) {
-  const [entity, setEntity] = useState("中央汇金");
-  const [basis, setBasis] = useState<"report" | "announce">("announce");
+  const [entity, setEntity] = usePreference(
+    "macro.entity",
+    "中央汇金",
+    (v: unknown): v is string => typeof v === "string",
+  );
+  const [basis, setBasis] = usePreference<"report" | "announce">(
+    "macro.basis",
+    "announce",
+    oneOf("report", "announce"),
+  );
   const rows = data.holders.filter((h) => h.entity === entity && h.basis === basis);
   const dates = rows.map((r) => r.quarter);
   // quarter-end CSI300 for alignment
@@ -234,7 +243,11 @@ function Banded({
 
 function Options({ data }: { data: MacroData }) {
   const names = Object.keys(data.options);
-  const [und, setUnd] = useState(names.includes("沪300ETF") ? "沪300ETF" : (names[0] ?? ""));
+  const [und, setUnd] = usePreference(
+    "macro.option",
+    names.includes("沪300ETF") ? "沪300ETF" : (names[0] ?? ""),
+    (v: unknown): v is string => typeof v === "string" && names.includes(v),
+  );
   const c = data.options[und];
   return (
     <Panel
@@ -327,7 +340,11 @@ function Options({ data }: { data: MacroData }) {
 }
 
 function MacroBody({ data }: { data: MacroData }) {
-  const [range, setRange] = useState<Range>("5y");
+  const [range, setRange] = usePreference<Range>(
+    "macro.range",
+    "5y",
+    oneOf("1y", "3y", "5y", "all"),
+  );
   const daily = useMemo(() => (data.daily ? cut(data.daily, range) : null), [data.daily, range]);
   const buffett = useMemo(() => {
     if (!data.buffett || !data.index_m) return null;
@@ -560,7 +577,11 @@ export default function MacroPage() {
 
 function Futures({ data }: { data: MacroData }) {
   const syms = Object.keys(data.futures);
-  const [sym, setSym] = useState(syms.includes("IF") ? "IF" : (syms[0] ?? ""));
+  const [sym, setSym] = usePreference(
+    "macro.future",
+    syms.includes("IF") ? "IF" : (syms[0] ?? ""),
+    (v: unknown): v is string => typeof v === "string" && syms.includes(v),
+  );
   const c = data.futures[sym];
   if (!c) return null;
   return (

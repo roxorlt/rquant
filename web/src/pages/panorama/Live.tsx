@@ -1,9 +1,10 @@
-import { useCallback, useState } from "react";
+import { useCallback } from "react";
 import { useLocation, useNavigate, useSearchParams } from "react-router";
 import { inTradingHours, useMarketLive } from "@/api/endpoints";
 import { TimeChart } from "@/charts/Chart";
 import { formatAmount, formatCount, formatFixed } from "@/format/number";
 import { DataTable } from "@/table/DataTable";
+import { oneOf, usePreference } from "@/theme/storage";
 import { ChangeText, KpiStrip, Panel, Segmented } from "@/ui";
 import { QueryView } from "../shared";
 import { BoardDetail } from "./BoardDetail";
@@ -16,7 +17,11 @@ type Lens = "breadth" | "limit";
 
 /** Live 市场全景 from the research 3-second snapshots (rebuild of the old Streamlit page). */
 export function LivePanorama() {
-  const [lens, setLens] = useState<Lens>("breadth");
+  const [lens, setLens] = usePreference<Lens>(
+    "panorama.lens",
+    "breadth",
+    oneOf("breadth", "limit"),
+  );
   // The open board lives in the URL (?board=…) as its own history entry, so the iOS
   // back-swipe / browser back closes the detail instead of leaving the page.
   const [params, setParams] = useSearchParams();

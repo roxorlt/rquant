@@ -14,6 +14,7 @@ import { formatPrice } from "@/format/number";
 import { formatListClock, formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
 import { SortMenu } from "@/table/SortMenu";
+import { oneOf, usePreference } from "@/theme/storage";
 import {
   Button,
   FailureNotice,
@@ -46,8 +47,16 @@ export default function MonitorPage() {
   const alertsCache = useAlertsCache();
   const inflight = useRef(new Set<string>());
   const [busyId, setBusyId] = useState<string | null>(null);
-  const [show, setShow] = useState<"all" | "open">("all");
-  const [sort, setSort] = useState("at:desc");
+  const [show, setShow] = usePreference<"all" | "open">(
+    "monitor.show",
+    "all",
+    oneOf("all", "open"),
+  );
+  const [sort, setSort] = usePreference(
+    "monitor.sort",
+    "at:desc",
+    (v: unknown): v is string => typeof v === "string",
+  );
   const [fail, setFail] = useState<RowFailure | null>(null);
   const phone = useMedia(PHONE_QUERY);
 

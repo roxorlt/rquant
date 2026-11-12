@@ -2352,6 +2352,22 @@
         "title": "Envelope[TaskLog]",
         "type": "object"
       },
+      "Envelope_UiPreferencesData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/UiPreferencesData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[UiPreferencesData]",
+        "type": "object"
+      },
       "Envelope_Union_BrinsonData__NoneType__": {
         "properties": {
           "data": {
@@ -7264,6 +7280,50 @@
         "title": "TranslateRequest",
         "type": "object"
       },
+      "UiPreferenceBody": {
+        "properties": {
+          "key": {
+            "maxLength": 70,
+            "minLength": 1,
+            "title": "Key",
+            "type": "string"
+          },
+          "value": {
+            "anyOf": [
+              {
+                "maxLength": 16000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Value"
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "title": "UiPreferenceBody",
+        "type": "object"
+      },
+      "UiPreferencesData": {
+        "description": "Page settings of the signed-in user (key -> text, as the page stores it).",
+        "properties": {
+          "prefs": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Prefs",
+            "type": "object"
+          }
+        },
+        "required": [
+          "prefs"
+        ],
+        "title": "UiPreferencesData",
+        "type": "object"
+      },
       "ValidationError": {
         "properties": {
           "ctx": {
@@ -9181,6 +9241,60 @@
           }
         },
         "summary": "任务日志"
+      }
+    },
+    "/api/v1/ui-preferences": {
+      "get": {
+        "operationId": "list_ui_preferences_api_v1_ui_preferences_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_UiPreferencesData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "页面设置（按登录用户）"
+      },
+      "put": {
+        "operationId": "save_ui_preference_api_v1_ui_preferences_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UiPreferenceBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "保存页面设置"
       }
     },
     "/api/v1/watchlist": {

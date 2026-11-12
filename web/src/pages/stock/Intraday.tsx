@@ -3,7 +3,10 @@ import { useIntraday } from "@/api/endpoints";
 import { deltas, profile, stitch } from "@/charts/orderflow";
 import { useTouchScrub } from "@/charts/useTouchScrub";
 import { formatFixed } from "@/format/number";
+import { oneOf, usePreference } from "@/theme/storage";
 import { DatePicker, Panel } from "@/ui";
+
+const isBool = (v: unknown): v is boolean => typeof v === "boolean";
 
 const P = { left: 56, right: 56, top: 8 };
 const PRICE_H = 260;
@@ -23,10 +26,14 @@ export function IntradayPanel({
 }) {
   const [day, setDay] = useState<string | undefined>(undefined);
   const q = useIntraday(code, day, span);
-  const [bands, setBands] = useState(true);
-  const [showVp, setShowVp] = useState(true);
-  const [marks, setMarks] = useState(true);
-  const [mode, setMode] = useState<"tick" | "bvc">("bvc");
+  const [bands, setBands] = usePreference("intraday.bands", true, isBool);
+  const [showVp, setShowVp] = usePreference("intraday.vp", true, isBool);
+  const [marks, setMarks] = usePreference("intraday.marks", true, isBool);
+  const [mode, setMode] = usePreference<"tick" | "bvc">(
+    "intraday.mode",
+    "bvc",
+    oneOf("tick", "bvc"),
+  );
   const [hover, setHover] = useState<number | null>(null);
   const ref = useRef<HTMLDivElement>(null);
   const [w, setW] = useState(900);
