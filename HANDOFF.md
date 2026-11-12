@@ -9,7 +9,7 @@
 
 ## 一、项目定位与当前真实边界
 
-**rQuant** 是个人自用的 A 股量化选股、实时盯盘、告警推送与可信策略研究平台（当前主线基线标签：`v0.35.5` / `web-8de81101`）。
+**rQuant** 是个人自用的 A 股量化选股、实时盯盘、告警推送与可信策略研究平台（当前主线基线标签：`v0.35.7` / `web-d518e931`（L2 常驻组件仍为 v0.35.5 / 8de81101，archive 修复尚未部署））。
 
 ### 1.1 核心边界
 - **只做**：盘后日线/因子/状态更新 → 条件筛选与候选池生成 → 盘中实时监控（分钟/快照/竞价/量能异动/受控 L2）→ 多通道告警通知（PushDeer / PushPlus）→ Point-in-Time（PIT）可信历史回放、策略评估与自动模拟盘。
@@ -160,7 +160,7 @@ cd notch_app && ./build.sh && ./install.sh
 > - **验证与部署状态**：...
 > ```
 
-### 2026-11-12 · L2 归档可靠性修复（R2 重试/失败诊断/续跑）与 v0.35.6 发布（`fix/l2-archive-reliability` → `v0.35.6`）
+### 2026-11-12 · L2 归档可靠性修复（R2 重试/失败诊断/续跑）与 v0.35.7 发布（`fix/l2-archive-reliability` → `v0.35.6`）
 - **背景/问题**：2026-11-10 的日终 R2 归档在运行 4 小时+ 后失败，仅返回 `archive_failed` 且无 traceback，远端 catalog 未推进。本机 R2 大对象实测：PUT/GET 均可用、9/9 往返无损坏，但带宽仅 ~0.7–1.3 MB/s、GET 延迟不稳（3MB 最高 24.8s、64MB 最高 70s）；判断为长串行请求中某次超时/失败而客户端无重试、异常被模块吞掉。前一次运行另被 systemd `TimeoutStartSec=2h` 超时杀掉。
 - **主要变更**：
   1. R2 客户端统一重试层（`snapshot_archive.py`）：仅对超时/连接错误/`URLError`/`http.client`/5xx 做指数退避重试（默认 5 次，1/2/4/8s），4xx 立即失败；单请求超时默认 600s，可用 `R2_TIMEOUT_S` 调整。PUT 每次尝试回卷请求体并重新签名；GET 整段下载在重试内完成，响应体中断会删除半成品。条件写遇 412 按“核对远端字节”语义处理，幂等性未变。
@@ -168,7 +168,7 @@ cd notch_app && ./build.sh && ./install.sh
   3. 幂等续跑：`_new_chunks` 上传前按内容寻址 key 做 HEAD 校验，size+sha256 一致则跳过重复上传（仍做一次完整类型化验证读取）；不一致走原 `immutable=True` 发布，绝不覆盖。catalog 语义未变（仍只在末尾 CAS 提交）。
   4. 分片诊断覆盖：`MAX_SHARD`/`MAX_LINE` 默认不变，支持 `RQUANT_ARCHIVE_SHARD_BYTES`/`RQUANT_ARCHIVE_LINE_BYTES` 覆盖（仅诊断用）。
 - **涉及文件**：`src/rquant/research/snapshot_archive.py`、`src/rquant/l2/archive.py`、`tests/unit/test_snapshot_archive.py`、`tests/unit/test_l2_archive.py`、`CHANGELOG.md`、`HANDOFF.md`。
-- **验证与部署状态**：`pytest tests/unit/test_l2_archive.py tests/unit/test_snapshot_archive.py -q` → **80 passed**（原 63 + 新增 17）；相关 L2 套件（retention/cold_store/cache_floor/archive_deploy/cache）→ 271 passed；未跑 ruff（环境无该二进制）。已随 PR 合并主线并以 annotated tag **`v0.35.6`** 发布 GitHub release asset `web-<sha8>`；**尚未部署**到生产（archive 组件部署需 archive 验收 + `deploy-production.sh --component l2-archive`，另行排期）。生产侧当前兜底：archive timer 停用，夜间 retention（`--no-archive-required`，每天 21:00）负责压缩清盘；历史数据（2026-11-09~12）已在冷存与本地备份，回填 R2 需单独方案。
+- **验证与部署状态**：`pytest tests/unit/test_l2_archive.py tests/unit/test_snapshot_archive.py -q` → **80 passed**（原 63 + 新增 17）；相关 L2 套件（retention/cold_store/cache_floor/archive_deploy/cache）→ 271 passed；未跑 ruff（环境无该二进制）。已随 PR 合并主线并以 annotated tag **`v0.35.7`** 发布（v0.35.6 已被当日 HANDOFF 文档发布会话占用） GitHub release asset `web-<sha8>`；**尚未部署**到生产（archive 组件部署需 archive 验收 + `deploy-production.sh --component l2-archive`，另行排期）。生产侧当前兜底：archive timer 停用，夜间 retention（`--no-archive-required`，每天 21:00）负责压缩清盘；历史数据（2026-11-09~12）已在冷存与本地备份，回填 R2 需单独方案。
 - **运维状态同步**：L2 采集器目前使用 daily start timer（工作日 09:30:10）+ daily stop timer（15:05）；夜间 retention timer 21:00 已启用并改为 archive 修复前的无归档兜底模式。
 
 ### 2026-11-12 · 建立项目主交接文档机制、补齐刘海插件 `v1.0.2–v1.0.4` 入库 & 修复盘中分时简图比例尺（`RQuantNotch v1.0.5`）
