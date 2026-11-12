@@ -117,4 +117,5 @@ notch_app/wuhu_token
 notch_app/.build/
 notch_app/build/
 notch_app/.bin/
+notch_app/rollback/
 RQuantNotch-src.tgz

@@ -80,27 +80,24 @@ struct Sparkline: View {
     }
 }
 
-/// Collapsed: sized to the physical notch (Layout.notchW × notchH).
+/// Collapsed: the physical notch (no pixels there), plus a right "ear" outside the notch
+/// that shows the unread 五虎-alert count during trading hours. Hotzone stays the notch only.
 struct CollapsedView: View {
     @ObservedObject var store: Store
+    static let ear: CGFloat = 30
+    var showCount: Bool { store.unread > 0 && (Config.replay || Store.isTradingWindow(Date())) }
     var body: some View {
-        HStack {
-            HStack(spacing: 4) {
-                ForEach(store.payload?.wuhu ?? []) { t in
-                    Circle().fill(P.bias(t.bias)).frame(width: 5, height: 5)
-                }
-                if store.payload == nil { Circle().fill(P.faint).frame(width: 5, height: 5) }
-            }
-            Spacer()
-            if store.error != nil {
-                Text("!").foregroundStyle(P.faint)
-            } else if store.unread > 0 {
-                Text("\(store.unread)").foregroundStyle(Color(hex: 0xAEAEB2))
+        HStack(spacing: 0) {
+            Color.clear.frame(width: showCount ? Self.ear : 0)
+            Color.clear.frame(width: Layout.notchW)
+            if showCount {
+                Text(store.unread > 99 ? "99+" : "\(store.unread)")
+                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+                    .foregroundStyle(P.up)
+                    .frame(width: Self.ear, alignment: .center)
             }
         }
-        .font(.system(size: 10))
-        .padding(.horizontal, 9)
-        .frame(width: Layout.notchW, height: Layout.notchH)
+        .frame(height: Layout.notchH)
     }
 }
 
@@ -122,42 +119,44 @@ struct PeekView: View {
     }
 }
 
-/// Expanded 440pt combined panel.
+/// Expanded 440pt combined panel. Fixed height = header + 5 rows on both sides.
 struct ExpandedView: View {
     @ObservedObject var store: Store
+    static let rowH: CGFloat = 30
+    static let headH: CGFloat = 14
+    static let rows = 5
+    var bodyH: CGFloat { Self.headH + CGFloat(Self.rows) * (Self.rowH + 0.5) }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack(alignment: .top, spacing: 10) {
-                tigerTable.frame(width: 238)
-                Rectangle().fill(P.rule).frame(width: 0.5)
-                alertList
-            }
+        HStack(alignment: .top, spacing: 10) {
+            tigerTable.frame(width: 238)
+            Rectangle().fill(P.rule).frame(width: 0.5)
+            alertList
         }
-        .padding(.top, Layout.notchH + 6)
+        .frame(height: bodyH, alignment: .top)
+        .clipped()
+        .padding(.top, Layout.notchH + 4)
         .padding(.horizontal, 12)
-        .padding(.bottom, 12)
+        .padding(.bottom, 8)
         .frame(width: Layout.expandedW, alignment: .topLeading)
     }
 
-    var header: some View {
-        HStack {
-            Text((store.payload?.replay == true ? "五虎 · 回放" : "五虎 · 实时") + " · 竞价池 \(String((store.payload?.date ?? "").suffix(5)))")
-            Spacer()
-        }.font(.system(size: 9)).foregroundStyle(P.faintest)
+    func colHead<C: View>(@ViewBuilder _ c: () -> C) -> some View {
+        HStack(spacing: 0) { c() }
+            .font(.system(size: 8.5)).foregroundStyle(P.faint)
+            .frame(height: Self.headH, alignment: .center)
     }
 
     var tigerTable: some View {
         VStack(alignment: .leading, spacing: 0) {
-            header.padding(.bottom, 3)
-            HStack(spacing: 0) {
+            colHead {
                 Text("名称/代码").frame(width: 66, alignment: .leading)
                 Text("竞价(%)").frame(width: 44, alignment: .trailing)
                 Text("涨跌(%)").frame(width: 44, alignment: .trailing)
                 Text("日内(%)").frame(width: 44, alignment: .trailing)
                 Text("分时").frame(width: 40, alignment: .trailing)
             }
-            .font(.system(size: 8.5)).foregroundStyle(P.faint).padding(.bottom, 2)
-            ForEach(store.payload?.wuhu ?? []) { t in
+            ForEach(Array((store.payload?.wuhu ?? []).prefix(Self.rows))) { t in
                 Divider().overlay(P.rule)
                 Button { store.open(t.ts_code) } label: {
                     HStack(spacing: 0) {
@@ -171,14 +170,16 @@ struct ExpandedView: View {
                         Sparkline(points: t.spark, ref: t.pre_close)
                             .frame(width: 30, height: 12).frame(width: 40, alignment: .trailing)
                     }
-                    .padding(.vertical, 3)
+                    .frame(height: Self.rowH)
                     .contentShape(Rectangle())
                 }.buttonStyle(.plain)
             }
             let n = store.payload?.wuhu.count ?? 0
-            if n < 5 {
+            if n < Self.rows {
+                Divider().overlay(P.rule)
                 Text(n == 0 ? (store.error ?? "暂无五虎") : "今日仅\(n)只入选")
-                    .font(.system(size: 9)).foregroundStyle(P.faintest).padding(.top, 5)
+                    .font(.system(size: 9)).foregroundStyle(P.faintest)
+                    .frame(height: Self.rowH)
             }
         }
     }
@@ -187,34 +188,43 @@ struct ExpandedView: View {
         Text(fmt(v)).font(.system(size: 10, design: .monospaced)).foregroundStyle(P.pct(v))
     }
 
+    /// 偏多 red, 偏空 green, neutral white.
+    func nameColor(_ b: String?) -> Color {
+        switch b {
+        case "多", "偏多": return P.up
+        case "空", "偏空": return P.down
+        default: return P.strong
+        }
+    }
+
     var alertList: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                Text("异动记录 · 最新在上")
-                Spacer()
-                Text(store.payload?.feed_time ?? "--:--:--")
-            }.font(.system(size: 9)).foregroundStyle(P.faintest).padding(.bottom, 4)
-            let list = Array(store.wuhuAlerts.prefix(5))
+            colHead {
+                Text("名称").frame(width: 46, alignment: .leading)
+                Text("异动").frame(maxWidth: .infinity, alignment: .leading)
+                Text("时间").frame(width: 28, alignment: .trailing)
+            }
+            let list = Array(store.wuhuAlerts.prefix(Self.rows))
             if list.isEmpty {
+                Divider().overlay(P.rule)
                 Text(store.payload?.alerts_available == false ? "今日暂无异动" : "暂无五虎异动")
-                    .font(.system(size: 9.5)).foregroundStyle(P.faintest).padding(.top, 4)
+                    .font(.system(size: 9.5)).foregroundStyle(P.faintest)
+                    .frame(height: Self.rowH)
             }
             ForEach(list) { a in
                 Divider().overlay(P.rule)
                 Button { store.open(a.ts_code) } label: {
-                    VStack(alignment: .leading, spacing: 1.5) {
-                        HStack(spacing: 6) {
-                            Text(a.time.prefix(5)).foregroundStyle(P.faintest).font(.system(size: 9, design: .monospaced))
-                            Text(a.name ?? "").foregroundStyle(P.strong).fontWeight(.medium).lineLimit(1)
-                            Spacer(minLength: 2)
-                            Text(P.biasLabel(a.bias)).foregroundStyle(P.bias(a.bias)).font(.system(size: 9))
-                        }
-                        Text(a.short).foregroundStyle(P.dim).font(.system(size: 9.5))
-                            .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+                    HStack(alignment: .center, spacing: 4) {
+                        Text(a.name ?? "").font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(nameColor(a.bias)).lineLimit(1).minimumScaleFactor(0.8)
+                            .frame(width: 46, alignment: .leading)
+                        Text(a.short).font(.system(size: 9)).foregroundStyle(P.dim)
+                            .lineLimit(2).minimumScaleFactor(0.85)
                             .frame(maxWidth: .infinity, alignment: .leading)
+                        Text(a.time.prefix(5)).font(.system(size: 8.5, design: .monospaced)).foregroundStyle(P.faintest)
+                            .frame(width: 28, alignment: .trailing)
                     }
-                    .font(.system(size: 10))
-                    .padding(.vertical, 4.5)
+                    .frame(height: Self.rowH)
                     .contentShape(Rectangle())
                 }.buttonStyle(.plain)
             }
@@ -232,13 +242,19 @@ enum Layout {
 
 enum Mode { case collapsed, peek, expanded }
 
+/// Expanded state, set by AppDelegate from mouse geometry (not by SwiftUI hover).
+@MainActor
+final class NotchUI: ObservableObject {
+    @Published var expanded = false
+}
+
 struct RootView: View {
     @ObservedObject var store: Store
-    @State var hovering = false
+    @ObservedObject var ui: NotchUI
     var onHover: (Bool) -> Void = { _ in }
     var onSize: (CGSize) -> Void
 
-    var mode: Mode { hovering ? .expanded : (store.peekAlert != nil ? .peek : .collapsed) }
+    var mode: Mode { ui.expanded ? .expanded : (store.peekAlert != nil ? .peek : .collapsed) }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -247,16 +263,17 @@ struct RootView: View {
                 case .collapsed: CollapsedView(store: store)
                 case .peek: PeekView(alert: store.peekAlert!)
                 case .expanded: ExpandedView(store: store)
+                    .background(GeometryReader { g in
+                        Color.clear
+                            .onAppear { onSize(g.size) }
+                            .onChange(of: g.size) { s in onSize(s) }
+                    })
                 }
             }
             .background(P.bg)
             .clipShape(NotchShape(radius: mode == .expanded ? 22 : 12))
             .shadow(color: .black.opacity(mode == .expanded ? 0.25 : 0), radius: 12, y: 6)
-            .onHover { h in
-                withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) { hovering = h }
-                onHover(h)
-                if h { store.markRead() }
-            }
+            .onHover { h in onHover(h) }   // AppDelegate decides expand/collapse from the mouse position
             Spacer(minLength: 0)
         }
         .frame(width: Layout.expandedW + 40, alignment: .top)

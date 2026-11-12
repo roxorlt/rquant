@@ -21,8 +21,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var panel: NotchPanel!
     let store = Store()
     var statusItem: NSStatusItem?
-    /// Mirrors RootView hover so collapsed hit-testing can shrink to the notch.
-    var hovering = false
+    /// Expanded/collapsed state is owned here (geometric), RootView only renders it.
+    let ui = NotchUI()
+    /// Measured size of the visible expanded panel (reported by RootView; .zero until first layout).
+    var expandedSize: CGSize = .zero
+    /// End of the exit (collapse) animation. Until then the window is click-through and only the
+    /// physical notch re-expands, so the fading expanded panel can't catch the mouse again.
+    private var collapseEndsAt: Date = .distantPast
+    static let exitAnimation: TimeInterval = 0.6   // ~settle time of the 0.28/0.3s springs
+    var isCollapsing: Bool { Date() < collapseEndsAt }
     private var mouseMonitor: Any?
     private var localMouseMonitor: Any?
 
@@ -42,8 +49,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.acceptsMouseMovedEvents = true
         let host = NSHostingView(rootView: RootView(
             store: store,
-            onHover: { [weak self] h in self?.hovering = h; self?.updateMouseThrough() },
-            onSize: { _ in }
+            ui: ui,
+            // SwiftUI hover is only a nudge to re-evaluate; the decision is geometric (updateMouseThrough).
+            onHover: { [weak self] _ in self?.updateMouseThrough() },
+            onSize: { [weak self] s in self?.expandedSize = s }
         ))
         host.frame = NSRect(origin: .zero, size: size)
         panel.contentView = host
@@ -75,7 +84,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func updateVisibility() {
         let show = Config.replay || Store.isTradingWindow(Date())
         if show { if !panel.isVisible { panel.orderFrontRegardless() } }
-        else if panel.isVisible { panel.orderOut(nil) }
+        else if panel.isVisible { setExpanded(false, animated: false); panel.orderOut(nil) }
     }
 
     /// Screen with a notch if present (built-in display), else main.
@@ -116,31 +125,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func expandedHitRect() -> NSRect {
         let f = panel.frame
-        // Visible expanded panel only (not the full transparent window).
-        let h: CGFloat = min(240, f.height)
+        // Visible expanded panel only (not the full transparent window): measured height, 240 until known.
+        let h: CGFloat = min(expandedSize.height > 0 ? expandedSize.height : 240, f.height)
         return NSRect(x: f.midX - Layout.expandedW / 2, y: f.maxY - h,
                       width: Layout.expandedW, height: h)
     }
 
-    /// Collapsed: only the real notch receives mouse events (Chrome tabs / menu bar pass through).
-    /// Peek / expanded: only the visible black panel.
+    /// Collapse first switches state + hit area, then animates; expand marks alerts read.
+    func setExpanded(_ e: Bool, animated: Bool) {
+        guard ui.expanded != e else { return }
+        if e {
+            collapseEndsAt = .distantPast
+            store.markRead()
+        } else {
+            collapseEndsAt = animated ? Date().addingTimeInterval(Self.exitAnimation) : .distantPast
+            if !panel.ignoresMouseEvents { panel.ignoresMouseEvents = true }  // click-through before the exit animation
+        }
+        if animated {
+            withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) { ui.expanded = e }
+        } else {
+            ui.expanded = e
+        }
+    }
+
+    /// Expanded: leaving the visible black panel collapses it. Collapsed: entering the physical notch expands
+    /// (also the peek pill while a peek shows, but not during the exit animation). Only the visible expanded
+    /// panel takes mouse events; collapsed / peek / exit animation pass through (Chrome tabs stay usable).
     func updateMouseThrough() {
         guard panel.isVisible else {
+            if ui.expanded { setExpanded(false, animated: false) }
             if !panel.ignoresMouseEvents { panel.ignoresMouseEvents = true }
             return
         }
         let m = NSEvent.mouseLocation
-        let hit: NSRect
-        if hovering {
-            hit = expandedHitRect()
-        } else if store.peekAlert != nil {
-            hit = peekHitRect()
+        // Rects are half-open; a cursor pushed to the very top can report y == screen maxY, so allow +1pt up.
+        func hit(_ r: NSRect) -> Bool { NSRect(x: r.minX, y: r.minY, width: r.width, height: r.height + 1).contains(m) }
+        if ui.expanded {
+            if !hit(expandedHitRect()) { setExpanded(false, animated: true) }
         } else {
-            hit = notchHitRect()
+            var trigger = notchHitRect()
+            if store.peekAlert != nil && !isCollapsing { trigger = trigger.union(peekHitRect()) }
+            if hit(trigger) { setExpanded(true, animated: true) }
         }
-        let inside = hit.contains(m)
-        if panel.ignoresMouseEvents == inside {
-            panel.ignoresMouseEvents = !inside
+        let accept = ui.expanded && hit(expandedHitRect())
+        if panel.ignoresMouseEvents == accept {
+            panel.ignoresMouseEvents = !accept
         }
     }
 

@@ -30,6 +30,7 @@ final class Store: ObservableObject {
             while !Task.isCancelled {
                 guard let self else { return }
                 let trading = Config.replay || Self.isTradingWindow(Date())
+                if !trading && self.unread > 0 { self.unread = 0 }   // no badge after close
                 if trading || self.payload == nil { await self.fetch() }
                 try? await Task.sleep(nanoseconds: (trading ? 3 : 60) * 1_000_000_000)
             }
