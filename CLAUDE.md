@@ -1,5 +1,11 @@
 # rQuant 项目指令
 
+## 会话启动与交接文档规范（强制）
+
+- **新 Session 首读交接文档**：本项目下开启的**任何新 session**，在修改代码、运行命令或制定方案前，**必须首先阅读项目主交接文档 [HANDOFF.md](HANDOFF.md)**，对齐当前系统真实架构、演进状态、云地拓扑与最近迭代记录。
+- **全部迭代强制写入交接文档**：未来本项目的**全部迭代记录**（功能新增、Bug 修复、重构、配置/部署变更，以及 `notch_app/` 等衍生子模块改动），交付时**必须追加（add）到 [HANDOFF.md](HANDOFF.md) 的「六、迭代记录（Iteration Log）」章节**；若模块结构或运行状态变化，同步更新 `HANDOFF.md` 正文。
+- **交接文档脱敏红线**：`HANDOFF.md` 纳入 Git 版本控制，严禁写入任何真实 Token、密码、API Key 或私网敏感凭据。
+
 ## 项目定位
 
 rQuant 是一个**个人自用**的 A 股量化选股与盯盘平台：
@@ -166,9 +172,10 @@ chore: init pyproject.toml with uv
 
 1. ✅ 本地实际运行，核心路径能跑通（**不是只看代码**）
 2. ✅ 更新 `CHANGELOG.md` 的 `[Unreleased]` section
-3. ✅ 测试通过（有 test 的话）
-4. ✅ 打 tag：`git tag -a v0.X.0 -m "Week N: xxx"`
-5. ✅ 关键变更同步到 `README.md` 或相关 docs
+3. ✅ 将本次迭代记录追加到 [HANDOFF.md](HANDOFF.md) 的「迭代记录（Iteration Log）」章节（结构变化时同步更新正文）
+4. ✅ 测试通过（有 test 的话）
+5. ✅ 打 tag：`git tag -a v0.X.0 -m "Week N: xxx"`
+6. ✅ 关键变更同步到 `README.md` 或相关 docs
 
 ### Changelog
 
@@ -261,6 +268,8 @@ chore: init pyproject.toml with uv
 
 ## 相关文件
 
+- 项目主交接文档（新 Session 必读 & 全量迭代记录）：[HANDOFF.md](HANDOFF.md)
 - 顶层设计：[README.md](README.md)
+- 全局运维手册：[docs/ops/README.md](docs/ops/README.md)
 - 数据源矩阵：[docs/data-sources-matrix.md](docs/data-sources-matrix.md)
 - 开源参考：[docs/references.md](docs/references.md)
