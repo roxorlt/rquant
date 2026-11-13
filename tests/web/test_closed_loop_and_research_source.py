@@ -136,14 +136,9 @@ def test_standalone_write_to_read_closed_loop(
     loaded = load_alert_rules(tmp_path / "no-serving", commands_dir=cmds_dir)
     assert len(loaded) == 1 and loaded[0].rule_id == "watch-l1"
 
-    # 4. Operations audit trail covers all 4 command kinds
-    ops = client.get("/api/v1/operations").json()["data"]["items"]
-    assert {o["kind"] for o in ops} >= {
-        "add_watchlist_item",
-        "remove_watchlist_item",
-        "save_alert_rule",
-        "save_canvas",
-    }
+    # 4. Retired operations/query routes are absent
+    assert client.get("/api/v1/operations").status_code == 404
+    assert client.post("/api/v1/query", json={"sql": "SELECT 1"}).status_code == 404
 
 
 def test_research_source_serves_live_db_without_touching_primary_duckdb(
@@ -223,8 +218,6 @@ def test_research_source_serves_live_db_without_touching_primary_duckdb(
             "/api/v1/pools",
             "/api/v1/alerts",
             "/api/v1/paper",
-            "/api/v1/query/tables",
-            "/api/v1/query/schema",
         ):
             res = client.get(route)
             assert res.status_code == 200, f"{route}: {res.text}"
@@ -247,21 +240,6 @@ def test_research_source_serves_live_db_without_touching_primary_duckdb(
         # No duplicate simulated paper accounts
         paper_accounts = client.get("/api/v1/paper").json()["data"]["accounts"]
         assert [a["account_id"] for a in paper_accounts] == ["sim-demo-breakout"]
-
-        # Schema has no duplicate column entries from attached mkt/ro catalogs
-        schema = client.get("/api/v1/query/schema").json()["data"]
-        sb_cols = [col[0] for col in schema["stock_basic"]]
-        assert sb_cols == ["ts_code", "name", "industry"]
-
-        # Sandboxed SQL query works over views and blocks configuration tampering
-        q_ok = client.post(
-            "/api/v1/query", json={"sql": "SELECT ts_code FROM screen_result ORDER BY ts_code"}
-        )
-        assert q_ok.status_code == 200
-        assert q_ok.json()["data"]["rows"] == [["000001.SZ"], ["600519.SH"]]
-
-        with pytest.raises(duckdb.Error):
-            app.state.source.query_sandboxed("SET enable_external_access = true")
     finally:
         writer_lock.close()
 

@@ -14,6 +14,7 @@ from pydantic import BaseModel
 
 Runner = Callable[[list[str]], str]
 _UNIT = re.compile(r"^rquant[\w@.:-]*\.(service|timer)$")
+_RETIRED_PREFIXES = ("rquant-runtime-", "rquant-page-control")
 
 
 class TaskRow(BaseModel):
@@ -47,6 +48,8 @@ def list_tasks(runner: Runner = run) -> list[TaskRow]:
         if len(parts) < 4 or not _UNIT.match(parts[0]):
             continue
         unit, _load, active, sub = parts[:4]
+        if unit.startswith(_RETIRED_PREFIXES):
+            continue
         rows[unit] = TaskRow(unit=unit, kind=unit.rsplit(".", 1)[1], active=active, sub=sub,
                              description=parts[4] if len(parts) > 4 else "")
     for line in timers.splitlines():

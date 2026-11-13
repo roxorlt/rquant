@@ -1,5 +1,4 @@
 import { Link } from "react-router";
-import { useReadOnlyReason } from "@/api/useMeta";
 import type { FailureCopy } from "./failure";
 
 /** One in-flow failure for a panel. A later failure replaces this one. */
@@ -32,16 +31,6 @@ export function FailureNotice({
           ) : null}
         </span>
       ) : null}
-    </div>
-  );
-}
-
-export function ReadOnlyBanner() {
-  const readOnly = useReadOnlyReason();
-  if (!readOnly) return null;
-  return (
-    <div className="notice" id="readonly-notice" role="note">
-      当前是只读账号，可以查看，不能修改
     </div>
   );
 }

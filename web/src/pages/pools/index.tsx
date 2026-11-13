@@ -1,20 +1,10 @@
 import { Link } from "react-router";
 import { inTradingHours, useAuctionPoolLive, usePools, useRemoveWatch } from "@/api/endpoints";
-import { useReadOnlyReason } from "@/api/useMeta";
 import { useUrlState } from "@/app/useUrlState";
 import { poolDisplayName, poolRefLabel, presetLabel } from "@/copy/publicText";
 import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
-import {
-  Button,
-  EmptyState,
-  FlowSteps,
-  PageHeader,
-  Panel,
-  ReadOnlyBanner,
-  Segmented,
-  useToast,
-} from "@/ui";
+import { Button, EmptyState, PageHeader, Panel, Segmented, useToast } from "@/ui";
 import { ChangeText } from "@/ui/ChangeText";
 import { Sparkline } from "@/ui/Sparkline";
 import { StockLink } from "@/ui/StockLink";
@@ -25,7 +15,6 @@ const WATCH_POOL = "自选股";
 type Member = NonNullable<ReturnType<typeof usePools>["data"]>["pools"][number]["members"][number];
 
 export default function PoolsPage() {
-  const readOnly = useReadOnlyReason();
   const query = usePools();
   const removeWatch = useRemoveWatch();
   const toast = useToast();
@@ -49,8 +38,7 @@ export default function PoolsPage() {
       : (query.data?.trade_date ?? undefined);
   return (
     <>
-      <PageHeader eyebrow="研究" title="池子" note={headerNote} actions={<FlowSteps />} />
-      <ReadOnlyBanner />
+      <PageHeader eyebrow="研究" title="池子" note={headerNote} />
       <QueryView query={query}>
         {(data) => {
           if (!data.pools.length)
@@ -109,7 +97,7 @@ export default function PoolsPage() {
                   (pool.pool_refs ?? []).length ? (
                     <Link
                       className="btn sm"
-                      to={`/experiments?preset=${encodeURIComponent(pool.pool_refs[0] ?? "")}`}
+                      to={`/backtest?tab=portfolio&preset=${encodeURIComponent(pool.pool_refs[0] ?? "")}`}
                     >
                       看此池的回测 →
                     </Link>
@@ -251,10 +239,8 @@ export default function PoolsPage() {
                                     <Button
                                       size="sm"
                                       variant="ghost"
-                                      ariaDisabled={!!readOnly}
                                       disabled={removeWatch.isPending}
                                       onClick={() => {
-                                        if (readOnly) return;
                                         removeWatch.mutate(row.code, {
                                           onSuccess: () =>
                                             toast({ text: "已移出自选", duration: 3000 }),

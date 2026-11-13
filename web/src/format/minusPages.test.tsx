@@ -240,6 +240,8 @@ function bodyFor(path: string): unknown {
   if (path.includes("/conditions")) return { runs: [] };
   if (path.includes("/screener-schemes")) return { schemes: [] };
   if (path.includes("/pools")) return { trade_date: "2026-10-20", pools: [] };
+  if (path.endsWith("/health")) return { services: [], freshness: [], layers: [] };
+  if (path.endsWith("/tasks")) return [];
   return {};
 }
 
@@ -259,10 +261,10 @@ afterEach(() => {
 
 const pages = [
   ["/macro", "聪明钱上穿MA20"],
-  ["/data", "日线行情"],
+  ["/health", "日线行情"],
   ["/screener", "−2.84%"],
   ["/factor", "−0.028"],
-  ["/reportmining", "−0.028"],
+  ["/factor?tab=reports", "−0.028"],
   ["/panorama", "−2.84%"],
   ["/stock/600519.SH", "自选"],
 ] as const;
@@ -274,9 +276,9 @@ it.each(pages)("%s shows numbers with a minus sign and no raw hyphen", async (pa
   expect(hyphenBeforeDigit(document.body.textContent ?? "")).toEqual([]);
 });
 
-it("labels daily_basic as 每日指标 on the data page", async () => {
+it("labels daily_basic as 每日指标 on the system status page", async () => {
   stub();
-  renderApp("/data");
+  renderApp("/health");
   expect((await screen.findAllByText("每日指标")).length).toBeGreaterThan(0);
   expect(document.body.textContent ?? "").not.toContain("daily_basic");
   expect(document.body.textContent ?? "").not.toContain("daily_bar");

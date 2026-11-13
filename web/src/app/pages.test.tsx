@@ -12,20 +12,11 @@ const BODIES: Record<string, unknown> = {
     signals: [],
   },
   health: {
-    services: [
-      {
-        service_id: "rquant-monitor",
-        plane: "live",
-        status: "running",
-        stale: false,
-        heartbeat_at: null,
-        backlog_count: 0,
-        consecutive_failures: 0,
-        last_error: null,
-      },
-    ],
+    services: [],
     freshness: [],
+    layers: [{ key: "monitor", title: "盘中盯盘", state: "ok", detail: ["正常"] }],
   },
+  tasks: [],
   panorama: {
     as_of: null,
     pulse: { up: 1, down: 2, flat: 0, limit_up: 0, limit_down: 0 },
@@ -48,14 +39,15 @@ const BODIES: Record<string, unknown> = {
   pools: { trade_date: null, pools: [] },
   backtests: { runs: [] },
   "portfolio-backtests": { runs: [] },
+  "event-studies": { studies: [] },
   alerts: { items: [] },
   paper: { accounts: [] },
   factors: { factors: [] },
+  "factors/correlation": { names: [] },
   "report-factors": { results: null },
   strategies: { strategies: [] },
   "alert-rules": { rules: [] },
   conditions: { runs: [] },
-  operations: { items: [] },
   "data-center": {
     datasets: [
       {
@@ -134,17 +126,22 @@ describe("MVP pages render from the API", () => {
   it.each([
     ["/overview", "候选股"],
     ["/health", "盘中盯盘"],
+    ["/health", "股票日线"],
     ["/panorama", "今天还没有快照"],
     ["/screener", "贵州茅台"],
     ["/pools", "还没有池子"],
     ["/backtest", "还没有已发布的回测"],
+    ["/backtest?tab=portfolio", "还没有组合回测结果"],
+    ["/backtest?tab=strategies", "还没有保存的策略"],
+    ["/experiments", "还没有组合回测结果"],
+    ["/strategies", "还没有保存的策略"],
     ["/monitor", "没有告警"],
     ["/paper", "没有模拟账户"],
     ["/data", "股票日线"],
     ["/factor", "还没有因子检验结果"],
+    ["/factor?tab=reports", "还没有研报因子结果"],
     ["/reportmining", "还没有研报因子结果"],
     ["/reportfactors", "还没有研报因子结果"],
-    ["/ops", "还没有网页操作"],
   ])("%s", async (path, text) => {
     stubApi();
     renderApp(path);

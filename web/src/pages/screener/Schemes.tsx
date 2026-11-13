@@ -4,7 +4,6 @@ import {
   useSaveScreenerScheme,
   useScreenerSchemes,
 } from "@/api/endpoints";
-import { useReadOnlyReason } from "@/api/useMeta";
 import { screenerSchemesEnabled } from "@/features";
 import { readPreference, writePreference } from "@/theme/storage";
 import { Button, FailureNotice, useToast } from "@/ui";
@@ -51,7 +50,6 @@ function SchemeEditor({
   const remote = useScreenerSchemes();
   const saveScheme = useSaveScreenerScheme();
   const removeScheme = useDeleteScreenerScheme();
-  const readOnly = useReadOnlyReason();
   const toast = useToast();
   const [local, setLocal] = useState<Scheme[]>(loadSchemes);
   const [name, setName] = useState("");
@@ -66,7 +64,7 @@ function SchemeEditor({
     : local;
   const save = () => {
     const n = name.trim();
-    if (!n || readOnly) return;
+    if (!n) return;
     const scheme = { name: n, filters, ranks };
     const body = {
       name: n,
@@ -87,7 +85,6 @@ function SchemeEditor({
     });
   };
   const remove = (n: string) => {
-    if (readOnly) return;
     const scheme = list.find((s) => s.name === n);
     const snapshot: Scheme | null = scheme
       ? {
@@ -137,12 +134,7 @@ function SchemeEditor({
           <button type="button" onClick={() => onLoad(s)} title="载入此方案">
             {s.name}
           </button>
-          <button
-            type="button"
-            aria-label={`删除方案 ${s.name}`}
-            aria-disabled={readOnly ? true : undefined}
-            onClick={() => remove(s.name)}
-          >
+          <button type="button" aria-label={`删除方案 ${s.name}`} onClick={() => remove(s.name)}>
             ×
           </button>
         </span>
@@ -156,13 +148,7 @@ function SchemeEditor({
           if (e.key === "Enter") save();
         }}
       />
-      <Button
-        size="sm"
-        onClick={save}
-        disabled={!readOnly && !name.trim()}
-        ariaDisabled={!!readOnly}
-        aria-describedby={readOnly ? "readonly-notice" : undefined}
-      >
+      <Button size="sm" onClick={save} disabled={!name.trim()}>
         保存方案
       </Button>
       {fail ? <FailureNotice copy={fail} onRetry={save} /> : null}

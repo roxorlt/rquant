@@ -1,7 +1,6 @@
 import { type FormEvent, useState } from "react";
 import type { Schemas } from "@/api/client";
 import { useAlertRules, useSaveAlertRule } from "@/api/endpoints";
-import { useReadOnlyReason } from "@/api/useMeta";
 import { AlertPoolTip } from "@/copy/AlertPoolTip";
 import {
   ALERT_POOL_ORDER,
@@ -33,7 +32,6 @@ export function AlertRules() {
   const query = useAlertRules();
   const save = useSaveAlertRule();
   const toast = useToast();
-  const readOnly = useReadOnlyReason();
   const [ruleFail, setRuleFail] = useState<{ copy: FailureCopy; rule: Rule } | null>(null);
   const [open, setOpen] = useState(false);
   const touch = useTouchOnly();
@@ -46,7 +44,6 @@ export function AlertRules() {
     cooldown_minutes: 30,
   });
   const submit = (rule: Rule) => {
-    if (readOnly) return;
     const ruleId = rule.rule_id || `r${Date.now().toString(36)}`.slice(0, 40);
     save.mutate(
       { ...rule, rule_id: ruleId },
@@ -76,13 +73,7 @@ export function AlertRules() {
             title={`告警规则 · ${data.rules.length}`}
             sub="没有规则时全部推送；有规则后只推送命中启用规则的告警"
             actions={
-              <Button
-                size="sm"
-                variant="primary"
-                ariaDisabled={!!readOnly}
-                aria-describedby={readOnly ? "readonly-notice" : undefined}
-                onClick={() => setOpen(true)}
-              >
+              <Button size="sm" variant="primary" onClick={() => setOpen(true)}>
                 新建规则
               </Button>
             }
@@ -124,8 +115,6 @@ export function AlertRules() {
                       size="sm"
                       variant="ghost"
                       onClick={() => submit({ ...row, enabled: !row.enabled })}
-                      aria-describedby={readOnly ? "readonly-notice" : undefined}
-                      ariaDisabled={!!readOnly}
                     >
                       {row.enabled ? <Pill kind="ok">启用</Pill> : <Pill kind="warn">停用</Pill>}
                     </Button>
@@ -153,14 +142,7 @@ export function AlertRules() {
             <Button type="button" onClick={() => setOpen(false)}>
               取消
             </Button>
-            <Button
-              type="submit"
-              form="rule-form"
-              variant="primary"
-              disabled={!draft.title.trim()}
-              ariaDisabled={!!readOnly}
-              aria-describedby={readOnly ? "readonly-notice" : undefined}
-            >
+            <Button type="submit" form="rule-form" variant="primary" disabled={!draft.title.trim()}>
               保存规则
             </Button>
           </div>

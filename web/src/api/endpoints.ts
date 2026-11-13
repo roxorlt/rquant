@@ -242,7 +242,6 @@ export function useSavePool() {
     },
     onSuccess: () => {
       void client.invalidateQueries({ queryKey: ["pools"] });
-      void client.invalidateQueries({ queryKey: ["operations"] });
       void client.invalidateQueries({ queryKey: ["stock"] });
     },
   });
@@ -267,7 +266,6 @@ export function useAddWatch() {
     onSuccess: () => {
       void client.invalidateQueries({ queryKey: ["watchlist"] });
       void client.invalidateQueries({ queryKey: ["pools"] });
-      void client.invalidateQueries({ queryKey: ["operations"] });
       void client.invalidateQueries({ queryKey: ["stock"] });
     },
   });
@@ -285,7 +283,6 @@ export function useRemoveWatch() {
     onSuccess: () => {
       void client.invalidateQueries({ queryKey: ["watchlist"] });
       void client.invalidateQueries({ queryKey: ["pools"] });
-      void client.invalidateQueries({ queryKey: ["operations"] });
       void client.invalidateQueries({ queryKey: ["stock"] });
     },
   });
@@ -372,7 +369,6 @@ export function useSaveAlertRule() {
     },
     onSuccess: () => {
       void client.invalidateQueries({ queryKey: ["alert-rules"] });
-      void client.invalidateQueries({ queryKey: ["operations"] });
     },
   });
 }
@@ -412,25 +408,6 @@ export function usePortfolioBand(
   );
 }
 
-export function useExplainBacktest() {
-  return useMutation({
-    mutationFn: async (runId: string) => {
-      const { data, response } = await apiClient().POST(
-        "/api/v1/portfolio-backtests/{run_id}/explain",
-        { params: { path: { run_id: runId } } },
-      );
-      return unwrap(data, response);
-    },
-  });
-}
-
-export function useOperations(): ServingQueryResult<Schemas["OperationsData"]> {
-  return useServingQuery(["operations"], async () => {
-    const { data, response } = await apiClient().GET("/api/v1/operations");
-    return unwrap(data, response);
-  });
-}
-
 export function useTasks(): ServingQueryResult<Schemas["TaskRow"][]> {
   return useServingQuery(["tasks"], async () => {
     const { data, response } = await apiClient().GET("/api/v1/tasks");
@@ -451,42 +428,6 @@ export function useTaskLog(unit: string | null): ServingQueryResult<Schemas["Tas
   );
 }
 
-export function useQueryTables(): ServingQueryResult<string[]> {
-  return useServingQuery(["query-tables"], async () => {
-    const { data, response } = await apiClient().GET("/api/v1/query/tables");
-    return unwrap(data, response);
-  });
-}
-
-export function useRunQuery() {
-  return useMutation({
-    mutationFn: async (sql: string) => {
-      const { data, error, response } = await apiClient().POST("/api/v1/query", {
-        body: { sql },
-      });
-      if (data === undefined) {
-        const detail = (error as { detail?: unknown } | undefined)?.detail;
-        throw new ApiError(
-          response.status,
-          typeof detail === "string" ? detail : `HTTP ${response.status}`,
-        );
-      }
-      const result = data.data;
-      if (!result || !Array.isArray(result.rows) || !Array.isArray(result.columns)) {
-        throw new ApiError(503, "查询结果不完整");
-      }
-      return result;
-    },
-  });
-}
-
-export function useFundamentals(): ServingQueryResult<Schemas["FundamentalsDoc"] | null> {
-  return useServingQuery(["fundamentals"], async () => {
-    const { data, response } = await apiClient().GET("/api/v1/fundamentals");
-    return unwrap(data, response);
-  });
-}
-
 export function useStock(code: string | undefined): ServingQueryResult<Schemas["StockProfile"]> {
   return useServingQuery(
     ["stock", code],
@@ -500,32 +441,9 @@ export function useStock(code: string | undefined): ServingQueryResult<Schemas["
   );
 }
 
-export function useBrinson(
-  runId: string | null,
-): ServingQueryResult<Schemas["BrinsonData"] | null> {
-  return useServingQuery(
-    ["portfolio-backtests", runId, "brinson"],
-    async () => {
-      const { data, response } = await apiClient().GET(
-        "/api/v1/portfolio-backtests/{run_id}/brinson",
-        { params: { path: { run_id: runId ?? "" } } },
-      );
-      return unwrap(data, response);
-    },
-    { enabled: runId !== null },
-  );
-}
-
 export function useFactorCorrelation(): ServingQueryResult<Schemas["FactorCorrData"]> {
   return useServingQuery(["factors", "correlation"], async () => {
     const { data, response } = await apiClient().GET("/api/v1/factors/correlation");
-    return unwrap(data, response);
-  });
-}
-
-export function useQuerySchema(): ServingQueryResult<Record<string, string[][]>> {
-  return useServingQuery(["query", "schema"], async () => {
-    const { data, response } = await apiClient().GET("/api/v1/query/schema");
     return unwrap(data, response);
   });
 }

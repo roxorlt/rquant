@@ -9,7 +9,7 @@ import os
 from collections.abc import Callable
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Annotated, Any, Literal, TypeVar
+from typing import Annotated, Any, TypeVar
 
 import duckdb
 import pandas as pd
@@ -26,17 +26,14 @@ from rquant.factor.condition import list_conditions
 from rquant.factor.store import list_factors, read_factor, read_latest, read_tracking
 from rquant.factor.tdx import TdxFormulaError
 from rquant.factor.tdx import translate as translate_tdx
-from rquant.fundamentals import FundamentalsDoc
 from rquant.fundamentals import read as read_fundamentals
 from rquant.web import page_control
-from rquant.web import query as sql_query
 from rquant.web import tasks as task_view
-from rquant.web.ai_explain import Explanation, build_facts, deepseek_complete, explain
 from rquant.web.backtest_perf import backtest_perf, perf_from_returns
-from rquant.web.brinson import BrinsonData, brinson
 from rquant.web.chips import TPO_DEFAULT, TPO_PERIODS, ChipsData, load_chips
 from rquant.web.health_layers import build_layers
 from rquant.web.intraday import IntradayData, load_intraday
+from rquant.web.llm import deepseek_complete
 from rquant.web.macro import MacroData, load_macro, load_summary
 from rquant.web.market_live import MarketLiveData, load_market_live
 from rquant.web.models import (
@@ -67,8 +64,6 @@ from rquant.web.models import (
     Kpi,
     MarketPulse,
     MetaData,
-    OperationRow,
-    OperationsData,
     OverviewData,
     PanoramaData,
     PaperAccount,
@@ -107,7 +102,6 @@ from rquant.web.models import (
     WatchlistData,
     WatchlistItemRow,
 )
-from rquant.web.overfit_stats import overfit_stats, sharpe_per_period
 from rquant.web.pool_live import PoolLiveData, load_pool_live
 from rquant.web.sector_flow import (
     FlowLeader,
@@ -116,7 +110,7 @@ from rquant.web.sector_flow import (
     load_sector_flow,
     start_warmer,
 )
-from rquant.web.source import Source, SourceUnavailableError, table_missing
+from rquant.web.source import Source, table_missing
 from rquant.web.stocks import CODE_RE, StockProfile, enrich, load_profile, market
 
 router = APIRouter(prefix="/api/v1")
@@ -162,7 +156,6 @@ def meta(request: Request, source: SourceDep) -> Envelope[MetaData]:
             generation=gen,
             notice=os.environ.get("RQUANT_WEB_NOTICE") or None,
             user=_user(request),
-            role=_role(request),
         ),
         serving=gen,
     )
@@ -634,36 +627,6 @@ def portfolio_band(run_id: str, request: Request, source: SourceDep,
                                       points=bootstrap_band(_nav_returns(run), days)))
 
 
-@router.get("/portfolio-backtests/{run_id}/brinson", response_model=Envelope[BrinsonData | None],
-            summary="行业 Brinson 归因")
-def portfolio_brinson(run_id: str, request: Request, source: SourceDep
-                      ) -> Envelope[BrinsonData | None]:
-    run = read_run(run_id, _research_root(request))
-    if run is None:
-        raise HTTPException(404, f"没有回测 {run_id}")
-    with market(Path(_research_root(request) or research_root())) as con:
-        try:
-            data = brinson(con, run.result.days, run.industries) if con is not None else None
-        except duckdb.Error:
-            data = None
-    return _envelope(source, data)
-
-
-@router.post("/portfolio-backtests/{run_id}/explain", response_model=Explanation,
-             summary="AI 解读回测（数字逐个核对）")
-def portfolio_explain(run_id: str, request: Request, source: SourceDep) -> Explanation:
-    detail = portfolio_backtest(run_id, request, source).data
-    llm = getattr(request.app.state, "llm", None) or deepseek_complete()
-    if llm is None:
-        raise HTTPException(503, "AI 未配置（DEEPSEEK_API_KEY）")
-    complete, model = llm
-    facts = build_facts(detail.run, detail.perf, detail.overfit)
-    try:
-        return explain(facts, complete, model)
-    except Exception as exc:  # noqa: BLE001 - upstream model/network failure
-        raise HTTPException(502, f"AI 调用失败：{type(exc).__name__}") from exc
-
-
 @router.get("/portfolio-backtests/{run_id}", response_model=Envelope[PortfolioRunDetailData],
             summary="组合回测详情")
 def portfolio_backtest(run_id: str, request: Request, source: SourceDep,
@@ -672,8 +635,6 @@ def portfolio_backtest(run_id: str, request: Request, source: SourceDep,
     if run is None:
         raise HTTPException(404, "portfolio backtest not found")
     returns = _nav_returns(run)
-    family = [sp for r in list_runs(_research_root(request)) if r.preset == run.preset
-              if (sp := sharpe_per_period(_nav_returns(r))) is not None]
     bench_rows = _benchmark_rows(source, benchmark)
     perf = perf_from_returns(returns, (benchmark, bench_rows) if bench_rows else None,
                              method="组合回测逐日净值")
@@ -682,7 +643,7 @@ def portfolio_backtest(run_id: str, request: Request, source: SourceDep,
     holdings = run.result.days[-1].positions if run.result.days else {}
     return _envelope(source, PortfolioRunDetailData(
         run=_portfolio_summary(run), perf=perf, orders=orders, holdings=holdings,
-        overfit=overfit_stats(returns, family), exposure=industry_exposure(run)))
+        exposure=industry_exposure(run)))
 
 
 def _benchmark_rows(source: Source, code: str) -> list[dict[str, Any]]:
@@ -956,16 +917,6 @@ def _user(request: Request) -> str | None:
     return request.headers.get("X-Remote-User") or None
 
 
-def _role(request: Request) -> str:
-    """``RQUANT_WEB_ADMINS`` (comma list) unset = everyone is admin (single-user default).
-
-    Set, only those basic-auth users may write; everyone else is a viewer. nginx must
-    pass ``proxy_set_header X-Remote-User $remote_user;`` for this to mean anything.
-    """
-    admins = {a.strip() for a in os.environ.get("RQUANT_WEB_ADMINS", "").split(",") if a.strip()}
-    return "admin" if not admins or _user(request) in admins else "viewer"
-
-
 def _preview_fail(request: Request) -> bool:
     """Fixture preview only. Production ignores ``?fail=1`` and the preview header."""
     if not getattr(request.app.state, "preview_writes", False):
@@ -976,8 +927,6 @@ def _preview_fail(request: Request) -> bool:
 
 
 def _send(request: Request, kind: str, fields: dict[str, Any]) -> CommandReceipt:
-    if _role(request) != "admin":
-        raise HTTPException(403, "只读账号不能执行写操作")
     if _preview_fail(request):
         raise HTTPException(503, "preview failure")
     transport: Callable | None = getattr(request.app.state, "page_control_transport", None)
@@ -1018,30 +967,6 @@ def _send(request: Request, kind: str, fields: dict[str, Any]) -> CommandReceipt
     )
 
 
-def _remember(
-    request: Request,
-    receipt: CommandReceipt,
-    *,
-    kind: Literal[
-        "add_watchlist_item",
-        "remove_watchlist_item",
-        "save_alert_rule",
-        "save_canvas",
-    ],
-    summary: str,
-    actor: str | None,
-) -> CommandReceipt:
-    if receipt.status in {"failed", "rejected"} or not receipt.command_id:
-        return receipt
-    log = getattr(request.app.state, "operation_log", None)
-    if log is None:
-        log = []
-        request.app.state.operation_log = log
-    log.append(OperationRow(at=datetime.now(UTC), kind=kind, summary=summary, actor=actor,
-                            command_id=receipt.command_id))
-    return receipt
-
-
 @router.post("/pools", response_model=CommandReceipt, summary="保存池子")
 def save_pool(body: SavePoolRequest, request: Request) -> CommandReceipt:
     fields: dict[str, Any] = {
@@ -1053,9 +978,7 @@ def save_pool(body: SavePoolRequest, request: Request) -> CommandReceipt:
         fields["codes"] = body.codes
     if body.mode != "new":
         fields["mode"] = body.mode
-    receipt = _send(request, "save_canvas", fields)
-    return _remember(request, receipt, kind="save_canvas",
-                     summary=f"保存池子 {body.name}", actor=_user(request))
+    return _send(request, "save_canvas", fields)
 
 
 def _optional_rows(source: Source, sql: str) -> list[dict[str, Any]]:
@@ -1065,36 +988,6 @@ def _optional_rows(source: Source, sql: str) -> list[dict[str, Any]]:
         if not table_missing(exc):
             raise
         return []
-
-
-@router.get("/operations", response_model=Envelope[OperationsData], summary="操作记录")
-def operations(request: Request, source: SourceDep) -> Envelope[OperationsData]:
-    """Web writes read back from both command logs and Serving projections."""
-    items = [OperationRow(at=r["added_at"], kind="add_watchlist_item",
-                           summary=f"加自选 {r['ts_code']} {r['note']}".strip(), actor=None,
-                           command_id=r["command_id"])
-              for r in _optional_rows(source, "SELECT ts_code, note, added_at, command_id "
-                                      "FROM manual_watchlist ORDER BY added_at DESC LIMIT 200")]
-    items += [OperationRow(at=r["saved_at"], kind="save_alert_rule",
-                           summary=f"{'启用' if r['enabled'] else '停用'}告警规则 {r['title']}",
-                           actor=None, command_id=r["command_id"])
-              for r in _optional_rows(source, "SELECT title, enabled, saved_at, command_id "
-                                      "FROM alert_rule ORDER BY saved_at DESC LIMIT 200")]
-    seen = {i.command_id for i in items}
-    cmd_dir = _commands_dir(request)
-    if cmd_dir is not None:
-        from rquant.web.commands_service import read_operations
-
-        for op in read_operations(cmd_dir):
-            if op.command_id not in seen:
-                items.append(OperationRow(**op.model_dump()))
-                seen.add(op.command_id)
-    for row in getattr(request.app.state, "operation_log", []) or []:
-        if row.command_id not in seen:
-            items.append(row)
-            seen.add(row.command_id)
-    items.sort(key=lambda i: i.at.timestamp() if i.at else 0, reverse=True)
-    return _envelope(source, OperationsData(items=items[:300]))
 
 
 @router.get("/alert-rules", response_model=Envelope[AlertRulesData], summary="告警规则")
@@ -1134,10 +1027,7 @@ def alert_rules(source: SourceDep,
 
 @router.post("/alert-rules", response_model=CommandReceipt, summary="保存告警规则")
 def save_alert_rule(body: AlertRuleBody, request: Request) -> CommandReceipt:
-    receipt = _send(request, "save_alert_rule", {"rule": body.model_dump()})
-    state = "启用" if body.enabled else "停用"
-    return _remember(request, receipt, kind="save_alert_rule",
-                     summary=f"{state}告警规则 {body.title}", actor=_user(request))
+    return _send(request, "save_alert_rule", {"rule": body.model_dump()})
 
 
 def _watchlist_rows(
@@ -1185,10 +1075,7 @@ def list_watch(request: Request, source: SourceDep) -> Envelope[WatchlistData]:
 
 @router.post("/watchlist", response_model=CommandReceipt, summary="加入自选")
 def add_watch(body: AddWatchRequest, request: Request) -> CommandReceipt:
-    receipt = _send(request, "add_watchlist_item", {"item": {"ts_code": body.code,
-                                                             "note": body.note}})
-    return _remember(request, receipt, kind="add_watchlist_item",
-                     summary=f"加自选 {body.code} {body.note}".strip(), actor=_user(request))
+    return _send(request, "add_watchlist_item", {"item": {"ts_code": body.code, "note": body.note}})
 
 
 @router.delete("/watchlist", response_model=CommandReceipt, summary="移出自选")
@@ -1196,9 +1083,7 @@ def remove_watch(
     request: Request,
     code: str = Query(pattern=r"^\d{6}\.(SH|SZ|BJ)$"),
 ) -> CommandReceipt:
-    receipt = _send(request, "remove_watchlist_item", {"ts_code": code})
-    return _remember(request, receipt, kind="remove_watchlist_item",
-                     summary=f"移出自选 {code}", actor=_user(request))
+    return _send(request, "remove_watchlist_item", {"ts_code": code})
 
 
 def _schemes(request: Request):
@@ -1231,8 +1116,6 @@ def list_screener_schemes(request: Request, source: SourceDep) -> Envelope[Scree
 
 @router.put("/screener-schemes", response_model=CommandReceipt, summary="保存选股方案")
 def save_screener_scheme(body: ScreenerSchemeBody, request: Request) -> CommandReceipt:
-    if _role(request) != "admin":
-        raise HTTPException(403, "只读账号不能执行写操作")
     if _preview_fail(request):
         raise HTTPException(503, "preview failure")
     _schemes(request).save(body.name, body.filters, body.ranks)
@@ -1242,8 +1125,6 @@ def save_screener_scheme(body: ScreenerSchemeBody, request: Request) -> CommandR
 @router.delete("/screener-schemes", response_model=CommandReceipt, summary="删除选股方案")
 def delete_screener_scheme(request: Request, name: str = Query(min_length=1, max_length=40),
                            ) -> CommandReceipt:
-    if _role(request) != "admin":
-        raise HTTPException(403, "只读账号不能执行写操作")
     if _preview_fail(request):
         raise HTTPException(503, "preview failure")
     _schemes(request).delete(name)
@@ -1261,8 +1142,6 @@ def list_ui_preferences(request: Request, source: SourceDep) -> Envelope[UiPrefe
 def save_ui_preference(body: UiPreferenceBody, request: Request) -> CommandReceipt:
     from rquant.web.screener_schemes import preference_key_ok
 
-    if _role(request) != "admin":
-        raise HTTPException(403, "只读账号不能执行写操作")
     if _preview_fail(request):
         raise HTTPException(503, "preview failure")
     if not preference_key_ok(body.key):
@@ -1280,7 +1159,9 @@ def tasks(request: Request, source: SourceDep) -> Envelope[list[task_view.TaskRo
     runner = getattr(request.app.state, "task_runner", None) or task_view.run
     try:
         rows = task_view.list_tasks(runner)
-    except Exception as exc:  # noqa: BLE001 - no systemd (dev box) is not an API failure
+    except FileNotFoundError:
+        rows = []
+    except Exception as exc:  # noqa: BLE001 - systemd query error
         raise HTTPException(503, f"读取 systemd 失败：{type(exc).__name__}") from exc
     return _envelope(source, rows)
 
@@ -1290,52 +1171,6 @@ def task_log(request: Request, source: SourceDep, unit: str,
              lines: int = 200) -> Envelope[task_view.TaskLog]:
     runner = getattr(request.app.state, "task_runner", None) or task_view.run
     return _envelope(source, task_view.tail(unit, lines, runner))
-
-
-@router.post("/query", response_model=Envelope[sql_query.QueryResult], summary="只读查询")
-def run_query(source: SourceDep,
-              body: sql_query.QueryRequest) -> Envelope[sql_query.QueryResult]:
-    try:
-        sql = sql_query.guard(body.sql)
-        runner = getattr(source, "query_sandboxed", source.query)
-        rows = runner(sql)
-    except sql_query.QueryError as exc:
-        raise HTTPException(400, str(exc)) from exc
-    except SourceUnavailableError:
-        raise
-    except Exception as exc:  # noqa: BLE001 - SQL errors go back to the user verbatim
-        raise HTTPException(400, f"{type(exc).__name__}: {str(exc)[:300]}") from exc
-    return _envelope(source, sql_query.shape(rows))
-
-
-@router.get("/query/schema", response_model=Envelope[dict[str, list[list[str]]]],
-            summary="可查询表的字段")
-def query_schema(source: SourceDep) -> Envelope[dict[str, list[list[str]]]]:
-    allowed = sql_query.allowed_tables()
-    out: dict[str, list[list[str]]] = {}
-    for r in source.query(
-        "SELECT table_name, column_name, data_type FROM information_schema.columns "
-        "WHERE table_catalog = current_database() ORDER BY table_name, ordinal_position"
-    ):
-        if r["table_name"] in allowed:
-            out.setdefault(r["table_name"], []).append([r["column_name"], r["data_type"]])
-    return _envelope(source, out)
-
-
-@router.get("/query/tables", response_model=Envelope[list[str]], summary="可查询的表")
-def query_tables(source: SourceDep) -> Envelope[list[str]]:
-    rows = source.query(
-        "SELECT DISTINCT table_name FROM information_schema.tables "
-        "WHERE table_catalog = current_database() ORDER BY 1"
-    )
-    allowed = sql_query.allowed_tables()
-    return _envelope(source, [r["table_name"] for r in rows if r["table_name"] in allowed])
-
-
-@router.get("/fundamentals", response_model=Envelope[FundamentalsDoc | None], summary="财务指标")
-def fundamentals(request: Request, source: SourceDep) -> Envelope[FundamentalsDoc | None]:
-    root = _research_root(request) or research_root()
-    return _envelope(source, read_fundamentals(Path(root)))
 
 
 @router.get("/stocks/{code}", response_model=Envelope[StockProfile], summary="个股档案")

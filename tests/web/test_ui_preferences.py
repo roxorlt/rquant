@@ -1,4 +1,4 @@
-"""Page settings in the web store: per user, allow-listed keys, admin-only writes."""
+"""Page settings in the web store: per user and allow-listed keys."""
 
 from __future__ import annotations
 
@@ -11,8 +11,7 @@ from rquant.web.screener_schemes import SqliteSchemeStore, preference_key_ok
 from rquant.web.source import FixtureSource
 
 
-def _client(tmp_path, monkeypatch, admins: str = "") -> tuple[TestClient, object]:
-    monkeypatch.setenv("RQUANT_WEB_ADMINS", admins)
+def _client(tmp_path) -> tuple[TestClient, object]:
     app = create_app(FixtureSource(), dist=None)
     store = SqliteSchemeStore(tmp_path / "web_store.sqlite3")
     app.state.screener_schemes = store
@@ -26,8 +25,8 @@ def test_schema_has_only_the_two_web_tables(tmp_path) -> None:
     assert names == {"screener_scheme", "ui_preference"}
 
 
-def test_round_trip_per_user(tmp_path, monkeypatch) -> None:
-    client, _ = _client(tmp_path, monkeypatch)
+def test_round_trip_per_user(tmp_path) -> None:
+    client, _ = _client(tmp_path)
     me = {"X-Remote-User": "roxor"}
     assert client.get("/api/v1/ui-preferences", headers=me).json()["data"]["prefs"] == {}
     put = client.put("/api/v1/ui-preferences", headers=me,
@@ -44,8 +43,8 @@ def test_round_trip_per_user(tmp_path, monkeypatch) -> None:
     assert prefs == {"pref.monitor.show": '"open"'}
 
 
-def test_keys_are_allow_listed(tmp_path, monkeypatch) -> None:
-    client, _ = _client(tmp_path, monkeypatch)
+def test_keys_are_allow_listed(tmp_path) -> None:
+    client, _ = _client(tmp_path)
     for key in ("theme", "rail", "screener.schemes", "cols.", "x.y"):
         assert not preference_key_ok(key)
         r = client.put("/api/v1/ui-preferences", json={"key": key, "value": "1"})
@@ -54,13 +53,3 @@ def test_keys_are_allow_listed(tmp_path, monkeypatch) -> None:
         assert preference_key_ok(key)
     too_big = {"key": "query.history", "value": "x" * 16_001}
     assert client.put("/api/v1/ui-preferences", json=too_big).status_code == 422
-
-
-def test_viewer_cannot_write(tmp_path, monkeypatch) -> None:
-    client, store = _client(tmp_path, monkeypatch, admins="roxor")
-    r = client.put("/api/v1/ui-preferences", headers={"X-Remote-User": "guest"},
-                   json={"key": "cols.选股结果", "value": "pe"})
-    assert r.status_code == 403
-    assert store.preferences("guest") == {}
-    guest = client.get("/api/v1/ui-preferences", headers={"X-Remote-User": "guest"})
-    assert guest.status_code == 200

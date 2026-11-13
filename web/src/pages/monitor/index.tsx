@@ -7,7 +7,7 @@ import { formatListClock, formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
 import { SortMenu } from "@/table/SortMenu";
 import { readPreference, usePreference, writePreference } from "@/theme/storage";
-import { PageHeader, Panel, Pill, ReadOnlyBanner } from "@/ui";
+import { PageHeader, Panel, Pill } from "@/ui";
 import { StockLink } from "@/ui/StockLink";
 import { PHONE_QUERY, useMedia } from "../panorama/useMedia";
 import { QueryView } from "../shared";
@@ -37,7 +37,6 @@ export default function MonitorPage() {
   return (
     <>
       <PageHeader eyebrow="跟踪与告警" title="盯盘与告警" />
-      <ReadOnlyBanner />
       <QueryView query={query}>
         {(data) => {
           const rows = data.items;

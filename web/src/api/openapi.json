@@ -1143,95 +1143,6 @@
         "title": "BreadthPick",
         "type": "object"
       },
-      "BrinsonData": {
-        "properties": {
-          "allocation": {
-            "title": "Allocation",
-            "type": "number"
-          },
-          "benchmark": {
-            "title": "Benchmark",
-            "type": "string"
-          },
-          "benchmark_return": {
-            "title": "Benchmark Return",
-            "type": "number"
-          },
-          "days": {
-            "title": "Days",
-            "type": "integer"
-          },
-          "interaction": {
-            "title": "Interaction",
-            "type": "number"
-          },
-          "portfolio_return": {
-            "title": "Portfolio Return",
-            "type": "number"
-          },
-          "rows": {
-            "items": {
-              "$ref": "#/components/schemas/BrinsonRow"
-            },
-            "title": "Rows",
-            "type": "array"
-          },
-          "selection": {
-            "title": "Selection",
-            "type": "number"
-          }
-        },
-        "required": [
-          "benchmark",
-          "days",
-          "portfolio_return",
-          "benchmark_return",
-          "allocation",
-          "selection",
-          "interaction",
-          "rows"
-        ],
-        "title": "BrinsonData",
-        "type": "object"
-      },
-      "BrinsonRow": {
-        "properties": {
-          "allocation": {
-            "title": "Allocation",
-            "type": "number"
-          },
-          "industry": {
-            "title": "Industry",
-            "type": "string"
-          },
-          "interaction": {
-            "title": "Interaction",
-            "type": "number"
-          },
-          "selection": {
-            "title": "Selection",
-            "type": "number"
-          },
-          "weight_benchmark": {
-            "title": "Weight Benchmark",
-            "type": "number"
-          },
-          "weight_portfolio": {
-            "title": "Weight Portfolio",
-            "type": "number"
-          }
-        },
-        "required": [
-          "industry",
-          "weight_portfolio",
-          "weight_benchmark",
-          "allocation",
-          "selection",
-          "interaction"
-        ],
-        "title": "BrinsonRow",
-        "type": "object"
-      },
       "CatalogDataset": {
         "additionalProperties": false,
         "properties": {
@@ -2011,22 +1922,6 @@
         "title": "Envelope[MetaData]",
         "type": "object"
       },
-      "Envelope_OperationsData_": {
-        "properties": {
-          "data": {
-            "$ref": "#/components/schemas/OperationsData"
-          },
-          "serving": {
-            "$ref": "#/components/schemas/ServingMeta"
-          }
-        },
-        "required": [
-          "data",
-          "serving"
-        ],
-        "title": "Envelope[OperationsData]",
-        "type": "object"
-      },
       "Envelope_OverviewData_": {
         "properties": {
           "data": {
@@ -2153,22 +2048,6 @@
           "serving"
         ],
         "title": "Envelope[PortfolioRunListData]",
-        "type": "object"
-      },
-      "Envelope_QueryResult_": {
-        "properties": {
-          "data": {
-            "$ref": "#/components/schemas/QueryResult"
-          },
-          "serving": {
-            "$ref": "#/components/schemas/ServingMeta"
-          }
-        },
-        "required": [
-          "data",
-          "serving"
-        ],
-        "title": "Envelope[QueryResult]",
         "type": "object"
       },
       "Envelope_ReportFactorsData_": {
@@ -2331,29 +2210,6 @@
         "title": "Envelope[UiPreferencesData]",
         "type": "object"
       },
-      "Envelope_Union_BrinsonData__NoneType__": {
-        "properties": {
-          "data": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/BrinsonData"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "serving": {
-            "$ref": "#/components/schemas/ServingMeta"
-          }
-        },
-        "required": [
-          "data",
-          "serving"
-        ],
-        "title": "Envelope[Union[BrinsonData, NoneType]]",
-        "type": "object"
-      },
       "Envelope_Union_ChipsData__NoneType__": {
         "properties": {
           "data": {
@@ -2375,29 +2231,6 @@
           "serving"
         ],
         "title": "Envelope[Union[ChipsData, NoneType]]",
-        "type": "object"
-      },
-      "Envelope_Union_FundamentalsDoc__NoneType__": {
-        "properties": {
-          "data": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/FundamentalsDoc"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "serving": {
-            "$ref": "#/components/schemas/ServingMeta"
-          }
-        },
-        "required": [
-          "data",
-          "serving"
-        ],
-        "title": "Envelope[Union[FundamentalsDoc, NoneType]]",
         "type": "object"
       },
       "Envelope_Union_IntradayData__NoneType__": {
@@ -2439,32 +2272,6 @@
         "title": "Envelope[WatchlistData]",
         "type": "object"
       },
-      "Envelope_dict_str__list_list_str____": {
-        "properties": {
-          "data": {
-            "additionalProperties": {
-              "items": {
-                "items": {
-                  "type": "string"
-                },
-                "type": "array"
-              },
-              "type": "array"
-            },
-            "title": "Data",
-            "type": "object"
-          },
-          "serving": {
-            "$ref": "#/components/schemas/ServingMeta"
-          }
-        },
-        "required": [
-          "data",
-          "serving"
-        ],
-        "title": "Envelope[dict[str, list[list[str]]]]",
-        "type": "object"
-      },
       "Envelope_list_FlowLeader__": {
         "properties": {
           "data": {
@@ -2503,26 +2310,6 @@
           "serving"
         ],
         "title": "Envelope[list[TaskRow]]",
-        "type": "object"
-      },
-      "Envelope_list_str__": {
-        "properties": {
-          "data": {
-            "items": {
-              "type": "string"
-            },
-            "title": "Data",
-            "type": "array"
-          },
-          "serving": {
-            "$ref": "#/components/schemas/ServingMeta"
-          }
-        },
-        "required": [
-          "data",
-          "serving"
-        ],
-        "title": "Envelope[list[str]]",
         "type": "object"
       },
       "EventHorizon": {
@@ -2659,40 +2446,6 @@
           "studies"
         ],
         "title": "EventStudyListData",
-        "type": "object"
-      },
-      "Explanation": {
-        "properties": {
-          "facts": {
-            "additionalProperties": {
-              "type": "string"
-            },
-            "title": "Facts",
-            "type": "object"
-          },
-          "model": {
-            "title": "Model",
-            "type": "string"
-          },
-          "text": {
-            "title": "Text",
-            "type": "string"
-          },
-          "unverified": {
-            "items": {
-              "type": "string"
-            },
-            "title": "Unverified",
-            "type": "array"
-          }
-        },
-        "required": [
-          "text",
-          "facts",
-          "unverified",
-          "model"
-        ],
-        "title": "Explanation",
         "type": "object"
       },
       "FactorCorrData": {
@@ -3464,80 +3217,6 @@
           "value"
         ],
         "title": "FreshnessItem",
-        "type": "object"
-      },
-      "FundamentalRow": {
-        "properties": {
-          "ann_date": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Ann Date"
-          },
-          "code": {
-            "title": "Code",
-            "type": "string"
-          },
-          "end_date": {
-            "title": "End Date",
-            "type": "string"
-          },
-          "values": {
-            "additionalProperties": {
-              "anyOf": [
-                {
-                  "type": "number"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "title": "Values",
-            "type": "object"
-          }
-        },
-        "required": [
-          "code",
-          "end_date",
-          "values"
-        ],
-        "title": "FundamentalRow",
-        "type": "object"
-      },
-      "FundamentalsDoc": {
-        "properties": {
-          "fetched_at": {
-            "format": "date-time",
-            "title": "Fetched At",
-            "type": "string"
-          },
-          "fields": {
-            "additionalProperties": {
-              "type": "string"
-            },
-            "title": "Fields",
-            "type": "object"
-          },
-          "rows": {
-            "items": {
-              "$ref": "#/components/schemas/FundamentalRow"
-            },
-            "title": "Rows",
-            "type": "array"
-          }
-        },
-        "required": [
-          "fetched_at",
-          "fields",
-          "rows"
-        ],
-        "title": "FundamentalsDoc",
         "type": "object"
       },
       "HTTPValidationError": {
@@ -4612,15 +4291,6 @@
             ],
             "title": "Notice"
           },
-          "role": {
-            "default": "admin",
-            "enum": [
-              "admin",
-              "viewer"
-            ],
-            "title": "Role",
-            "type": "string"
-          },
           "user": {
             "anyOf": [
               {
@@ -4700,76 +4370,6 @@
           "drawdown"
         ],
         "title": "NavPoint",
-        "type": "object"
-      },
-      "OperationRow": {
-        "properties": {
-          "actor": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Actor"
-          },
-          "at": {
-            "anyOf": [
-              {
-                "format": "date-time",
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "At"
-          },
-          "command_id": {
-            "title": "Command Id",
-            "type": "string"
-          },
-          "kind": {
-            "enum": [
-              "add_watchlist_item",
-              "remove_watchlist_item",
-              "save_alert_rule",
-              "save_canvas"
-            ],
-            "title": "Kind",
-            "type": "string"
-          },
-          "summary": {
-            "title": "Summary",
-            "type": "string"
-          }
-        },
-        "required": [
-          "at",
-          "kind",
-          "summary",
-          "actor",
-          "command_id"
-        ],
-        "title": "OperationRow",
-        "type": "object"
-      },
-      "OperationsData": {
-        "properties": {
-          "items": {
-            "items": {
-              "$ref": "#/components/schemas/OperationRow"
-            },
-            "title": "Items",
-            "type": "array"
-          }
-        },
-        "required": [
-          "items"
-        ],
-        "title": "OperationsData",
         "type": "object"
       },
       "OptionLatest": {
@@ -4860,65 +4460,6 @@
           "atm_iv_pct"
         ],
         "title": "OptionLatest",
-        "type": "object"
-      },
-      "OverfitStats": {
-        "properties": {
-          "dsr": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Dsr"
-          },
-          "min_track_record_days": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Min Track Record Days"
-          },
-          "observations": {
-            "title": "Observations",
-            "type": "integer"
-          },
-          "psr": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Psr"
-          },
-          "sharpe_per_day": {
-            "title": "Sharpe Per Day",
-            "type": "number"
-          },
-          "trials": {
-            "title": "Trials",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "observations",
-          "sharpe_per_day",
-          "psr",
-          "min_track_record_days",
-          "dsr",
-          "trials"
-        ],
-        "title": "OverfitStats",
         "type": "object"
       },
       "OverviewData": {
@@ -5435,16 +4976,6 @@
             "title": "Orders",
             "type": "array"
           },
-          "overfit": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/OverfitStats"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
           "perf": {
             "anyOf": [
               {
@@ -5614,49 +5145,6 @@
           "mean_return"
         ],
         "title": "QuantileReturn",
-        "type": "object"
-      },
-      "QueryRequest": {
-        "properties": {
-          "sql": {
-            "title": "Sql",
-            "type": "string"
-          }
-        },
-        "required": [
-          "sql"
-        ],
-        "title": "QueryRequest",
-        "type": "object"
-      },
-      "QueryResult": {
-        "properties": {
-          "columns": {
-            "items": {
-              "type": "string"
-            },
-            "title": "Columns",
-            "type": "array"
-          },
-          "rows": {
-            "items": {
-              "items": {},
-              "type": "array"
-            },
-            "title": "Rows",
-            "type": "array"
-          },
-          "truncated": {
-            "title": "Truncated",
-            "type": "boolean"
-          }
-        },
-        "required": [
-          "columns",
-          "rows",
-          "truncated"
-        ],
-        "title": "QueryResult",
         "type": "object"
       },
       "ReportFactorsData": {
@@ -7955,24 +7443,6 @@
         "summary": "通达信公式翻译（只校验，不执行）"
       }
     },
-    "/api/v1/fundamentals": {
-      "get": {
-        "operationId": "fundamentals_api_v1_fundamentals_get",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Envelope_Union_FundamentalsDoc__NoneType__"
-                }
-              }
-            },
-            "description": "Successful Response"
-          }
-        },
-        "summary": "财务指标"
-      }
-    },
     "/api/v1/health": {
       "get": {
         "operationId": "health_api_v1_health_get",
@@ -8045,25 +7515,6 @@
           }
         },
         "summary": "Meta"
-      }
-    },
-    "/api/v1/operations": {
-      "get": {
-        "description": "Web writes read back from both command logs and Serving projections.",
-        "operationId": "operations_api_v1_operations_get",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Envelope_OperationsData_"
-                }
-              }
-            },
-            "description": "Successful Response"
-          }
-        },
-        "summary": "操作记录"
       }
     },
     "/api/v1/overview": {
@@ -8548,158 +7999,6 @@
           }
         },
         "summary": "回测自助抽样区间"
-      }
-    },
-    "/api/v1/portfolio-backtests/{run_id}/brinson": {
-      "get": {
-        "operationId": "portfolio_brinson_api_v1_portfolio_backtests__run_id__brinson_get",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "run_id",
-            "required": true,
-            "schema": {
-              "title": "Run Id",
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Envelope_Union_BrinsonData__NoneType__"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "行业 Brinson 归因"
-      }
-    },
-    "/api/v1/portfolio-backtests/{run_id}/explain": {
-      "post": {
-        "operationId": "portfolio_explain_api_v1_portfolio_backtests__run_id__explain_post",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "run_id",
-            "required": true,
-            "schema": {
-              "title": "Run Id",
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Explanation"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "AI 解读回测（数字逐个核对）"
-      }
-    },
-    "/api/v1/query": {
-      "post": {
-        "operationId": "run_query_api_v1_query_post",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/QueryRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Envelope_QueryResult_"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "只读查询"
-      }
-    },
-    "/api/v1/query/schema": {
-      "get": {
-        "operationId": "query_schema_api_v1_query_schema_get",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Envelope_dict_str__list_list_str____"
-                }
-              }
-            },
-            "description": "Successful Response"
-          }
-        },
-        "summary": "可查询表的字段"
-      }
-    },
-    "/api/v1/query/tables": {
-      "get": {
-        "operationId": "query_tables_api_v1_query_tables_get",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Envelope_list_str__"
-                }
-              }
-            },
-            "description": "Successful Response"
-          }
-        },
-        "summary": "可查询的表"
       }
     },
     "/api/v1/report-factors": {

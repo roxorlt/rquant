@@ -209,23 +209,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/fundamentals": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** 财务指标 */
-        get: operations["fundamentals_api_v1_fundamentals_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/v1/health": {
         parameters: {
             query?: never;
@@ -286,26 +269,6 @@ export interface paths {
         };
         /** Meta */
         get: operations["meta_api_v1_meta_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/operations": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * 操作记录
-         * @description Web writes read back from both command logs and Serving projections.
-         */
-        get: operations["operations_api_v1_operations_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -511,91 +474,6 @@ export interface paths {
         };
         /** 回测自助抽样区间 */
         get: operations["portfolio_band_api_v1_portfolio_backtests__run_id__band_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/portfolio-backtests/{run_id}/brinson": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** 行业 Brinson 归因 */
-        get: operations["portfolio_brinson_api_v1_portfolio_backtests__run_id__brinson_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/portfolio-backtests/{run_id}/explain": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** AI 解读回测（数字逐个核对） */
-        post: operations["portfolio_explain_api_v1_portfolio_backtests__run_id__explain_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/query": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** 只读查询 */
-        post: operations["run_query_api_v1_query_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/query/schema": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** 可查询表的字段 */
-        get: operations["query_schema_api_v1_query_schema_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/query/tables": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** 可查询的表 */
-        get: operations["query_tables_api_v1_query_tables_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1168,40 +1046,6 @@ export interface components {
             /** Variant */
             variant: string;
         };
-        /** BrinsonData */
-        BrinsonData: {
-            /** Allocation */
-            allocation: number;
-            /** Benchmark */
-            benchmark: string;
-            /** Benchmark Return */
-            benchmark_return: number;
-            /** Days */
-            days: number;
-            /** Interaction */
-            interaction: number;
-            /** Portfolio Return */
-            portfolio_return: number;
-            /** Rows */
-            rows: components["schemas"]["BrinsonRow"][];
-            /** Selection */
-            selection: number;
-        };
-        /** BrinsonRow */
-        BrinsonRow: {
-            /** Allocation */
-            allocation: number;
-            /** Industry */
-            industry: string;
-            /** Interaction */
-            interaction: number;
-            /** Selection */
-            selection: number;
-            /** Weight Benchmark */
-            weight_benchmark: number;
-            /** Weight Portfolio */
-            weight_portfolio: number;
-        };
         /** CatalogDataset */
         CatalogDataset: {
             /** Category */
@@ -1447,11 +1291,6 @@ export interface components {
             data: components["schemas"]["MetaData"];
             serving: components["schemas"]["ServingMeta"];
         };
-        /** Envelope[OperationsData] */
-        Envelope_OperationsData_: {
-            data: components["schemas"]["OperationsData"];
-            serving: components["schemas"]["ServingMeta"];
-        };
         /** Envelope[OverviewData] */
         Envelope_OverviewData_: {
             data: components["schemas"]["OverviewData"];
@@ -1490,11 +1329,6 @@ export interface components {
         /** Envelope[PortfolioRunListData] */
         Envelope_PortfolioRunListData_: {
             data: components["schemas"]["PortfolioRunListData"];
-            serving: components["schemas"]["ServingMeta"];
-        };
-        /** Envelope[QueryResult] */
-        Envelope_QueryResult_: {
-            data: components["schemas"]["QueryResult"];
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[ReportFactorsData] */
@@ -1547,19 +1381,9 @@ export interface components {
             data: components["schemas"]["UiPreferencesData"];
             serving: components["schemas"]["ServingMeta"];
         };
-        /** Envelope[Union[BrinsonData, NoneType]] */
-        Envelope_Union_BrinsonData__NoneType__: {
-            data: components["schemas"]["BrinsonData"] | null;
-            serving: components["schemas"]["ServingMeta"];
-        };
         /** Envelope[Union[ChipsData, NoneType]] */
         Envelope_Union_ChipsData__NoneType__: {
             data: components["schemas"]["ChipsData"] | null;
-            serving: components["schemas"]["ServingMeta"];
-        };
-        /** Envelope[Union[FundamentalsDoc, NoneType]] */
-        Envelope_Union_FundamentalsDoc__NoneType__: {
-            data: components["schemas"]["FundamentalsDoc"] | null;
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[Union[IntradayData, NoneType]] */
@@ -1572,14 +1396,6 @@ export interface components {
             data: components["schemas"]["WatchlistData"];
             serving: components["schemas"]["ServingMeta"];
         };
-        /** Envelope[dict[str, list[list[str]]]] */
-        Envelope_dict_str__list_list_str____: {
-            /** Data */
-            data: {
-                [key: string]: string[][];
-            };
-            serving: components["schemas"]["ServingMeta"];
-        };
         /** Envelope[list[FlowLeader]] */
         Envelope_list_FlowLeader__: {
             /** Data */
@@ -1590,12 +1406,6 @@ export interface components {
         Envelope_list_TaskRow__: {
             /** Data */
             data: components["schemas"]["TaskRow"][];
-            serving: components["schemas"]["ServingMeta"];
-        };
-        /** Envelope[list[str]] */
-        Envelope_list_str__: {
-            /** Data */
-            data: string[];
             serving: components["schemas"]["ServingMeta"];
         };
         /** EventHorizon */
@@ -1669,19 +1479,6 @@ export interface components {
         EventStudyListData: {
             /** Studies */
             studies: components["schemas"]["EventStudy"][];
-        };
-        /** Explanation */
-        Explanation: {
-            /** Facts */
-            facts: {
-                [key: string]: string;
-            };
-            /** Model */
-            model: string;
-            /** Text */
-            text: string;
-            /** Unverified */
-            unverified: string[];
         };
         /** FactorCorrData */
         FactorCorrData: {
@@ -1901,33 +1698,6 @@ export interface components {
             label: string;
             /** Value */
             value: string | null;
-        };
-        /** FundamentalRow */
-        FundamentalRow: {
-            /** Ann Date */
-            ann_date?: string | null;
-            /** Code */
-            code: string;
-            /** End Date */
-            end_date: string;
-            /** Values */
-            values: {
-                [key: string]: number | null;
-            };
-        };
-        /** FundamentalsDoc */
-        FundamentalsDoc: {
-            /**
-             * Fetched At
-             * Format: date-time
-             */
-            fetched_at: string;
-            /** Fields */
-            fields: {
-                [key: string]: string;
-            };
-            /** Rows */
-            rows: components["schemas"]["FundamentalRow"][];
         };
         /** HTTPValidationError */
         HTTPValidationError: {
@@ -2254,12 +2024,6 @@ export interface components {
             generation: components["schemas"]["ServingMeta"];
             /** Notice */
             notice?: string | null;
-            /**
-             * Role
-             * @default admin
-             * @enum {string}
-             */
-            role: "admin" | "viewer";
             /** User */
             user?: string | null;
             /** Version */
@@ -2288,27 +2052,6 @@ export interface components {
             /** Nav */
             nav: number;
         };
-        /** OperationRow */
-        OperationRow: {
-            /** Actor */
-            actor: string | null;
-            /** At */
-            at: string | null;
-            /** Command Id */
-            command_id: string;
-            /**
-             * Kind
-             * @enum {string}
-             */
-            kind: "add_watchlist_item" | "remove_watchlist_item" | "save_alert_rule" | "save_canvas";
-            /** Summary */
-            summary: string;
-        };
-        /** OperationsData */
-        OperationsData: {
-            /** Items */
-            items: components["schemas"]["OperationRow"][];
-        };
         /** OptionLatest */
         OptionLatest: {
             /** Atm Iv */
@@ -2327,21 +2070,6 @@ export interface components {
             und: string;
             /** Vol Surge */
             vol_surge: number | null;
-        };
-        /** OverfitStats */
-        OverfitStats: {
-            /** Dsr */
-            dsr: number | null;
-            /** Min Track Record Days */
-            min_track_record_days: number | null;
-            /** Observations */
-            observations: number;
-            /** Psr */
-            psr: number | null;
-            /** Sharpe Per Day */
-            sharpe_per_day: number;
-            /** Trials */
-            trials: number;
         };
         /** OverviewData */
         OverviewData: {
@@ -2493,7 +2221,6 @@ export interface components {
             };
             /** Orders */
             orders: components["schemas"]["PortfolioOrder"][];
-            overfit?: components["schemas"]["OverfitStats"] | null;
             perf: components["schemas"]["BacktestPerf"] | null;
             run: components["schemas"]["PortfolioRunSummary"];
         };
@@ -2557,20 +2284,6 @@ export interface components {
             mean_return: number;
             /** Quantile */
             quantile: number;
-        };
-        /** QueryRequest */
-        QueryRequest: {
-            /** Sql */
-            sql: string;
-        };
-        /** QueryResult */
-        QueryResult: {
-            /** Columns */
-            columns: string[];
-            /** Rows */
-            rows: unknown[][];
-            /** Truncated */
-            truncated: boolean;
         };
         /**
          * ReportFactorsData
@@ -3502,26 +3215,6 @@ export interface operations {
             };
         };
     };
-    fundamentals_api_v1_fundamentals_get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Envelope_Union_FundamentalsDoc__NoneType__"];
-                };
-            };
-        };
-    };
     health_api_v1_health_get: {
         parameters: {
             query?: never;
@@ -3600,26 +3293,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_MetaData_"];
-                };
-            };
-        };
-    };
-    operations_api_v1_operations_get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Envelope_OperationsData_"];
                 };
             };
         };
@@ -3968,141 +3641,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    portfolio_brinson_api_v1_portfolio_backtests__run_id__brinson_get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                run_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Envelope_Union_BrinsonData__NoneType__"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    portfolio_explain_api_v1_portfolio_backtests__run_id__explain_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                run_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Explanation"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    run_query_api_v1_query_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["QueryRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Envelope_QueryResult_"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    query_schema_api_v1_query_schema_get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Envelope_dict_str__list_list_str____"];
-                };
-            };
-        };
-    };
-    query_tables_api_v1_query_tables_get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Envelope_list_str__"];
                 };
             };
         };

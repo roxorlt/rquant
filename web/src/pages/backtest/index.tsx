@@ -1,14 +1,16 @@
+import { useSearchParams } from "react-router";
 import { useBacktestDetail, useBacktests } from "@/api/endpoints";
 import { useUrlState } from "@/app/useUrlState";
 import { entryModeLabel, variantLabel } from "@/copy/publicText";
 import { formatPercent, formatPrice } from "@/format/number";
 import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
-import { ChangeText, FlowSteps, PageHeader, Panel } from "@/ui";
+import { ChangeText, PageHeader, Panel, Segmented } from "@/ui";
 import { StockLink } from "@/ui/StockLink";
 import { QueryView } from "../shared";
+import { EventStudies } from "./EventStudies";
 import { PerfPanel } from "./Perf";
-import { PortfolioRuns } from "./Portfolio";
+import { PortfolioRuns, StrategyList } from "./Portfolio";
 
 function Trades({ runId }: { runId: string }) {
   const query = useBacktestDetail(runId);
@@ -64,12 +66,11 @@ function Trades({ runId }: { runId: string }) {
   );
 }
 
-export default function BacktestPage() {
+function SingleBacktestTab() {
   const query = useBacktests();
   const [runId, setRunId] = useUrlState("run");
   return (
     <>
-      <PageHeader eyebrow="策略与验证" title="回测" actions={<FlowSteps />} />
       <QueryView query={query}>
         {(data) => (
           <Panel title={`已发布回测 · ${data.runs.length}`} sub="点一行看逐笔交易" flush>
@@ -115,7 +116,42 @@ export default function BacktestPage() {
         )}
       </QueryView>
       {runId ? <Trades runId={runId} /> : null}
-      <PortfolioRuns />
+    </>
+  );
+}
+
+type BacktestTab = "single" | "portfolio" | "strategies";
+
+export default function BacktestPage() {
+  const [params] = useSearchParams();
+  const [rawTab, setTab] = useUrlState("tab");
+  const inferredDefault: BacktestTab =
+    params.has("preset") || params.has("prun") ? "portfolio" : "single";
+  const tab: BacktestTab =
+    rawTab === "portfolio" || rawTab === "strategies" || rawTab === "single"
+      ? rawTab
+      : inferredDefault;
+  return (
+    <>
+      <PageHeader eyebrow="策略与验证" title="回测" />
+      <Segmented
+        label="回测视图"
+        value={tab}
+        onChange={(next) => setTab(next === "single" ? null : next)}
+        options={[
+          { value: "single", label: "单策略回测" },
+          { value: "portfolio", label: "组合回测" },
+          { value: "strategies", label: "策略版本" },
+        ]}
+      />
+      {tab === "single" ? <SingleBacktestTab /> : null}
+      {tab === "portfolio" ? <PortfolioRuns /> : null}
+      {tab === "strategies" ? (
+        <>
+          <StrategyList />
+          <EventStudies />
+        </>
+      ) : null}
     </>
   );
 }

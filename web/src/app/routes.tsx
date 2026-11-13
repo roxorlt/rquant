@@ -1,18 +1,25 @@
 import { type ComponentType, type LazyExoticComponent, lazy } from "react";
-
-const StockPage = lazy(() => import("@/pages/stock"));
-
-import { Navigate, type RouteObject } from "react-router";
+import { Navigate, type RouteObject, useLocation } from "react-router";
 import { currentHomePath } from "./home";
 import { NotFound } from "./NotFound";
 import { PAGES, type PageId } from "./pages";
 import { RouteError } from "./RouteError";
 import { Shell } from "./Shell";
 
+const StockPage = lazy(() => import("@/pages/stock"));
+
 /** Decided once, when `/` is opened. Resize does not navigate again, and `replace`
  * drops `/` from history so Back is not bounced through the redirect. */
 function HomeRedirect() {
   return <Navigate to={currentHomePath()} replace />;
+}
+
+function LegacyRedirect({ to, tab }: { to: string; tab?: string }) {
+  const { search } = useLocation();
+  const params = new URLSearchParams(search);
+  if (tab && !params.has("tab")) params.set("tab", tab);
+  const qs = params.toString();
+  return <Navigate to={qs ? `${to}?${qs}` : to} replace />;
 }
 
 type LazyPage = LazyExoticComponent<ComponentType>;
@@ -27,14 +34,7 @@ const PAGE_COMPONENTS: Record<PageId, LazyPage> = {
   panorama: lazy(() => import("@/pages/panorama")),
   sectorflow: lazy(() => import("@/pages/sectorflow")),
   health: lazy(() => import("@/pages/health")),
-  data: lazy(() => import("@/pages/data")),
-  ops: lazy(() => import("@/pages/ops")),
   factor: lazy(() => import("@/pages/factor")),
-  reportmining: lazy(() => import("@/pages/reportmining")),
-  strategies: lazy(() => import("@/pages/strategies")),
-  experiments: lazy(() => import("@/pages/experiments")),
-  tasks: lazy(() => import("@/pages/tasks")),
-  query: lazy(() => import("@/pages/query")),
   macro: lazy(() => import("@/pages/macro")),
 };
 
@@ -49,7 +49,14 @@ export const appRoutes: RouteObject[] = [
         const Page = PAGE_COMPONENTS[page.id];
         return { path: page.id, element: <Page />, handle: { title: page.title } };
       }),
-      { path: "reportfactors", element: <Navigate to="/reportmining" replace /> },
+      { path: "ops", element: <LegacyRedirect to="/overview" /> },
+      { path: "tasks", element: <LegacyRedirect to="/health" /> },
+      { path: "data", element: <LegacyRedirect to="/health" /> },
+      { path: "query", element: <LegacyRedirect to="/health" /> },
+      { path: "experiments", element: <LegacyRedirect to="/backtest" tab="portfolio" /> },
+      { path: "strategies", element: <LegacyRedirect to="/backtest" tab="strategies" /> },
+      { path: "reportmining", element: <LegacyRedirect to="/factor" tab="reports" /> },
+      { path: "reportfactors", element: <LegacyRedirect to="/factor" tab="reports" /> },
       { path: "stock/:code", element: <StockPage />, handle: { title: "个股档案" } },
       { path: "*", element: <NotFound />, handle: { title: "页面不存在" } },
     ],
