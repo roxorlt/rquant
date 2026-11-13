@@ -6,6 +6,8 @@
 
 ### Changed
 
+- **Web 命令服务解耦旧 `page_control` 并开启选股方案与告警撤销正式构建**：`rquant.web.commands_service` 移除对历史 `rquant.page_control` 的全部依赖，内置独立 Pydantic 校验与 `fcntl.flock` 幂等 JSONL 读写投影；`web-release.yml` 正式开启 `VITE_FEATURE_SCREENER_SCHEMES=1` 与 `VITE_FEATURE_ALERT_UNACK=1`；`snapshots.build_universe` 与 `load_alert_rules` 直接消费 `rquant-web-commands` 自选/自定义池子及 `market.duckdb` 选股结果。
+
 - **L2 归档分片大小可诊断覆盖**：`MAX_SHARD` / `MAX_LINE` 默认 32MiB / 20MiB 保持不变，新增 `RQUANT_ARCHIVE_SHARD_BYTES` / `RQUANT_ARCHIVE_LINE_BYTES` 环境变量覆盖（仅用于诊断运行；该边界同时用于恢复校验，正常作业不要设置）。
 
 - **L2 种子流控与冷存候选发布（合并入主线，默认行为不变）**：新增可选的分批建连（`--connections`）、分批订阅与自适应节奏（`--subscribe-batch-stocks`）、延迟种子重试（`--seed-retry-limit`）、接收/解包/落盘异步解耦（`--receive-pump`），以及冷存段文件与滚动保留（`rquant.l2.cold_store` / `rquant.l2.retention`，默认关闭）。2026-11-06 真实窗口实测 4 连接 80 股 240/240 流种子（等待 0.534s，旧单连接形态 72/240）；8 连接被供应商直接关闭，方案作废。全部参数默认关闭，生产 20 股档位与行为不变；80 股档位仍受写盘容量限制，未切换。新增 `--commit-group` / `--status-flush-interval` 写盘分组提交与状态节流候选（默认关闭，基准 2.0–2.2x）。
@@ -21,6 +23,8 @@
 
 ### Fixed
 
+- **Web 写操作不回显、默认空格池名被拒与表格重渲染卸载修复**：打通 `GET /pools`、`GET /alerts`、`GET /alert-rules`、`GET /operations` 对 `~/rquant-web-commands` JSONL 的实时回读闭环；修复选股器默认保存池名（如 `选股 10-20`）因不含空格规则被拒收、筛选结果 `codes` 与 `mode="existing"` 未保存的问题；修复 `DataTable` 在父组件查询刷新重渲染时因 `flexRender` 匿名组件包装导致单元格 DOM 节点被卸载重建的问题。
+
 - **L2 归档可靠性（R2 瞬时失败重试、失败可诊断、已上传分片幂等续跑）**：R2 客户端 PUT/HEAD/GET/DELETE 统一增加指数退避重试（默认 5 次、1/2/4/8s，仅重试超时/连接错误/`URLError`/`http.client` 异常/5xx，4xx 不重试；单请求超时可配 `R2_TIMEOUT_S`，默认 600s）；条件写重试遇到 412 时交回既有“核对远端字节”路径，已提交且字节一致仍判成功，幂等语义不变。归档失败时不再被吞成单一 `archive_failed`：`main` 捕获处生成脱敏的错误描述（类型、消息、阶段、`first/last_sequence`、chunk/day），写入 `state_root/archive-error.json` 并打印 stderr，失败 receipt 新增 `error` / `error_artifact` 字段（仍 exit 1，成功时清除旧错误文件）。`_new_chunks` 上传前按内容寻址 key HEAD 校验，size+sha256 一致则跳过重复 PUT、仍做完整类型化验证读取，避免全天重跑时重复上传。背景：2026-11-10 归档运行 4 小时+ 后失败且无 traceback，R2 catalog 未推进；本机 R2 实测带宽仅 ~0.7–1.3 MB/s，判断为长串行请求中单次超时且无重试。本版尚未部署；部署前须通过 archive 验收（synthetic + 真 R2 selftest）、新 tag release 与盘后首次诊断运行（建议 `R2_TIMEOUT_S=120`）。
 
 - **MacBook 五虎刘海插件补齐 `v1.0.2–v1.0.4` 入库并修复盘中分时简图比例尺（`notch_app` `v1.0.5`）**：同步本地 `v1.0.2–v1.0.4` 改动入库（`AppDelegate.updateMouseThrough()` 几何热区判定防退场动画误触重展开、收起态刘海右侧五虎未读数外耳、固定 5 行展开布局、盘后清零未读数及 `sim/hover_sim.swift` 状态机模拟）；在其基础上修复 `Sparkline` 按当前点数 `i / (pts.count - 1)` 将早盘局部走势拉伸至全天宽度的问题，新增 240 分钟 A 股连续交易轴映射（`SessionAxis`：`09:30` → `0%`，`11:30–13:00` 午休 → 精确 `50%` 半宽，`13:00–15:00` → `50%–100%`，兼容 `--replay` 回放时钟、非当日历史池全宽展示及早盘封板水平延伸），昨收虚线保持全天固定总宽（`30pt`），`wuhu_live.py` 向后兼容补充精确分钟槽位 `spark_m`。
@@ -29,6 +33,8 @@
 - **L2 服务器控制/确认帧容错与单流种子超时（候选，未部署）**：`page=0` 的结构合法服务器帧不再可能落进行情解码：`request=0, flags=6` 且命令为 2201/2202 的确认帧按 ack 处理，`request=0xFFFFFFFD, flags=11` 的订阅事件与 `flags=0x1000B` 的会话元数据沿用原有识别（会话 JSON 仍严格校验），其余未识别的 page-0 家族一律按控制帧计数并忽略——10/29 早盘正是 2615 字节的新确认帧未被识别导致整场中止。单条流 15 秒等不到种子响应时只把该流标 `failed` 并继续其余流，已发出的请求 ID 保留给迟到响应；bootstrap ack 超时、帧/字节预算、关联与解码错误仍终止。当本 epoch 至少一次种子超时且没有任何种子落地时，以时长结束、收到停止信号或 Ctrl-C 退出都写 `blocked` / `seed_timeout`，不再伪装成正常结束；该信号不新增持久状态字段，避免独立部署的旧版归档与回滚读不了 `status.json`。真实故障帧只保留帧头证据；本版仍须精确 CI 与持续行情验收，未部署。
 
 ### Added
+
+- **Web 实时只读 `ResearchSource`、自选股增删查询接口与 SQLite Web Store**：新增 `ResearchSource`（`RQUANT_WEB_SOURCE=research`，以内存 DuckDB 只读挂载 `market.duckdb` 与可选只读副本 `rquant_ro.duckdb`，拒绝直连主库 `rquant.duckdb`，动态投影 18 张标准视图并支持受限沙盒 SQL 查询）；新增 `GET / DELETE /api/v1/watchlist`、池子页自选移出按钮与个股 F9 页加/移自选开关；新增 `GET / PUT / DELETE /api/v1/screener-schemes` 与 `GET / PUT /api/v1/ui-preferences` 服务器持久化存储。
 
 - **L2 行情时间新鲜度指标（P0 观测）**：`status.json` 新增 `last_market_timestamp`（最近已提交批次中最新的帧内行情事件时间，取自成交页字段 `34320` 的 epoch 秒；订单页布局未携带）与 `market_time_lag_ms`（接收时间减该事件时间，毫秒、下限 0，候选值）。盘中午间监督脚本 `scripts/l2-collector-watchdog.sh` 新增滞后告警：传输仍新鲜但 `market_time_lag_ms` 超过 `LAG_ALERT_MS`（默认 30000）且连续两次检查（间隔 ≤6 分钟）都超限时，经 `rquant alert` 推送，带独立 dedup key 与 15 分钟冷却；恢复后自动 resolve 并清除首见状态。本版仅新增可选字段与 shell 告警，不改变行情解码、缓存布局与既有状态语义；新字段要随下一次 L2 组件部署才在生产 `status.json` 出现，watchdog 脚本可先独立更新（字段缺失时按 `lag=unknown` 处理）。
 

@@ -44,7 +44,7 @@ rquant/
 │   ├── risk/                # 负向因子日度 PIT 过滤（risk_flags_daily）与交易所异动监控/预测
 │   ├── vp/                  # 三重锁相 Volume Profile 子包（engine/ 只读底座 + sandbox/ 7 文件研究沙盒）
 │   ├── dashboard/           # 遗留/专用 Streamlit 页面（market_panorama.py 等）
-│   └── web/                 # FastAPI 服务端（只读读 Serving 代 + 3s 板块流合成 + page_control 写转发）
+│   └── web/                 # FastAPI 服务端（ResearchSource 实时只读/Serving 代 + 3s 板块流 + 命令与偏好闭环）
 ├── web/                     # React 19 + TypeScript + Vite 前端（总览/选股/池子/回测/模拟盘/告警/全景/健康/个股 F9）
 ├── notch_app/               # MacBook 五虎盯盘刘海插件（Sources/RQuantNotch/*.swift + server/wuhu_live.py）
 ├── deploy/                  # systemd units & slices、launchd plists、nginx 配置、web 发布脚本、sudoers
@@ -75,8 +75,9 @@ rquant/
    - 生产常驻 20 股核心（`v0.34.0`–`v0.35.5`），已配置 `Restart=on-failure`、`OnFailure=rquant-alert@%n.service` 与交易时段每 2 分钟的 `rquant-l2-collector-watchdog.timer`。严禁与生产共享同一上游设备会话跑并行测试（`run_80_window.sh` 有硬门禁）。
 
 5. **Web 应用（`src/rquant/web/` + `web/`）**
-   - 纯只读进程（读 `RQUANT_SERVING_ROOT` 指向的 Serving 代及 `RQUANT_RESEARCH_ROOT` 研究快照/库），仅有的 3 个写动作（保存池子、确认告警、加自选）全部经 `rquant.web.page_control` 转发至 `127.0.0.1:8767/v1/commands`。
-   - 个股页提供日 K（含 VP / 筹码分布）、分时（240 分钟连续交易轴 + VWAP/BVC 订单流估算）、5 日分时、TPO 市场轮廓、资金流与财务指标。
+   - 支持双只读底座切换：`ResearchSource`（`RQUANT_WEB_SOURCE=research`，以内存 DuckDB 只读挂载 `market.duckdb` 与可选只读副本 `rquant_ro.duckdb`，代码硬拦截直连主库 `rquant.duckdb`，动态投影 18 张标准视图）与兼容旧 `ServingSource`（`RQUANT_SERVING_ROOT`）。
+   - 彻底解耦旧 `rquant.page_control`：`rquant.web.commands_service`（线上 `127.0.0.1:8769` 或进程内直写 `~/rquant-web-commands`）提供幂等 JSONL 落盘与实时读取投影，闭环「加/删自选、保存/并入池子（含筛选后精确股票列表与空格池名）、确认/撤销告警、告警规则与操作记录」；选股方案与跨端 UI 偏好由独立 SQLite Web Store（`screener_schemes.py`）持久化。
+   - 个股页提供日 K（含 VP / 筹码分布）、分时（240 分钟连续交易轴 + VWAP/BVC 订单流估算）、5 日分时、TPO 市场轮廓、资金流、财务指标及一键加/移自选。
 
 6. **MacBook 五虎盯盘刘海插件（`notch_app/`，当前 `v1.0.5`）**
    - **服务端** `notch_app/server/wuhu_live.py`（systemd `rquant-wuhu.service`，监听 `127.0.0.1:8775`，内存上限 300M，nginx `:8081/api/v1/wuhu/` 反代，提供免鉴权 `/health` 与需 Bearer 鉴权的 `/live`，Token 存于服务器 `/etc/rquant-wuhu.env` `0600`）：全程只读读取 `pools/auction/<date>.json`（前 5 名「五虎」，当日池未产出时回退最近日期文件）、`snapshots/<date>/quotes/part-*.parquet`（约 30s 全市场快照）、`snapshots/<date>/stream/d-*.parquet`（约 3s 增量快照）与 `alerts/<date>.jsonl`（末尾 256KB 最近 20 条，按类型映射偏多/偏空/中性），输出实时涨跌、日内涨幅、240 分钟交易轴分时序列（`spark` + `spark_m`），支持 `?replay=1` 按 8s 步进循环回放异动。
@@ -100,7 +101,7 @@ rquant/
 ### 3.2 线上核心端口映射（`82.156.0.68`）
 - `:8081`（nginx `rquant-backup.conf`）：`/app/` & `/app/api/` → `127.0.0.1:8768`（`rquant-web`）；`/api/v1/wuhu/` → `127.0.0.1:8775`（`rquant-wuhu` Bearer 鉴权）；`/dashboard/` → `:8501`；`/preview/` → `:8509`
 - `:28080`（nginx `panorama.conf`）：Cookie 登录门 `:8507` → 市场全景 Streamlit `:8506`
-- `127.0.0.1:8767`：`rquant-page-control`（Web 写命令入口）
+- `127.0.0.1:8769`：`rquant-web-commands`（Web 幂等 JSONL 写命令入口，落盘 `~/rquant-web-commands`，旧 `8767` `rquant-page-control` 已解耦淘汰）
 
 ### 3.3 DuckDB 并发与云地同步强制铁律（最高优先级）
 1. **DuckDB 单文件排他锁**：写者（如盘中常驻 `rquant-monitor`）持锁期间，**任何直连主库的新连接（即使 `read_only=True`）都会立即抛 `IOError: Could not set lock on file`**。
@@ -140,8 +141,8 @@ cd notch_app && ./build.sh && ./install.sh
 
 ## 五、当前推进重点（Active Focus）
 
-1. **L2 持续稳定性与归档闭环**：观察 20 股常驻核心 + `rquant-l2-collector-watchdog` 自愈表现；独立完成 R2 日终归档目标验证与 timer 启用；评估写盘吞吐后再决定是否推进 80 股档位。
-2. **Route A Serving 与 Web 写路径二期**：推进生产 Serving 代日常稳定发布与 `rquant-page-control` 启用，闭环 Web 端「保存池子 / 确认预警 / 加自选」写链路。
+1. **L2 持续稳定性与归档闭环**：观察 20 股常驻核心 + `rquant-l2-collector-watchdog`（含帧内行情 lag 告警）表现；独立完成 R2 日终归档组件验收与部署；后续摸索上游连接与写盘吞吐真实上限。
+2. **Web 实时数据源切换与旧版 Codex 减法（Wave 2）**：合并并发布 Web 读写闭环版后，在生产非交易窗口将 `/etc/rquant-web.env` 切换至 `RQUANT_WEB_SOURCE=research`；随后推进 Wave 2 清理已废弃的 Route-A / `page_control` / `source_broker` / `lab` 重型代码。
 3. **Stage 1 三策略正式验收晋级**：推进 N 字、科创/创业放量、集合竞价三策略真实资格 manifest 回补与覆盖率达标（baseline ≥95%，eligibility/B/S ≥99%），通过 `formal-smoke-replay` 后从 `exploratory` 晋级。
 4. **终端盯盘体验迭代**：Web 桌面/手机端细节打磨与 MacBook `notch_app` 五虎盘中盯盘体验优化。
 
@@ -159,6 +160,18 @@ cd notch_app && ./build.sh && ./install.sh
 > - **涉及文件**：...
 > - **验证与部署状态**：...
 > ```
+
+### 2026-11-12 · Web 平台全链路读写闭环、彻底解耦旧 `page_control` & 新增实时只读 `ResearchSource`（`feat/web-closed-loop`）
+- **背景/问题**：
+  1. 线上 Web 原依赖冻结于 `2026-09-25` 的 Route-A `ServingSource` 快照与旧 `rquant.page_control` 模型；`rquant-web-commands` 虽然已将操作写入 JSONL，但读取端未消费，导致「加自选、保存池子（尤其默认带空格名称如 `选股 10-20` 被旧正则拒收，且未保存筛选后精确股票列表）、确认/撤销告警、告警规则、操作审计」写入后均无法回显，选股方案与告警撤销开关也在构建中被隐藏。
+  2. 旧版 Codex 引入的 Route-A 25 角色控制面与 `page_control` 体系过度沉重，阻碍新版 Web + Research + L2 平台敏捷演进。
+- **主要变更**：
+  1. **解耦 `rquant.page_control` 并打通全部 6 类命令读写闭环**（`src/rquant/web/commands_service.py`、`src/rquant/web/routes.py`、`src/rquant/web/models.py`）：内置独立 Pydantic 命令模型、`fcntl.flock` 幂等 JSONL 落盘与读取投影（`read_ack_states` / `read_watchlist_items` / `read_alert_rules` / `read_saved_pools` / `read_operations`）；放开池名空格限制并支持保存筛选后 `codes` 列表与 `mode="existing"` 并入已有池；新增 `GET /api/v1/watchlist` 与 `DELETE /api/v1/watchlist`；未配置外部转发 URL 时自动直写本地命令目录，`--fixture` 演示模式同样在临时目录内完整闭环。
+  2. **接入选股方案与跨端界面偏好持久化**：合入 SQLite Web Store（`src/rquant/web/screener_schemes.py`、`GET/PUT /api/v1/ui-preferences`、`deploy/web/web-store.sh`），并在 `.github/workflows/web-release.yml` 正式开启 `VITE_FEATURE_SCREENER_SCHEMES=1` 与 `VITE_FEATURE_ALERT_UNACK=1`。
+  3. **新增实时只读 `ResearchSource` 摆脱冻结 Serving 代**（`src/rquant/web/source.py`、`src/rquant/web/app.py`）：通过 `RQUANT_WEB_SOURCE=research`（或无 `current.json` 时自动回退）使用内存 DuckDB `ATTACH ... (READ_ONLY)` 挂载 `market.duckdb` 与可选只读副本 `rquant_ro.duckdb`（代码级硬拒绝挂载主库 `DUCKDB_PATH` `rquant.duckdb`，严守单写者文件锁铁律），完整投影 18 张标准视图并提供锁死外部访问的沙盒 SQL 查询；总览模拟盘净值缺失时自动回退 `read_sim()`。
+  4. **前后端交互与监控宇宙联动**：选股页从 `GET /api/v1/watchlist` 持久回显「✓ 已在自选」并传递筛选 `codes` + `mode` 保存池子；池子页「自选股」支持单行「移出」；个股 F9 页头部新增「加自选 / ✓ 已在自选」切换；修复 `DataTable` 父组件重渲染时 `flexRender` 卸载重挂单元格 DOM 节点的问题；`snapshots.build_universe` 与 `load_alert_rules` 直连新命令投影与 `market.duckdb`。
+- **涉及文件**：`src/rquant/web/{commands_service,source,routes,app,models,__main__,screener_schemes}.py`、`src/rquant/research/snapshots.py`、`src/rquant/alert_rules.py`、`web/src/api/{endpoints.ts,openapi.json,schema.d.ts}`、`web/src/pages/{screener,pools,stock,ops}/index.tsx`、`web/src/table/DataTable.tsx`、`web/src/theme/storage.ts`、`web/src/copy/publicText.ts`、`deploy/web/web-store.sh`、`.github/workflows/web-release.yml`、`docs/deploy/web-commands-service.md`、`tests/web/{test_closed_loop_and_research_source,test_ui_preferences}.py`。
+- **验证与部署状态**：`ruff check` 零告警；`pytest tests/web`（含新增闭环与主库排他锁隔离单测）及 Roadmap 201 项单测、L2 组件部署 94 项权限门禁全部通过；前端 `pnpm run lint`、`pnpm run typecheck`、`vitest`（34 文件 140 用例）与 `vite build` 全绿。合并主线产出 `web-<sha8>` 后可先零停机升级 Web（立即生效全部读写闭环），盘后可将 `/etc/rquant-web.env` 切换至 `RQUANT_WEB_SOURCE=research`。
 
 ### 2026-11-12 · 修复阻塞发版的 CI flaky 测试（L2 feed 种子优先级 + web poolScope 等待）
 - **背景/问题**：`test_receive_pump_prioritises_the_seed_over_queued_pushes` 用墙钟阈值（`seed_wait < 0.5s`、固定 4s 时长）与批次顺序断言，在共享 CI 负载下偶发 0.51s 超限、种子回执数不足，连续阻塞 PR #450/#451/#452 的 main push；`web/src/pages/monitor/poolScope.test.tsx` 的 `waitFor` 使用默认 1s 超时，偶发超时失败。
