@@ -336,6 +336,37 @@ export function applyFilters(rows: ScreenRow[], filters: Filter[]) {
   return { rows: out, steps };
 }
 
+export function dedupScreenRows(rows: readonly ScreenRow[]): ScreenRow[] {
+  const byCode = new Map<string, ScreenRow>();
+  const presetsByCode = new Map<string, string[]>();
+  for (const row of rows) {
+    if (!row?.code) continue;
+    if (!byCode.has(row.code)) {
+      byCode.set(row.code, row);
+    }
+    const list = presetsByCode.get(row.code) ?? [];
+    const tokens =
+      Array.isArray(row.presets) && row.presets.length > 0
+        ? row.presets
+        : String(row.preset ?? "").split(",");
+    for (const raw of tokens) {
+      const p = raw.trim();
+      if (p && !list.includes(p)) list.push(p);
+    }
+    presetsByCode.set(row.code, list);
+  }
+  const out: ScreenRow[] = [];
+  for (const [code, base] of byCode) {
+    const merged = presetsByCode.get(code) ?? (base.preset ? [base.preset] : []);
+    out.push({
+      ...base,
+      preset: merged.join(",") || base.preset,
+      presets: merged,
+    });
+  }
+  return out;
+}
+
 /** Client-side fallback funnel when server /screener/run is unavailable (e.g. static export). */
 export function applyClientBlocks(
   rows: ScreenRow[],
@@ -345,19 +376,20 @@ export function applyClientBlocks(
   ruleMap: ReadonlyMap<string, RuleCatalogItem>,
   previewStep: number | null,
 ): { rows: ScreenRow[]; steps: ScreenerFunnelStep[]; activeStep: number } {
+  const uniqueRows = dedupScreenRows(rows);
   const steps: ScreenerFunnelStep[] = [
     {
       step: 0,
       block_id: null,
       label: "候选池",
-      remaining: rows.length,
+      remaining: uniqueRows.length,
       dropped: 0,
       dropped_pct: 0,
       error: null,
     },
   ];
-  const slices: ScreenRow[][] = [rows];
-  let current = rows;
+  const slices: ScreenRow[][] = [uniqueRows];
+  let current = uniqueRows;
   let stepIdx = 0;
 
   for (const b of blocks) {

@@ -2595,6 +2595,8 @@ export interface components {
             pe_ttm?: number | null;
             /** Preset */
             preset: string;
+            /** Presets */
+            presets?: string[];
             /** Ret20 */
             ret20?: number | null;
             /** Ret5 */
@@ -2841,7 +2843,11 @@ export interface components {
              * @default presets
              * @enum {string}
              */
-            base: "presets" | "all_market" | "preset" | "pool" | "watchlist";
+            base: "presets" | "all_market" | "preset" | "pool" | "watchlist" | "codes";
+            /** Base Label */
+            base_label?: string | null;
+            /** Codes */
+            codes?: string[];
             /** Exclude Pools */
             exclude_pools?: string[];
             /** Include Pools */

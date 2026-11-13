@@ -38,7 +38,16 @@ export default function PoolsPage() {
       : (query.data?.trade_date ?? undefined);
   return (
     <>
-      <PageHeader eyebrow="研究" title="池子" note={headerNote} />
+      <PageHeader
+        eyebrow="研究"
+        title="池子"
+        note={headerNote}
+        actions={
+          <Link className="btn sm" to="/screener?view=canvas">
+            节点画布编排 →
+          </Link>
+        }
+      />
       <QueryView query={query}>
         {(data) => {
           if (!data.pools.length)
@@ -55,6 +64,28 @@ export default function PoolsPage() {
             );
           const pool = data.pools.find((p) => p.name === selected) ?? data.pools[0];
           if (!pool) return null;
+          const uniqueMembers: Member[] = [];
+          const byCode = new Map<string, number>();
+          for (const m of pool.members ?? []) {
+            const idx = byCode.get(m.code);
+            if (idx === undefined) {
+              byCode.set(m.code, uniqueMembers.length);
+              uniqueMembers.push(m);
+            } else {
+              const prev = uniqueMembers[idx];
+              if (prev) {
+                const mergedPresets = Array.from(
+                  new Set(
+                    `${prev.preset},${m.preset}`
+                      .split(",")
+                      .map((x) => x.trim())
+                      .filter(Boolean),
+                  ),
+                ).join(",");
+                uniqueMembers[idx] = { ...prev, preset: mergedPresets };
+              }
+            }
+          }
           return (
             <>
               <Segmented
@@ -71,7 +102,7 @@ export default function PoolsPage() {
                   pool.name === AUCTION_POOL && live.data?.date ? (
                     <>
                       {inTradingHours() ? <span className="live-dot" aria-hidden /> : null}
-                      {`${poolDisplayName(pool.name)} · ${pool.members.length} 只`}
+                      {`${poolDisplayName(pool.name)} · ${uniqueMembers.length} 只`}
                       <span
                         className="faint"
                         style={{ fontWeight: 400, marginLeft: 8, fontSize: 12 }}
@@ -83,7 +114,7 @@ export default function PoolsPage() {
                       </span>
                     </>
                   ) : (
-                    `${poolDisplayName(pool.name)} · ${pool.members?.length ?? 0} 只`
+                    `${poolDisplayName(pool.name)} · ${uniqueMembers.length} 只`
                   )
                 }
                 sub={[
@@ -108,8 +139,8 @@ export default function PoolsPage() {
                 <DataTable
                   label="池子成员"
                   tools="池子成员"
-                  rows={pool.members ?? []}
-                  rowKey={(row) => `${row.preset}:${row.code}`}
+                  rows={uniqueMembers}
+                  rowKey={(row) => row.code}
                   emptyText="今天没有成员：去「选股器」筛选后点「保存为池子」。"
                   columns={[
                     {

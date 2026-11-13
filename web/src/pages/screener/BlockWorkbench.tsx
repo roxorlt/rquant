@@ -264,33 +264,115 @@ export function UpstreamScopeBar({
   );
 }
 
+function buildCustomBodyFromBlocks(
+  name: string,
+  description: string,
+  list: readonly ScreenerBlock[],
+): CustomBlockSaveRequest {
+  const b = list.length === 1 ? list[0] : undefined;
+  if (b) {
+    if (b.type === "tdx") {
+      return { name, description, kind: "tdx", spec: { tdx: b.tdx ?? "" } };
+    }
+    if (b.type === "rule") {
+      return {
+        name,
+        description,
+        kind: "rule",
+        spec: { rule_name: b.rule_name, args: b.args ?? {} },
+      };
+    }
+    if (b.type === "field") {
+      return {
+        name,
+        description,
+        kind: "field",
+        spec: { field: b.field, op: b.op, value: b.value, value2: b.value2 },
+      };
+    }
+  }
+  return {
+    name,
+    description,
+    kind: "composite",
+    spec: { blocks: list },
+  };
+}
+
 export function NlWhiteBoxBar({
   onAppendBlocks,
+  defaultSyncLibrary = false,
+  onCustomBlockSaved,
 }: {
   onAppendBlocks: (blocks: ScreenerBlock[]) => void;
+  defaultSyncLibrary?: boolean;
+  onCustomBlockSaved?: (item: CustomBlockItem) => void;
 }) {
   const [text, setText] = useState("");
+  const [syncLibrary, setSyncLibrary] = useState(defaultSyncLibrary);
+  const [savedLabel, setSavedLabel] = useState<string | null>(null);
   const ai = useScreenerFromText();
+  const saveBlock = useSaveCustomBlock();
+  const toast = useToast();
+
+  const persistAsCustomBlock = (
+    promptText: string,
+    compiled: ScreenerBlock[],
+    summary?: string,
+  ) => {
+    if (compiled.length === 0) return;
+    const cleanPrompt = promptText.trim().slice(0, 22);
+    const blockName = `NL · ${cleanPrompt}`;
+    const desc = (summary || promptText).slice(0, 120);
+    const blockId = makeSlug(cleanPrompt);
+    const body = buildCustomBodyFromBlocks(blockName, desc, compiled);
+    const optimistic: CustomBlockItem = {
+      block_id: blockId,
+      name: blockName,
+      description: desc,
+      kind: body.kind,
+      spec: body.spec,
+      created_at: new Date().toISOString(),
+    };
+    saveBlock.mutate(
+      { blockId, body },
+      {
+        onSuccess: (saved) => {
+          setSavedLabel(saved?.name ?? blockName);
+          onCustomBlockSaved?.(saved ?? optimistic);
+          toast(`已同步存入『★ 我的积木』：${saved?.name ?? blockName}`);
+        },
+        onError: () => {
+          setSavedLabel(blockName);
+          onCustomBlockSaved?.(optimistic);
+        },
+      },
+    );
+  };
 
   const submit = () => {
     const trimmed = text.trim();
     if (trimmed.length < 2 || ai.isPending) return;
+    setSavedLabel(null);
     ai.mutate(trimmed, {
       onSuccess: (res) => {
         if (res.blocks && res.blocks.length > 0) {
-          onAppendBlocks(
-            res.blocks.map((b) => ({
-              ...b,
-              id: b.id || newBlockId(),
-              enabled: true,
-            })),
-          );
+          const normalized = res.blocks.map((b) => ({
+            ...b,
+            id: b.id || newBlockId(),
+            enabled: true,
+          }));
+          onAppendBlocks(normalized);
+          if (syncLibrary) {
+            persistAsCustomBlock(trimmed, normalized, res.summary ?? undefined);
+          }
         }
       },
     });
   };
 
-  const compiledCount = ai.data?.blocks?.length ?? 0;
+  const compiledBlocks = ai.data?.blocks ?? [];
+  const compiledCount = compiledBlocks.length;
   const ok = compiledCount > 0 || Boolean(ai.data?.expression);
 
   return (
@@ -309,6 +391,16 @@ export function NlWhiteBoxBar({
           {ai.isPending ? "生成中…" : "一句话生成"}
         </Button>
       </div>
+      <div className="wb-nl-opts">
+        <label className="wb-nl-sync">
+          <input
+            type="checkbox"
+            checked={syncLibrary}
+            onChange={(e) => setSyncLibrary(e.target.checked)}
+          />
+          <span>生成后同步加入可选积木库（★ 我的积木）</span>
+        </label>
+      </div>
       {ai.error ? (
         <FailureNotice copy={failureCopy("条件", "生成", ai.error)} onRetry={submit} />
       ) : null}
@@ -323,6 +415,24 @@ export function NlWhiteBoxBar({
                   : "校验通过"
                 : "未能识别"}
             </span>
+            {savedLabel ? (
+              <span className="wb-badge custom">★ 已入积木库：{savedLabel}</span>
+            ) : null}
+            {!savedLabel && compiledCount > 0 ? (
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() =>
+                  persistAsCustomBlock(
+                    text || ai.data?.summary || "自然语言条件",
+                    compiledBlocks.map((b) => ({ ...b, id: b.id || newBlockId(), enabled: true })),
+                    ai.data?.summary ?? undefined,
+                  )
+                }
+              >
+                ★ 存入可选积木
+              </Button>
+            ) : null}
             {ai.data.summary ? <span className="hint">{ai.data.summary}</span> : null}
           </div>
           <div className="formula-result-expr">
@@ -505,12 +615,14 @@ export function BlockListWorkbench({
   fields,
   rules,
   customBlocks,
+  onCustomBlockSaved,
 }: {
   blocks: ScreenerBlock[];
   onChange: (next: ScreenerBlock[]) => void;
   fields: Record<string, string>;
   rules: readonly RuleCatalogItem[];
   customBlocks: readonly CustomBlockItem[];
+  onCustomBlockSaved?: (item: CustomBlockItem) => void;
 }) {
   const toast = useToast();
   const saveBlock = useSaveCustomBlock();
@@ -633,13 +745,24 @@ export function BlockListWorkbench({
       };
     }
 
+    const blockId = makeSlug(trimmed);
     saveBlock.mutate(
-      { blockId: makeSlug(trimmed), body },
+      { blockId, body },
       {
-        onSuccess: () => {
+        onSuccess: (saved) => {
           setSaveTarget(null);
           setCustomName("");
           setSaveError(null);
+          onCustomBlockSaved?.(
+            saved ?? {
+              block_id: blockId,
+              name: trimmed,
+              description: customDesc,
+              kind: body.kind,
+              spec: body.spec,
+              created_at: new Date().toISOString(),
+            },
+          );
           toast(`已存入『★ 我的积木』：${trimmed}`);
         },
         onError: (err) => {

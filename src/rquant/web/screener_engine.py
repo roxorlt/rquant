@@ -656,7 +656,11 @@ def list_catalog(
         )
     )
 
-    custom_blocks = [CustomBlockItem(**b) for b in scheme_store.list_blocks()]
+    try:
+        raw_blocks = scheme_store.list_blocks()
+    except Exception:  # noqa: BLE001
+        raw_blocks = []
+    custom_blocks = [CustomBlockItem(**b) for b in raw_blocks]
     return ScreenerCatalogData(
         trade_date=day,
         all_market_count=len(all_codes),
@@ -696,24 +700,37 @@ def _resolve_upstream(
     screen_rows: list[dict[str, Any]],
     pool_items: list[PoolItem],
     watchlist_items: list[WatchlistItemRow],
-) -> tuple[list[str], dict[str, str], list[str], str]:
+) -> tuple[list[str], dict[str, str], dict[str, list[str]], list[str], str]:
     by_preset: dict[str, list[str]] = {}
-    preset_by_code: dict[str, str] = {}
+    presets_by_code: dict[str, list[str]] = {}
     for r in screen_rows:
         c = str(r["ts_code"])
         p = str(r["preset_name"])
-        if c not in preset_by_code:
-            preset_by_code[c] = p
+        plist = presets_by_code.setdefault(c, [])
+        if p not in plist:
+            plist.append(p)
         lst = by_preset.setdefault(p, [])
         if c not in lst:
             lst.append(c)
+
+    preset_by_code: dict[str, str] = {
+        c: ",".join(ps) for c, ps in presets_by_code.items() if ps
+    }
 
     by_pool: dict[str, list[str]] = {}
     for pool in pool_items:
         by_pool[pool.name] = list(dict.fromkeys(m.code for m in pool.members))
     watch_codes = list(dict.fromkeys(w.code for w in watchlist_items))
 
-    if upstream.base == "all_market":
+    if upstream.base == "codes":
+        base_codes = list(
+            dict.fromkeys(str(c).strip().upper() for c in upstream.codes if str(c).strip())
+        )
+        pool_refs = ["saved"]
+        base_label = (upstream.base_label or "").strip() or "画布上游输入"
+        for c in base_codes:
+            preset_by_code.setdefault(c, "saved")
+    elif upstream.base == "all_market":
         base_codes = list(all_codes)
         pool_refs = ["all_market"]
         base_label = "全市场 A 股"
@@ -724,6 +741,8 @@ def _resolve_upstream(
         base_codes = list(by_preset.get(pname, []))
         pool_refs = [pname]
         base_label = f"预设 · {pname}"
+        for c in base_codes:
+            preset_by_code[c] = pname
     elif upstream.base == "pool" and upstream.pool:
         pname = upstream.pool
         base_codes = list(by_pool.get(pname, []))
@@ -775,7 +794,7 @@ def _resolve_upstream(
 
     if set_notes:
         base_label = f"{base_label} ({' '.join(set_notes)})"
-    return code_set, preset_by_code, pool_refs, base_label
+    return code_set, preset_by_code, presets_by_code, pool_refs, base_label
 
 
 def _rsi_frame(close_piv: pd.DataFrame, period: int) -> pd.DataFrame:
@@ -1297,7 +1316,11 @@ def run_screener(
     pool_items: list[PoolItem],
     watchlist_items: list[WatchlistItemRow],
 ) -> ScreenerRunData:
-    custom_map = {b["block_id"]: b for b in scheme_store.list_blocks()}
+    try:
+        raw_blocks = scheme_store.list_blocks()
+    except Exception:  # noqa: BLE001
+        raw_blocks = []
+    custom_map = {b["block_id"]: b for b in raw_blocks}
     field_groups = build_field_groups(root)
     field_labels = {item.field: item.label for g in field_groups for item in g.items}
 
@@ -1317,7 +1340,7 @@ def run_screener(
                 names_map.setdefault(str(r["ts_code"]), str(r["name"]))
 
         presets = sorted({str(r["preset_name"]) for r in screen_rows})
-        candidate_codes, preset_by_code, pool_refs, base_label = _resolve_upstream(
+        candidate_codes, preset_by_code, presets_by_code, pool_refs, base_label = _resolve_upstream(
             body.upstream, all_codes, screen_rows, pool_items, watchlist_items
         )
 
@@ -1391,11 +1414,14 @@ def run_screener(
         for c in candidate_codes:
             cl, pc = bar_snapshot.get(c, (None, None))
             fvals = fund_map.get(c, {})
+            p_str = preset_by_code.get(c, "all_market")
+            p_list = presets_by_code.get(c) or [x for x in p_str.split(",") if x]
             row_by_code[c] = ScreenRow(
                 trade_date=day,
                 code=c,
                 name=names_map.get(c) or None,
-                preset=preset_by_code.get(c, "all_market"),
+                preset=p_str,
+                presets=p_list,
                 close=cl,
                 pct_chg=pc,
                 **extra_by_code.get(c, {}),

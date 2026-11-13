@@ -448,3 +448,144 @@ def test_screener_never_touches_locked_primary_duckdb(tmp_path: Path, monkeypatc
     finally:
         holder.terminate()
         holder.wait(timeout=5)
+
+
+def test_screen_and_pools_deduplicate_multi_preset_stocks(tmp_path: Path) -> None:
+    root = tmp_path / "research"
+    root.mkdir(parents=True, exist_ok=True)
+    write_demo_research(root)
+
+    # Insert 文投控股 into market.duckdb so screener_engine can enrich & filter it too
+    con_mkt = duckdb.connect(str(root / "market.duckdb"))
+    try:
+        latest_day = con_mkt.execute("SELECT max(trade_date) FROM daily_bar").fetchone()[0]
+        con_mkt.execute(
+            "INSERT INTO stock_basic VALUES "
+            "('600715.SH', '文投控股', '传媒', '主板', DATE '2000-01-01', NULL)"
+        )
+        con_mkt.execute(
+            "INSERT INTO daily_bar VALUES "
+            "('600715.SH', ?, 2.30, 2.53, 2.28, 2.53, 2.30, 10.0, 500000.0, 125000.0)",
+            [latest_day],
+        )
+    finally:
+        con_mkt.close()
+
+    fixture = FixtureSource(today=latest_day)
+    d = latest_day.isoformat()
+    # Insert 3 rows for 文投控股 hitting 3 distinct presets on the same day
+    fixture.con.execute("INSERT INTO stock_basic VALUES ('600715.SH', '文投控股', '传媒')")
+    fixture.con.executemany(
+        "INSERT INTO screen_result VALUES (?, '600715.SH', ?, '文投控股', 2.53, 10.0)",
+        [(d, "pool1"), (d, "breakout"), (d, "volume_surge")],
+    )
+    fixture.con.execute(
+        "INSERT INTO canvas_definition VALUES ('多策略合集池', '三策略并集', "
+        "'[\"pool1\",\"breakout\",\"volume_surge\"]', now(), now(), 'fixture')"
+    )
+    fixture.con.executemany(
+        "INSERT INTO canvas_hit VALUES (?, ?, '600715.SH', '{}')",
+        [(d, "pool1"), (d, "breakout"), (d, "volume_surge")],
+    )
+
+    app = create_app(fixture, dist=None, research_root=root)
+    app.state.screener_schemes = SqliteSchemeStore(tmp_path / "web_store.sqlite3")
+    client = TestClient(app)
+
+    # 1. GET /api/v1/screen deduplicates 文投控股 into 1 row with merged presets
+    screen_rows = client.get("/api/v1/screen").json()["data"]["rows"]
+    wentou = [r for r in screen_rows if r["code"] == "600715.SH"]
+    assert len(wentou) == 1
+    assert set(wentou[0]["presets"]) == {"pool1", "breakout", "volume_surge"}
+    assert set(wentou[0]["preset"].split(",")) == {"pool1", "breakout", "volume_surge"}
+
+    # 2. GET /api/v1/overview counts DISTINCT ts_code (4 seeded + 1 文投控股 = 5, not 7)
+    ov = client.get("/api/v1/overview").json()["data"]
+    cand_kpi = next(k for k in ov["kpis"] if k["key"] == "candidates")
+    assert cand_kpi["value"] == "5"
+
+    # 3. GET /api/v1/pools deduplicates members across multi-preset canvas_definition
+    pools_data = client.get("/api/v1/pools").json()["data"]["pools"]
+    merged_pool = next(p for p in pools_data if p["name"] == "多策略合集池")
+    wentou_members = [m for m in merged_pool["members"] if m["code"] == "600715.SH"]
+    assert len(wentou_members) == 1
+    assert set(wentou_members[0]["preset"].split(",")) == {"pool1", "breakout", "volume_surge"}
+
+    # 4. POST /api/v1/screener/run (base="presets") also deduplicates and preserves all presets
+    run_rows = client.post(
+        "/api/v1/screener/run",
+        json={"upstream": {"base": "presets"}, "blocks": [], "ranks": []},
+    ).json()["data"]["rows"]
+    wentou_run = [r for r in run_rows if r["code"] == "600715.SH"]
+    assert len(wentou_run) == 1
+    assert set(wentou_run[0]["presets"]) == {"pool1", "breakout", "volume_surge"}
+
+
+def test_readonly_home_fallback_never_500s_on_catalog_or_run(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "research"
+    root.mkdir(parents=True, exist_ok=True)
+    write_demo_research(root)
+
+    ro_dir = tmp_path / "readonly_home"
+    ro_dir.mkdir(parents=True, exist_ok=True)
+    ro_dir.chmod(0o555)
+    try:
+        monkeypatch.setenv("RQUANT_SCREENER_SCHEMES_DB", str(ro_dir / "blocked" / "store.sqlite3"))
+        monkeypatch.setenv("HOME", str(ro_dir))
+
+        fixture = FixtureSource(today=date.today())
+        # Deliberately do NOT set app.state.screener_schemes so _schemes(request) runs live
+        app = create_app(fixture, dist=None, research_root=root)
+        client = TestClient(app)
+
+        cat = client.get("/api/v1/screener/catalog")
+        assert cat.status_code == 200
+        assert len(cat.json()["data"]["rules"]) == 26
+
+        run = client.post(
+            "/api/v1/screener/run",
+            json={"upstream": {"base": "all_market"}, "blocks": [], "ranks": []},
+        )
+        assert run.status_code == 200
+        assert len(run.json()["data"]["rows"]) == 6
+
+        # Canvas DAG layout preference ("pref.screener.canvas.v1") persists cleanly
+        canvas_json = json.dumps(
+            {"version": 1, "nodes": [{"id": "root_market", "name": "全市场"}]}
+        )
+        pref_put = client.put(
+            "/api/v1/ui-preferences",
+            json={"key": "pref.screener.canvas.v1", "value": canvas_json},
+        )
+        assert pref_put.status_code == 200
+        pref_get = client.get("/api/v1/ui-preferences")
+        assert pref_get.status_code == 200
+        saved_pref = json.loads(pref_get.json()["data"]["prefs"]["pref.screener.canvas.v1"])
+        assert saved_pref["version"] == 1
+    finally:
+        ro_dir.chmod(0o755)
+
+
+def test_canvas_dag_upstream_codes_execution(tmp_path: Path) -> None:
+    client, _ = _build_client(tmp_path)
+    res = client.post(
+        "/api/v1/screener/run",
+        json={
+            "upstream": {
+                "base": "codes",
+                "codes": ["600519.SH", "000999.SZ", "830001.BJ"],
+                "base_label": "上游 Pool 1 初筛",
+            },
+            "blocks": [
+                {"id": "b1", "type": "rule", "rule_name": "not_st", "args": {}},
+                {"id": "b2", "type": "rule", "rule_name": "not_bj", "args": {}},
+            ],
+            "ranks": [],
+        },
+    )
+    assert res.status_code == 200
+    data = res.json()["data"]
+    assert [s["remaining"] for s in data["steps"]] == [3, 2, 1]
+    assert data["steps"][0]["label"] == "上游 Pool 1 初筛"
+    assert [r["code"] for r in data["rows"]] == ["600519.SH"]
+

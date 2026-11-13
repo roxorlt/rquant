@@ -57,6 +57,7 @@ export const appRoutes: RouteObject[] = [
       { path: "strategies", element: <LegacyRedirect to="/backtest" tab="strategies" /> },
       { path: "reportmining", element: <LegacyRedirect to="/factor" tab="reports" /> },
       { path: "reportfactors", element: <LegacyRedirect to="/factor" tab="reports" /> },
+      { path: "canvas", element: <Navigate to="/screener?view=canvas" replace /> },
       { path: "stock/:code", element: <StockPage />, handle: { title: "个股档案" } },
       { path: "*", element: <NotFound />, handle: { title: "页面不存在" } },
     ],

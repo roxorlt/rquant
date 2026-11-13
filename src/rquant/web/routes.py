@@ -175,7 +175,7 @@ def overview(
 ) -> Envelope[OverviewData]:
     names = _names(source)
     screen = source.query(
-        "SELECT trade_date, count(*) AS n FROM screen_result "
+        "SELECT trade_date, count(DISTINCT ts_code) AS n FROM screen_result "
         "GROUP BY trade_date ORDER BY trade_date DESC LIMIT 1")
     alerts = source.query(
         "SELECT count(*) AS n FROM monitor_event "
@@ -295,19 +295,30 @@ def screen(request: Request, source: SourceDep, trade_date: date | None = None,
         return _envelope(source, ScreenData(trade_date=None, presets=[], rows=[]))
     presets = sorted({r["preset_name"] for r in rows})
     rows = [r for r in rows if preset is None or r["preset_name"] == preset]
+    dedup_rows: dict[str, dict[str, Any]] = {}
+    presets_by_code: dict[str, list[str]] = {}
+    for r in rows:
+        code = str(r["ts_code"])
+        pname = str(r["preset_name"])
+        if code not in dedup_rows:
+            dedup_rows[code] = r
+        plist = presets_by_code.setdefault(code, [])
+        if pname not in plist:
+            plist.append(pname)
     root = Path(_research_root(request) or research_root())
-    codes = sorted({r["ts_code"] for r in rows})
+    codes = sorted(dedup_rows)
     with market(root) as con:
         extra = enrich(con, codes, day)
     doc = read_fundamentals(root)
     fund = {f.code: f.values for f in doc.rows} if doc else {}
     factor_pct = read_latest(root)
     items = []
-    for r in rows:
-        code = r["ts_code"]
+    for code, r in dedup_rows.items():
         f = fund.get(code, {})
+        matched = presets_by_code.get(code, [str(r["preset_name"])])
         items.append(ScreenRow(
-            trade_date=r["trade_date"], code=code, name=r["name"], preset=r["preset_name"],
+            trade_date=r["trade_date"], code=code, name=r["name"],
+            preset=",".join(matched), presets=matched,
             close=_f(r["close"]), pct_chg=_f(r["pct_chg"]), **extra.get(code, {}),
             roe=f.get("roe"), grossprofit_margin=f.get("grossprofit_margin"),
             netprofit_margin=f.get("netprofit_margin"), netprofit_yoy=f.get("netprofit_yoy"),
@@ -327,6 +338,24 @@ def _market_names(request: Request | None) -> dict[str, str]:
             return dict(con.execute("SELECT ts_code, name FROM stock_basic LIMIT 8000").fetchall())
         except duckdb.Error:
             return {}
+
+
+def _dedup_pool_members(members: list[PoolMember]) -> list[PoolMember]:
+    by_code: dict[str, PoolMember] = {}
+    presets_by_code: dict[str, list[str]] = {}
+    for m in members:
+        code = str(m.code)
+        if code not in by_code:
+            by_code[code] = m
+        plist = presets_by_code.setdefault(code, [])
+        for p in str(m.preset).split(","):
+            p = p.strip()
+            if p and p not in plist:
+                plist.append(p)
+    return [
+        m.model_copy(update={"preset": ",".join(presets_by_code.get(code, [m.preset]))})
+        for code, m in by_code.items()
+    ]
 
 
 @router.get("/pools", response_model=Envelope[PoolsData], summary="池子")
@@ -351,7 +380,7 @@ def pools(source: SourceDep, request: Request = None) -> Envelope[PoolsData]:  #
             "SELECT name, description, pool_refs_json, updated_at FROM canvas_definition "
             "ORDER BY name LIMIT 512"):
         refs = json.loads(c["pool_refs_json"] or "[]")
-        members = [m for ref in refs for m in by_preset.get(ref, [])]
+        members = _dedup_pool_members([m for ref in refs for m in by_preset.get(ref, [])])
         out.append(PoolItem(name=c["name"], description=c["description"] or "", pool_refs=refs,
                             updated_at=c["updated_at"], members=members))
 
@@ -380,10 +409,14 @@ def pools(source: SourceDep, request: Request = None) -> Envelope[PoolsData]:  #
         for sp in saved:
             tag = sp.pool_refs[0] if len(sp.pool_refs) == 1 else "saved"
             if sp.codes:
-                members = [PoolMember(code=code, name=names.get(code), preset=tag, detail={})
-                           for code in sp.codes]
+                members = _dedup_pool_members([
+                    PoolMember(code=code, name=names.get(code), preset=tag, detail={})
+                    for code in sp.codes
+                ])
             else:
-                members = [m for ref in sp.pool_refs for m in by_preset.get(ref, [])]
+                members = _dedup_pool_members([
+                    m for ref in sp.pool_refs for m in by_preset.get(ref, [])
+                ])
             item = PoolItem(name=sp.name, description=sp.description, pool_refs=sp.pool_refs,
                             updated_at=sp.updated_at, members=members)
             if sp.name in by_existing:
@@ -1097,6 +1130,9 @@ def remove_watch(
 
 
 def _schemes(request: Request):
+    import sqlite3
+    import tempfile
+
     from rquant.web.screener_schemes import MemorySchemeStore, SqliteSchemeStore
     from rquant.web.source import FixtureSource
 
@@ -1112,8 +1148,25 @@ def _schemes(request: Request):
         from rquant.config import get_settings
 
         raw = os.environ.get("RQUANT_SCREENER_SCHEMES_DB")
-        path = Path(raw) if raw else get_settings().data_dir / "screener_schemes.sqlite3"
-        store = SqliteSchemeStore(path)
+        candidates: list[Path] = []
+        if raw:
+            candidates.append(Path(raw))
+        else:
+            home_store = Path.home() / "rquant-web-store" / "web_store.sqlite3"
+            if home_store.parent.is_dir():
+                candidates.append(home_store)
+            candidates.append(get_settings().data_dir / "screener_schemes.sqlite3")
+        candidates.append(Path(tempfile.gettempdir()) / "rquant-web-store" / "web_store.sqlite3")
+
+        store = None
+        for candidate in candidates:
+            try:
+                store = SqliteSchemeStore(candidate)
+                break
+            except (OSError, sqlite3.Error):
+                continue
+        if store is None:
+            store = MemorySchemeStore()
     request.app.state.screener_schemes = store
     return store
 
