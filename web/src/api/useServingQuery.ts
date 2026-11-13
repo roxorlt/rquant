@@ -29,6 +29,7 @@ export function useServingQuery<T>(
   options: {
     enabled?: boolean;
     staleTime?: number;
+    keepPrevious?: boolean;
     refetchInterval?: number | false | (() => number | false);
   } = {},
 ): ServingQueryResult<T> {
@@ -37,6 +38,7 @@ export function useServingQuery<T>(
     queryFn: fetcher,
     enabled: options.enabled ?? true,
     staleTime: options.staleTime,
+    placeholderData: options.keepPrevious ? (prev) => prev : undefined,
     refetchInterval: options.refetchInterval,
   });
   return {

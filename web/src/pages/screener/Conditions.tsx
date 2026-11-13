@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from "react";
-import { useConditions, useTextToCondition, useTranslateTdx } from "@/api/endpoints";
+import { useState } from "react";
+import { useConditions, useTranslateTdx } from "@/api/endpoints";
 import { toneClass, toneOf } from "@/format/color";
 import { formatFixed, formatPrice } from "@/format/number";
 import { DataTable } from "@/table/DataTable";
@@ -14,62 +14,14 @@ function unrecognizedCount(error: string | null): number {
   return hits?.length ?? 1;
 }
 
-function TdxImport() {
+function TdxImport({ onAddTdx }: { onAddTdx?: (tdx: string) => void }) {
   const [tdx, setTdx] = useState("C>MA(C,5) AND V>REF(V,1)*2");
   const translate = useTranslateTdx();
   const result = translate.data;
-  const [text, setText] = useState("");
-  const ai = useTextToCondition();
   const passed = Boolean(result?.expression);
   const misses = unrecognizedCount(result?.error ?? null);
-  const failRef = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    if (!ai.error) return;
-    failRef.current?.scrollIntoView({ block: "center" });
-  }, [ai.error]);
   return (
-    <Panel title="通达信公式导入" sub="只翻译和校验">
-      <div className="formula-ai">
-        <input
-          aria-label="一句话条件"
-          placeholder="一句话描述条件，例如：站上20日线且放量一倍"
-          value={text}
-          onChange={(e) => setText(e.target.value)}
-        />
-        <Button
-          variant="quiet"
-          disabled={ai.isPending || text.trim().length < 2}
-          onClick={() =>
-            ai.mutate(text, {
-              onSuccess: (d) => {
-                if (d.tdx) setTdx(d.tdx);
-                translate.reset();
-              },
-            })
-          }
-        >
-          {ai.isPending ? "生成中…" : "一句话生成"}
-        </Button>
-      </div>
-      {ai.error ? (
-        <div ref={failRef}>
-          <FailureNotice
-            copy={failureCopy("条件", "生成", ai.error)}
-            onRetry={() => ai.mutate(text)}
-          />
-        </div>
-      ) : null}
-      {ai.data ? (
-        <output className="formula-result" aria-label="生成结果">
-          <div className="formula-result-h">
-            <span className="formula-result-label">生成结果</span>
-            <span className={ai.data.expression ? "st ok" : "st warn"}>
-              {ai.data.expression ? "校验通过" : "有 1 处不认识"}
-            </span>
-          </div>
-          <div className="formula-result-expr">{ai.data.expression ?? ai.data.error}</div>
-        </output>
-      ) : null}
+    <Panel title="通达信公式沙盒" sub="校验语法后可一键加入上方实时选股漏斗">
       <textarea
         aria-label="通达信公式"
         rows={3}
@@ -78,7 +30,14 @@ function TdxImport() {
         onChange={(e) => setTdx(e.target.value)}
       />
       <div className="formula-actions">
-        <Button onClick={() => translate.mutate(tdx)}>翻译</Button>
+        <Button variant="quiet" onClick={() => translate.mutate(tdx)}>
+          翻译
+        </Button>
+        {onAddTdx ? (
+          <Button variant="primary" disabled={!tdx.trim()} onClick={() => onAddTdx(tdx.trim())}>
+            加入选股漏斗
+          </Button>
+        ) : null}
       </div>
       {translate.error ? (
         <FailureNotice
@@ -101,39 +60,50 @@ function TdxImport() {
   );
 }
 
-export function Conditions() {
+export function Conditions({ onAddTdx }: { onAddTdx?: (tdx: string) => void }) {
   const query = useConditions();
   const [picked, setPicked] = useState(0);
   return (
     <>
-      <TdxImport />
+      <TdxImport onAddTdx={onAddTdx} />
       <QueryView query={query}>
         {(data) => {
           const runs = data.runs ?? [];
           const run = runs[picked];
           return (
             <Panel
-              title="条件选股"
+              title="历史离线条件选股"
               sub={
                 run
                   ? `${run.name} · ${run.trade_date ?? "—"} · 命中 ${run.hits.length}/${run.universe}`
-                  : "还没有条件选股结果"
+                  : "还没有离线条件选股结果"
               }
               actions={
-                runs.length > 1 ? (
-                  <select
-                    className="select"
-                    aria-label="演示条件"
-                    value={picked}
-                    onChange={(e) => setPicked(Number(e.target.value))}
-                  >
-                    {runs.map((r, i) => (
-                      <option key={r.run_id} value={i}>
-                        {r.name}
-                      </option>
-                    ))}
-                  </select>
-                ) : null
+                <span className="tools-group">
+                  {runs.length > 1 ? (
+                    <select
+                      className="select"
+                      aria-label="演示条件"
+                      value={picked}
+                      onChange={(e) => setPicked(Number(e.target.value))}
+                    >
+                      {runs.map((r, i) => (
+                        <option key={r.run_id} value={i}>
+                          {r.name}
+                        </option>
+                      ))}
+                    </select>
+                  ) : null}
+                  {run?.source_formula && onAddTdx ? (
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => onAddTdx(run.source_formula ?? "")}
+                    >
+                      载入公式到漏斗
+                    </Button>
+                  ) : null}
+                </span>
               }
               flush
             >
@@ -143,7 +113,7 @@ export function Conditions() {
                   tools="条件选股"
                   rows={run.hits}
                   rowKey={(row) => row.code}
-                  height={320}
+                  height={300}
                   columns={[
                     {
                       id: "code",

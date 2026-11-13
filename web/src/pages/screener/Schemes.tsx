@@ -1,5 +1,7 @@
 import { useState } from "react";
 import {
+  type ScreenerBlock,
+  type ScreenerUpstream,
   useDeleteScreenerScheme,
   useSaveScreenerScheme,
   useScreenerSchemes,
@@ -8,12 +10,20 @@ import { screenerSchemesEnabled } from "@/features";
 import { readPreference, writePreference } from "@/theme/storage";
 import { Button, FailureNotice, useToast } from "@/ui";
 import { type FailureCopy, failureCopy } from "@/ui/failure";
-import type { Filter, Rank } from "./Builder";
+import {
+  blocksToLegacyFilters,
+  DEFAULT_UPSTREAM,
+  type Filter,
+  filtersToBlocks,
+  type Rank,
+} from "./Builder";
 
 export interface Scheme {
   name: string;
   filters: Filter[];
   ranks: Rank[];
+  upstream?: ScreenerUpstream;
+  blocks?: ScreenerBlock[];
 }
 
 const KEY = "screener.schemes";
@@ -32,18 +42,39 @@ function storeLocal(list: Scheme[]): boolean {
   return list.length === 0 || readPreference(KEY) != null;
 }
 
-export function Schemes(props: { filters: Filter[]; ranks: Rank[]; onLoad: (s: Scheme) => void }) {
+function normalizeUpstream(raw: unknown): ScreenerUpstream | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const obj = raw as Record<string, unknown>;
+  if (typeof obj.base !== "string") return undefined;
+  return {
+    base: obj.base as ScreenerUpstream["base"],
+    preset: typeof obj.preset === "string" ? obj.preset : null,
+    pool: typeof obj.pool === "string" ? obj.pool : null,
+    include_pools: Array.isArray(obj.include_pools) ? (obj.include_pools as string[]) : [],
+    intersect_pools: Array.isArray(obj.intersect_pools) ? (obj.intersect_pools as string[]) : [],
+    exclude_pools: Array.isArray(obj.exclude_pools) ? (obj.exclude_pools as string[]) : [],
+  };
+}
+
+export function Schemes(props: {
+  blocks: ScreenerBlock[];
+  upstream: ScreenerUpstream;
+  ranks: Rank[];
+  onLoad: (s: Scheme) => void;
+}) {
   if (!screenerSchemesEnabled()) return null;
   return <SchemeEditor {...props} />;
 }
 
-/** Named condition schemes. The server is the copy that follows the account; this browser is only a fallback. */
+/** Named condition schemes (persists upstream + blocks + ranks in SQLite Web Store). */
 function SchemeEditor({
-  filters,
+  blocks,
+  upstream,
   ranks,
   onLoad,
 }: {
-  filters: Filter[];
+  blocks: ScreenerBlock[];
+  upstream: ScreenerUpstream;
   ranks: Rank[];
   onLoad: (s: Scheme) => void;
 }) {
@@ -56,20 +87,35 @@ function SchemeEditor({
   const [fail, setFail] = useState<FailureCopy | null>(null);
   const remoteSchemes = remote.data?.schemes;
   const list: Scheme[] = Array.isArray(remoteSchemes)
-    ? remoteSchemes.map((s) => ({
-        name: s.name,
-        filters: s.filters as unknown as Filter[],
-        ranks: s.ranks as unknown as Rank[],
-      }))
+    ? remoteSchemes.map((s) => {
+        const legacyFilters = (s.filters ?? []) as unknown as Filter[];
+        const rawBlocks = Array.isArray(s.blocks) ? (s.blocks as unknown as ScreenerBlock[]) : [];
+        return {
+          name: s.name,
+          filters: legacyFilters,
+          ranks: (s.ranks ?? []) as unknown as Rank[],
+          upstream: normalizeUpstream(s.upstream),
+          blocks: rawBlocks.length > 0 ? rawBlocks : filtersToBlocks(legacyFilters),
+        };
+      })
     : local;
   const save = () => {
     const n = name.trim();
     if (!n) return;
-    const scheme = { name: n, filters, ranks };
+    const legacyFilters = blocksToLegacyFilters(blocks);
+    const scheme: Scheme = {
+      name: n,
+      filters: legacyFilters,
+      ranks,
+      upstream,
+      blocks,
+    };
     const body = {
       name: n,
-      filters: filters as unknown as Record<string, unknown>[],
+      filters: legacyFilters as unknown as Record<string, unknown>[],
       ranks: ranks as unknown as Record<string, unknown>[],
+      upstream: upstream as unknown as Record<string, unknown>,
+      blocks: blocks as unknown as Record<string, unknown>[],
     };
     saveScheme.mutate(body, {
       onSuccess: () => {
@@ -91,6 +137,8 @@ function SchemeEditor({
           name: scheme.name,
           filters: scheme.filters.map((f) => ({ ...f })),
           ranks: scheme.ranks.map((r) => ({ ...r })),
+          upstream: scheme.upstream ? { ...scheme.upstream } : undefined,
+          blocks: scheme.blocks ? scheme.blocks.map((b) => ({ ...b })) : undefined,
         }
       : null;
     removeScheme.mutate(n, {
@@ -106,6 +154,11 @@ function SchemeEditor({
                 name: snapshot.name,
                 filters: snapshot.filters as unknown as Record<string, unknown>[],
                 ranks: snapshot.ranks as unknown as Record<string, unknown>[],
+                upstream: (snapshot.upstream ?? DEFAULT_UPSTREAM) as unknown as Record<
+                  string,
+                  unknown
+                >,
+                blocks: (snapshot.blocks ?? []) as unknown as Record<string, unknown>[],
               });
               const next = [...loadSchemes().filter((s) => s.name !== snapshot.name), snapshot];
               if (storeLocal(next)) setLocal(next);
@@ -141,7 +194,7 @@ function SchemeEditor({
       ))}
       <input
         aria-label="方案名"
-        placeholder="命名当前条件…"
+        placeholder="命名当前范围与积木…"
         value={name}
         onChange={(e) => setName(e.target.value)}
         onKeyDown={(e) => {

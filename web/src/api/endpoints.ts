@@ -243,6 +243,8 @@ export function useSavePool() {
     onSuccess: () => {
       void client.invalidateQueries({ queryKey: ["pools"] });
       void client.invalidateQueries({ queryKey: ["stock"] });
+      void client.invalidateQueries({ queryKey: ["screener-catalog"] });
+      void client.invalidateQueries({ queryKey: ["screener-run"] });
     },
   });
 }
@@ -267,6 +269,8 @@ export function useAddWatch() {
       void client.invalidateQueries({ queryKey: ["watchlist"] });
       void client.invalidateQueries({ queryKey: ["pools"] });
       void client.invalidateQueries({ queryKey: ["stock"] });
+      void client.invalidateQueries({ queryKey: ["screener-catalog"] });
+      void client.invalidateQueries({ queryKey: ["screener-run"] });
     },
   });
 }
@@ -284,6 +288,8 @@ export function useRemoveWatch() {
       void client.invalidateQueries({ queryKey: ["watchlist"] });
       void client.invalidateQueries({ queryKey: ["pools"] });
       void client.invalidateQueries({ queryKey: ["stock"] });
+      void client.invalidateQueries({ queryKey: ["screener-catalog"] });
+      void client.invalidateQueries({ queryKey: ["screener-run"] });
     },
   });
 }
@@ -532,5 +538,97 @@ export function useReportFactors(): ServingQueryResult<Schemas["ReportFactorsDat
   return useServingQuery(["report-factors"], async () => {
     const { data, response } = await apiClient().GET("/api/v1/report-factors");
     return unwrap(data, response);
+  });
+}
+
+// ---- Wave 3 Mode-A Screener Workbench ----
+
+export type ScreenerCatalogData = Schemas["ScreenerCatalogData"];
+export type ScreenerRunRequest = Schemas["ScreenerRunRequest"];
+export type ScreenerRunData = Schemas["ScreenerRunData"];
+export type ScreenerBlock = Schemas["ScreenerBlock"];
+export type ScreenerUpstream = Schemas["ScreenerUpstream"];
+export type ScreenerFunnelStep = Schemas["ScreenerFunnelStep"];
+export type ScreenerRankSpec = Schemas["ScreenerRankSpec"];
+export type RuleCatalogItem = Schemas["RuleCatalogItem"];
+export type RuleParamSpec = Schemas["RuleParamSpec"];
+export type FieldCatalogGroup = Schemas["FieldCatalogGroup"];
+export type FieldCatalogItem = Schemas["FieldCatalogItem"];
+export type CustomBlockItem = Schemas["CustomBlockItem"];
+export type CustomBlockSaveRequest = Schemas["CustomBlockSaveRequest"];
+export type ScreenerNlCompileData = Schemas["ScreenerNlCompileData"];
+export type UpstreamOptionItem = Schemas["UpstreamOptionItem"];
+
+export function useScreenerCatalog(): ServingQueryResult<ScreenerCatalogData> {
+  return useServingQuery(["screener-catalog"], async () => {
+    const { data, response } = await apiClient().GET("/api/v1/screener/catalog");
+    return unwrap(data, response);
+  });
+}
+
+export function useScreenerRun(
+  body: ScreenerRunRequest,
+  enabled = true,
+): ServingQueryResult<ScreenerRunData> {
+  return useServingQuery(
+    ["screener-run", JSON.stringify(body)],
+    async () => {
+      const { data, response } = await apiClient().POST("/api/v1/screener/run", { body });
+      return unwrap(data, response);
+    },
+    { enabled, keepPrevious: true },
+  );
+}
+
+export function useScreenerFromText() {
+  return useMutation({
+    mutationFn: async (text: string) => {
+      const { data, response } = await apiClient().POST("/api/v1/screener/from-text", {
+        body: { text },
+      });
+      return unwrap(data, response);
+    },
+  });
+}
+
+export function useCustomBlocks(): ServingQueryResult<Schemas["CustomBlocksData"]> {
+  return useServingQuery(["screener-blocks"], async () => {
+    const { data, response } = await apiClient().GET("/api/v1/screener/blocks");
+    return unwrap(data, response);
+  });
+}
+
+export function useSaveCustomBlock() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ blockId, body }: { blockId: string; body: CustomBlockSaveRequest }) => {
+      const { data, response } = await apiClient().PUT("/api/v1/screener/blocks/{block_id}", {
+        params: { path: { block_id: blockId } },
+        body,
+      });
+      return unwrap(data, response);
+    },
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ["screener-blocks"] });
+      void client.invalidateQueries({ queryKey: ["screener-catalog"] });
+      void client.invalidateQueries({ queryKey: ["screener-run"] });
+    },
+  });
+}
+
+export function useDeleteCustomBlock() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async (blockId: string) => {
+      const { data, response } = await apiClient().DELETE("/api/v1/screener/blocks/{block_id}", {
+        params: { path: { block_id: blockId } },
+      });
+      return unwrap(data, response);
+    },
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ["screener-blocks"] });
+      void client.invalidateQueries({ queryKey: ["screener-catalog"] });
+      void client.invalidateQueries({ queryKey: ["screener-run"] });
+    },
   });
 }

@@ -9,7 +9,7 @@
 
 ## 一、项目定位与当前真实边界
 
-**rQuant** 是个人自用的 A 股量化选股、实时盯盘、告警推送与可信策略研究平台（当前主线基线标签：`v0.36.0`（L2 常驻组件仍为 v0.35.5 / 8de81101，archive 修复尚未部署））。
+**rQuant** 是个人自用的 A 股量化选股、实时盯盘、告警推送与可信策略研究平台（当前主线基线标签：`v0.37.0`（L2 常驻组件仍为 v0.35.5 / 8de81101，archive 修复尚未部署））。
 
 ### 1.1 核心边界
 - **只做**：盘后日线/因子/状态更新 → 条件筛选与候选池生成 → 盘中实时监控（分钟/快照/竞价/量能异动/受控 L2）→ 多通道告警通知（PushDeer / PushPlus）→ Point-in-Time（PIT）可信历史回放、策略评估与自动模拟盘。
@@ -76,7 +76,7 @@ rquant/
 5. **Web 应用（`src/rquant/web/` + `web/`，11 个核心导航页）**
    - 支持双只读底座切换：`ResearchSource`（`RQUANT_WEB_SOURCE=research`，以内存 DuckDB 只读挂载 `market.duckdb` 与可选只读副本 `rquant_ro.duckdb`，代码硬拦截直连主库 `rquant.duckdb`，动态投影标准视图）与兼容旧 `ServingSource`（`RQUANT_SERVING_ROOT`）。
    - 侧栏收敛为 **11 个核心页面**：`总览` (`/overview`)、`选股器` (`/screener`)、`池子` (`/pools`)、`因子库` (`/factor`，含自研因子与研报挖掘双 Tab)、`盯盘与告警` (`/monitor`)、`市场全景` (`/panorama`)、`板块资金流` (`/sectorflow`)、`模拟盘` (`/paper`)、`回测` (`/backtest`，含单策略回测 / 组合回测 / 策略版本三 Tab)、`宏观` (`/macro`)、`系统状态` (`/health`，统一整合健康度、systemd 服务/定时器日志抽屉与数据集覆盖率审计）。旧路由（`/experiments`、`/strategies`、`/reportmining`、`/tasks`、`/data`、`/query`）均保留兼容重定向。
-   - 单用户无锁闭环：`rquant.web.commands_service`（线上 `127.0.0.1:8769` 或进程内直写 `~/rquant-web-commands`）提供幂等 JSONL 落盘与实时读取投影，闭环「加/删自选、保存/并入池子（含筛选后精确股票列表与空格池名）、告警规则」；选股方案与跨端 UI 偏好由独立 SQLite Web Store（`screener_schemes.py`）持久化；已彻底移除多人 RBAC 只读锁、告警 `ack/unack`、`/ops` 操作审计页、网页 SQL 查询与 Brinson/PBO 过度包装指标。
+   - 单用户无锁闭环与形态 A 选股工作台：`rquant.web.commands_service`（线上 `127.0.0.1:8769` 或进程内直写 `~/rquant-web-commands`）提供幂等 JSONL 落盘与实时读取投影，闭环「加/删自选、保存/并入池子（含筛选后精确股票列表与空格池名）、告警规则」；`/screener` 已升级为形态 A 级联选股工作台（`screener_engine.py` 只读内存 DuckDB 挂载，支持全市场 A 股 / 今日候选池 / 预设 / 自定义与竞价池 / 自选股及并集、交集、排除集合运算，26 个内置规则积木、实时可执行 TDX 公式、全量财务与已验证因子分位过滤、白盒自然语言编译、「存为我的积木」`screener_custom_block` 复用，以及可点击预览任意中间层的逐层漏斗诊断，底层 `upstream + blocks + ranks` 原生预留形态 B 画布兼容）；选股方案、自定义积木与跨端 UI 偏好由独立 SQLite Web Store（`screener_schemes.py`）持久化；已彻底移除多人 RBAC 只读锁、告警 `ack/unack`、`/ops` 操作审计页、网页 SQL 查询与 Brinson/PBO 过度包装指标。
    - 个股页提供日 K（含 VP / 筹码分布）、分时（240 分钟连续交易轴 + VWAP/BVC 订单流估算）、5 日分时、TPO 市场轮廓、资金流、财务指标及一键加/移自选。
 
 6. **MacBook 五虎盯盘刘海插件（`notch_app/`，当前 `v1.0.5`）**
@@ -142,7 +142,7 @@ cd notch_app && ./build.sh && ./install.sh
 ## 五、当前推进重点（Active Focus）
 
 1. **L2 持续稳定性、段式写盘上限验证与归档闭环**：观察 20 股常驻核心 + `rquant-l2-collector-watchdog`（含帧内行情 lag 告警）表现；推进 40/80 股段式写盘窗口验证与 R2 日终归档组件独立验收部署。
-2. **Web 新版选股器工作台（Wave 3 · 形态 A）与生产 `ResearchSource` 切换**：Wave 1（`v0.35.9` 读写闭环）与 Wave 2（`v0.36.0` ~67 万行旧版 Codex 代码清理 + Web 18→11 页收敛）已完成；下一步推进 `/screener` 形态 A（单池 + 级联上游池输入 + 全积木/TDX 公式/已验证因子 + DeepSeek 白盒自然语言编译与「存为我的积木」+ 实时漏斗计数，优先适配 MacBook 触控板手势交互，数据结构预留 DAG 画布形态 B），并在盘后窗口将生产 `/etc/rquant-web.env` 切至 `RQUANT_WEB_SOURCE=research`。
+2. **生产 `ResearchSource` 切换与池子编排画布演进（形态 B）**：Wave 1（`v0.35.9` 读写闭环）、Wave 2（`v0.36.0` ~67 万行旧版 Codex 代码清理 + Web 18→11 页收敛）与 Wave 3（`v0.37.0` `/screener` 形态 A 级联选股工作台）均已合入主线；下一步在盘后窗口将生产 `/etc/rquant-web.env` 切至 `RQUANT_WEB_SOURCE=research`，并在形态 A 日常使用稳定后按需推进多分支 DAG 池子编排画布（形态 B，优先适配 MacBook 触控板双指平移与 pinch 缩放手势）。
 3. **Stage 1 三策略正式验收晋级**：推进 N 字、科创/创业放量、集合竞价三策略真实资格 manifest 回补与覆盖率达标（baseline ≥95%，eligibility/B/S ≥99%），通过 `formal-smoke-replay` 后从 `exploratory` 晋级。
 4. **终端盯盘体验迭代**：Web 桌面/手机端细节打磨与 MacBook `notch_app` 五虎盘中盯盘体验优化。
 
@@ -160,6 +160,21 @@ cd notch_app && ./build.sh && ./install.sh
 > - **涉及文件**：...
 > - **验证与部署状态**：...
 > ```
+
+### 2026-11-13 · Wave 3 Web 选股器工作台（形态 A：级联上游范围 + 全量积木/实时 TDX/因子分位 + 白盒自然语言与自定义积木 + 交互式漏斗）（`feat/wave3-screener-workbench` → `v0.37.0`）
+- **背景/问题**：
+  1. 旧版 Web `/screener` 仅能在已落盘的 `screen_result` 候选池行上做少量数值列的客户端内存过滤（仅涨跌幅、ROE 等极少数列可调），既无法以全市场 A 股、自定义池或竞价池为输入范围，也无法直接调用平台沉淀的 26 个通达信/MyTT 风格内置规则积木、实时可执行通达信选股公式与已验证因子分位。
+  2. 自然语言一句话生成此前仅输出只读表达式预览，无法白盒落入当前条件漏斗逐条微调参数或沉淀为个人可复用的「我的积木」；同时漏斗条仅静态展示数字，无法点击查看中间层剩余标的定位错杀。
+- **主要变更**：
+  1. **级联上游输入范围与多池集合运算（`ScreenerUpstream`）**：支持在 `今日候选池`（`presets`）、`全市场 A 股`（`all_market`）、单个系统预设（`preset`）、已保存池子/竞价选股池（`pool`）与 `自选股`（`watchlist`）之间一键切换，并支持叠加 `+ 并集`（`include_pools`）、`∩ 交集`（`intersect_pools`）与 `− 排除`（`exclude_pools`）级联集合修饰，单页完成「在 A 池基础上排除黑名单池再筛首板」等真实工作流。
+  2. **只读内存 DuckDB 实时选股执行引擎（`src/rquant/web/screener_engine.py`）**：使用 `:memory:` 连接只读 `ATTACH` 研究库 `market.duckdb` 与可选只读副本 `rquant_ro.duckdb`（代码级硬拦截直连主库 `DUCKDB_PATH` `rquant.duckdb`，严守单写者排他锁铁律；日期查询采用周末安全的 `max(trade_date) <= target`），服务端实时执行四大类条件积木：
+     - **26 个内置规则积木（`type="rule"`）**：完整接入 `rquant.screen.rules` / `rquant.llm.registry`（基础过滤、涨跌停与连板、均线趋势、量价异动、通用表达式比较），自动提取参数 Schema 供前端行内编辑周期、回溯日、板块多选等参数；
+     - **实时可执行通达信公式积木（`type="tdx"`）**：经 `rquant.factor.tdx.translate` 校验翻译并在日线面板上通过 `rquant.factor.expr.evaluate` 实时求值；
+     - **全量数值/财务与已验证因子积木（`type="field"`）**：覆盖行情、估值、资金流、6 项核心财务指标（`roe`、`grossprofit_margin`、`netprofit_margin`、`netprofit_yoy`、`or_yoy`、`debt_to_assets`）及自研/研报已验证因子横截面分位（`f:<name>`，自动附带 `FactorTracking` 近期 IC 提示），支持 `>=`、`<=`、`between`、`top_pct`（前 N%）与 `bottom_pct`（后 N%）；
+     - **个人自定义积木（`type="custom"` / `★ 我的积木`）**：SQLite Web Store（`screener_schemes.py`）新增 `screener_custom_block` 表（并对旧版 4 列 `screener_scheme` 表平滑自动迁移 `upstream_json` / `blocks_json`），支持将单条规则/公式或当前多条件组合一键「★ 存为我的积木」并在积木库搜索复用或删除。
+  3. **白盒自然语言编译与交互式逐层漏斗诊断**：新增 `POST /api/v1/screener/from-text`（`compile_nl_to_blocks`，支持 DeepSeek 积木白盒编排与无 Key 本地规则/TDX 双重兜底，硬拒绝未注册积木幻觉），一句话直接拆解追加为可勾选、可改参、可排序的白盒积木；漏斗条（`FunnelStrip`）返回 `step 0..N` 每层剩余数、淘汰数与淘汰占比，支持点击任意中间层（`preview_step`）即时预览该层剩余股票并一键返回最终结果；交互控件全面适配 MacBook 触控板（`pointerdown` 外点关闭、`overscroll-behavior: contain`、无滚轮劫持）。
+- **涉及文件**：`src/rquant/web/{screener_engine,screener_schemes,models,routes,__main__}.py`、`web/src/api/{endpoints,useServingQuery}.ts`、`web/src/api/{openapi.json,schema.d.ts}`、`web/src/copy/publicText.ts`、`web/src/pages/screener/{BlockWorkbench,Builder,Conditions,FieldPicker,Schemes,index}.tsx`、`web/src/styles/screener.css`、`tests/web/{test_screener_workbench,test_ui_preferences}.py`、`web/src/pages/screener/workbench.test.tsx`、`web/e2e/smoke.spec.ts`、`CHANGELOG.md`、`HANDOFF.md`。
+- **验证与部署状态**：严守并行开发边界（零触碰 `src/rquant/l2/`、`scripts/*l2*`、`scripts/deploy-production.sh` 与 `deploy/`）；`bash scripts/check-core-quality.sh`、`ruff check`、`pytest tests/web`（含全市场/集合运算、26 规则/TDX/因子分位、自定义积木 CRUD、白盒 NL 防幻觉、旧库自动迁移与主库排他锁隔离单测）、前端 `biome ci`、`tsc`、`vitest`（含新增 `workbench.test.tsx`）、`vite build`、OpenAPI 契约一致性与 Playwright E2E（12 用例全绿）全部通过。合并主线并打标 `v0.37.0` 产出 `web-<sha8>` 发布包。
 
 ### 2026-11-13 · Wave 2 旧版 Codex 后端模块大瘦身（净减 ~67 万行）与 Web 18→11 页收敛及伪需求清理（`refactor/wave2-codex-slimming` → `v0.36.0`）
 - **背景/问题**：
