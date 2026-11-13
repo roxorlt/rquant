@@ -19,11 +19,14 @@ test("every MVP page opens from the rail", async ({ page }) => {
 
 test("adding a stock to watchlist persists in pools", async ({ page }) => {
   await page.goto("./#/screener");
-  await page.getByRole("button", { name: "加自选" }).first().click();
+  await page
+    .getByRole("row", { name: /贵州茅台/ })
+    .getByRole("button", { name: "加自选" })
+    .click();
   await expect(page.getByText("已加入自选")).toBeVisible();
   await page.goto("./#/pools");
-  await page.getByRole("button", { name: /自选股/ }).click();
-  await expect(page.getByText("贵州茅台")).toBeVisible();
+  await page.getByRole("button", { name: "自选股" }).click();
+  await expect(page.getByRole("row", { name: /贵州茅台/ })).toBeVisible();
 });
 
 test("a backtest run shows its performance block", async ({ page }) => {

@@ -44,10 +44,6 @@ def main(argv: list[str] | None = None) -> None:
 
         def transport(payload: dict) -> dict:
             handle_command(cmds, payload)
-            if payload["kind"] == "ack_alert":
-                return fixture.record_ack(payload)
-            if payload["kind"] == "unack_alert":
-                return fixture.record_unack(payload)
             if payload["kind"] == "save_alert_rule":
                 return fixture.record_rule(payload)
             return {"command_id": payload["command_id"], "status": "succeeded"}
