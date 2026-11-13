@@ -133,14 +133,30 @@ const VARIANT_LABEL: Record<string, string> = {
   base: "基准",
 };
 
-export function presetLabel(value: string | null | undefined): string {
-  if (!value) return "—";
-  const at = value.lastIndexOf("@");
-  const slug = at > 0 ? value.slice(0, at) : value;
-  const version = at > 0 ? value.slice(at + 1) : "";
+function singlePresetLabel(part: string): string {
+  const at = part.lastIndexOf("@");
+  const slug = at > 0 ? part.slice(0, at) : part;
+  const version = at > 0 ? part.slice(at + 1) : "";
   const known = PRESET_LABEL[slug];
   const name = known ?? (/^[a-z0-9][a-z0-9_-]*$/i.test(slug) ? "选股方案" : slug);
   return version && known ? `${name} ${version}` : name;
+}
+
+export function presetLabel(value: string | null | undefined): string {
+  if (!value) return "—";
+  if (value.includes(",")) {
+    const labels = Array.from(
+      new Set(
+        value
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean)
+          .map(singlePresetLabel),
+      ),
+    );
+    return labels.length > 0 ? labels.join(" / ") : "—";
+  }
+  return singlePresetLabel(value);
 }
 
 /** Alert-rule scope ids. The API values stay pool1 / pool2 / manual. */

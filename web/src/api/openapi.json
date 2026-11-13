@@ -5823,6 +5823,13 @@
             "title": "Preset",
             "type": "string"
           },
+          "presets": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Presets",
+            "type": "array"
+          },
           "ret20": {
             "anyOf": [
               {
@@ -6497,10 +6504,31 @@
               "all_market",
               "preset",
               "pool",
-              "watchlist"
+              "watchlist",
+              "codes"
             ],
             "title": "Base",
             "type": "string"
+          },
+          "base_label": {
+            "anyOf": [
+              {
+                "maxLength": 80,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Base Label"
+          },
+          "codes": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 8000,
+            "title": "Codes",
+            "type": "array"
           },
           "exclude_pools": {
             "items": {

@@ -149,6 +149,7 @@ class ScreenRow(BaseModel):
     or_yoy: float | None = None
     debt_to_assets: float | None = None
     score: float | None = None
+    presets: list[str] = Field(default_factory=list)
     factors: dict[str, float] = Field(default_factory=dict)  # name -> cross-section pct 0-100
 
 
@@ -593,9 +594,11 @@ class ScreenerSchemesData(BaseModel):
 
 
 class ScreenerUpstream(BaseModel):
-    base: Literal["presets", "all_market", "preset", "pool", "watchlist"] = "presets"
+    base: Literal["presets", "all_market", "preset", "pool", "watchlist", "codes"] = "presets"
     preset: str | None = Field(default=None, max_length=64)
     pool: str | None = Field(default=None, max_length=64)
+    codes: list[str] = Field(default_factory=list, max_length=8000)
+    base_label: str | None = Field(default=None, max_length=80)
     include_pools: list[str] = Field(default_factory=list, max_length=20)
     intersect_pools: list[str] = Field(default_factory=list, max_length=20)
     exclude_pools: list[str] = Field(default_factory=list, max_length=20)

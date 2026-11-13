@@ -9,7 +9,7 @@
 
 ## 一、项目定位与当前真实边界
 
-**rQuant** 是个人自用的 A 股量化选股、实时盯盘、告警推送与可信策略研究平台（当前主线基线标签：`v0.37.0`（L2 常驻组件仍为 v0.35.5 / 8de81101，archive 修复尚未部署））。
+**rQuant** 是个人自用的 A 股量化选股、实时盯盘、告警推送与可信策略研究平台（当前主线基线标签：`v0.38.0`（L2 常驻组件仍为 v0.35.5 / 8de81101，archive 修复尚未部署））。
 
 ### 1.1 核心边界
 - **只做**：盘后日线/因子/状态更新 → 条件筛选与候选池生成 → 盘中实时监控（分钟/快照/竞价/量能异动/受控 L2）→ 多通道告警通知（PushDeer / PushPlus）→ Point-in-Time（PIT）可信历史回放、策略评估与自动模拟盘。
@@ -76,7 +76,7 @@ rquant/
 5. **Web 应用（`src/rquant/web/` + `web/`，11 个核心导航页）**
    - 支持双只读底座切换：`ResearchSource`（`RQUANT_WEB_SOURCE=research`，以内存 DuckDB 只读挂载 `market.duckdb` 与可选只读副本 `rquant_ro.duckdb`，代码硬拦截直连主库 `rquant.duckdb`，动态投影标准视图）与兼容旧 `ServingSource`（`RQUANT_SERVING_ROOT`）。
    - 侧栏收敛为 **11 个核心页面**：`总览` (`/overview`)、`选股器` (`/screener`)、`池子` (`/pools`)、`因子库` (`/factor`，含自研因子与研报挖掘双 Tab)、`盯盘与告警` (`/monitor`)、`市场全景` (`/panorama`)、`板块资金流` (`/sectorflow`)、`模拟盘` (`/paper`)、`回测` (`/backtest`，含单策略回测 / 组合回测 / 策略版本三 Tab)、`宏观` (`/macro`)、`系统状态` (`/health`，统一整合健康度、systemd 服务/定时器日志抽屉与数据集覆盖率审计）。旧路由（`/experiments`、`/strategies`、`/reportmining`、`/tasks`、`/data`、`/query`）均保留兼容重定向。
-   - 单用户无锁闭环与形态 A 选股工作台：`rquant.web.commands_service`（线上 `127.0.0.1:8769` 或进程内直写 `~/rquant-web-commands`）提供幂等 JSONL 落盘与实时读取投影，闭环「加/删自选、保存/并入池子（含筛选后精确股票列表与空格池名）、告警规则」；`/screener` 已升级为形态 A 级联选股工作台（`screener_engine.py` 只读内存 DuckDB 挂载，支持全市场 A 股 / 今日候选池 / 预设 / 自定义与竞价池 / 自选股及并集、交集、排除集合运算，26 个内置规则积木、实时可执行 TDX 公式、全量财务与已验证因子分位过滤、白盒自然语言编译、「存为我的积木」`screener_custom_block` 复用，以及可点击预览任意中间层的逐层漏斗诊断，底层 `upstream + blocks + ranks` 原生预留形态 B 画布兼容）；选股方案、自定义积木与跨端 UI 偏好由独立 SQLite Web Store（`screener_schemes.py`）持久化；已彻底移除多人 RBAC 只读锁、告警 `ack/unack`、`/ops` 操作审计页、网页 SQL 查询与 Brinson/PBO 过度包装指标。
+   - 单用户无锁闭环与双形态选股工作台（形态 A + 形态 B）：`rquant.web.commands_service`（线上 `127.0.0.1:8769` 或进程内直写 `~/rquant-web-commands`）提供幂等 JSONL 落盘与实时读取投影，闭环「加/删自选、保存/并入池子（含筛选后精确股票列表与空格池名）、告警规则」；`/screener` 提供顶栏一键切换的双形态工作台——**形态 A `列表工作台`**（级联上游输入范围、26 个内置规则积木、实时可执行 TDX 公式、全量财务与已验证因子分位过滤、白盒自然语言编译、「存为我的积木」复用、中间层可点击漏斗预览）与 **形态 B `节点画布`（`/screener?view=canvas`）**（适配 MacBook 触控板双指滑动平移与双指 pinch 缩放的可视化多分支 DAG 池子编排，支持节点自由拖拽、新建初始/下游节点抽屉内直接编辑筛选积木、自然语言新增条件自动同步至 `★ 我的积木`、多父节点 `承接/并集/交集/排除` 拓扑级联执行及单节点结果存为池子）；全链路按 `ts_code` 合并去重多预设命中标的并聚合来源标签；选股方案、自定义积木与跨端 UI 偏好（含画布拓扑坐标）由独立 SQLite Web Store（`screener_schemes.py`，只读宿主环境自动降级 `MemorySchemeStore`）持久化；已彻底移除多人 RBAC 只读锁、告警 `ack/unack`、`/ops` 操作审计页、网页 SQL 查询与 Brinson/PBO 过度包装指标。
    - 个股页提供日 K（含 VP / 筹码分布）、分时（240 分钟连续交易轴 + VWAP/BVC 订单流估算）、5 日分时、TPO 市场轮廓、资金流、财务指标及一键加/移自选。
 
 6. **MacBook 五虎盯盘刘海插件（`notch_app/`，当前 `v1.0.5`）**
@@ -142,7 +142,7 @@ cd notch_app && ./build.sh && ./install.sh
 ## 五、当前推进重点（Active Focus）
 
 1. **L2 持续稳定性、段式写盘上限验证与归档闭环**：观察 20 股常驻核心 + `rquant-l2-collector-watchdog`（含帧内行情 lag 告警）表现；推进 40/80 股段式写盘窗口验证与 R2 日终归档组件独立验收部署。
-2. **生产 `ResearchSource` 切换与池子编排画布演进（形态 B）**：Wave 1（`v0.35.9` 读写闭环）、Wave 2（`v0.36.0` ~67 万行旧版 Codex 代码清理 + Web 18→11 页收敛）与 Wave 3（`v0.37.0` `/screener` 形态 A 级联选股工作台）均已合入主线；下一步在盘后窗口将生产 `/etc/rquant-web.env` 切至 `RQUANT_WEB_SOURCE=research`，并在形态 A 日常使用稳定后按需推进多分支 DAG 池子编排画布（形态 B，优先适配 MacBook 触控板双指平移与 pinch 缩放手势）。
+2. **生产 `ResearchSource` 切换与双形态选股器日常打磨**：Wave 1（`v0.35.9` 读写闭环）、Wave 2（`v0.36.0` ~67 万行旧版 Codex 代码清理 + Web 18→11 页收敛）、Wave 3（`v0.37.0` `/screener` 形态 A 列表工作台）与 Wave 3.1（`v0.38.0` `/screener?view=canvas` 形态 B 池子节点依赖画布、多预设命中去重与只读环境 SQLite 容错）均已合入主线；下一步在盘后窗口将生产 `/etc/rquant-web.env` 切至 `RQUANT_WEB_SOURCE=research` 并显式指向可写 `RQUANT_SCREENER_SCHEMES_DB`。
 3. **Stage 1 三策略正式验收晋级**：推进 N 字、科创/创业放量、集合竞价三策略真实资格 manifest 回补与覆盖率达标（baseline ≥95%，eligibility/B/S ≥99%），通过 `formal-smoke-replay` 后从 `exploratory` 晋级。
 4. **终端盯盘体验迭代**：Web 桌面/手机端细节打磨与 MacBook `notch_app` 五虎盘中盯盘体验优化。
 
@@ -160,6 +160,21 @@ cd notch_app && ./build.sh && ./install.sh
 > - **涉及文件**：...
 > - **验证与部署状态**：...
 > ```
+
+### 2026-11-13 · Wave 3.1 选股器形态 B 池子节点依赖画布上线、多预设重复标的去重与只读沙箱容错修复（`feat/pool-canvas-and-dedup` → `v0.38.0`）
+- **背景/问题**：
+  1. `v0.37.0` 上线腾讯云 `82.156.0.68` 后用户反馈两项现场问题：① 页面未看到此前对齐过的**池子节点依赖画布（形态 B）**（`v0.37.0` 仅上线形态 A 列表工作台）；② 选股器列表中存在大量重复股票行（例如同一只「文投控股」出现 3 行）。
+  2. 根因定位：`rquant-web.service` 开启了 `ProtectSystem=strict` + `ProtectHome=read-only`，在未显式配置 `RQUANT_SCREENER_SCHEMES_DB` 时默认在只读宿主目录打开 SQLite 抛 `OSError: Read-only file system`（HTTP 500），导致前端自动降级到旧接口 `GET /api/v1/screen`；而旧接口及预设成员查询直接按 `screen_result` 的 `(preset_name, ts_code)` 原样输出，当单只股票同日命中 3 个系统预设策略时便产生 3 条重复记录。
+- **主要变更**：
+  1. **全链路重复标的去重与多来源标签合并**：`GET /api/v1/screen`、`GET /api/v1/pools`、`screener_engine.execute_screener` 与前端 `dedupScreenRows()` 统一按 `ts_code` 去重；`ScreenRow` 新增 `presets: list[str]` 字段，同日命中多个预设时自动合并为 `N字初筛 / 突破 / 放量` 联合标签（保留最优排名与得分），`GET /api/v1/overview` 今日候选池 KPI 同步改为 `count(DISTINCT ts_code)`；选股与池子表格显式绑定 `rowKey={(row) => row.code}`。
+  2. **只读沙箱环境下 SQLite Web Store 无缝容错（`routes._schemes`）**：未配置或目标路径只读不可写时依次尝试可写候选目录，仍不可写时自动平滑降级进程内 `MemorySchemeStore`（并对 `screener_engine` 自定义积木读取增加异常保护），彻底杜绝因宿主只读权限导致 `/api/v1/screener/{catalog,run}` 报 500。
+  3. **上线形态 B 可交互池子节点依赖画布（`PoolCanvasWorkbench`，`/screener?view=canvas`）**：
+     - **双形态入口切换**：`/screener` 页头新增醒目 `[ 列表工作台 | 节点画布 ]` 分段切换器（URL `?view=canvas` 双向同步），`/pools` 页头新增 `节点画布编排 →` 快捷跳转，`/canvas` 路由自动重定向至 `/screener?view=canvas`。
+     - **MacBook 触控板手势优先与节点自由拖拽**：原生支持双指滑动平移画布（非缩放 `wheel`）、双指捏合以光标为中心无级缩放（`ctrlKey/metaKey` `wheel` + Safari `gesturestart/gesturechange`，`0.45x–1.85x`）及右下角 `− / 100% / + / 适应屏幕` 悬浮控制条；节点卡片支持 Pointer 自由拖拽排布（按当前缩放比换算位移且拖拽中零重算抖动，画布拓扑与坐标通过 `ui_preference` `pref.screener.canvas.v1` 持久化）。
+     - **新建初始/下游节点行内编辑筛选条件 + 自然语言直通 `★ 我的积木`**：工具栏同时提供 `+ 新建初始节点` 与 `+ 新建下游节点`（节点卡亦带 `+下游` 快捷按钮），新建抽屉内直接内嵌 `NlWhiteBoxBar` 与 `BlockListWorkbench`，创建节点同时即可添加/调参条件积木；在节点抽屉内用自然语言新增条件默认自动勾选「同步存入 ★ 我的积木」，生成瞬间自动调用 `PUT /api/v1/screener/blocks/{block_id}` 写入积木库，立即出现在全画布所有节点的 `★ 我的积木` 可选列表中。
+     - **服务端拓扑级联求值**：`ScreenerUpstream` 新增 `base="codes"` 输入模式，画布按 DAG 拓扑序将上游节点产出股票列表经 `承接` / `∪ 并集` / `∩ 交集` / `− 排除` 组合后发往 `POST /api/v1/screener/run` 实时求值，支持中间漏斗层点击预览与单节点一键保存为池子。
+- **涉及文件**：`src/rquant/web/{models,routes,screener_engine}.py`、`web/src/app/routes.tsx`、`web/src/copy/publicText.ts`、`web/src/pages/pools/index.tsx`、`web/src/pages/screener/{BlockWorkbench,Builder,PoolCanvas,index}.tsx`、`web/src/styles/screener.css`、`web/src/api/{openapi.json,schema.d.ts}`、`tests/web/test_screener_workbench.py`、`web/src/pages/screener/canvas.test.tsx`、`web/e2e/smoke.spec.ts`、`CHANGELOG.md`、`HANDOFF.md`。
+- **验证与部署状态**：严守并行边界（零触碰 `src/rquant/l2/`、`scripts/*l2*`、`scripts/deploy-production.sh` 与 `deploy/`）；`ruff check`、`bash scripts/check-core-quality.sh`、`pytest tests/web`（91 用例全绿，新增多预设去重、只读目录 SQLite 容错与 DAG `base="codes"` 级联单测）、前端 `biome ci`、`tsc`、`vitest`（33 文件 138 用例全绿，新增 `canvas.test.tsx`）、`vite build`、OpenAPI 契约与 Playwright E2E（13 用例全绿）全部通过。合并主线打标 `v0.38.0` 并产出 `web-<sha8>` 发布包供腾讯云 `82.156.0.68` 原子切换。
 
 ### 2026-11-13 · Wave 3 Web 选股器工作台（形态 A：级联上游范围 + 全量积木/实时 TDX/因子分位 + 白盒自然语言与自定义积木 + 交互式漏斗）（`feat/wave3-screener-workbench` → `v0.37.0`）
 - **背景/问题**：

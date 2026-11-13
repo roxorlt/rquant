@@ -138,3 +138,25 @@ test("mode-A screener workbench switches upstream, saves custom block, and previ
   await funnel.getByRole("button", { name: /全市场 A 股/ }).click();
   await expect(page.getByRole("button", { name: /返回最终结果/ })).toBeVisible();
 });
+
+test("mode-B pool dependency canvas renders DAG nodes, creates downstream node with inline filter, and toggles view", async ({
+  page,
+}) => {
+  await page.goto("./#/screener?view=canvas");
+  await expect(page.getByText("Pool 1 · 基础初筛池")).toBeVisible();
+  await expect(page.getByText("Pool 2-1 · 趋势精选池")).toBeVisible();
+
+  await page.getByRole("button", { name: "+ 新建下游节点" }).click();
+  const drawer = page.getByRole("dialog", { name: "新建下游池子节点" });
+  await drawer.getByLabel("节点名称").fill("E2E下游池");
+  await drawer.getByRole("button", { name: "+ 添加条件积木" }).click();
+  await drawer
+    .getByRole("dialog", { name: "选股积木库" })
+    .getByRole("button", { name: /排除北交所/ })
+    .click();
+  await drawer.getByRole("button", { name: "创建下游节点并连线" }).click();
+  await expect(page.getByTestId("pool-canvas-stage").getByText("E2E下游池")).toBeVisible();
+
+  await page.getByRole("button", { name: "列表工作台" }).click();
+  await expect(page.getByText("条件工作台")).toBeVisible();
+});

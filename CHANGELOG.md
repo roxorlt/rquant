@@ -31,6 +31,8 @@
 
 ### Fixed
 
+- **修复选股器与池子页多预设命中重复行（如单股出现多条记录）及云端只读目录 SQLite 降级故障（`v0.38.0`）**：修复 `GET /api/v1/screen`、`GET /api/v1/pools`、`screener_engine` 与前端兜底在单只股票同日命中多个预设策略时按 `(preset_name, ts_code)` 重复返回多行的问题，统一按 `ts_code` 去重并聚合展示全部命中来源标签（`presets` 数组及 `/` 分隔中文标签），`GET /api/v1/overview` 候选池计数同步改为 `count(DISTINCT ts_code)`；修复 `rquant-web` 在 `ProtectSystem=strict` + `ProtectHome=read-only` 且未配置 `RQUANT_SCREENER_SCHEMES_DB` 时打开默认 SQLite 抛 `Read-only file system` 导致 `/api/v1/screener/{catalog,run}` 报 500 降级的问题，新增多候选可写目录探测与 `MemorySchemeStore` 自动兜底。
+
 - **Web 写操作不回显、默认空格池名被拒与表格重渲染卸载修复**：打通 `GET /pools`、`GET /alert-rules`、`GET /operations` 对 `~/rquant-web-commands` JSONL 的实时回读闭环；修复选股器默认保存池名（如 `选股 10-20`）因不含空格规则被拒收、筛选结果 `codes` 与 `mode="existing"` 未保存的问题；修复 `DataTable` 在父组件查询刷新重渲染时因 `flexRender` 匿名组件包装导致单元格 DOM 节点被卸载重建的问题。
 
 - **L2 归档可靠性（R2 瞬时失败重试、失败可诊断、已上传分片幂等续跑）**：R2 客户端 PUT/HEAD/GET/DELETE 统一增加指数退避重试（默认 5 次、1/2/4/8s，仅重试超时/连接错误/`URLError`/`http.client` 异常/5xx，4xx 不重试；单请求超时可配 `R2_TIMEOUT_S`，默认 600s）；条件写重试遇到 412 时交回既有“核对远端字节”路径，已提交且字节一致仍判成功，幂等语义不变。归档失败时不再被吞成单一 `archive_failed`：`main` 捕获处生成脱敏的错误描述（类型、消息、阶段、`first/last_sequence`、chunk/day），写入 `state_root/archive-error.json` 并打印 stderr，失败 receipt 新增 `error` / `error_artifact` 字段（仍 exit 1，成功时清除旧错误文件）。`_new_chunks` 上传前按内容寻址 key HEAD 校验，size+sha256 一致则跳过重复 PUT、仍做完整类型化验证读取，避免全天重跑时重复上传。背景：2026-11-10 归档运行 4 小时+ 后失败且无 traceback，R2 catalog 未推进；本机 R2 实测带宽仅 ~0.7–1.3 MB/s，判断为长串行请求中单次超时且无重试。本版尚未部署；部署前须通过 archive 验收（synthetic + 真 R2 selftest）、新 tag release 与盘后首次诊断运行（建议 `R2_TIMEOUT_S=120`）。
@@ -41,6 +43,8 @@
 - **L2 服务器控制/确认帧容错与单流种子超时（候选，未部署）**：`page=0` 的结构合法服务器帧不再可能落进行情解码：`request=0, flags=6` 且命令为 2201/2202 的确认帧按 ack 处理，`request=0xFFFFFFFD, flags=11` 的订阅事件与 `flags=0x1000B` 的会话元数据沿用原有识别（会话 JSON 仍严格校验），其余未识别的 page-0 家族一律按控制帧计数并忽略——10/29 早盘正是 2615 字节的新确认帧未被识别导致整场中止。单条流 15 秒等不到种子响应时只把该流标 `failed` 并继续其余流，已发出的请求 ID 保留给迟到响应；bootstrap ack 超时、帧/字节预算、关联与解码错误仍终止。当本 epoch 至少一次种子超时且没有任何种子落地时，以时长结束、收到停止信号或 Ctrl-C 退出都写 `blocked` / `seed_timeout`，不再伪装成正常结束；该信号不新增持久状态字段，避免独立部署的旧版归档与回滚读不了 `status.json`。真实故障帧只保留帧头证据；本版仍须精确 CI 与持续行情验收，未部署。
 
 ### Added
+
+- **Web 选股器形态 B 池子节点依赖画布上线（`/screener?view=canvas` / `v0.38.0`）**：新增可交互 DAG 池子编排画布 `PoolCanvasWorkbench`（选股器顶栏 `[ 列表工作台 | 节点画布 ]` 分段切换、池子页 `节点画布编排 →` 快捷跳转及 `/canvas` 路由重定向），优先适配 MacBook 触控板双指滑动平移与双指捏合（`pinch` + Safari `gesturestart/change`）以光标为中心缩放（`0.45x–1.85x`）及右下角缩放控制条；支持节点块 Pointer 自由拖拽排布（`ui_preference` 跨端保存）、`+ 新建初始节点` 与 `+ 新建下游节点`（`+下游`）抽屉内直接编辑白盒自然语言与条件积木列表、节点内自然语言新增条件自动同步至 `★ 我的积木` 跨节点复用；服务端 `ScreenerUpstream` 新增 `base="codes"` 任意股票集合输入，支持多父节点 `承接` / `∪ 并集` / `∩ 交集` / `− 排除` 拓扑级联实时执行、中间漏斗层预览与单节点一键保存为池子。
 
 - **Web 选股器实时执行引擎、白盒自然语言编译与「我的积木」持久化（`v0.37.0`）**：新增 `rquant.web.screener_engine`（只读内存 DuckDB 挂载 `market.duckdb` 与可选只读副本 `rquant_ro.duckdb`，代码硬拒绝直连主库 `rquant.duckdb`）与 `/api/v1/screener/{catalog,run,from-text,blocks}` 系列接口，服务端实时执行 26 个内置选股规则积木、通达信选股公式（`translate` + `evaluate`）、全量行情/估值/资金/财务指标及已验证自研/研报因子分位（`>=` / `<=` / `between` / `top_pct` / `bottom_pct`，附 `FactorTracking` 近期 IC 提示）；新增一句话白盒编译（`compile_nl_to_blocks`）、自定义单条/组合积木保存与复用（`screener_custom_block`）及支持点击任意中间层（`preview_step`）预览剩余股票的逐层漏斗诊断条。
 
