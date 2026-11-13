@@ -15,8 +15,6 @@
 
 /** Writes the public preview can complete. Anything else fails closed. */
 const PREVIEW_WRITES: readonly { method: string; path: string }[] = [
-  { method: "POST", path: "/api/v1/alerts/ack" },
-  { method: "POST", path: "/api/v1/alerts/unack" },
   { method: "POST", path: "/api/v1/watchlist" },
   { method: "PUT", path: "/api/v1/screener-schemes" },
   { method: "DELETE", path: "/api/v1/screener-schemes" },
@@ -25,13 +23,7 @@ const PREVIEW_WRITES: readonly { method: string; path: string }[] = [
 ];
 export const STATIC_PREVIEW_WRITE_MOCK = "STATIC_PREVIEW_WRITE_MOCK";
 
-interface AlertMark {
-  acked: boolean;
-  at: string;
-}
-
 interface WriteOverlay {
-  alerts: Map<string, AlertMark>;
   schemes: Map<string, Record<string, unknown> | null>;
   pools: Map<string, Record<string, unknown>>;
   rules: Map<string, Record<string, unknown>>;
@@ -40,7 +32,6 @@ interface WriteOverlay {
 
 function emptyOverlay(): WriteOverlay {
   return {
-    alerts: new Map(),
     schemes: new Map(),
     pools: new Map(),
     rules: new Map(),
@@ -105,16 +96,6 @@ function rememberWrite(url: string, body: unknown): void {
   const parsed = parsedUrl(url);
   const path = parsed.pathname.replace(/\/$/, "");
   const payload = record(body);
-  if (path.endsWith("/api/v1/alerts/ack") || path.endsWith("/api/v1/alerts/unack")) {
-    const id = payload?.alert_id;
-    if (typeof id === "string") {
-      overlay.alerts.set(id, {
-        acked: path.endsWith("/ack"),
-        at: new Date().toISOString(),
-      });
-    }
-    return;
-  }
   if (path.endsWith("/api/v1/screener-schemes")) {
     const name = payload?.name ?? parsed.searchParams.get("name");
     if (typeof name !== "string" || !name) return;
@@ -147,7 +128,6 @@ function allowlistedWrite(method: string, url: string): boolean {
 
 function overlayEmpty(): boolean {
   return (
-    overlay.alerts.size === 0 &&
     overlay.schemes.size === 0 &&
     overlay.pools.size === 0 &&
     overlay.rules.size === 0 &&
@@ -160,18 +140,6 @@ function applyOverlay(url: string, payload: unknown): unknown {
   const data = record(root?.data);
   if (!root || !data) return payload;
   const path = parsedUrl(url).pathname.replace(/\/$/, "");
-  if (path.endsWith("/api/v1/alerts") && Array.isArray(data.items)) {
-    data.items = data.items.map((item) => {
-      const row = record(item);
-      const id = row?.alert_id;
-      if (!row || typeof id !== "string") return item;
-      const mark = overlay.alerts.get(id);
-      if (!mark) return item;
-      return mark.acked
-        ? { ...row, acked_at: mark.at, acked_by: "我" }
-        : { ...row, acked_at: null, acked_by: null };
-    });
-  }
   if (path.endsWith("/api/v1/screener-schemes") && Array.isArray(data.schemes)) {
     const schemes = data.schemes.filter((item) => {
       const row = record(item);

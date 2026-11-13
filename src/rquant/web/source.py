@@ -7,6 +7,7 @@ e2e smoke use ``FixtureSource``: an in-memory DuckDB with the same table names.
 
 from __future__ import annotations
 
+import contextlib
 import json
 from collections.abc import Sequence
 from datetime import UTC, date, datetime, timedelta
@@ -69,6 +70,490 @@ class ServingSource:
         return [dict(zip(result.columns, row, strict=True)) for row in result.rows]
 
 
+def _sql_quote(path: Path) -> str:
+    return str(path).replace("'", "''")
+
+
+def _same_file(a: Path, b: Path) -> bool:
+    try:
+        return a.resolve() == b.resolve()
+    except OSError:
+        return False
+
+
+_PRESET_TITLES: dict[str, tuple[str, str]] = {
+    "pool1": ("N字初筛", "每个交易日盘后自动筛出的候选池"),
+    "pool2": ("N字精选", "从初筛中持续跟踪的观察池"),
+}
+
+
+class ResearchSource:
+    """Live read-only source over ``$RQUANT_RESEARCH_ROOT/market.duckdb`` and optional
+    ``rquant_ro.duckdb`` replica. Never opens the primary writable ``rquant.duckdb``.
+    """
+
+    def __init__(
+        self,
+        research_root: str | Path,
+        readonly_db: str | Path | None = None,
+        commands_dir: str | Path | None = None,
+    ) -> None:
+        self.research_root = Path(research_root)
+        self.readonly_db = Path(readonly_db) if readonly_db is not None else None
+        self.commands_dir = (
+            Path(commands_dir)
+            if commands_dir is not None
+            else self.research_root / "web-commands"
+        )
+
+    def _primary_db_path(self) -> Path | None:
+        import os
+
+        raw = os.environ.get("DUCKDB_PATH")
+        if raw:
+            return Path(raw)
+        try:
+            from rquant.config import get_settings
+
+            return Path(get_settings().duckdb_path)
+        except Exception:  # noqa: BLE001 - standalone env without .env
+            return None
+
+    def _resolve_readonly_db(self) -> Path | None:
+        import os
+
+        candidate = self.readonly_db
+        if candidate is None:
+            raw = os.environ.get("DUCKDB_READONLY_PATH")
+            if raw:
+                candidate = Path(raw)
+            else:
+                try:
+                    from rquant.config import get_settings
+
+                    candidate = Path(get_settings().duckdb_readonly_path)
+                except Exception:  # noqa: BLE001
+                    candidate = None
+        if candidate is None or not candidate.is_file():
+            return None
+        primary = self._primary_db_path()
+        if primary is not None and _same_file(candidate, primary):
+            return None
+        if _same_file(candidate, self.research_root / "market.duckdb"):
+            return None
+        return candidate
+
+    def _market_db_path(self) -> Path:
+        mkt = self.research_root / "market.duckdb"
+        if not mkt.is_file():
+            raise SourceUnavailableError(f"market.duckdb not found in {self.research_root}")
+        primary = self._primary_db_path()
+        if primary is not None and _same_file(mkt, primary):
+            raise SourceUnavailableError("refusing to open primary writable duckdb_path")
+        return mkt
+
+    def generation(self) -> tuple[str | None, datetime | None]:
+        mkt = self._market_db_path()
+        try:
+            probe = duckdb.connect(str(mkt), read_only=True)
+            probe.close()
+            mtime = mkt.stat().st_mtime
+        except (duckdb.Error, OSError) as exc:
+            raise SourceUnavailableError(f"{type(exc).__name__}: {exc}") from exc
+        ro = self._resolve_readonly_db()
+        if ro is not None:
+            with contextlib.suppress(OSError):
+                mtime = max(mtime, ro.stat().st_mtime)
+        built_at = datetime.fromtimestamp(mtime, UTC)
+        return f"research-{built_at.strftime('%Y%m%dT%H%M%SZ')}", built_at
+
+    @staticmethod
+    def _catalog_columns(con: duckdb.DuckDBPyConnection, catalog: str) -> dict[str, set[str]]:
+        out: dict[str, set[str]] = {}
+        rows = con.execute(
+            "SELECT table_name, column_name FROM information_schema.columns "
+            "WHERE table_catalog = ? AND table_schema = 'main'",
+            [catalog],
+        ).fetchall()
+        for tbl, col in rows:
+            out.setdefault(str(tbl), set()).add(str(col))
+        return out
+
+    def _open_connection(self) -> duckdb.DuckDBPyConnection:
+        mkt = self._market_db_path()
+        con = duckdb.connect(":memory:")
+        try:
+            try:
+                con.execute(f"ATTACH '{_sql_quote(mkt)}' AS mkt (READ_ONLY)")
+            except duckdb.Error as exc:
+                raise SourceUnavailableError(f"{type(exc).__name__}: {exc}") from exc
+            mkt_cols = self._catalog_columns(con, "mkt")
+
+            ro_cols: dict[str, set[str]] = {}
+            ro = self._resolve_readonly_db()
+            if ro is not None:
+                try:
+                    con.execute(f"ATTACH '{_sql_quote(ro)}' AS ro (READ_ONLY)")
+                    ro_cols = self._catalog_columns(con, "ro")
+                except duckdb.Error:
+                    ro_cols = {}
+
+            self._install_projections(con, mkt_cols, ro_cols)
+            return con
+        except Exception:
+            con.close()
+            raise
+
+    def _install_projections(
+        self,
+        con: duckdb.DuckDBPyConnection,
+        mkt_cols: dict[str, set[str]],
+        ro_cols: dict[str, set[str]],
+    ) -> None:
+        if "stock_basic" in mkt_cols:
+            con.execute(
+                "CREATE VIEW stock_basic AS SELECT ts_code, name, industry FROM mkt.stock_basic"
+            )
+        elif "stock_basic" in ro_cols:
+            con.execute(
+                "CREATE VIEW stock_basic AS SELECT ts_code, name, industry FROM ro.stock_basic"
+            )
+        else:
+            con.execute("CREATE TABLE stock_basic(ts_code VARCHAR, name VARCHAR, industry VARCHAR)")
+
+        has_mkt_sr = "screen_result" in mkt_cols
+        has_ro_sr = "screen_result" in ro_cols
+        mkt_extra = (
+            "COALESCE(CAST(extra AS VARCHAR), '{}')"
+            if has_mkt_sr and "extra" in mkt_cols["screen_result"]
+            else "'{}'"
+        )
+        ro_extra = (
+            "COALESCE(CAST(extra AS VARCHAR), '{}')"
+            if has_ro_sr and "extra" in ro_cols["screen_result"]
+            else "'{}'"
+        )
+        if has_mkt_sr and has_ro_sr:
+            con.execute(
+                "CREATE VIEW screen_result AS "
+                "SELECT trade_date, ts_code, preset_name, name, close, pct_chg "
+                "FROM mkt.screen_result "
+                "UNION ALL "
+                "SELECT s.trade_date, s.ts_code, s.preset_name, s.name, s.close, s.pct_chg "
+                "FROM ro.screen_result s "
+                "WHERE NOT EXISTS ("
+                "  SELECT 1 FROM mkt.screen_result m "
+                "  WHERE m.trade_date = s.trade_date "
+                "    AND m.preset_name = s.preset_name "
+                "    AND m.ts_code = s.ts_code"
+                ")"
+            )
+            ro_row_json = ro_extra.replace("extra", "s.extra")
+            con.execute(
+                "CREATE VIEW canvas_hit AS "
+                f"SELECT trade_date, preset_name, ts_code, {mkt_extra} AS row_json "
+                "FROM mkt.screen_result "
+                "UNION ALL "
+                f"SELECT s.trade_date, s.preset_name, s.ts_code, {ro_row_json} AS row_json "
+                "FROM ro.screen_result s "
+                "WHERE NOT EXISTS ("
+                "  SELECT 1 FROM mkt.screen_result m "
+                "  WHERE m.trade_date = s.trade_date "
+                "    AND m.preset_name = s.preset_name "
+                "    AND m.ts_code = s.ts_code"
+                ")"
+            )
+        elif has_mkt_sr:
+            con.execute(
+                "CREATE VIEW screen_result AS "
+                "SELECT trade_date, ts_code, preset_name, name, close, pct_chg "
+                "FROM mkt.screen_result"
+            )
+            con.execute(
+                "CREATE VIEW canvas_hit AS "
+                f"SELECT trade_date, preset_name, ts_code, {mkt_extra} AS row_json "
+                "FROM mkt.screen_result"
+            )
+        elif has_ro_sr:
+            con.execute(
+                "CREATE VIEW screen_result AS "
+                "SELECT trade_date, ts_code, preset_name, name, close, pct_chg "
+                "FROM ro.screen_result"
+            )
+            con.execute(
+                "CREATE VIEW canvas_hit AS "
+                f"SELECT trade_date, preset_name, ts_code, {ro_extra} AS row_json "
+                "FROM ro.screen_result"
+            )
+        else:
+            con.execute(
+                "CREATE TABLE screen_result(trade_date DATE, ts_code VARCHAR, "
+                "preset_name VARCHAR, name VARCHAR, close DOUBLE, pct_chg DOUBLE)"
+            )
+            con.execute(
+                "CREATE TABLE canvas_hit(trade_date DATE, preset_name VARCHAR, "
+                "ts_code VARCHAR, row_json VARCHAR)"
+            )
+
+        con.execute(
+            "CREATE TABLE canvas_definition(name VARCHAR, description VARCHAR, "
+            "pool_refs_json VARCHAR, created_at TIMESTAMP, updated_at TIMESTAMP, source VARCHAR)"
+        )
+        from rquant.research.screens import PRESETS
+
+        preset_rows = con.execute(
+            "SELECT preset_name, max(trade_date) FROM screen_result "
+            "WHERE trade_date = (SELECT max(trade_date) FROM screen_result) "
+            "GROUP BY preset_name ORDER BY preset_name"
+        ).fetchall()
+        for preset_name, max_day in preset_rows:
+            pname = str(preset_name)
+            if pname in PRESETS:
+                title, desc = PRESETS[pname][0], "研究预设候选池"
+            elif pname in _PRESET_TITLES:
+                title, desc = _PRESET_TITLES[pname]
+            else:
+                title, desc = pname, "选股候选池"
+            ts = (
+                datetime.combine(max_day, datetime.min.time()).replace(hour=16)
+                if isinstance(max_day, date)
+                else datetime.now(UTC).replace(tzinfo=None)
+            )
+            con.execute(
+                "INSERT INTO canvas_definition VALUES (?, ?, ?, ?, ?, 'research')",
+                [title, desc, json.dumps([pname]), ts, ts],
+            )
+
+        if "index_daily" in mkt_cols:
+            con.execute(
+                "CREATE VIEW benchmark_daily AS "
+                "SELECT ts_code, trade_date, close, pct_chg FROM mkt.index_daily"
+            )
+        elif "index_daily_bar" in ro_cols:
+            con.execute(
+                "CREATE VIEW benchmark_daily AS "
+                "SELECT ts_code, trade_date, close, pct_chg FROM ro.index_daily_bar"
+            )
+        else:
+            con.execute(
+                "CREATE TABLE benchmark_daily(ts_code VARCHAR, trade_date DATE, "
+                "close DOUBLE, pct_chg DOUBLE)"
+            )
+
+        if "monitor_event" in ro_cols:
+            con.execute(
+                "CREATE VIEW monitor_event AS "
+                "SELECT trade_date, trigger_time, ts_code, level, trigger_price, "
+                "level_price, trigger_type, pool FROM ro.monitor_event"
+            )
+        else:
+            con.execute(
+                "CREATE TABLE monitor_event(trade_date DATE, trigger_time TIMESTAMP, "
+                "ts_code VARCHAR, level VARCHAR, trigger_price DOUBLE, level_price DOUBLE, "
+                "trigger_type VARCHAR, pool VARCHAR)"
+            )
+
+        if "daily_bar" in mkt_cols and "stock_basic" in mkt_cols:
+            con.execute(
+                "CREATE VIEW market_snapshot AS "
+                "SELECT CAST(b.trade_date AS TIMESTAMP) + INTERVAL 15 HOUR AS as_of, "
+                "b.ts_code, s.name, b.close AS price, b.open, b.high, b.low, "
+                "b.pre_close, b.pct_chg, b.vol AS volume, b.amount "
+                "FROM mkt.daily_bar b LEFT JOIN mkt.stock_basic s USING (ts_code) "
+                "WHERE b.trade_date = (SELECT max(trade_date) FROM mkt.daily_bar)"
+            )
+            if "moneyflow" in mkt_cols:
+                con.execute(
+                    "CREATE VIEW market_overview AS "
+                    "SELECT CAST(b.trade_date AS TIMESTAMP) + INTERVAL 15 HOUR AS as_of, "
+                    "'dc_industry' AS system, 'IND:' || s.industry AS board_code, "
+                    "s.industry AS board_name, "
+                    "SUM(b.amount) * 1000.0 AS amount, "
+                    "SUM(mf.buy_lg_amount + mf.buy_elg_amount - mf.sell_lg_amount "
+                    "    - mf.sell_elg_amount) * 10000.0 AS main_net_amount, "
+                    "CASE WHEN SUM(b.amount) > 0 THEN "
+                    "  SUM(mf.buy_lg_amount + mf.buy_elg_amount - mf.sell_lg_amount "
+                    "      - mf.sell_elg_amount) * 1000.0 / SUM(b.amount) "
+                    "ELSE NULL END AS main_net_rate, "
+                    "median(b.pct_chg) AS pct_chg_median, "
+                    "CAST(count(*) FILTER (WHERE b.pct_chg >= 9.8) AS INTEGER) AS limit_up_count, "
+                    "0::INTEGER AS broken_count, "
+                    "CAST(count(*) AS INTEGER) AS stock_count, "
+                    "CAST(count(*) FILTER (WHERE b.pct_chg >= 9.8) * 100.0 / count(*) AS DOUBLE) "
+                    "  AS limit_up_ratio_pct, "
+                    "arg_max(s.name, b.pct_chg) AS leading_stock "
+                    "FROM mkt.daily_bar b "
+                    "JOIN mkt.stock_basic s USING (ts_code) "
+                    "LEFT JOIN mkt.moneyflow mf USING (ts_code, trade_date) "
+                    "WHERE b.trade_date = (SELECT max(trade_date) FROM mkt.daily_bar) "
+                    "  AND s.industry IS NOT NULL AND length(trim(s.industry)) > 0 "
+                    "GROUP BY b.trade_date, s.industry"
+                )
+            else:
+                con.execute(
+                    "CREATE VIEW market_overview AS "
+                    "SELECT CAST(b.trade_date AS TIMESTAMP) + INTERVAL 15 HOUR AS as_of, "
+                    "'dc_industry' AS system, 'IND:' || s.industry AS board_code, "
+                    "s.industry AS board_name, "
+                    "SUM(b.amount) * 1000.0 AS amount, "
+                    "NULL::DOUBLE AS main_net_amount, NULL::DOUBLE AS main_net_rate, "
+                    "median(b.pct_chg) AS pct_chg_median, "
+                    "CAST(count(*) FILTER (WHERE b.pct_chg >= 9.8) AS INTEGER) AS limit_up_count, "
+                    "0::INTEGER AS broken_count, "
+                    "CAST(count(*) AS INTEGER) AS stock_count, "
+                    "CAST(count(*) FILTER (WHERE b.pct_chg >= 9.8) * 100.0 / count(*) AS DOUBLE) "
+                    "  AS limit_up_ratio_pct, "
+                    "arg_max(s.name, b.pct_chg) AS leading_stock "
+                    "FROM mkt.daily_bar b JOIN mkt.stock_basic s USING (ts_code) "
+                    "WHERE b.trade_date = (SELECT max(trade_date) FROM mkt.daily_bar) "
+                    "  AND s.industry IS NOT NULL AND length(trim(s.industry)) > 0 "
+                    "GROUP BY b.trade_date, s.industry"
+                )
+        else:
+            con.execute(
+                "CREATE TABLE market_snapshot(as_of TIMESTAMP, ts_code VARCHAR, name VARCHAR, "
+                "price DOUBLE, open DOUBLE, high DOUBLE, low DOUBLE, pre_close DOUBLE, "
+                "pct_chg DOUBLE, volume DOUBLE, amount DOUBLE)"
+            )
+            con.execute(
+                "CREATE TABLE market_overview(as_of TIMESTAMP, system VARCHAR, board_code VARCHAR, "
+                "board_name VARCHAR, amount DOUBLE, main_net_amount DOUBLE, main_net_rate DOUBLE, "
+                "pct_chg_median DOUBLE, limit_up_count INTEGER, broken_count INTEGER, "
+                "stock_count INTEGER, limit_up_ratio_pct DOUBLE, leading_stock VARCHAR)"
+            )
+
+        daily_bar_latest = (
+            "(SELECT max(trade_date) FROM mkt.daily_bar)"
+            if "daily_bar" in mkt_cols
+            else "NULL::DATE"
+        )
+        daily_bar_rows = (
+            "(SELECT count(*) FROM mkt.daily_bar)"
+            if "daily_bar" in mkt_cols
+            else "0::BIGINT"
+        )
+        minute_bar_rows = (
+            "(SELECT count(*) FROM mkt.minute_bar)"
+            if "minute_bar" in mkt_cols
+            else "0::BIGINT"
+        )
+        con.execute(
+            "CREATE VIEW dashboard_summary AS "
+            f"SELECT 'live' AS snapshot_key, {daily_bar_latest} AS latest_daily_bar, "
+            "(SELECT max(trade_date) FROM screen_result) AS latest_screen, "
+            f"{daily_bar_rows} AS daily_bar_rows, "
+            "(SELECT count(*) FROM monitor_event) AS monitor_event_rows, "
+            f"{minute_bar_rows} AS minute_bar_rows"
+        )
+
+        con.execute(
+            "CREATE VIEW signals AS "
+            "SELECT CAST(row_number() OVER (ORDER BY trade_date DESC, preset_name, ts_code) "
+            "            AS BIGINT) AS global_sequence, "
+            "preset_name || ':' || CAST(trade_date AS VARCHAR) || ':' || ts_code AS signal_id, "
+            "preset_name AS strategy_id, ts_code AS candidate_id, 'watch' AS action, "
+            "CAST(trade_date AS TIMESTAMPTZ) AS available_at, '[]' AS reason_codes_json "
+            "FROM screen_result "
+            "WHERE trade_date = (SELECT max(trade_date) FROM screen_result)"
+        )
+
+        con.execute(
+            "CREATE TABLE runtime_services(service_id VARCHAR, plane VARCHAR, status VARCHAR, "
+            "stale BOOLEAN, observed_at TIMESTAMPTZ, heartbeat_at TIMESTAMPTZ, "
+            "backlog_count INTEGER, consecutive_failures INTEGER, last_error VARCHAR)"
+        )
+        con.execute(
+            "CREATE TABLE paper_accounts(account_id VARCHAR, as_of_time TIMESTAMPTZ, "
+            "cash DECIMAL(18,2), available_cash DECIMAL(18,2), nav DECIMAL(18,2), "
+            "unrealized_pnl DECIMAL(18,2), realized_pnl DECIMAL(18,2))"
+        )
+        con.execute(
+            "CREATE TABLE paper_holdings(account_id VARCHAR, ts_code VARCHAR, "
+            "quantity DECIMAL(18,2), available_quantity DECIMAL(18,2), "
+            "average_cost DECIMAL(18,4), market_price DECIMAL(18,4), "
+            "market_value DECIMAL(18,2), unrealized_pnl DECIMAL(18,2), as_of_time TIMESTAMPTZ)"
+        )
+        if "strategy_summary" in ro_cols:
+            con.execute("CREATE VIEW strategy_summary AS SELECT * FROM ro.strategy_summary")
+        else:
+            con.execute(
+                "CREATE TABLE strategy_summary(run_id VARCHAR, computed_at TIMESTAMP, "
+                "start_date DATE, end_date DATE, max_hold_days INTEGER, entry_mode VARCHAR, "
+                "profile_variant VARCHAR, candidates INTEGER, trades INTEGER, "
+                "trigger_rate_pct DOUBLE, mean_ret_pct DOUBLE, median_ret_pct DOUBLE, "
+                "win_rate_pct DOUBLE, best_ret_pct DOUBLE, worst_ret_pct DOUBLE, "
+                "gap_stop_rate_pct DOUBLE)"
+            )
+        if "strategy_trade" in ro_cols:
+            con.execute("CREATE VIEW strategy_trade AS SELECT * FROM ro.strategy_trade")
+        else:
+            con.execute(
+                "CREATE TABLE strategy_trade(run_id VARCHAR, trade_id VARCHAR, "
+                "entry_mode VARCHAR, profile_variant VARCHAR, signal_date DATE, ts_code VARCHAR, "
+                "name VARCHAR, entry_time TIMESTAMP, entry_price DOUBLE, exit_time TIMESTAMP, "
+                "exit_price DOUBLE, exit_reason VARCHAR, ret_pct DOUBLE)"
+            )
+
+        con.execute(
+            "CREATE TABLE alert_rule(rule_id VARCHAR, title VARCHAR, enabled BOOLEAN, "
+            "pools VARCHAR, levels VARCHAR, cooldown_minutes INTEGER, saved_at TIMESTAMPTZ, "
+            "command_id VARCHAR)"
+        )
+        con.execute(
+            "CREATE TABLE manual_watchlist(ts_code VARCHAR, note VARCHAR, added_at TIMESTAMPTZ, "
+            "command_id VARCHAR)"
+        )
+        if self.commands_dir.is_dir():
+            from rquant.web.commands_service import (
+                read_alert_rules,
+                read_watchlist_items,
+            )
+
+            rule_rows = [
+                (
+                    r.rule_id,
+                    r.title,
+                    r.enabled,
+                    ",".join(r.pools),
+                    ",".join(r.levels),
+                    r.cooldown_minutes,
+                    r.saved_at,
+                    r.command_id,
+                )
+                for r in read_alert_rules(self.commands_dir).values()
+            ]
+            if rule_rows:
+                con.executemany(
+                    "INSERT INTO alert_rule VALUES (?, ?, ?, ?, ?, ?, ?, ?)", rule_rows
+                )
+            watch_rows = [
+                (w.code, w.note, w.added_at, w.command_id)
+                for w in read_watchlist_items(self.commands_dir)
+            ]
+            if watch_rows:
+                con.executemany("INSERT INTO manual_watchlist VALUES (?, ?, ?, ?)", watch_rows)
+
+    def query(self, sql: str, params: Sequence[object] = ()) -> list[dict[str, Any]]:
+        con = self._open_connection()
+        try:
+            cur = con.execute(sql, list(params))
+            cols = [c[0] for c in cur.description]
+            return [dict(zip(cols, row, strict=True)) for row in cur.fetchall()]
+        finally:
+            con.close()
+
+    def query_sandboxed(self, sql: str) -> list[dict[str, Any]]:
+        con = self._open_connection()
+        try:
+            con.execute("SET enable_external_access = false")
+            con.execute("SET lock_configuration = true")
+            cur = con.execute(f"SELECT * FROM ({sql}) AS _sandbox LIMIT 1001")
+            cols = [c[0] for c in cur.description]
+            return [dict(zip(cols, row, strict=True)) for row in cur.fetchall()]
+        finally:
+            con.close()
+
+
 _FIXTURE_DDL = """
 CREATE TABLE stock_basic(ts_code VARCHAR, name VARCHAR, industry VARCHAR);
 CREATE TABLE screen_result(trade_date DATE, ts_code VARCHAR, preset_name VARCHAR,
@@ -108,8 +593,6 @@ CREATE TABLE signals(global_sequence BIGINT, signal_id VARCHAR, strategy_id VARC
 CREATE TABLE paper_accounts(account_id VARCHAR, as_of_time TIMESTAMPTZ, cash DECIMAL(18,2),
   available_cash DECIMAL(18,2), nav DECIMAL(18,2), unrealized_pnl DECIMAL(18,2),
   realized_pnl DECIMAL(18,2));
-CREATE TABLE alert_ack(alert_id VARCHAR, acked_at TIMESTAMPTZ, actor_id VARCHAR,
-  command_id VARCHAR);
 CREATE TABLE paper_holdings(account_id VARCHAR, ts_code VARCHAR, quantity DECIMAL(18,2),
   available_quantity DECIMAL(18,2), average_cost DECIMAL(18,4), market_price DECIMAL(18,4),
   market_value DECIMAL(18,2), unrealized_pnl DECIMAL(18,2), as_of_time TIMESTAMPTZ);
@@ -197,19 +680,6 @@ class FixtureSource:
         self.con.execute(_FIXTURE_DDL)
         _seed(self.con, today or datetime.now(UTC).date())
         self.built_at = datetime.now(UTC)
-
-    def record_ack(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Fixture stand-in for page control + Serving republish of ``ack_alert``."""
-        self.con.execute(
-            "INSERT INTO alert_ack VALUES (?, now(), ?, ?)",
-            [payload["alert_id"], payload["actor_id"], payload["command_id"]],
-        )
-        return {"command_id": payload["command_id"], "status": "succeeded"}
-
-    def record_unack(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Drop the ack row so the alert reads as unconfirmed again."""
-        self.con.execute("DELETE FROM alert_ack WHERE alert_id = ?", [payload["alert_id"]])
-        return {"command_id": payload["command_id"], "status": "succeeded"}
 
     def record_rule(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Fixture stand-in for ``save_alert_rule`` + Serving republish (latest wins)."""

@@ -6,9 +6,10 @@ import { PageHeader, Panel } from "@/ui";
 import { QueryView } from "../shared";
 
 const KIND: Record<string, string> = {
-  ack_alert: "确认告警",
   add_watchlist_item: "加自选",
+  remove_watchlist_item: "移出自选",
   save_alert_rule: "告警规则",
+  save_canvas: "保存池子",
 };
 
 export default function OpsPage() {
@@ -23,7 +24,7 @@ export default function OpsPage() {
               label="操作记录"
               rows={data.items}
               rowKey={(row) => `${row.kind}:${row.command_id}`}
-              emptyText="还没有网页操作：保存池子、确认告警、加自选等写操作会记录在这里。"
+              emptyText="还没有网页操作：保存池子、告警规则、加自选等写操作会记录在这里。"
               height={600}
               columns={[
                 {

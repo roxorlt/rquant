@@ -36,7 +36,9 @@ afterEach(() => {
   vi.unstubAllEnvs();
 });
 
-function stub(opts: { failWatch?: boolean; schemes?: (typeof scheme)[] } = {}) {
+function stub(
+  opts: { failWatch?: boolean; schemes?: (typeof scheme)[]; watchlist?: string[] } = {},
+) {
   const puts: unknown[] = [];
   const calls: string[] = [];
   const schemes = opts.schemes ?? [scheme];
@@ -74,15 +76,24 @@ function stub(opts: { failWatch?: boolean; schemes?: (typeof scheme)[] } = {}) {
               presets: ["breakout"],
               rows: [row("XQ0001.BJ", "星河股份"), row("XQ0003.BJ", "青田材料")],
             }
-          : key === "screener-schemes"
-            ? { schemes }
-            : key === "conditions"
-              ? { runs: [] }
-              : key === "pools"
-                ? { trade_date: "2026-10-20", pools: [] }
-                : key === "meta"
-                  ? { app: "rQuant", version: "t", role: "admin", generation: serving }
-                  : {};
+          : key === "watchlist" && opts.watchlist
+            ? {
+                items: opts.watchlist.map((code) => ({
+                  code,
+                  name: null,
+                  note: "",
+                  added_at: "2026-10-20T07:00:00Z",
+                })),
+              }
+            : key === "screener-schemes"
+              ? { schemes }
+              : key === "conditions"
+                ? { runs: [] }
+                : key === "pools"
+                  ? { trade_date: "2026-10-20", pools: [] }
+                  : key === "meta"
+                    ? { app: "rQuant", version: "t", role: "admin", generation: serving }
+                    : {};
       return json({ data, serving });
     }),
   );
@@ -97,6 +108,16 @@ it("keeps 已在自选 after leaving the page until a full reload", async () => 
   first.unmount();
   renderApp("/screener");
   expect(await screen.findByText("✓ 已在自选")).toBeInTheDocument();
+});
+
+it("hydrates 已在自选 from GET /api/v1/watchlist after a full reload", async () => {
+  resetRememberedWatch();
+  stub({ watchlist: ["XQ0003.BJ"] });
+  renderApp("/screener");
+  const qingtian = await screen.findByRole("row", { name: /青田材料/ });
+  expect(await within(qingtian).findByText("✓ 已在自选")).toBeInTheDocument();
+  const star = screen.getByRole("row", { name: /星河股份/ });
+  expect(within(star).getByRole("button", { name: "加自选" })).toBeInTheDocument();
 });
 
 it("merges two watchlist failures and keeps a retry on each row", async () => {

@@ -1,20 +1,34 @@
 import { Link } from "react-router";
-import { inTradingHours, useAuctionPoolLive, usePools } from "@/api/endpoints";
+import { inTradingHours, useAuctionPoolLive, usePools, useRemoveWatch } from "@/api/endpoints";
+import { useReadOnlyReason } from "@/api/useMeta";
 import { useUrlState } from "@/app/useUrlState";
 import { poolDisplayName, poolRefLabel, presetLabel } from "@/copy/publicText";
 import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
-import { EmptyState, FlowSteps, PageHeader, Panel, ReadOnlyBanner, Segmented } from "@/ui";
+import {
+  Button,
+  EmptyState,
+  FlowSteps,
+  PageHeader,
+  Panel,
+  ReadOnlyBanner,
+  Segmented,
+  useToast,
+} from "@/ui";
 import { ChangeText } from "@/ui/ChangeText";
 import { Sparkline } from "@/ui/Sparkline";
 import { StockLink } from "@/ui/StockLink";
 import { QueryView } from "../shared";
 
 const AUCTION_POOL = "竞价选股";
+const WATCH_POOL = "自选股";
 type Member = NonNullable<ReturnType<typeof usePools>["data"]>["pools"][number]["members"][number];
 
 export default function PoolsPage() {
+  const readOnly = useReadOnlyReason();
   const query = usePools();
+  const removeWatch = useRemoveWatch();
+  const toast = useToast();
   const [selected, setSelected] = useUrlState("pool");
   const first = query.data?.pools[0]?.name;
   const isAuction = (selected ?? first) === AUCTION_POOL;
@@ -226,6 +240,33 @@ export default function PoolsPage() {
                             header: "来源",
                             value: (row: Member) => presetLabel(row.preset),
                           },
+                          ...(pool.name === WATCH_POOL
+                            ? [
+                                {
+                                  id: "remove",
+                                  header: "",
+                                  sortable: false,
+                                  value: () => null,
+                                  cell: (row: Member) => (
+                                    <Button
+                                      size="sm"
+                                      variant="ghost"
+                                      ariaDisabled={!!readOnly}
+                                      disabled={removeWatch.isPending}
+                                      onClick={() => {
+                                        if (readOnly) return;
+                                        removeWatch.mutate(row.code, {
+                                          onSuccess: () =>
+                                            toast({ text: "已移出自选", duration: 3000 }),
+                                        });
+                                      }}
+                                    >
+                                      移出
+                                    </Button>
+                                  ),
+                                },
+                              ]
+                            : []),
                         ]),
                   ]}
                 />

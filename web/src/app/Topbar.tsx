@@ -1,9 +1,10 @@
 import { type FormEvent, useEffect, useRef, useState } from "react";
-import { Link, useMatches, useNavigate } from "react-router";
+import { Link, useLocation, useMatches, useNavigate } from "react-router";
 import type { MetaEnvelope } from "@/api/client";
 import { useAlerts, useHealth } from "@/api/endpoints";
 import { fullCode } from "@/format/code";
 import { formatShanghaiDateTime, shanghaiDate } from "@/format/time";
+import { readPreference } from "@/theme/storage";
 import { THEME_LABELS, useTheme } from "@/theme/ThemeProvider";
 import { currentHomePath } from "./home";
 import { BellIcon, BrandMark, SearchIcon, ThemeIcon } from "./icons";
@@ -28,6 +29,7 @@ function usePageTitle(): string {
 export function Topbar({ meta, failed }: { meta: MetaEnvelope | undefined; failed: boolean }) {
   const { mode, cycle } = useTheme();
   const navigate = useNavigate();
+  const location = useLocation();
   const pageTitle = usePageTitle();
   const health = useHealth();
   const alerts = useAlerts();
@@ -52,7 +54,11 @@ export function Topbar({ meta, failed }: { meta: MetaEnvelope | undefined; faile
   const text = failed ? "数据 未连接" : `数据 ${dataTime}`;
   const tone = worstHealth((health.data?.layers ?? []).map((layer) => layer.state));
   const healthLabel = HEALTH_LABEL[tone];
-  const unread = unreadAlertCount(alerts.data?.items ?? []);
+  const seenAt = readPreference("alerts.seenAt");
+  const unread =
+    location.pathname === "/monitor"
+      ? 0
+      : unreadAlertCount(alerts.data?.items ?? [], today.date, seenAt);
 
   useEffect(() => {
     if (searchOpen) searchRef.current?.focus();

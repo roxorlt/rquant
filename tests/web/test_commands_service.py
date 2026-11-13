@@ -18,8 +18,6 @@ def _payload(kind: str, **fields: object) -> dict:
 
 def test_each_kind_lands_in_its_log_and_is_idempotent(tmp_path):
     cases = [
-        (_payload("ack_alert", alert_id="a" * 64, generation_id="g", actor_id="roxor"),
-         "alert_acks/acks.jsonl"),
         (_payload("add_watchlist_item", item={"ts_code": "600519.SH", "note": ""}),
          "watchlist/items.jsonl"),
         (_payload("save_alert_rule", rule={"rule_id": "r1", "title": "t", "enabled": False,
@@ -37,7 +35,8 @@ def test_each_kind_lands_in_its_log_and_is_idempotent(tmp_path):
 
 
 def test_rejects_invalid_and_unknown(tmp_path):
-    assert handle(tmp_path, _payload("ack_alert", alert_id="nothex"))[0] == 400
+    assert handle(tmp_path, _payload("add_watchlist_item", item={"ts_code": "bad"}))[0] == 400
+    assert handle(tmp_path, _payload("ack_alert", alert_id="a" * 64))[0] == 400
     assert handle(tmp_path, _payload("delete_everything"))[0] == 400
     assert not any(tmp_path.iterdir())
 

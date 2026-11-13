@@ -240,82 +240,53 @@ export function useSavePool() {
       const { data, response } = await apiClient().POST("/api/v1/pools", { body });
       return unwrap(data, response);
     },
-    onSuccess: () => client.invalidateQueries({ queryKey: ["pools"] }),
-  });
-}
-
-export function useAckAlert() {
-  const client = useQueryClient();
-  return useMutation({
-    mutationFn: async (alertId: string) => {
-      const { data, response } = await apiClient().POST("/api/v1/alerts/ack", {
-        body: { alert_id: alertId },
-      });
-      return unwrap(data, response);
-    },
     onSuccess: () => {
-      void client.invalidateQueries({ queryKey: ["alerts"] });
+      void client.invalidateQueries({ queryKey: ["pools"] });
       void client.invalidateQueries({ queryKey: ["operations"] });
+      void client.invalidateQueries({ queryKey: ["stock"] });
     },
   });
 }
 
-/** Optimistic ack updates stay next to the alerts query, not in the page. */
-export function useAlertsCache() {
-  const client = useQueryClient();
-  return {
-    snapshot: () => client.getQueryData(["alerts"]),
-    restore: (previous: unknown) => {
-      client.setQueryData(["alerts"], previous);
-    },
-    refresh: () => client.invalidateQueries({ queryKey: ["alerts"] }),
-    patchAck: (alertId: string, acked: boolean) => {
-      client.setQueryData(["alerts"], (old: { data?: { items?: AlertItem[] } } | undefined) => {
-        const items = old?.data?.items;
-        if (!items) return old;
-        return {
-          ...old,
-          data: {
-            ...old.data,
-            items: items.map((item) =>
-              item.alert_id === alertId
-                ? {
-                    ...item,
-                    acked_at: acked ? new Date().toISOString() : null,
-                    acked_by: acked ? "我" : null,
-                  }
-                : item,
-            ),
-          },
-        };
-      });
-    },
-  };
-}
-
-export function useUnackAlert() {
-  const client = useQueryClient();
-  return useMutation({
-    mutationFn: async (alertId: string) => {
-      const { data, response } = await apiClient().POST("/api/v1/alerts/unack", {
-        body: { alert_id: alertId },
-      });
-      return unwrap(data, response);
-    },
-    onSuccess: () => {
-      void client.invalidateQueries({ queryKey: ["alerts"] });
-      void client.invalidateQueries({ queryKey: ["operations"] });
-    },
+export function useWatchlist(): ServingQueryResult<Schemas["WatchlistData"]> {
+  return useServingQuery(["watchlist"], async () => {
+    const { data, response } = await apiClient().GET("/api/v1/watchlist");
+    return unwrap(data, response);
   });
 }
 
 export function useAddWatch() {
+  const client = useQueryClient();
   return useMutation({
     mutationFn: async (code: string) => {
       const { data, response } = await apiClient().POST("/api/v1/watchlist", {
         body: { code, note: "" },
       });
       return unwrap(data, response);
+    },
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ["watchlist"] });
+      void client.invalidateQueries({ queryKey: ["pools"] });
+      void client.invalidateQueries({ queryKey: ["operations"] });
+      void client.invalidateQueries({ queryKey: ["stock"] });
+    },
+  });
+}
+
+export function useRemoveWatch() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async (code: string) => {
+      const { data, response } = await apiClient().DELETE("/api/v1/watchlist", {
+        params: { query: { code } },
+      });
+      return unwrap(data, response);
+    },
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ["watchlist"] });
+      void client.invalidateQueries({ queryKey: ["pools"] });
+      void client.invalidateQueries({ queryKey: ["operations"] });
+      void client.invalidateQueries({ queryKey: ["stock"] });
     },
   });
 }
@@ -399,7 +370,10 @@ export function useSaveAlertRule() {
       const { data, response } = await apiClient().POST("/api/v1/alert-rules", { body });
       return unwrap(data, response);
     },
-    onSuccess: () => client.invalidateQueries({ queryKey: ["alert-rules"] }),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ["alert-rules"] });
+      void client.invalidateQueries({ queryKey: ["operations"] });
+    },
   });
 }
 

@@ -131,12 +131,14 @@ export function DataTable<T>({
   pinEnds = false,
   phoneSort = false,
 }: DataTableProps<T>) {
-  const prefKey = `cols.${label}`;
+  const narrow =
+    typeof window.matchMedia === "function" && window.matchMedia("(max-width: 599px)").matches;
+  // Phones hide secondary columns by default, so phones and computers keep separate choices
+  // (both follow the account: a phone choice shows on other phones, a desktop one on computers).
+  const prefKey = narrow ? `cols.${label}@phone` : `cols.${label}`;
   const [hidden, setHidden] = useState<Set<string>>(() => {
     const saved = tools ? readPreference(prefKey) : null;
     if (saved !== null) return new Set(saved.split(",").filter(Boolean));
-    const narrow =
-      typeof window.matchMedia === "function" && window.matchMedia("(max-width: 599px)").matches;
     return new Set(
       allColumns
         .filter((column) => column.hiddenByDefault || (narrow && column.secondary))
@@ -154,7 +156,30 @@ export function DataTable<T>({
       return next;
     });
   const columns = useMemo(() => allColumns.filter((c) => !hidden.has(c.id)), [allColumns, hidden]);
-  const [sorting, setSorting] = useState<SortingState>(initialSort ? [initialSort] : []);
+  const sortKey = `sort.${label}`;
+  const [sorting, setSortingState] = useState<SortingState>(() => {
+    const saved = tools ? readPreference(sortKey) : null;
+    if (saved) {
+      try {
+        const parsed: unknown = JSON.parse(saved);
+        if (
+          Array.isArray(parsed) &&
+          parsed.every((s) => typeof s?.id === "string" && typeof s?.desc === "boolean") &&
+          parsed.every((s) => allColumns.some((c) => c.id === s.id))
+        )
+          return parsed as SortingState;
+      } catch {
+        // fall through to the default order
+      }
+    }
+    return initialSort ? [initialSort] : [];
+  });
+  const setSorting = (updater: SortingState | ((old: SortingState) => SortingState)) =>
+    setSortingState((old) => {
+      const next = typeof updater === "function" ? updater(old) : updater;
+      if (tools) writePreference(sortKey, JSON.stringify(next));
+      return next;
+    });
   const scrollRef = useRef<HTMLDivElement>(null);
   const [overflowing, setOverflowing] = useState(false);
   // Column count changes scrollWidth without resizing the wrap, so it is a dependency.
@@ -411,15 +436,18 @@ export function DataTable<T>({
                   selectable ? (event) => onRowKeyDown(event, index, row.original) : undefined
                 }
               >
-                {row.getVisibleCells().map((cell) => (
-                  <td
-                    key={cell.id}
-                    className={cellClass(cell.column.id)}
-                    data-phone-line={byId.get(cell.column.id)?.phoneLine}
-                  >
-                    {flexRender(cell.column.columnDef.cell, cell.getContext())}
-                  </td>
-                ))}
+                {row.getVisibleCells().map((cell) => {
+                  const col = byId.get(cell.column.id);
+                  return (
+                    <td
+                      key={cell.id}
+                      className={cellClass(cell.column.id)}
+                      data-phone-line={col?.phoneLine}
+                    >
+                      {col?.cell ? col.cell(row.original) : (col?.value(row.original) ?? "—")}
+                    </td>
+                  );
+                })}
               </tr>
             ))}
             {padBottom > 0 ? (

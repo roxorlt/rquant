@@ -1,8 +1,8 @@
-import { useState } from "react";
 import { Link } from "react-router";
 import { useMarketLive } from "@/api/endpoints";
 import type { components } from "@/api/schema";
 import { formatAmount, formatFixed } from "@/format/number";
+import { oneOf, usePreference } from "@/theme/storage";
 import { AppDrawer, ChangeText, SkeletonRows } from "@/ui";
 
 type LiveBoard = components["schemas"]["LiveBoard"];
@@ -24,7 +24,7 @@ export function BoardDetail({
   phone?: boolean;
   onClose: () => void;
 }) {
-  const [sort, setSort] = useState<Sort>("pct");
+  const [sort, setSort] = usePreference<Sort>("panorama.boardSort", "pct", oneOf("pct", "amount"));
   const query = useMarketLive(board);
   const data = query.data?.board === board ? query.data : undefined;
   const info = (data?.boards ?? boards).find((b) => b.name === board);

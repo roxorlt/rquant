@@ -1,13 +1,14 @@
-/** Unread bell: alerts from the latest trade date that nobody has confirmed. */
+/** Unread bell: today's alerts newer than the last time /monitor was opened. */
 export function unreadAlertCount(
-  items: readonly { trade_date: string; acked_at?: string | null }[],
+  items: readonly { trade_date: string; at?: string | null }[],
+  today: string,
+  seenAt?: string | null,
 ): number {
-  let latest = "";
-  for (const item of items) {
-    if (item.trade_date > latest) latest = item.trade_date;
-  }
-  if (!latest) return 0;
-  return items.filter((item) => item.trade_date === latest && !item.acked_at).length;
+  return items.filter((item) => {
+    if (item.trade_date !== today) return false;
+    if (!seenAt) return true;
+    return Boolean(item.at && item.at > seenAt);
+  }).length;
 }
 
 const HEALTH_RANK: Record<string, number> = { ok: 0, unknown: 1, warn: 2, crit: 3 };

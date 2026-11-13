@@ -1,46 +1,47 @@
-# rquant-web-commands（网页写入通道）
+# rquant-web-commands（网页写入与闭环读取通道）
 
-## 做了什么
-- `rquant-web-commands.service`（`deploy/systemd/`）：普通 systemd unit，无凭据、无 pyz，用当前 web
-  发布的 venv 跑 `python -m rquant.web.commands_service`，监听 `127.0.0.1:8769`，`POST /v1/commands`，
-  `GET /healthz`。
-- 用 page control 自己的命令模型校验，按 `command_id` 幂等追加 JSONL 到固定目录
-  `/home/lighthouse/rquant-web-commands/`（布局与 page control 数据目录一致）：
+## 架构定位
+- Web 应用彻底解耦历史 `rquant.page_control` 守护进程与 Route A Serving 投影表依赖：
+  - `src/rquant/web/commands_service.py` 内置独立 Pydantic 命令校验模型、`fcntl.flock` 进程锁与 `command_id` 幂等 JSONL 追加器，零依赖 `rquant.page_control`。
+  - **写入路径**：
+    1. 若配置了 `RQUANT_PAGE_CONTROL_URL`（如线上 `http://127.0.0.1:8769/v1/commands` 的 `rquant-web-commands.service`），`rquant-web` 经 HTTP 转发写入；
+    2. 若未配置外部转发且提供本地命令目录（`RQUANT_WEB_COMMANDS_DIR` 或默认 `~/rquant-web-commands`），`rquant-web` 直接调用 `commands_service.handle()` 幂等落盘。
+  - **读取闭环**：`rquant-web`（`GET /pools`、`GET /watchlist`、`GET /alert-rules`、`GET /operations`）、快照候选池构建（`rquant.research.snapshots.build_universe`）与监控规则读取（`rquant.alert_rules.load_alert_rules`）均**直接投影消费** `~/rquant-web-commands/` 下的 JSONL 日志，无需等待 Route A Serving 代际发布即可实时回显。
 
-| 命令 | 文件 |
-|---|---|
-| `ack_alert` | `alert_acks/acks.jsonl` |
-| `add_watchlist_item` | `watchlist/items.jsonl` |
-| `save_alert_rule`（新建/修改/停用） | `alert_rules/rules.jsonl` |
-| `save_canvas`（保存池子） | `canvas_saves/saves.jsonl` |
+## 支持命令与存储布局
 
-- `/etc/rquant-web.env`：`RQUANT_PAGE_CONTROL_URL=http://127.0.0.1:8769/v1/commands`。
-- `rquant-web-deploy` 切发布时，如果该 unit 已启用，会一起重启它。
+默认命令目录：`/home/lighthouse/rquant-web-commands/`（可通过 `RQUANT_WEB_COMMANDS_DIR` 覆盖）：
 
-## 读取端现状（三期待办）
-网页写入现在会落盘，但**还没有读取端消费**，所以确认/自选/规则在网页上不会回显，也不影响盯盘和通知：
-1. 通知方投影（notifier 的 `SignalPageProjectionProducer`）从
-   `<page_projection_canvas_catalog_root 的上级>/{alert_acks,watchlist,alert_rules}/*.jsonl` 读取，
-   但线上 runtime 代 `e458c47…` 的代码是 producer_commit `df621ef`（2026-09-25），**不含这段读取代码**
-   （`alert_ack_log`/`watchlist_log`/`alert_rule_log` 均不存在），而且 Serving 合同里也没有
-   `alert_ack`/`manual_watchlist`/`alert_rule` 投影。只靠软链接/配置无法让它读。
-   需要：用 `rquant-production-deploy.pyz` 发一个包含当前 main 的新 runtime 代，并让
-   `<canvas_catalog_root>/..`（当前配置为 `~/rquant/data/runtime/serving/page-control/`，目录尚不存在）
-   下的 `alert_acks`、`watchlist`、`alert_rules` 指向 `/home/lighthouse/rquant-web-commands/` 对应子目录
-   （软链接，或把 `page_projection_canvas_catalog_root` 配到本目录下）。注意 page control 的
-   `_append_managed_jsonl` 拒绝跟随软链接写入，但本服务直接写真实目录，读取端读软链接没有限制
-   ——上线前需在新代上验证读取端是否也做了 no-follow 检查，必要时改用配置路径。
-2. 盯盘 `rquant-monitor` 跑在 `~/rquant` checkout（e4e303b，2026-08-04），没有
-   `load_manual_watchlist_codes`/`load_alert_rules`；而且新代码也是从 Serving 表读，不是直接读文件。
-   需要先完成第 1 步，再按 runbook 二期第 4 条把盯盘迁到独立发布目录（改 unit，需单独批准）。
-3. 保存池子（`save_canvas`）：runtime 的正式画布目录是签名 catalog，本服务只记录保存请求；
-   要在画布/池子列表里出现，需 page control runtime 消费 `canvas_saves/saves.jsonl` 或改走正式 page control。
+| 命令 (`kind`) | 落盘文件 | 读取消费端 |
+|---|---|---|
+| `add_watchlist_item` / `remove_watchlist_item` | `watchlist/items.jsonl` | `GET /api/v1/watchlist`、`GET /api/v1/pools`（「自选股」池）、`snapshots.build_universe`、`GET /api/v1/operations` |
+| `save_alert_rule` | `alert_rules/rules.jsonl` | `GET /api/v1/alert-rules`、`rquant.alert_rules.load_alert_rules`、`GET /api/v1/operations` |
+| `save_canvas` | `canvas_saves/saves.jsonl` | `GET /api/v1/pools`（支持中文/空格池名如 `选股 10-20`、筛选后精确 `codes` 列表及 `mode="existing"` 并入已有池）、`snapshots.build_universe`、`GET /api/v1/operations` |
 
-## 运维
+此外，选股方案与跨端界面偏好由独立 SQLite Web Store（`RQUANT_WEB_STORE_PATH`，默认 `~/rquant-web-store/web_store.sqlite3`）持久化承载：
+- `GET / PUT / DELETE /api/v1/screener-schemes`
+- `GET / PUT /api/v1/ui-preferences`
+
+## 实时只读数据源（`ResearchSource`）切换
+
+`rquant-web` 支持通过环境变量 `RQUANT_WEB_SOURCE` 选择只读底座：
+- `RQUANT_WEB_SOURCE=research`：启用 `ResearchSource`，每次连接使用内存库只读挂载 `RQUANT_RESEARCH_ROOT/market.duckdb`（`ATTACH ... READ_ONLY`）及可选生产只读副本 `DUCKDB_READONLY_PATH`（`rquant_ro.duckdb`，**严禁且代码硬拦截直连主库 `rquant.duckdb`**），动态投影全部标准视图并提供锁死外部访问的只读 SQL 查询台，彻底摆脱冻结的 Route A Serving 快照依赖。
+- `RQUANT_WEB_SOURCE=serving`：沿用历史 `ServingSource`（读取 `RQUANT_SERVING_ROOT/current.json`）。
+- 未显式设置时：若 `RQUANT_SERVING_ROOT` 未配置且默认 `current.json` 不存在，自动回退至 `ResearchSource`。
+
+## 运维与自检
 ```bash
 sudo systemctl status rquant-web-commands
-curl -s 127.0.0.1:8769/healthz
-tail ~/rquant-web-commands/watchlist/items.jsonl
+curl -s http://127.0.0.1:8769/healthz
+ls -la ~/rquant-web-commands/{watchlist,alert_rules,canvas_saves}
 ```
-回滚：`/etc/rquant-web.env` 里删掉 `RQUANT_PAGE_CONTROL_URL` 行（恢复默认 8767，写操作返回 503），
-`sudo systemctl restart rquant-web && sudo systemctl disable --now rquant-web-commands`。
+
+如需在生产 `/etc/rquant-web.env` 切换至实时 `ResearchSource`（须在非交易时段或获明确授权后执行）：
+```bash
+# /etc/rquant-web.env 追加：
+# RQUANT_WEB_SOURCE=research
+# RQUANT_WEB_COMMANDS_DIR=/home/lighthouse/rquant-web-commands
+# DUCKDB_READONLY_PATH=/home/lighthouse/rquant/data/rquant_ro.duckdb
+sudo systemctl restart rquant-web
+curl -fsS http://127.0.0.1:8768/api/v1/meta
+```

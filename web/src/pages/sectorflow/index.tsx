@@ -25,6 +25,7 @@ import {
   tone,
 } from "./model";
 import "./sectorflow.css";
+import { oneOf, usePreference } from "@/theme/storage";
 
 type Leader = SectorFlowData["leaders"][number];
 type Stock = Leader["stocks"][number];
@@ -83,7 +84,11 @@ function Body({
   live: boolean;
   onReplay: (time: string | null) => void;
 }) {
-  const [mode, setMode] = useState<Mode>("net");
+  const [mode, setMode] = usePreference<Mode>(
+    "sectorflow.mode",
+    "net",
+    oneOf("net", "ratio", "pct"),
+  );
   const [picked, setPicked] = useState<string[] | null>(null);
   const [focus, setFocus] = useState<string | null>(null);
   const [cursor, setCursor] = useState<number | null>(null); // null = follow live

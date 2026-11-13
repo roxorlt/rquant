@@ -1,11 +1,12 @@
 import type { ReactNode } from "react";
 import { Link, useParams } from "react-router";
-import { useStock } from "@/api/endpoints";
+import { useAddWatch, useRemoveWatch, useStock, useWatchlist } from "@/api/endpoints";
+import { useReadOnlyReason } from "@/api/useMeta";
 import { useUrlState } from "@/app/useUrlState";
 import { poolRefLabel, triggerLabel } from "@/copy/publicText";
 import { formatFixed } from "@/format/number";
 import { formatShanghaiDateTime } from "@/format/time";
-import { ChangeText, PageHeader, Panel, Pill, Segmented } from "@/ui";
+import { Button, ChangeText, PageHeader, Panel, Pill, Segmented, useToast } from "@/ui";
 import { QueryView } from "../shared";
 import { FlowPanel } from "./Flow";
 import { IntradayPanel } from "./Intraday";
@@ -42,11 +43,31 @@ function ChartTabs({
 /** 个股档案 (F9-lite): quote, K-line, valuation, returns, fundamentals, pools, alerts. */
 export default function StockPage() {
   const { code } = useParams();
+  const readOnly = useReadOnlyReason();
   const query = useStock(code);
+  const watchlist = useWatchlist();
+  const addWatch = useAddWatch();
+  const removeWatch = useRemoveWatch();
+  const toast = useToast();
   return (
     <QueryView query={query}>
       {(s) => {
         const last = s.bars[s.bars.length - 1];
+        const inWatch =
+          Array.isArray(watchlist.data?.items) &&
+          watchlist.data.items.some((item) => item.code === s.code);
+        const toggleWatch = () => {
+          if (readOnly) return;
+          if (inWatch) {
+            removeWatch.mutate(s.code, {
+              onSuccess: () => toast({ text: "已移出自选", duration: 3000 }),
+            });
+          } else {
+            addWatch.mutate(s.code, {
+              onSuccess: () => toast({ text: "已加入自选", duration: 3000 }),
+            });
+          }
+        };
         return (
           <>
             <PageHeader
@@ -62,6 +83,17 @@ export default function StockPage() {
                 </span>
               }
               note={last ? null : "没有行情"}
+              actions={
+                <Button
+                  size="sm"
+                  variant={inWatch ? "quiet" : "ghost"}
+                  ariaDisabled={!!readOnly}
+                  disabled={addWatch.isPending || removeWatch.isPending}
+                  onClick={toggleWatch}
+                >
+                  {inWatch ? "✓ 已在自选" : "加自选"}
+                </Button>
+              }
             />
             <QuoteGrid s={s} />
             <ChartTabs

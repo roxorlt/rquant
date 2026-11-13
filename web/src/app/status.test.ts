@@ -10,23 +10,35 @@ describe("home path", () => {
 });
 
 describe("top bar status", () => {
-  it("counts unconfirmed alerts on the latest trade date only", () => {
+  it("counts today's alerts newer than seenAt only", () => {
     expect(
-      unreadAlertCount([
-        { trade_date: "2026-10-17", acked_at: null },
-        { trade_date: "2026-10-20", acked_at: null },
-        { trade_date: "2026-10-20", acked_at: "2026-10-20T08:00:00Z" },
-        { trade_date: "2026-10-20", acked_at: null },
-      ]),
+      unreadAlertCount(
+        [
+          { trade_date: "2026-10-17", at: "2026-10-17T06:00:00Z" },
+          { trade_date: "2026-10-20", at: "2026-10-20T05:00:00Z" },
+          { trade_date: "2026-10-20", at: "2026-10-20T06:30:00Z" },
+          { trade_date: "2026-10-20", at: "2026-10-20T07:00:00Z" },
+        ],
+        "2026-10-20",
+        "2026-10-20T06:00:00Z",
+      ),
     ).toBe(2);
   });
 
-  it("shows no badge number when everything on the latest day is confirmed", () => {
+  it("shows no badge number when alerts belong to an older trade date or have all been seen", () => {
     expect(
-      unreadAlertCount([
-        { trade_date: "2026-10-17", acked_at: null },
-        { trade_date: "2026-10-20", acked_at: "2026-10-20T08:00:00Z" },
-      ]),
+      unreadAlertCount(
+        [{ trade_date: "2026-10-17", at: "2026-10-17T06:00:00Z" }],
+        "2026-10-20",
+        null,
+      ),
+    ).toBe(0);
+    expect(
+      unreadAlertCount(
+        [{ trade_date: "2026-10-20", at: "2026-10-20T06:00:00Z" }],
+        "2026-10-20",
+        "2026-10-20T06:00:00Z",
+      ),
     ).toBe(0);
   });
 

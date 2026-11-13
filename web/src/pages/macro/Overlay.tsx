@@ -1,6 +1,7 @@
 import { type MouseEvent, useMemo, useState } from "react";
 import type { MacroData } from "@/api/endpoints";
 import { formatFixed } from "@/format/number";
+import { oneOf, stringList, usePreference } from "@/theme/storage";
 import { Panel, Segmented } from "@/ui";
 
 /**
@@ -161,9 +162,21 @@ function align(
 export function MacroOverlay({ data }: { data: MacroData }) {
   const inds = useMemo(() => buildIndicators(data), [data]);
   const pcts = useMemo(() => new Map(inds.map((i) => [i.key, expandingPct(i.values)])), [inds]);
-  const [sel, setSel] = useState<string[]>(["buffett", "erp"]);
-  const [idx, setIdx] = useState<"all_a" | "csi300">("all_a");
-  const [range, setRange] = useState<Range>("5y");
+  const [sel, setSel] = usePreference<string[]>(
+    "macro.overlay.sel",
+    ["buffett", "erp"],
+    stringList,
+  );
+  const [idx, setIdx] = usePreference<"all_a" | "csi300">(
+    "macro.overlay.idx",
+    "all_a",
+    oneOf("all_a", "csi300"),
+  );
+  const [range, setRange] = usePreference<Range>(
+    "macro.overlay.range",
+    "5y",
+    oneOf("1y", "3y", "5y", "all"),
+  );
   const [hover, setHover] = useState<number | null>(null);
   const daily = data.daily;
   if (!daily) return null;
@@ -217,8 +230,7 @@ export function MacroOverlay({ data }: { data: MacroData }) {
     const px = ((e.clientX - r.left) / r.width) * W;
     setHover(Math.max(0, Math.min(n - 1, Math.round(((px - L) / (W - L - R)) * (n - 1)))));
   };
-  const toggle = (k: string) =>
-    setSel((s) => (s.includes(k) ? s.filter((v) => v !== k) : [...s, k]));
+  const toggle = (k: string) => setSel(sel.includes(k) ? sel.filter((v) => v !== k) : [...sel, k]);
   const xt = [0, Math.floor(n / 4), Math.floor(n / 2), Math.floor((3 * n) / 4), n - 1];
 
   return (

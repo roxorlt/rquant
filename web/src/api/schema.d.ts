@@ -39,40 +39,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/alerts/ack": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** 确认告警 */
-        post: operations["ack_alert_api_v1_alerts_ack_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/alerts/unack": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** 撤销确认 */
-        post: operations["unack_alert_api_v1_alerts_unack_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/v1/backtests": {
         parameters: {
             query?: never;
@@ -337,7 +303,7 @@ export interface paths {
         };
         /**
          * 操作记录
-         * @description Web writes as page control recorded them (read back from their Serving projections).
+         * @description Web writes read back from both command logs and Serving projections.
          */
         get: operations["operations_api_v1_operations_get"];
         put?: never;
@@ -827,6 +793,24 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/ui-preferences": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 页面设置（按登录用户） */
+        get: operations["list_ui_preferences_api_v1_ui_preferences_get"];
+        /** 保存页面设置 */
+        put: operations["save_ui_preference_api_v1_ui_preferences_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/watchlist": {
         parameters: {
             query?: never;
@@ -834,11 +818,13 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /** 自选股列表 */
+        get: operations["list_watch_api_v1_watchlist_get"];
         put?: never;
         /** 加入自选 */
         post: operations["add_watch_api_v1_watchlist_post"];
-        delete?: never;
+        /** 移出自选 */
+        delete: operations["remove_watch_api_v1_watchlist_delete"];
         options?: never;
         head?: never;
         patch?: never;
@@ -848,11 +834,6 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
-        /** AckAlertRequest */
-        AckAlertRequest: {
-            /** Alert Id */
-            alert_id: string;
-        };
         /** AddWatchRequest */
         AddWatchRequest: {
             /** Code */
@@ -865,10 +846,6 @@ export interface components {
         };
         /** AlertItem */
         AlertItem: {
-            /** Acked At */
-            acked_at?: string | null;
-            /** Acked By */
-            acked_by?: string | null;
             /** Alert Id */
             alert_id: string;
             /** At */
@@ -1565,6 +1542,11 @@ export interface components {
             data: components["schemas"]["TaskLog"];
             serving: components["schemas"]["ServingMeta"];
         };
+        /** Envelope[UiPreferencesData] */
+        Envelope_UiPreferencesData_: {
+            data: components["schemas"]["UiPreferencesData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
         /** Envelope[Union[BrinsonData, NoneType]] */
         Envelope_Union_BrinsonData__NoneType__: {
             data: components["schemas"]["BrinsonData"] | null;
@@ -1583,6 +1565,11 @@ export interface components {
         /** Envelope[Union[IntradayData, NoneType]] */
         Envelope_Union_IntradayData__NoneType__: {
             data: components["schemas"]["IntradayData"] | null;
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[WatchlistData] */
+        Envelope_WatchlistData_: {
+            data: components["schemas"]["WatchlistData"];
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[dict[str, list[list[str]]]] */
@@ -2313,7 +2300,7 @@ export interface components {
              * Kind
              * @enum {string}
              */
-            kind: "ack_alert" | "unack_alert" | "add_watchlist_item" | "save_alert_rule";
+            kind: "add_watchlist_item" | "remove_watchlist_item" | "save_alert_rule" | "save_canvas";
             /** Summary */
             summary: string;
         };
@@ -2608,11 +2595,19 @@ export interface components {
         };
         /** SavePoolRequest */
         SavePoolRequest: {
+            /** Codes */
+            codes?: string[];
             /**
              * Description
              * @default
              */
             description: string;
+            /**
+             * Mode
+             * @default new
+             * @enum {string}
+             */
+            mode: "new" | "existing";
             /** Name */
             name: string;
             /** Pool Refs */
@@ -3075,6 +3070,23 @@ export interface components {
             /** Tdx */
             tdx: string;
         };
+        /** UiPreferenceBody */
+        UiPreferenceBody: {
+            /** Key */
+            key: string;
+            /** Value */
+            value?: string | null;
+        };
+        /**
+         * UiPreferencesData
+         * @description Page settings of the signed-in user (key -> text, as the page stores it).
+         */
+        UiPreferencesData: {
+            /** Prefs */
+            prefs: {
+                [key: string]: string;
+            };
+        };
         /** ValidationError */
         ValidationError: {
             /** Context */
@@ -3126,6 +3138,25 @@ export interface components {
             vah: number;
             /** Val */
             val: number;
+        };
+        /** WatchlistData */
+        WatchlistData: {
+            /** Items */
+            items: components["schemas"]["WatchlistItemRow"][];
+        };
+        /** WatchlistItemRow */
+        WatchlistItemRow: {
+            /** Added At */
+            added_at?: string | null;
+            /** Code */
+            code: string;
+            /** Name */
+            name?: string | null;
+            /**
+             * Note
+             * @default
+             */
+            note: string;
         };
     };
     responses: never;
@@ -3207,72 +3238,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_AlertsData_"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    ack_alert_api_v1_alerts_ack_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["AckAlertRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["CommandReceipt"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    unack_alert_api_v1_alerts_unack_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["AckAlertRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["CommandReceipt"];
                 };
             };
             /** @description Validation Error */
@@ -4504,6 +4469,79 @@ export interface operations {
             };
         };
     };
+    list_ui_preferences_api_v1_ui_preferences_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_UiPreferencesData_"];
+                };
+            };
+        };
+    };
+    save_ui_preference_api_v1_ui_preferences_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UiPreferenceBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommandReceipt"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_watch_api_v1_watchlist_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_WatchlistData_"];
+                };
+            };
+        };
+    };
     add_watch_api_v1_watchlist_post: {
         parameters: {
             query?: never;
@@ -4516,6 +4554,37 @@ export interface operations {
                 "application/json": components["schemas"]["AddWatchRequest"];
             };
         };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommandReceipt"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    remove_watch_api_v1_watchlist_delete: {
+        parameters: {
+            query: {
+                code: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
         responses: {
             /** @description Successful Response */
             200: {

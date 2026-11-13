@@ -55,10 +55,10 @@ def test_viewer_can_run_readonly_query(client, monkeypatch):
     guest = {"X-Remote-User": "guest"}
     r = client.post("/api/v1/query", json={"sql": "select 1"}, headers=guest)
     assert r.status_code == 200
-    ack = client.post(
-        "/api/v1/alerts/ack", json={"alert_id": "b" * 64}, headers=guest,
+    write = client.post(
+        "/api/v1/watchlist", json={"code": "600519.SH"}, headers=guest,
     )
-    assert ack.status_code == 403
+    assert write.status_code == 403
 
 
 def test_fetch_latest_period(tmp_path):

@@ -1,7 +1,8 @@
-import { type CSSProperties, useState } from "react";
+import type { CSSProperties } from "react";
 import { Link } from "react-router";
 import { useAlerts, useHealth, useOverview } from "@/api/endpoints";
 import {
+  alertPoolLabel,
   layerTitle,
   listedStockCode,
   presetLabel,
@@ -14,6 +15,7 @@ import {
 import { formatListClock, formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
 import { SortMenu } from "@/table/SortMenu";
+import { usePreference } from "@/theme/storage";
 import { Button, KpiStrip, PageHeader, Panel, Pill } from "@/ui";
 import { StockLink } from "@/ui/StockLink";
 import { PHONE_QUERY, useMedia } from "../panorama/useMedia";
@@ -57,7 +59,6 @@ function Pipeline() {
 
 function Attention() {
   const health = useHealth();
-  const alerts = useAlerts();
   const items: {
     key: string;
     kind: "crit" | "warn" | "acc";
@@ -77,16 +78,6 @@ function Attention() {
         btn: "看健康",
       });
   }
-  const unacked = (alerts.data?.items ?? []).filter((a) => !a.acked_at).length;
-  if (unacked)
-    items.push({
-      key: "alerts",
-      kind: "acc",
-      text: `${unacked} 条告警未确认`,
-      sub: "在盯盘页逐条确认",
-      to: "/monitor",
-      btn: "去盯盘",
-    });
   return (
     <Panel title="需要关注" sub={`${items.length} 项`} flush>
       {items.length ? (
@@ -212,11 +203,10 @@ function LatestAlerts() {
             value: (r) => triggerLabel(r.trigger_type ?? r.level),
           },
           {
-            id: "state",
-            header: "状态",
-            value: (r) => (r.acked_at ? 1 : 0),
-            cell: (r) =>
-              r.acked_at ? <Pill kind="ok">已确认</Pill> : <Pill kind="warn">未确认</Pill>,
+            id: "pool",
+            header: "范围",
+            value: (r) => r.pool ?? null,
+            cell: (r) => alertPoolLabel(r.pool),
           },
         ]}
       />
@@ -228,7 +218,11 @@ export default function OverviewPage() {
   const query = useOverview();
   const health = useHealth();
   const phone = useMedia(PHONE_QUERY);
-  const [signalSort, setSignalSort] = useState("at:desc");
+  const [signalSort, setSignalSort] = usePreference(
+    "overview.signalSort",
+    "at:desc",
+    (v: unknown): v is string => typeof v === "string",
+  );
   return (
     <>
       <PageHeader

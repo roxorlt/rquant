@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { screen, waitFor } from "@testing-library/react";
+import { screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import { renderApp } from "@/test/render";
 import {
@@ -106,8 +106,6 @@ function frozenBody(url: string): { status: number; body: unknown } {
                   trigger_price: 10,
                   level_price: 9.8,
                   pool: null,
-                  acked_at: null,
-                  acked_by: null,
                 },
               ]
             : [],
@@ -191,44 +189,38 @@ describe("static preview reads frozen files", () => {
     expect(await stale.json()).toMatchObject({ data: { notice: "这是一份过期快照" } });
   });
 
-  it("keeps a confirmed alert confirmed after the frozen file is read again", async () => {
+  it("keeps a saved alert rule after the frozen file is read again", async () => {
     installFrozenFiles();
-    const file = "http://localhost:3000/states/normal/api/v1/alerts";
+    const file = "http://localhost:3000/states/normal/api/v1/alert-rules";
     const before = (await (await fetch(file)).json()) as {
-      data: { items: { acked_at: string | null }[] };
+      data: { rules: { rule_id: string; title: string }[] };
     };
-    expect(before.data.items[0]?.acked_at).toBeNull();
+    expect(before.data.rules).toEqual([]);
 
-    const ack = await fetch("http://localhost:3000/states/normal/api/v1/alerts/ack", {
+    const saved = await fetch("http://localhost:3000/states/normal/api/v1/alert-rules", {
       method: "POST",
-      body: JSON.stringify({ alert_id: alertId }),
+      body: JSON.stringify({ rule_id: "r1", title: "早盘一档", enabled: true }),
     });
-    expect(ack.status).toBe(200);
+    expect(saved.status).toBe(200);
 
     const refreshed = (await (await fetch(file)).json()) as {
-      data: { items: { acked_at: string | null; name: string }[] };
+      data: { rules: { rule_id: string; title: string }[] };
     };
-    expect(refreshed.data.items[0]?.acked_at).toBeTruthy();
-    expect(refreshed.data.items[0]?.name).toBe("青田材料");
-
-    const again = (await (await fetch(file)).json()) as {
-      data: { items: { acked_at: string | null }[] };
-    };
-    expect(again.data.items[0]?.acked_at).toBe(refreshed.data.items[0]?.acked_at);
+    expect(refreshed.data.rules[0]?.title).toBe("早盘一档");
   });
 
   it("answers writes with 503 when the page asks to fail, and does not keep that write", async () => {
     installFrozenFiles();
     window.history.pushState({}, "", "/preview.html?fail=1");
-    const failed = await fetch("http://localhost:3000/states/normal/api/v1/alerts/ack", {
+    const failed = await fetch("http://localhost:3000/states/normal/api/v1/alert-rules", {
       method: "POST",
-      body: JSON.stringify({ alert_id: alertId }),
+      body: JSON.stringify({ rule_id: "r1", title: "早盘一档" }),
     });
     expect(failed.status).toBe(503);
     const read = (await (
-      await fetch("http://localhost:3000/states/normal/api/v1/alerts")
-    ).json()) as { data: { items: { acked_at: string | null }[] } };
-    expect(read.data.items[0]?.acked_at).toBeNull();
+      await fetch("http://localhost:3000/states/normal/api/v1/alert-rules")
+    ).json()) as { data: { rules: unknown[] } };
+    expect(read.data.rules).toEqual([]);
   });
 
   it("shows the read-only banner from the viewer file, not a hard-coded admin role", async () => {
@@ -284,8 +276,6 @@ describe("static preview reads frozen files", () => {
   it("returns success only for the allowlisted writes", async () => {
     installFrozenFiles();
     const allowed = [
-      ["POST", "/api/v1/alerts/ack"],
-      ["POST", "/api/v1/alerts/unack"],
       ["POST", "/api/v1/watchlist"],
       ["PUT", "/api/v1/screener-schemes"],
       ["DELETE", "/api/v1/screener-schemes"],
@@ -300,6 +290,8 @@ describe("static preview reads frozen files", () => {
       expect(response.status, `${method} ${path}`).toBe(200);
     }
     const blocked = [
+      ["POST", "/api/v1/alerts/ack"],
+      ["POST", "/api/v1/alerts/unack"],
       ["POST", "/api/v1/query"],
       ["POST", "/api/v1/formula/translate"],
       ["POST", "/api/v1/formula/from-text"],
@@ -334,19 +326,6 @@ describe("static preview reads frozen files", () => {
     expect(await screen.findByText(/公式没翻译上/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "重试" })).toBeInTheDocument();
     expect(screen.queryByText("有 0 处不认识")).not.toBeInTheDocument();
-  });
-
-  it("still shows 已确认 after the alerts query is refreshed", async () => {
-    setPage("normal");
-    installFrozenFiles();
-    const view = renderApp("/monitor");
-    expect(await screen.findByText("青田材料")).toBeInTheDocument();
-    expect(screen.getByText("未确认")).toBeInTheDocument();
-    screen.getByRole("button", { name: "确认" }).click();
-    await waitFor(() => expect(screen.getByText("已确认")).toBeInTheDocument());
-    await view.queryClient.invalidateQueries({ queryKey: ["alerts"] });
-    await waitFor(() => expect(screen.getByText("已确认")).toBeInTheDocument());
-    expect(screen.queryByText("未确认")).not.toBeInTheDocument();
   });
 
   it("is absent from the production bundle, and the preview bundle has no real listings", () => {
