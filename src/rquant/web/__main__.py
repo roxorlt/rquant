@@ -52,12 +52,24 @@ def main(argv: list[str] | None = None) -> None:
         app.state.preview_writes = True
 
         def demo_llm(messages: list[dict]) -> str:  # no network in demo mode
-            if "通达信" in messages[0]["content"]:
+            sys_msg = messages[0]["content"]
+            user_msg = messages[-1]["content"]
+            if "白盒编译器" in sys_msg:
+                from rquant.web.screener_engine import parse_nl_locally
+
+                local_blocks = parse_nl_locally(user_msg)
+                if local_blocks:
+                    return json.dumps(
+                        {"blocks": [b.model_dump() for b in local_blocks]},
+                        ensure_ascii=False,
+                    )
+                return json.dumps(
+                    {"blocks": [{"type": "tdx", "tdx": "C>MA(C,20) AND V>MA(V,5)*2"}]},
+                    ensure_ascii=False,
+                )
+            if "通达信" in sys_msg:
                 return "C>MA(C,20) AND V>MA(V,5)*2"
-            lines = messages[1]["content"].splitlines()[1:]
-            facts = dict(line[2:].split("：", 1) for line in lines)
-            total, drawdown = facts.get("总收益", "—"), facts.get("最大回撤", "—")
-            return f"1. 演示解读：总收益 {total}，最大回撤 {drawdown}。"
+            return "1. 演示结果。"
 
         app.state.llm = (demo_llm, "demo")
         from rquant.web.tasks import demo_runner

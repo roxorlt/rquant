@@ -114,3 +114,27 @@ test("one sentence becomes a validated condition", async ({ page }) => {
   await page.getByRole("button", { name: "一句话生成" }).click();
   await expect(page.getByLabel("生成结果")).toContainText("ts_mean(close,20)");
 });
+
+test("mode-A screener workbench switches upstream, saves custom block, and previews funnel steps", async ({
+  page,
+}) => {
+  await page.goto("./#/screener");
+  await page.getByRole("button", { name: /全市场 A 股/ }).click();
+  await expect(page.getByRole("row", { name: /招商银行/ })).toBeVisible();
+
+  await page.getByRole("button", { name: "+ 添加条件积木" }).click();
+  const picker = page.getByRole("dialog", { name: "选股积木库" });
+  await picker.getByRole("button", { name: /排除 ST/ }).click();
+
+  await page.getByRole("button", { name: "★ 存为我的积木" }).click();
+  await page.getByLabel("自定义积木名称").fill("E2E基础滤网");
+  await page.getByRole("button", { name: "保存积木" }).click();
+
+  await page.getByRole("button", { name: "+ 添加条件积木" }).click();
+  await expect(page.getByRole("dialog", { name: "选股积木库" })).toContainText("★ E2E基础滤网");
+  await page.getByRole("button", { name: "+ 添加条件积木" }).click();
+
+  const funnel = page.getByRole("list", { name: "逐条命中" });
+  await funnel.getByRole("button", { name: /全市场 A 股/ }).click();
+  await expect(page.getByRole("button", { name: /返回最终结果/ })).toBeVisible();
+});

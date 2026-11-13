@@ -6,6 +6,8 @@
 
 ### Changed
 
+- **Web 选股器升级为形态 A 级联工作台（`/screener`）**：将原仅针对落盘候选池的客户端简单数值过滤升级为前后端联动的实时积木选股工作台，支持全市场 A 股 / 今日候选池 / 预设 / 自定义与竞价池 / 自选股输入范围切换与并集、交集、排除集合运算，选股方案持久化平滑扩展 `upstream_json` 与 `blocks_json`（兼容旧版 4 列 SQLite 表并预留形态 B DAG 画布节点结构），交互全面适配 MacBook 触控板。
+
 - **Web 侧栏 18→11 页整合与单用户无锁化重构**：将单策略回测、组合回测（原 `/experiments`）与策略版本/事件研究（原 `/strategies`）整合进统一「回测」（`/backtest`）三 Tab；将自研因子与研报挖掘（原 `/reportmining`）整合进统一「因子库」（`/factor`）双 Tab；将分层健康度、活跃 systemd 服务/定时器（含日志抽屉，原 `/tasks`）与数据集覆盖率审计（原 `/data`）整合进统一「系统状态」（`/health`），并为全部旧路径保留前端兼容重定向。
 
 - **Web 命令服务解耦旧 `page_control`、移除告警「确认/撤销」伪需求并开启选股方案构建**：`rquant.web.commands_service` 移除对历史 `rquant.page_control` 的全部依赖，内置独立 Pydantic 校验与 `fcntl.flock` 幂等 JSONL 读写投影；移除不符合个人单用户盯盘场景的告警 `ack` / `unack` 接口、状态列与总览「未确认」横幅，顶栏铃铛改为基于本地浏览时间的当日新告警计数；`web-release.yml` 正式开启 `VITE_FEATURE_SCREENER_SCHEMES=1`；`snapshots.build_universe` 与 `load_alert_rules` 直接消费 `rquant-web-commands` 自选/自定义池子及 `market.duckdb` 选股结果。
@@ -39,6 +41,8 @@
 - **L2 服务器控制/确认帧容错与单流种子超时（候选，未部署）**：`page=0` 的结构合法服务器帧不再可能落进行情解码：`request=0, flags=6` 且命令为 2201/2202 的确认帧按 ack 处理，`request=0xFFFFFFFD, flags=11` 的订阅事件与 `flags=0x1000B` 的会话元数据沿用原有识别（会话 JSON 仍严格校验），其余未识别的 page-0 家族一律按控制帧计数并忽略——10/29 早盘正是 2615 字节的新确认帧未被识别导致整场中止。单条流 15 秒等不到种子响应时只把该流标 `failed` 并继续其余流，已发出的请求 ID 保留给迟到响应；bootstrap ack 超时、帧/字节预算、关联与解码错误仍终止。当本 epoch 至少一次种子超时且没有任何种子落地时，以时长结束、收到停止信号或 Ctrl-C 退出都写 `blocked` / `seed_timeout`，不再伪装成正常结束；该信号不新增持久状态字段，避免独立部署的旧版归档与回滚读不了 `status.json`。真实故障帧只保留帧头证据；本版仍须精确 CI 与持续行情验收，未部署。
 
 ### Added
+
+- **Web 选股器实时执行引擎、白盒自然语言编译与「我的积木」持久化（`v0.37.0`）**：新增 `rquant.web.screener_engine`（只读内存 DuckDB 挂载 `market.duckdb` 与可选只读副本 `rquant_ro.duckdb`，代码硬拒绝直连主库 `rquant.duckdb`）与 `/api/v1/screener/{catalog,run,from-text,blocks}` 系列接口，服务端实时执行 26 个内置选股规则积木、通达信选股公式（`translate` + `evaluate`）、全量行情/估值/资金/财务指标及已验证自研/研报因子分位（`>=` / `<=` / `between` / `top_pct` / `bottom_pct`，附 `FactorTracking` 近期 IC 提示）；新增一句话白盒编译（`compile_nl_to_blocks`）、自定义单条/组合积木保存与复用（`screener_custom_block`）及支持点击任意中间层（`preview_step`）预览剩余股票的逐层漏斗诊断条。
 
 - **Web 实时只读 `ResearchSource`、自选股增删查询接口与 SQLite Web Store**：新增 `ResearchSource`（`RQUANT_WEB_SOURCE=research`，以内存 DuckDB 只读挂载 `market.duckdb` 与可选只读副本 `rquant_ro.duckdb`，拒绝直连主库 `rquant.duckdb`，动态投影 18 张标准视图并支持受限沙盒 SQL 查询）；新增 `GET / DELETE /api/v1/watchlist`、池子页自选移出按钮与个股 F9 页加/移自选开关；新增 `GET / PUT / DELETE /api/v1/screener-schemes` 与 `GET / PUT /api/v1/ui-preferences` 服务器持久化存储。
 

@@ -18,11 +18,11 @@ def _client(tmp_path) -> tuple[TestClient, object]:
     return TestClient(app), store
 
 
-def test_schema_has_only_the_two_web_tables(tmp_path) -> None:
+def test_schema_has_only_the_three_web_tables(tmp_path) -> None:
     SqliteSchemeStore(tmp_path / "s.sqlite3")
     con = sqlite3.connect(tmp_path / "s.sqlite3")
     names = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
-    assert names == {"screener_scheme", "ui_preference"}
+    assert names == {"screener_scheme", "screener_custom_block", "ui_preference"}
 
 
 def test_round_trip_per_user(tmp_path) -> None:

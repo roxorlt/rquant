@@ -2,13 +2,19 @@ import { previewWatchlistCodes } from "virtual:static-preview";
 import { useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router";
 import {
+  type ScreenerBlock,
+  type ScreenerRunRequest,
+  type ScreenerUpstream,
   type ScreenRow,
   useAddWatch,
   usePools,
   useSavePool,
   useScreen,
+  useScreenerCatalog,
+  useScreenerRun,
   useWatchlist,
 } from "@/api/endpoints";
+import type { ServingQueryResult } from "@/api/useServingQuery";
 import { presetLabel } from "@/copy/publicText";
 import { formatFixed, formatPrice } from "@/format/number";
 import { DataTable } from "@/table/DataTable";
@@ -25,83 +31,20 @@ import {
 import { type FailureCopy, failureCopy } from "@/ui/failure";
 import { StockLink } from "@/ui/StockLink";
 import { QueryView } from "../shared";
+import { BlockListWorkbench, FunnelStrip, NlWhiteBoxBar, UpstreamScopeBar } from "./BlockWorkbench";
 import {
-  applyFilters,
-  BASE_FIELDS,
-  type Field,
-  type Filter,
+  applyClientBlocks,
+  DEFAULT_UPSTREAM,
+  FALLBACK_RULES,
   fieldsFor,
+  filtersToBlocks,
   groupsFor,
+  newBlockId,
   type Rank,
   score,
 } from "./Builder";
 import { Conditions } from "./Conditions";
-import { FieldPicker } from "./FieldPicker";
 import { Schemes } from "./Schemes";
-
-function stepLabel(filters: Filter[], i: number): string {
-  const f = filters[i - 1];
-  return f
-    ? `${BASE_FIELDS[f.field] ?? f.field.replace(/^f:/, "因子·")} ${f.op} ${f.value}`
-    : "股票池";
-}
-
-function FilterRows({
-  filters,
-  onChange,
-  fields,
-}: {
-  filters: Filter[];
-  onChange: (f: Filter[]) => void;
-  fields: Record<string, string>;
-}) {
-  const set = (i: number, patch: Partial<Filter>) =>
-    onChange(filters.map((f, j) => (j === i ? { ...f, ...patch } : f)));
-  return (
-    <div>
-      {filters.map((f, i) => (
-        // biome-ignore lint/suspicious/noArrayIndexKey: rows are positional.
-        <div className="cond-row" key={i}>
-          <span className="mono">{i + 1}</span>
-          <FieldPicker
-            label="字段"
-            value={f.field}
-            fields={fields}
-            onChange={(v) => set(i, { field: v as Field })}
-          />
-          <select
-            aria-label="比较"
-            value={f.op}
-            onChange={(e) => set(i, { op: e.target.value as Filter["op"] })}
-          >
-            <option value=">=">≥</option>
-            <option value="<=">≤</option>
-          </select>
-          <input
-            aria-label="阈值"
-            type="number"
-            value={f.value}
-            onChange={(e) => set(i, { value: Number(e.target.value) })}
-          />
-          <Button
-            size="sm"
-            variant="ghost"
-            onClick={() => onChange(filters.filter((_, j) => j !== i))}
-          >
-            ×
-          </Button>
-        </div>
-      ))}
-      <Button
-        size="sm"
-        variant="ghost"
-        onClick={() => onChange([...filters, { field: "pct_chg", op: ">=", value: 0 }])}
-      >
-        + 添加条件
-      </Button>
-    </div>
-  );
-}
 
 function RankRows({
   ranks,
@@ -204,11 +147,35 @@ function watchBanner(fails: WatchFail[]): FailureCopy {
   };
 }
 
-const ALL = "__all__";
-
 export default function ScreenerPage() {
-  const [preset, setPreset] = useState<string>(ALL);
-  const query = useScreen(preset === ALL ? null : preset);
+  const [upstream, setUpstreamState] = useState<ScreenerUpstream>(DEFAULT_UPSTREAM);
+  const [blocks, setBlocksState] = useState<ScreenerBlock[]>([]);
+  const [ranks, setRanks] = useState<Rank[]>([{ field: "pct_chg", desc: true, weight: 100 }]);
+  const [previewStep, setPreviewStep] = useState<number | null>(null);
+
+  const setUpstream = (next: ScreenerUpstream) => {
+    setUpstreamState(next);
+    setPreviewStep(null);
+  };
+  const setBlocks = (next: ScreenerBlock[]) => {
+    setBlocksState(next);
+    setPreviewStep(null);
+  };
+
+  const screenPreset = upstream.base === "preset" && upstream.preset ? upstream.preset : null;
+  const screenQuery = useScreen(screenPreset);
+  const catalogQuery = useScreenerCatalog();
+  const runBody = useMemo<ScreenerRunRequest>(
+    () => ({
+      upstream,
+      blocks,
+      ranks,
+      preview_step: previewStep,
+    }),
+    [upstream, blocks, ranks, previewStep],
+  );
+  const runQuery = useScreenerRun(runBody);
+
   const savePool = useSavePool();
   const addWatch = useAddWatch();
   const toast = useToast();
@@ -221,33 +188,105 @@ export default function ScreenerPage() {
   const [saveFail, setSaveFail] = useState<FailureCopy | null>(null);
   const [watchFails, setWatchFails] = useState<WatchFail[]>([]);
   const [inPool, setInPool] = useState<Set<string>>(currentWatch);
+
   const watched = useMemo(() => {
     const items = watchlist.data?.items;
     const serverCodes = Array.isArray(items) ? items.map((item) => item.code) : [];
     return new Set([...inPool, ...serverCodes]);
   }, [inPool, watchlist.data]);
-  const presets = query.data?.presets ?? [];
+
   const [params] = useSearchParams();
   const q = (params.get("q") ?? "").trim();
-  const [filters, setFilters] = useState<Filter[]>([]);
-  const [ranks, setRanks] = useState<Rank[]>([{ field: "pct_chg", desc: true, weight: 100 }]);
-  const base = useMemo(
+
+  const serverActive = Array.isArray(runQuery.data?.rows);
+  const rules = useMemo(
     () =>
-      (query.data?.rows ?? []).filter(
-        (r) => !q || r.code.includes(q) || (r.name ?? "").includes(q),
-      ),
-    [query.data, q],
+      Array.isArray(catalogQuery.data?.rules) && catalogQuery.data.rules.length > 0
+        ? catalogQuery.data.rules
+        : FALLBACK_RULES,
+    [catalogQuery.data],
   );
-  const filtered = useMemo(() => applyFilters(base, filters), [base, filters]);
-  const fields = useMemo(() => fieldsFor(query.data?.rows ?? []), [query.data]);
-  const factorNames = Object.keys(fields)
-    .filter((k) => k.startsWith("f:"))
-    .map((k) => k.slice(2));
-  const scores = useMemo(() => score(filtered.rows, ranks), [filtered, ranks]);
+  const customBlocks = useMemo(
+    () => (Array.isArray(catalogQuery.data?.custom_blocks) ? catalogQuery.data.custom_blocks : []),
+    [catalogQuery.data],
+  );
+  const ruleMap = useMemo(() => new Map(rules.map((r) => [r.name, r])), [rules]);
+  const customMap = useMemo(
+    () => new Map(customBlocks.map((b) => [b.block_id, b])),
+    [customBlocks],
+  );
+
+  const rawRowsForFields = serverActive
+    ? (runQuery.data?.rows ?? [])
+    : (screenQuery.data?.rows ?? []);
+  const fields = useMemo(
+    () => fieldsFor(rawRowsForFields, catalogQuery.data?.field_groups),
+    [rawRowsForFields, catalogQuery.data],
+  );
+  const factorNames = useMemo(
+    () =>
+      Object.keys(fields)
+        .filter((k) => k.startsWith("f:"))
+        .map((k) => k.slice(2)),
+    [fields],
+  );
+
+  const fallbackResult = useMemo(() => {
+    if (serverActive) return null;
+    const baseRows = (screenQuery.data?.rows ?? []).filter(
+      (r) => !q || r.code.includes(q) || (r.name ?? "").includes(q),
+    );
+    return applyClientBlocks(baseRows, blocks, fields, customMap, ruleMap, previewStep);
+  }, [serverActive, screenQuery.data, q, blocks, fields, customMap, ruleMap, previewStep]);
+
+  const effectiveRows = useMemo(() => {
+    if (serverActive) {
+      const serverRows = runQuery.data?.rows ?? [];
+      return q
+        ? serverRows.filter((r) => r.code.includes(q) || (r.name ?? "").includes(q))
+        : serverRows;
+    }
+    return fallbackResult?.rows ?? [];
+  }, [serverActive, runQuery.data, q, fallbackResult]);
+
+  const effectiveSteps = serverActive
+    ? (runQuery.data?.steps ?? [])
+    : (fallbackResult?.steps ?? []);
+  const activeStep = serverActive
+    ? (runQuery.data?.active_step ?? Math.max(0, effectiveSteps.length - 1))
+    : (fallbackResult?.activeStep ?? 0);
+
+  const presets = useMemo(() => {
+    if (Array.isArray(runQuery.data?.presets) && runQuery.data.presets.length > 0) {
+      return runQuery.data.presets;
+    }
+    if (Array.isArray(catalogQuery.data?.presets) && catalogQuery.data.presets.length > 0) {
+      return catalogQuery.data.presets;
+    }
+    return screenQuery.data?.presets ?? [];
+  }, [runQuery.data, catalogQuery.data, screenQuery.data]);
+
+  const tradeDate =
+    runQuery.data?.trade_date ??
+    catalogQuery.data?.trade_date ??
+    screenQuery.data?.trade_date ??
+    "";
+
+  const poolRefs = useMemo(() => {
+    if (Array.isArray(runQuery.data?.pool_refs) && runQuery.data.pool_refs.length > 0) {
+      return runQuery.data.pool_refs;
+    }
+    if (upstream.base === "preset" && upstream.preset) return [upstream.preset];
+    if (upstream.base === "all_market") return ["all_market"];
+    if (upstream.base === "pool" && upstream.pool) return [upstream.pool];
+    if (upstream.base === "watchlist") return ["manual"];
+    return presets;
+  }, [runQuery.data, upstream, presets]);
+
+  const clientScores = useMemo(() => score(effectiveRows, ranks), [effectiveRows, ranks]);
 
   const openSave = () => {
-    const day = query.data?.trade_date ?? "";
-    const [, month, date] = day.split("-");
+    const [, month, date] = tradeDate.split("-");
     setPoolMode("new");
     setPoolName(month && date ? `选股 ${month}-${date}` : "选股结果");
     setSaveFail(null);
@@ -260,8 +299,8 @@ export default function ScreenerPage() {
       {
         name,
         description: "",
-        pool_refs: preset === ALL ? presets : [preset],
-        codes: filtered.rows.map((r) => r.code),
+        pool_refs: poolRefs,
+        codes: effectiveRows.map((r) => r.code),
         mode: poolMode,
       },
       {
@@ -269,7 +308,7 @@ export default function ScreenerPage() {
           setSaveOpen(false);
           setSaveFail(null);
           toast({
-            text: `已保存为池子『${name}』，共 ${filtered.rows.length} 只`,
+            text: `已保存为池子『${name}』，共 ${effectiveRows.length} 只`,
             action: { label: "去看看", onClick: () => navigate("/pools") },
           });
         },
@@ -297,62 +336,90 @@ export default function ScreenerPage() {
     });
   };
   const failedCodes = new Set(watchFails.map((item) => item.code));
+  const primaryQuery: ServingQueryResult<unknown> = serverActive ? runQuery : screenQuery;
 
   return (
     <>
       <PageHeader
         eyebrow="研究"
         title="选股器"
-        note={query.data?.trade_date ?? undefined}
+        note={tradeDate || undefined}
         actions={
-          <Button onClick={openSave} disabled={presets.length === 0}>
+          <Button onClick={openSave} disabled={effectiveRows.length === 0 && presets.length === 0}>
             保存为池子
           </Button>
         }
       />
-      <Segmented
-        label="选股方案"
-        value={preset}
-        onChange={setPreset}
-        options={[
-          { value: ALL, label: "全部" },
-          ...presets.map((p) => ({ value: p, label: presetLabel(p) })),
-        ]}
+
+      <UpstreamScopeBar
+        upstream={upstream}
+        onChange={setUpstream}
+        presets={presets}
+        pools={pools.data?.pools ?? []}
+        upstreamOptions={catalogQuery.data?.upstream_options ?? []}
+        allMarketCount={catalogQuery.data?.all_market_count ?? 0}
       />
-      <Panel title="条件" sub={q ? `搜索：${q}` : "门槛全部满足才保留；排名按加权分位打分"}>
+
+      <Panel
+        title="条件工作台"
+        sub={
+          q
+            ? `搜索：${q}`
+            : "支持 26 个内置积木、财务与已验证因子、可执行 TDX 公式与自定义积木；点击漏斗任意层可预览中间结果"
+        }
+      >
+        <NlWhiteBoxBar onAppendBlocks={(added) => setBlocks([...blocks, ...added])} />
+
         <div className="cond-grid">
           <div>
-            <h3 className="sub">筛选</h3>
-            {filters.length === 0 ? <p className="cond-none">无门槛，全部股票进入排名</p> : null}
-            <FilterRows filters={filters} onChange={setFilters} fields={fields} />
+            <h3 className="sub">筛选积木</h3>
+            <BlockListWorkbench
+              blocks={blocks}
+              onChange={setBlocks}
+              fields={fields}
+              rules={rules}
+              customBlocks={customBlocks}
+            />
           </div>
           <div>
-            <h3 className="sub">排名</h3>
-            {ranks.length === 0 ? <p className="cond-none">未设排名，按原顺序输出</p> : null}
+            <h3 className="sub">加权排名</h3>
+            {ranks.length === 0 ? <p className="cond-none">未设排名，按涨跌幅输出</p> : null}
             <RankRows ranks={ranks} onChange={setRanks} fields={fields} />
           </div>
         </div>
+
         <Schemes
-          filters={filters}
+          blocks={blocks}
+          upstream={upstream}
           ranks={ranks}
           onLoad={(sc) => {
-            setFilters(sc.filters);
+            if (sc.upstream) setUpstreamState(sc.upstream);
+            setBlocksState(
+              sc.blocks && sc.blocks.length > 0 ? sc.blocks : filtersToBlocks(sc.filters),
+            );
             setRanks(sc.ranks);
+            setPreviewStep(null);
           }}
         />
-        <ol className="funnel-inline" aria-label="逐条命中">
-          {filtered.steps.map((n, i) => (
-            // biome-ignore lint/suspicious/noArrayIndexKey: steps are positional.
-            <li key={i}>
-              <span className="fl">{stepLabel(filters, i)}</span>
-              <span className="fv num">{n}</span>
-            </li>
-          ))}
-        </ol>
+
+        <FunnelStrip
+          steps={effectiveSteps}
+          activeStep={activeStep}
+          previewStep={previewStep}
+          onSelectStep={setPreviewStep}
+        />
       </Panel>
-      <QueryView query={query}>
+
+      <QueryView query={primaryQuery}>
         {() => (
-          <Panel title={`结果 · 命中 ${filtered.rows.length} 只`} flush>
+          <Panel
+            title={
+              previewStep !== null && previewStep < effectiveSteps.length - 1
+                ? `中间层预览（第 ${activeStep} 层）· 共 ${effectiveRows.length} 只`
+                : `结果 · 命中 ${effectiveRows.length} 只`
+            }
+            flush
+          >
             {watchFails.length ? (
               <FailureNotice
                 pin
@@ -360,7 +427,7 @@ export default function ScreenerPage() {
                 busy={addWatch.isPending}
                 onRetry={() => {
                   for (const item of watchFails) {
-                    const row = filtered.rows.find((candidate) => candidate.code === item.code);
+                    const row = effectiveRows.find((candidate) => candidate.code === item.code);
                     if (row) watch(row);
                   }
                 }}
@@ -371,11 +438,11 @@ export default function ScreenerPage() {
               tools="选股结果"
               phoneSort
               pinEnds
-              rows={filtered.rows}
+              rows={effectiveRows}
               rowKey={(row) => `${row.preset}:${row.code}`}
               initialSort={{ id: "score", desc: true }}
               height={560}
-              emptyText="当天没有选股结果：盘后选股尚未产出，或该方案今天无命中。可切换方案，或用下方条件选股自定义。"
+              emptyText="当前输入范围与条件组合下暂无命中股票。可点击上方漏斗诊断条查看是在哪一层被过滤，或放宽条件阈值。"
               columns={[
                 {
                   id: "code",
@@ -386,7 +453,7 @@ export default function ScreenerPage() {
                 { id: "name", header: "名称", value: (row) => row.name ?? null },
                 {
                   id: "preset",
-                  header: "方案",
+                  header: "来源",
                   value: (row) => presetLabel(row.preset),
                   secondary: true,
                 },
@@ -439,11 +506,29 @@ export default function ScreenerPage() {
                   cell: (row) => (row.roe == null ? "—" : formatFixed(row.roe, 1)),
                 },
                 {
+                  id: "gpm",
+                  header: "毛利率%",
+                  numeric: true,
+                  hiddenByDefault: true,
+                  value: (row) => row.grossprofit_margin ?? null,
+                  cell: (row) =>
+                    row.grossprofit_margin == null ? "—" : formatFixed(row.grossprofit_margin, 1),
+                },
+                {
                   id: "npyoy",
                   header: "净利同比",
                   numeric: true,
                   value: (row) => row.netprofit_yoy ?? null,
                   cell: (row) => <ChangeText value={row.netprofit_yoy ?? null} />,
+                },
+                {
+                  id: "debt",
+                  header: "负债率%",
+                  numeric: true,
+                  hiddenByDefault: true,
+                  value: (row) => row.debt_to_assets ?? null,
+                  cell: (row) =>
+                    row.debt_to_assets == null ? "—" : formatFixed(row.debt_to_assets, 1),
                 },
                 ...factorNames.map((name) => ({
                   id: `f:${name}`,
@@ -457,8 +542,8 @@ export default function ScreenerPage() {
                   id: "score",
                   header: "排名分",
                   numeric: true,
-                  value: (row) => scores.get(row) ?? null,
-                  cell: (row) => formatFixed(scores.get(row) ?? 0, 1),
+                  value: (row) => row.score ?? clientScores.get(row) ?? null,
+                  cell: (row) => formatFixed(row.score ?? clientScores.get(row) ?? 0, 1),
                 },
                 {
                   id: "watch",
@@ -491,6 +576,7 @@ export default function ScreenerPage() {
           </Panel>
         )}
       </QueryView>
+
       <AppDrawer
         open={saveOpen}
         onClose={() => setSaveOpen(false)}
@@ -517,7 +603,7 @@ export default function ScreenerPage() {
             { value: "existing", label: "加入已有" },
           ]}
         />
-        <p className="hint">共 {filtered.rows.length} 只</p>
+        <p className="hint">共 {effectiveRows.length} 只</p>
         {poolMode === "existing" ? (
           <label className="fld">
             已有池子
@@ -548,7 +634,16 @@ export default function ScreenerPage() {
           <FailureNotice copy={saveFail} busy={savePool.isPending} onRetry={save} />
         ) : null}
       </AppDrawer>
-      <Conditions />
+
+      <Conditions
+        onAddTdx={(tdx) => {
+          setBlocks([
+            ...blocks,
+            { id: newBlockId(), type: "tdx", enabled: true, tdx, op: ">=", value: 0 },
+          ]);
+          toast("已将通达信公式加入实时选股漏斗");
+        }}
+      />
     </>
   );
 }

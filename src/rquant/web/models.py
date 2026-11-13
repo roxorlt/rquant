@@ -143,8 +143,12 @@ class ScreenRow(BaseModel):
     main_net: float | None = None  # 主力净流入 亿元 (大单+特大单)
     main_net_5d: float | None = None
     roe: float | None = None
+    grossprofit_margin: float | None = None
+    netprofit_margin: float | None = None
     netprofit_yoy: float | None = None
     or_yoy: float | None = None
+    debt_to_assets: float | None = None
+    score: float | None = None
     factors: dict[str, float] = Field(default_factory=dict)  # name -> cross-section pct 0-100
 
 
@@ -576,6 +580,8 @@ class ScreenerSchemeBody(BaseModel):
     name: str = Field(min_length=1, max_length=40)
     filters: list[dict[str, Any]] = []
     ranks: list[dict[str, Any]] = []
+    upstream: dict[str, Any] = Field(default_factory=dict)
+    blocks: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class ScreenerSchemeRow(ScreenerSchemeBody):
@@ -584,6 +590,149 @@ class ScreenerSchemeRow(ScreenerSchemeBody):
 
 class ScreenerSchemesData(BaseModel):
     schemes: list[ScreenerSchemeRow]
+
+
+class ScreenerUpstream(BaseModel):
+    base: Literal["presets", "all_market", "preset", "pool", "watchlist"] = "presets"
+    preset: str | None = Field(default=None, max_length=64)
+    pool: str | None = Field(default=None, max_length=64)
+    include_pools: list[str] = Field(default_factory=list, max_length=20)
+    intersect_pools: list[str] = Field(default_factory=list, max_length=20)
+    exclude_pools: list[str] = Field(default_factory=list, max_length=20)
+
+
+class ScreenerBlock(BaseModel):
+    id: str = Field(default="", max_length=64)
+    type: Literal["rule", "field", "tdx", "custom"]
+    enabled: bool = True
+    label: str | None = Field(default=None, max_length=120)
+    rule_name: str | None = Field(default=None, max_length=64)
+    args: dict[str, Any] = Field(default_factory=dict)
+    field: str | None = Field(default=None, max_length=80)
+    op: Literal[">=", "<=", "between", "top_pct", "bottom_pct"] = ">="
+    value: float = 0.0
+    value2: float | None = None
+    tdx: str | None = Field(default=None, max_length=2000)
+    custom_id: str | None = Field(default=None, max_length=64)
+
+
+class ScreenerRankSpec(BaseModel):
+    field: str = Field(min_length=1, max_length=80)
+    desc: bool = True
+    weight: float = Field(default=100.0, ge=0, le=1000)
+
+
+class ScreenerFunnelStep(BaseModel):
+    step: int
+    block_id: str | None = None
+    label: str
+    remaining: int
+    dropped: int = 0
+    dropped_pct: float = 0.0
+    error: str | None = None
+
+
+class ScreenerRunRequest(BaseModel):
+    trade_date: date | None = None
+    upstream: ScreenerUpstream = Field(default_factory=ScreenerUpstream)
+    blocks: list[ScreenerBlock] = Field(default_factory=list, max_length=40)
+    ranks: list[ScreenerRankSpec] = Field(default_factory=list, max_length=10)
+    preview_step: int | None = Field(default=None, ge=0, le=40)
+
+
+class ScreenerRunData(BaseModel):
+    trade_date: date | None
+    active_step: int
+    steps: list[ScreenerFunnelStep]
+    rows: list[ScreenRow]
+    presets: list[str] = Field(default_factory=list)
+    pool_refs: list[str] = Field(default_factory=list)
+
+
+class RuleParamSpec(BaseModel):
+    name: str
+    label: str
+    kind: Literal["int", "float", "str", "operand", "boards", "ma_line"]
+    required: bool = True
+    default: Any = None
+    min: float | None = None
+    max: float | None = None
+    step: float | None = None
+    options: list[dict[str, str]] = Field(default_factory=list)
+
+
+class RuleCatalogItem(BaseModel):
+    name: str
+    title: str
+    description: str
+    category: str
+    category_label: str
+    examples: list[str] = Field(default_factory=list)
+    params: list[RuleParamSpec] = Field(default_factory=list)
+
+
+class FieldCatalogItem(BaseModel):
+    field: str
+    label: str
+    kind: Literal["market", "valuation", "fundamental", "flow", "factor"] = "market"
+    mean_ic: float | None = None
+    recent_ic: float | None = None
+
+
+class FieldCatalogGroup(BaseModel):
+    group: str
+    items: list[FieldCatalogItem]
+
+
+class CustomBlockItem(BaseModel):
+    block_id: str
+    name: str
+    description: str = ""
+    kind: Literal["rule", "field", "tdx", "composite"]
+    spec: dict[str, Any] = Field(default_factory=dict)
+    created_at: str
+
+
+class CustomBlockSaveRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=48)
+    description: str = Field(default="", max_length=200)
+    kind: Literal["rule", "field", "tdx", "composite"]
+    spec: dict[str, Any] = Field(default_factory=dict)
+
+
+class CustomBlocksData(BaseModel):
+    blocks: list[CustomBlockItem]
+
+
+class UpstreamOptionItem(BaseModel):
+    ref: str
+    kind: Literal["preset", "pool", "watchlist"]
+    name: str
+    label: str
+    count: int
+
+
+class ScreenerCatalogData(BaseModel):
+    trade_date: date | None = None
+    all_market_count: int = 0
+    presets: list[str] = Field(default_factory=list)
+    upstream_options: list[UpstreamOptionItem] = Field(default_factory=list)
+    rules: list[RuleCatalogItem] = Field(default_factory=list)
+    field_groups: list[FieldCatalogGroup] = Field(default_factory=list)
+    custom_blocks: list[CustomBlockItem] = Field(default_factory=list)
+
+
+class ScreenerNlCompileRequest(BaseModel):
+    text: str = Field(min_length=2, max_length=400)
+
+
+class ScreenerNlCompileData(BaseModel):
+    blocks: list[ScreenerBlock] = Field(default_factory=list)
+    summary: str = ""
+    tdx: str | None = None
+    expression: str | None = None
+    error: str | None = None
+    model: str = "rule-parser"
 
 
 class UiPreferencesData(BaseModel):

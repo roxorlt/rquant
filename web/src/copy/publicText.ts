@@ -85,6 +85,8 @@ const PRESET_LABEL: Record<string, string> = {
   pool2: "N字精选",
   manual: "自选",
   saved: "自定池",
+  all_market: "全市场",
+  pullback: "回踩",
   "breakout55-top10": "55日新高",
 };
 

@@ -51,6 +51,9 @@ from rquant.web.models import (
     BoardItem,
     CommandReceipt,
     ConditionListData,
+    CustomBlockItem,
+    CustomBlockSaveRequest,
+    CustomBlocksData,
     DataCenterData,
     Envelope,
     EventStudy,
@@ -81,6 +84,11 @@ from rquant.web.models import (
     ReportFactorsSummaryData,
     SavePoolRequest,
     ScreenData,
+    ScreenerCatalogData,
+    ScreenerNlCompileData,
+    ScreenerNlCompileRequest,
+    ScreenerRunData,
+    ScreenerRunRequest,
     ScreenerSchemeBody,
     ScreenerSchemeRow,
     ScreenerSchemesData,
@@ -301,7 +309,9 @@ def screen(request: Request, source: SourceDep, trade_date: date | None = None,
         items.append(ScreenRow(
             trade_date=r["trade_date"], code=code, name=r["name"], preset=r["preset_name"],
             close=_f(r["close"]), pct_chg=_f(r["pct_chg"]), **extra.get(code, {}),
-            roe=f.get("roe"), netprofit_yoy=f.get("netprofit_yoy"), or_yoy=f.get("or_yoy"),
+            roe=f.get("roe"), grossprofit_margin=f.get("grossprofit_margin"),
+            netprofit_margin=f.get("netprofit_margin"), netprofit_yoy=f.get("netprofit_yoy"),
+            or_yoy=f.get("or_yoy"), debt_to_assets=f.get("debt_to_assets"),
             factors={n: v[code] for n, v in factor_pct.items() if code in v}))
     return _envelope(source, ScreenData(trade_date=day, presets=presets, rows=items))
 
@@ -1118,7 +1128,13 @@ def list_screener_schemes(request: Request, source: SourceDep) -> Envelope[Scree
 def save_screener_scheme(body: ScreenerSchemeBody, request: Request) -> CommandReceipt:
     if _preview_fail(request):
         raise HTTPException(503, "preview failure")
-    _schemes(request).save(body.name, body.filters, body.ranks)
+    _schemes(request).save(
+        body.name,
+        body.filters,
+        body.ranks,
+        upstream=body.upstream,
+        blocks=body.blocks,
+    )
     return CommandReceipt(command_id=None, status="succeeded")
 
 
@@ -1128,6 +1144,136 @@ def delete_screener_scheme(request: Request, name: str = Query(min_length=1, max
     if _preview_fail(request):
         raise HTTPException(503, "preview failure")
     _schemes(request).delete(name)
+    return CommandReceipt(command_id=None, status="succeeded")
+
+
+_CUSTOM_BLOCK_ID_RE = __import__("re").compile(r"^[a-zA-Z0-9_-]{1,48}$")
+
+
+@router.get(
+    "/screener/catalog",
+    response_model=Envelope[ScreenerCatalogData],
+    summary="选股工作台积木库与输入范围目录",
+)
+def screener_catalog(request: Request, source: SourceDep) -> Envelope[ScreenerCatalogData]:
+    from rquant.web.screener_engine import list_catalog
+
+    root = Path(_research_root(request) or research_root())
+    names = {**_market_names(request), **_names(source)}
+    pool_items = pools(source, request).data.pools
+    watch_items = _watchlist_rows(request, source, names)
+    data = list_catalog(
+        root=root,
+        source=source,
+        scheme_store=_schemes(request),
+        pool_items=pool_items,
+        watchlist_items=watch_items,
+    )
+    return _envelope(source, data)
+
+
+@router.post(
+    "/screener/run",
+    response_model=Envelope[ScreenerRunData],
+    summary="选股工作台实时漏斗执行",
+)
+def screener_run(
+    body: ScreenerRunRequest,
+    request: Request,
+    source: SourceDep,
+) -> Envelope[ScreenerRunData]:
+    from rquant.web.screener_engine import run_screener
+
+    root = Path(_research_root(request) or research_root())
+    names = {**_market_names(request), **_names(source)}
+    pool_items = pools(source, request).data.pools
+    watch_items = _watchlist_rows(request, source, names)
+    data = run_screener(
+        body=body,
+        root=root,
+        source=source,
+        scheme_store=_schemes(request),
+        pool_items=pool_items,
+        watchlist_items=watch_items,
+    )
+    return _envelope(source, data)
+
+
+@router.post(
+    "/screener/from-text",
+    response_model=ScreenerNlCompileData,
+    summary="选股工作台一句话白盒生成条件积木",
+)
+def screener_from_text(
+    body: ScreenerNlCompileRequest,
+    request: Request,
+) -> ScreenerNlCompileData:
+    from rquant.web.screener_engine import compile_nl_to_blocks
+
+    llm = getattr(request.app.state, "llm", None) or deepseek_complete()
+    try:
+        return compile_nl_to_blocks(body.text, llm)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"AI 调用失败：{type(exc).__name__}") from exc
+
+
+@router.get(
+    "/screener/blocks",
+    response_model=Envelope[CustomBlocksData],
+    summary="我的自定义积木列表",
+)
+def list_custom_blocks(request: Request, source: SourceDep) -> Envelope[CustomBlocksData]:
+    items = [CustomBlockItem(**b) for b in _schemes(request).list_blocks()]
+    return _envelope(source, CustomBlocksData(blocks=items))
+
+
+@router.put(
+    "/screener/blocks/{block_id}",
+    response_model=CustomBlockItem,
+    summary="保存为我的积木",
+)
+def save_custom_block(
+    block_id: str,
+    body: CustomBlockSaveRequest,
+    request: Request,
+) -> CustomBlockItem:
+    if _preview_fail(request):
+        raise HTTPException(503, "preview failure")
+    if not _CUSTOM_BLOCK_ID_RE.match(block_id):
+        raise HTTPException(422, "invalid block_id")
+    if body.kind == "tdx":
+        formula = str(body.spec.get("tdx") or "").strip()
+        if not formula:
+            raise HTTPException(422, "通达信公式不能为空")
+        try:
+            expr = translate_tdx(formula)
+            body.spec = {**body.spec, "tdx": formula, "expression": expr}
+        except TdxFormulaError as exc:
+            raise HTTPException(422, f"通达信公式校验未通过：{exc}") from exc
+    try:
+        saved = _schemes(request).save_block(
+            block_id=block_id,
+            name=body.name.strip(),
+            description=body.description.strip(),
+            kind=body.kind,
+            spec=body.spec,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return CustomBlockItem(**saved)
+
+
+@router.delete(
+    "/screener/blocks/{block_id}",
+    response_model=CommandReceipt,
+    summary="删除我的积木",
+)
+def delete_custom_block(block_id: str, request: Request) -> CommandReceipt:
+    if _preview_fail(request):
+        raise HTTPException(503, "preview failure")
+    if not _CUSTOM_BLOCK_ID_RE.match(block_id):
+        raise HTTPException(422, "invalid block_id")
+    _schemes(request).delete_block(block_id)
     return CommandReceipt(command_id=None, status="succeeded")
 
 

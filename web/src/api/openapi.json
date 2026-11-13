@@ -1569,6 +1569,103 @@
         "title": "ConditionRun",
         "type": "object"
       },
+      "CustomBlockItem": {
+        "properties": {
+          "block_id": {
+            "title": "Block Id",
+            "type": "string"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "description": {
+            "default": "",
+            "title": "Description",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "rule",
+              "field",
+              "tdx",
+              "composite"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "spec": {
+            "additionalProperties": true,
+            "title": "Spec",
+            "type": "object"
+          }
+        },
+        "required": [
+          "block_id",
+          "name",
+          "kind",
+          "created_at"
+        ],
+        "title": "CustomBlockItem",
+        "type": "object"
+      },
+      "CustomBlockSaveRequest": {
+        "properties": {
+          "description": {
+            "default": "",
+            "maxLength": 200,
+            "title": "Description",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "rule",
+              "field",
+              "tdx",
+              "composite"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 48,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "spec": {
+            "additionalProperties": true,
+            "title": "Spec",
+            "type": "object"
+          }
+        },
+        "required": [
+          "name",
+          "kind"
+        ],
+        "title": "CustomBlockSaveRequest",
+        "type": "object"
+      },
+      "CustomBlocksData": {
+        "properties": {
+          "blocks": {
+            "items": {
+              "$ref": "#/components/schemas/CustomBlockItem"
+            },
+            "title": "Blocks",
+            "type": "array"
+          }
+        },
+        "required": [
+          "blocks"
+        ],
+        "title": "CustomBlocksData",
+        "type": "object"
+      },
       "DataCenterData": {
         "properties": {
           "audit": {
@@ -1776,6 +1873,22 @@
           "serving"
         ],
         "title": "Envelope[ConditionListData]",
+        "type": "object"
+      },
+      "Envelope_CustomBlocksData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/CustomBlocksData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[CustomBlocksData]",
         "type": "object"
       },
       "Envelope_DataCenterData_": {
@@ -2096,6 +2209,38 @@
           "serving"
         ],
         "title": "Envelope[ScreenData]",
+        "type": "object"
+      },
+      "Envelope_ScreenerCatalogData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/ScreenerCatalogData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[ScreenerCatalogData]",
+        "type": "object"
+      },
+      "Envelope_ScreenerRunData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/ScreenerRunData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[ScreenerRunData]",
         "type": "object"
       },
       "Envelope_ScreenerSchemesData_": {
@@ -2846,6 +2991,79 @@
           "points"
         ],
         "title": "FactorTracking",
+        "type": "object"
+      },
+      "FieldCatalogGroup": {
+        "properties": {
+          "group": {
+            "title": "Group",
+            "type": "string"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/FieldCatalogItem"
+            },
+            "title": "Items",
+            "type": "array"
+          }
+        },
+        "required": [
+          "group",
+          "items"
+        ],
+        "title": "FieldCatalogGroup",
+        "type": "object"
+      },
+      "FieldCatalogItem": {
+        "properties": {
+          "field": {
+            "title": "Field",
+            "type": "string"
+          },
+          "kind": {
+            "default": "market",
+            "enum": [
+              "market",
+              "valuation",
+              "fundamental",
+              "flow",
+              "factor"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "mean_ic": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mean Ic"
+          },
+          "recent_ic": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recent Ic"
+          }
+        },
+        "required": [
+          "field",
+          "label"
+        ],
+        "title": "FieldCatalogItem",
         "type": "object"
       },
       "FlowLeader": {
@@ -5202,6 +5420,135 @@
         "title": "ReportFactorsSummaryData",
         "type": "object"
       },
+      "RuleCatalogItem": {
+        "properties": {
+          "category": {
+            "title": "Category",
+            "type": "string"
+          },
+          "category_label": {
+            "title": "Category Label",
+            "type": "string"
+          },
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "examples": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Examples",
+            "type": "array"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "params": {
+            "items": {
+              "$ref": "#/components/schemas/RuleParamSpec"
+            },
+            "title": "Params",
+            "type": "array"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "title",
+          "description",
+          "category",
+          "category_label"
+        ],
+        "title": "RuleCatalogItem",
+        "type": "object"
+      },
+      "RuleParamSpec": {
+        "properties": {
+          "default": {
+            "title": "Default"
+          },
+          "kind": {
+            "enum": [
+              "int",
+              "float",
+              "str",
+              "operand",
+              "boards",
+              "ma_line"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "max": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max"
+          },
+          "min": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Min"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "options": {
+            "items": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "title": "Options",
+            "type": "array"
+          },
+          "required": {
+            "default": true,
+            "title": "Required",
+            "type": "boolean"
+          },
+          "step": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Step"
+          }
+        },
+        "required": [
+          "name",
+          "label",
+          "kind"
+        ],
+        "title": "RuleParamSpec",
+        "type": "object"
+      },
       "SavePoolRequest": {
         "properties": {
           "codes": {
@@ -5333,12 +5680,34 @@
             "title": "Code",
             "type": "string"
           },
+          "debt_to_assets": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Debt To Assets"
+          },
           "factors": {
             "additionalProperties": {
               "type": "number"
             },
             "title": "Factors",
             "type": "object"
+          },
+          "grossprofit_margin": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Grossprofit Margin"
           },
           "industry": {
             "anyOf": [
@@ -5383,6 +5752,17 @@
               }
             ],
             "title": "Name"
+          },
+          "netprofit_margin": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Netprofit Margin"
           },
           "netprofit_yoy": {
             "anyOf": [
@@ -5476,6 +5856,17 @@
             ],
             "title": "Roe"
           },
+          "score": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Score"
+          },
           "total_mv": {
             "anyOf": [
               {
@@ -5537,8 +5928,456 @@
         "title": "ScreenRow",
         "type": "object"
       },
+      "ScreenerBlock": {
+        "properties": {
+          "args": {
+            "additionalProperties": true,
+            "title": "Args",
+            "type": "object"
+          },
+          "custom_id": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Custom Id"
+          },
+          "enabled": {
+            "default": true,
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "field": {
+            "anyOf": [
+              {
+                "maxLength": 80,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Field"
+          },
+          "id": {
+            "default": "",
+            "maxLength": 64,
+            "title": "Id",
+            "type": "string"
+          },
+          "label": {
+            "anyOf": [
+              {
+                "maxLength": 120,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Label"
+          },
+          "op": {
+            "default": ">=",
+            "enum": [
+              ">=",
+              "<=",
+              "between",
+              "top_pct",
+              "bottom_pct"
+            ],
+            "title": "Op",
+            "type": "string"
+          },
+          "rule_name": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rule Name"
+          },
+          "tdx": {
+            "anyOf": [
+              {
+                "maxLength": 2000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tdx"
+          },
+          "type": {
+            "enum": [
+              "rule",
+              "field",
+              "tdx",
+              "custom"
+            ],
+            "title": "Type",
+            "type": "string"
+          },
+          "value": {
+            "default": 0.0,
+            "title": "Value",
+            "type": "number"
+          },
+          "value2": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Value2"
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "title": "ScreenerBlock",
+        "type": "object"
+      },
+      "ScreenerCatalogData": {
+        "properties": {
+          "all_market_count": {
+            "default": 0,
+            "title": "All Market Count",
+            "type": "integer"
+          },
+          "custom_blocks": {
+            "items": {
+              "$ref": "#/components/schemas/CustomBlockItem"
+            },
+            "title": "Custom Blocks",
+            "type": "array"
+          },
+          "field_groups": {
+            "items": {
+              "$ref": "#/components/schemas/FieldCatalogGroup"
+            },
+            "title": "Field Groups",
+            "type": "array"
+          },
+          "presets": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Presets",
+            "type": "array"
+          },
+          "rules": {
+            "items": {
+              "$ref": "#/components/schemas/RuleCatalogItem"
+            },
+            "title": "Rules",
+            "type": "array"
+          },
+          "trade_date": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trade Date"
+          },
+          "upstream_options": {
+            "items": {
+              "$ref": "#/components/schemas/UpstreamOptionItem"
+            },
+            "title": "Upstream Options",
+            "type": "array"
+          }
+        },
+        "title": "ScreenerCatalogData",
+        "type": "object"
+      },
+      "ScreenerFunnelStep": {
+        "properties": {
+          "block_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Block Id"
+          },
+          "dropped": {
+            "default": 0,
+            "title": "Dropped",
+            "type": "integer"
+          },
+          "dropped_pct": {
+            "default": 0.0,
+            "title": "Dropped Pct",
+            "type": "number"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "remaining": {
+            "title": "Remaining",
+            "type": "integer"
+          },
+          "step": {
+            "title": "Step",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "step",
+          "label",
+          "remaining"
+        ],
+        "title": "ScreenerFunnelStep",
+        "type": "object"
+      },
+      "ScreenerNlCompileData": {
+        "properties": {
+          "blocks": {
+            "items": {
+              "$ref": "#/components/schemas/ScreenerBlock"
+            },
+            "title": "Blocks",
+            "type": "array"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "expression": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expression"
+          },
+          "model": {
+            "default": "rule-parser",
+            "title": "Model",
+            "type": "string"
+          },
+          "summary": {
+            "default": "",
+            "title": "Summary",
+            "type": "string"
+          },
+          "tdx": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tdx"
+          }
+        },
+        "title": "ScreenerNlCompileData",
+        "type": "object"
+      },
+      "ScreenerNlCompileRequest": {
+        "properties": {
+          "text": {
+            "maxLength": 400,
+            "minLength": 2,
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "title": "ScreenerNlCompileRequest",
+        "type": "object"
+      },
+      "ScreenerRankSpec": {
+        "properties": {
+          "desc": {
+            "default": true,
+            "title": "Desc",
+            "type": "boolean"
+          },
+          "field": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Field",
+            "type": "string"
+          },
+          "weight": {
+            "default": 100.0,
+            "maximum": 1000.0,
+            "minimum": 0.0,
+            "title": "Weight",
+            "type": "number"
+          }
+        },
+        "required": [
+          "field"
+        ],
+        "title": "ScreenerRankSpec",
+        "type": "object"
+      },
+      "ScreenerRunData": {
+        "properties": {
+          "active_step": {
+            "title": "Active Step",
+            "type": "integer"
+          },
+          "pool_refs": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Pool Refs",
+            "type": "array"
+          },
+          "presets": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Presets",
+            "type": "array"
+          },
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/ScreenRow"
+            },
+            "title": "Rows",
+            "type": "array"
+          },
+          "steps": {
+            "items": {
+              "$ref": "#/components/schemas/ScreenerFunnelStep"
+            },
+            "title": "Steps",
+            "type": "array"
+          },
+          "trade_date": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trade Date"
+          }
+        },
+        "required": [
+          "trade_date",
+          "active_step",
+          "steps",
+          "rows"
+        ],
+        "title": "ScreenerRunData",
+        "type": "object"
+      },
+      "ScreenerRunRequest": {
+        "properties": {
+          "blocks": {
+            "items": {
+              "$ref": "#/components/schemas/ScreenerBlock"
+            },
+            "maxItems": 40,
+            "title": "Blocks",
+            "type": "array"
+          },
+          "preview_step": {
+            "anyOf": [
+              {
+                "maximum": 40.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Preview Step"
+          },
+          "ranks": {
+            "items": {
+              "$ref": "#/components/schemas/ScreenerRankSpec"
+            },
+            "maxItems": 10,
+            "title": "Ranks",
+            "type": "array"
+          },
+          "trade_date": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trade Date"
+          },
+          "upstream": {
+            "$ref": "#/components/schemas/ScreenerUpstream"
+          }
+        },
+        "title": "ScreenerRunRequest",
+        "type": "object"
+      },
       "ScreenerSchemeBody": {
         "properties": {
+          "blocks": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Blocks",
+            "type": "array"
+          },
           "filters": {
             "default": [],
             "items": {
@@ -5562,6 +6401,11 @@
             },
             "title": "Ranks",
             "type": "array"
+          },
+          "upstream": {
+            "additionalProperties": true,
+            "title": "Upstream",
+            "type": "object"
           }
         },
         "required": [
@@ -5572,6 +6416,14 @@
       },
       "ScreenerSchemeRow": {
         "properties": {
+          "blocks": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Blocks",
+            "type": "array"
+          },
           "filters": {
             "default": [],
             "items": {
@@ -5607,6 +6459,11 @@
               }
             ],
             "title": "Saved At"
+          },
+          "upstream": {
+            "additionalProperties": true,
+            "title": "Upstream",
+            "type": "object"
           }
         },
         "required": [
@@ -5629,6 +6486,72 @@
           "schemes"
         ],
         "title": "ScreenerSchemesData",
+        "type": "object"
+      },
+      "ScreenerUpstream": {
+        "properties": {
+          "base": {
+            "default": "presets",
+            "enum": [
+              "presets",
+              "all_market",
+              "preset",
+              "pool",
+              "watchlist"
+            ],
+            "title": "Base",
+            "type": "string"
+          },
+          "exclude_pools": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 20,
+            "title": "Exclude Pools",
+            "type": "array"
+          },
+          "include_pools": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 20,
+            "title": "Include Pools",
+            "type": "array"
+          },
+          "intersect_pools": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 20,
+            "title": "Intersect Pools",
+            "type": "array"
+          },
+          "pool": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pool"
+          },
+          "preset": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Preset"
+          }
+        },
+        "title": "ScreenerUpstream",
         "type": "object"
       },
       "SectorFlowData": {
@@ -6806,6 +7729,44 @@
           "prefs"
         ],
         "title": "UiPreferencesData",
+        "type": "object"
+      },
+      "UpstreamOptionItem": {
+        "properties": {
+          "count": {
+            "title": "Count",
+            "type": "integer"
+          },
+          "kind": {
+            "enum": [
+              "preset",
+              "pool",
+              "watchlist"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "ref": {
+            "title": "Ref",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ref",
+          "kind",
+          "name",
+          "label",
+          "count"
+        ],
+        "title": "UpstreamOptionItem",
         "type": "object"
       },
       "ValidationError": {
@@ -8191,6 +9152,204 @@
           }
         },
         "summary": "保存选股方案"
+      }
+    },
+    "/api/v1/screener/blocks": {
+      "get": {
+        "operationId": "list_custom_blocks_api_v1_screener_blocks_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_CustomBlocksData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "我的自定义积木列表"
+      }
+    },
+    "/api/v1/screener/blocks/{block_id}": {
+      "delete": {
+        "operationId": "delete_custom_block_api_v1_screener_blocks__block_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "block_id",
+            "required": true,
+            "schema": {
+              "title": "Block Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "删除我的积木"
+      },
+      "put": {
+        "operationId": "save_custom_block_api_v1_screener_blocks__block_id__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "block_id",
+            "required": true,
+            "schema": {
+              "title": "Block Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CustomBlockSaveRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CustomBlockItem"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "保存为我的积木"
+      }
+    },
+    "/api/v1/screener/catalog": {
+      "get": {
+        "operationId": "screener_catalog_api_v1_screener_catalog_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_ScreenerCatalogData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "选股工作台积木库与输入范围目录"
+      }
+    },
+    "/api/v1/screener/from-text": {
+      "post": {
+        "operationId": "screener_from_text_api_v1_screener_from_text_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScreenerNlCompileRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScreenerNlCompileData"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "选股工作台一句话白盒生成条件积木"
+      }
+    },
+    "/api/v1/screener/run": {
+      "post": {
+        "operationId": "screener_run_api_v1_screener_run_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScreenerRunRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_ScreenerRunData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "选股工作台实时漏斗执行"
       }
     },
     "/api/v1/stocks/{code}": {

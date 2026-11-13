@@ -552,6 +552,92 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/screener/blocks": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 我的自定义积木列表 */
+        get: operations["list_custom_blocks_api_v1_screener_blocks_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/screener/blocks/{block_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** 保存为我的积木 */
+        put: operations["save_custom_block_api_v1_screener_blocks__block_id__put"];
+        post?: never;
+        /** 删除我的积木 */
+        delete: operations["delete_custom_block_api_v1_screener_blocks__block_id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/screener/catalog": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 选股工作台积木库与输入范围目录 */
+        get: operations["screener_catalog_api_v1_screener_catalog_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/screener/from-text": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 选股工作台一句话白盒生成条件积木 */
+        post: operations["screener_from_text_api_v1_screener_from_text_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/screener/run": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 选股工作台实时漏斗执行 */
+        post: operations["screener_run_api_v1_screener_run_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/stocks/{code}": {
         parameters: {
             query?: never;
@@ -1186,6 +1272,53 @@ export interface components {
             /** Universe */
             universe: number;
         };
+        /** CustomBlockItem */
+        CustomBlockItem: {
+            /** Block Id */
+            block_id: string;
+            /** Created At */
+            created_at: string;
+            /**
+             * Description
+             * @default
+             */
+            description: string;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "rule" | "field" | "tdx" | "composite";
+            /** Name */
+            name: string;
+            /** Spec */
+            spec?: {
+                [key: string]: unknown;
+            };
+        };
+        /** CustomBlockSaveRequest */
+        CustomBlockSaveRequest: {
+            /**
+             * Description
+             * @default
+             */
+            description: string;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "rule" | "field" | "tdx" | "composite";
+            /** Name */
+            name: string;
+            /** Spec */
+            spec?: {
+                [key: string]: unknown;
+            };
+        };
+        /** CustomBlocksData */
+        CustomBlocksData: {
+            /** Blocks */
+            blocks: components["schemas"]["CustomBlockItem"][];
+        };
         /** DataCenterData */
         DataCenterData: {
             audit: components["schemas"]["AuditReport"] | null;
@@ -1244,6 +1377,11 @@ export interface components {
         /** Envelope[ConditionListData] */
         Envelope_ConditionListData_: {
             data: components["schemas"]["ConditionListData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[CustomBlocksData] */
+        Envelope_CustomBlocksData_: {
+            data: components["schemas"]["CustomBlocksData"];
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[DataCenterData] */
@@ -1344,6 +1482,16 @@ export interface components {
         /** Envelope[ScreenData] */
         Envelope_ScreenData_: {
             data: components["schemas"]["ScreenData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[ScreenerCatalogData] */
+        Envelope_ScreenerCatalogData_: {
+            data: components["schemas"]["ScreenerCatalogData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[ScreenerRunData] */
+        Envelope_ScreenerRunData_: {
+            data: components["schemas"]["ScreenerRunData"];
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[ScreenerSchemesData] */
@@ -1592,6 +1740,30 @@ export interface components {
              * Format: date
              */
             window_start: string;
+        };
+        /** FieldCatalogGroup */
+        FieldCatalogGroup: {
+            /** Group */
+            group: string;
+            /** Items */
+            items: components["schemas"]["FieldCatalogItem"][];
+        };
+        /** FieldCatalogItem */
+        FieldCatalogItem: {
+            /** Field */
+            field: string;
+            /**
+             * Kind
+             * @default market
+             * @enum {string}
+             */
+            kind: "market" | "valuation" | "fundamental" | "flow" | "factor";
+            /** Label */
+            label: string;
+            /** Mean Ic */
+            mean_ic?: number | null;
+            /** Recent Ic */
+            recent_ic?: number | null;
         };
         /** FlowLeader */
         FlowLeader: {
@@ -2306,6 +2478,52 @@ export interface components {
                 [key: string]: unknown;
             } | null;
         };
+        /** RuleCatalogItem */
+        RuleCatalogItem: {
+            /** Category */
+            category: string;
+            /** Category Label */
+            category_label: string;
+            /** Description */
+            description: string;
+            /** Examples */
+            examples?: string[];
+            /** Name */
+            name: string;
+            /** Params */
+            params?: components["schemas"]["RuleParamSpec"][];
+            /** Title */
+            title: string;
+        };
+        /** RuleParamSpec */
+        RuleParamSpec: {
+            /** Default */
+            default?: unknown;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "int" | "float" | "str" | "operand" | "boards" | "ma_line";
+            /** Label */
+            label: string;
+            /** Max */
+            max?: number | null;
+            /** Min */
+            min?: number | null;
+            /** Name */
+            name: string;
+            /** Options */
+            options?: {
+                [key: string]: string;
+            }[];
+            /**
+             * Required
+             * @default true
+             */
+            required: boolean;
+            /** Step */
+            step?: number | null;
+        };
         /** SavePoolRequest */
         SavePoolRequest: {
             /** Codes */
@@ -2347,10 +2565,14 @@ export interface components {
             close: number | null;
             /** Code */
             code: string;
+            /** Debt To Assets */
+            debt_to_assets?: number | null;
             /** Factors */
             factors?: {
                 [key: string]: number;
             };
+            /** Grossprofit Margin */
+            grossprofit_margin?: number | null;
             /** Industry */
             industry?: string | null;
             /** Main Net */
@@ -2359,6 +2581,8 @@ export interface components {
             main_net_5d?: number | null;
             /** Name */
             name: string | null;
+            /** Netprofit Margin */
+            netprofit_margin?: number | null;
             /** Netprofit Yoy */
             netprofit_yoy?: number | null;
             /** Or Yoy */
@@ -2377,6 +2601,8 @@ export interface components {
             ret5?: number | null;
             /** Roe */
             roe?: number | null;
+            /** Score */
+            score?: number | null;
             /** Total Mv */
             total_mv?: number | null;
             /**
@@ -2391,8 +2617,168 @@ export interface components {
             /** Vol Ratio */
             vol_ratio?: number | null;
         };
+        /** ScreenerBlock */
+        ScreenerBlock: {
+            /** Args */
+            args?: {
+                [key: string]: unknown;
+            };
+            /** Custom Id */
+            custom_id?: string | null;
+            /**
+             * Enabled
+             * @default true
+             */
+            enabled: boolean;
+            /** Field */
+            field?: string | null;
+            /**
+             * Id
+             * @default
+             */
+            id: string;
+            /** Label */
+            label?: string | null;
+            /**
+             * Op
+             * @default >=
+             * @enum {string}
+             */
+            op: ">=" | "<=" | "between" | "top_pct" | "bottom_pct";
+            /** Rule Name */
+            rule_name?: string | null;
+            /** Tdx */
+            tdx?: string | null;
+            /**
+             * Type
+             * @enum {string}
+             */
+            type: "rule" | "field" | "tdx" | "custom";
+            /**
+             * Value
+             * @default 0
+             */
+            value: number;
+            /** Value2 */
+            value2?: number | null;
+        };
+        /** ScreenerCatalogData */
+        ScreenerCatalogData: {
+            /**
+             * All Market Count
+             * @default 0
+             */
+            all_market_count: number;
+            /** Custom Blocks */
+            custom_blocks?: components["schemas"]["CustomBlockItem"][];
+            /** Field Groups */
+            field_groups?: components["schemas"]["FieldCatalogGroup"][];
+            /** Presets */
+            presets?: string[];
+            /** Rules */
+            rules?: components["schemas"]["RuleCatalogItem"][];
+            /** Trade Date */
+            trade_date?: string | null;
+            /** Upstream Options */
+            upstream_options?: components["schemas"]["UpstreamOptionItem"][];
+        };
+        /** ScreenerFunnelStep */
+        ScreenerFunnelStep: {
+            /** Block Id */
+            block_id?: string | null;
+            /**
+             * Dropped
+             * @default 0
+             */
+            dropped: number;
+            /**
+             * Dropped Pct
+             * @default 0
+             */
+            dropped_pct: number;
+            /** Error */
+            error?: string | null;
+            /** Label */
+            label: string;
+            /** Remaining */
+            remaining: number;
+            /** Step */
+            step: number;
+        };
+        /** ScreenerNlCompileData */
+        ScreenerNlCompileData: {
+            /** Blocks */
+            blocks?: components["schemas"]["ScreenerBlock"][];
+            /** Error */
+            error?: string | null;
+            /** Expression */
+            expression?: string | null;
+            /**
+             * Model
+             * @default rule-parser
+             */
+            model: string;
+            /**
+             * Summary
+             * @default
+             */
+            summary: string;
+            /** Tdx */
+            tdx?: string | null;
+        };
+        /** ScreenerNlCompileRequest */
+        ScreenerNlCompileRequest: {
+            /** Text */
+            text: string;
+        };
+        /** ScreenerRankSpec */
+        ScreenerRankSpec: {
+            /**
+             * Desc
+             * @default true
+             */
+            desc: boolean;
+            /** Field */
+            field: string;
+            /**
+             * Weight
+             * @default 100
+             */
+            weight: number;
+        };
+        /** ScreenerRunData */
+        ScreenerRunData: {
+            /** Active Step */
+            active_step: number;
+            /** Pool Refs */
+            pool_refs?: string[];
+            /** Presets */
+            presets?: string[];
+            /** Rows */
+            rows: components["schemas"]["ScreenRow"][];
+            /** Steps */
+            steps: components["schemas"]["ScreenerFunnelStep"][];
+            /** Trade Date */
+            trade_date: string | null;
+        };
+        /** ScreenerRunRequest */
+        ScreenerRunRequest: {
+            /** Blocks */
+            blocks?: components["schemas"]["ScreenerBlock"][];
+            /** Preview Step */
+            preview_step?: number | null;
+            /** Ranks */
+            ranks?: components["schemas"]["ScreenerRankSpec"][];
+            /** Trade Date */
+            trade_date?: string | null;
+            upstream?: components["schemas"]["ScreenerUpstream"];
+        };
         /** ScreenerSchemeBody */
         ScreenerSchemeBody: {
+            /** Blocks */
+            blocks?: {
+                [key: string]: unknown;
+            }[];
             /**
              * Filters
              * @default []
@@ -2409,9 +2795,17 @@ export interface components {
             ranks: {
                 [key: string]: unknown;
             }[];
+            /** Upstream */
+            upstream?: {
+                [key: string]: unknown;
+            };
         };
         /** ScreenerSchemeRow */
         ScreenerSchemeRow: {
+            /** Blocks */
+            blocks?: {
+                [key: string]: unknown;
+            }[];
             /**
              * Filters
              * @default []
@@ -2430,11 +2824,34 @@ export interface components {
             }[];
             /** Saved At */
             saved_at?: string | null;
+            /** Upstream */
+            upstream?: {
+                [key: string]: unknown;
+            };
         };
         /** ScreenerSchemesData */
         ScreenerSchemesData: {
             /** Schemes */
             schemes: components["schemas"]["ScreenerSchemeRow"][];
+        };
+        /** ScreenerUpstream */
+        ScreenerUpstream: {
+            /**
+             * Base
+             * @default presets
+             * @enum {string}
+             */
+            base: "presets" | "all_market" | "preset" | "pool" | "watchlist";
+            /** Exclude Pools */
+            exclude_pools?: string[];
+            /** Include Pools */
+            include_pools?: string[];
+            /** Intersect Pools */
+            intersect_pools?: string[];
+            /** Pool */
+            pool?: string | null;
+            /** Preset */
+            preset?: string | null;
         };
         /** SectorFlowData */
         SectorFlowData: {
@@ -2799,6 +3216,22 @@ export interface components {
             prefs: {
                 [key: string]: string;
             };
+        };
+        /** UpstreamOptionItem */
+        UpstreamOptionItem: {
+            /** Count */
+            count: number;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "preset" | "pool" | "watchlist";
+            /** Label */
+            label: string;
+            /** Name */
+            name: string;
+            /** Ref */
+            ref: string;
         };
         /** ValidationError */
         ValidationError: {
@@ -3788,6 +4221,178 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["CommandReceipt"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_custom_blocks_api_v1_screener_blocks_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_CustomBlocksData_"];
+                };
+            };
+        };
+    };
+    save_custom_block_api_v1_screener_blocks__block_id__put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                block_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CustomBlockSaveRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CustomBlockItem"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    delete_custom_block_api_v1_screener_blocks__block_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                block_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommandReceipt"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    screener_catalog_api_v1_screener_catalog_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_ScreenerCatalogData_"];
+                };
+            };
+        };
+    };
+    screener_from_text_api_v1_screener_from_text_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ScreenerNlCompileRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScreenerNlCompileData"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    screener_run_api_v1_screener_run_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ScreenerRunRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_ScreenerRunData_"];
                 };
             };
             /** @description Validation Error */
