@@ -316,8 +316,6 @@ class AlertItem(BaseModel):
     trigger_price: float | None
     level_price: float | None
     pool: str | None
-    acked_at: datetime | None = None
-    acked_by: str | None = None
 
 
 class AlertsData(BaseModel):
@@ -385,10 +383,6 @@ class SavePoolRequest(BaseModel):
                 seen.add(code)
                 out.append(code)
         return out
-
-
-class AckAlertRequest(BaseModel):
-    alert_id: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 class AlertRuleBody(BaseModel):
@@ -542,8 +536,6 @@ class BandData(BaseModel):
 class OperationRow(BaseModel):
     at: datetime | None
     kind: Literal[
-        "ack_alert",
-        "unack_alert",
         "add_watchlist_item",
         "remove_watchlist_item",
         "save_alert_rule",

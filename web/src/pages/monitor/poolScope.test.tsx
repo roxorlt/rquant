@@ -25,8 +25,6 @@ function alert(id: string, name: string, pool: string | null, trigger: string) {
     trigger_price: 10,
     level_price: 10,
     pool,
-    acked_at: null,
-    acked_by: null,
   };
 }
 
@@ -237,9 +235,10 @@ it("uses a two-line list for the phone timeline and keeps the title short", asyn
     );
     expect(row?.querySelector(".alert-meta-pool")).toHaveTextContent("N字初筛");
     expect(within(row as HTMLElement).queryByText("未确认")).not.toBeInTheDocument();
-    expect(within(row as HTMLElement).getByRole("button", { name: "确认" })).toBeInTheDocument();
+    expect(
+      within(row as HTMLElement).queryByRole("button", { name: "确认" }),
+    ).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "排序" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /^未确认 / })).toBeInTheDocument();
     expect(within(list).getAllByRole("listitem").length).toBeGreaterThanOrEqual(5);
     const surge = screen.getByRole("heading", { name: /量能异动/ });
     expect(timelineHeadingBefore(surge)).toBeTruthy();
@@ -267,7 +266,6 @@ it("shows the previous trade date with the full N字初筛 pool name", async () 
       "10-20 14:00 · 10.00 · L1 · 跳空高开 ·",
     );
     expect(row?.querySelector(".alert-meta-pool")).toHaveTextContent(/^N字初筛$/);
-    expect(within(row as HTMLElement).getByRole("button", { name: "确认" })).toBeInTheDocument();
   } finally {
     window.matchMedia = original;
   }

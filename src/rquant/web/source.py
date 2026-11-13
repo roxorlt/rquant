@@ -495,10 +495,6 @@ class ResearchSource:
             )
 
         con.execute(
-            "CREATE TABLE alert_ack(alert_id VARCHAR, acked_at TIMESTAMPTZ, actor_id VARCHAR, "
-            "command_id VARCHAR)"
-        )
-        con.execute(
             "CREATE TABLE alert_rule(rule_id VARCHAR, title VARCHAR, enabled BOOLEAN, "
             "pools VARCHAR, levels VARCHAR, cooldown_minutes INTEGER, saved_at TIMESTAMPTZ, "
             "command_id VARCHAR)"
@@ -509,18 +505,10 @@ class ResearchSource:
         )
         if self.commands_dir.is_dir():
             from rquant.web.commands_service import (
-                read_ack_states,
                 read_alert_rules,
                 read_watchlist_items,
             )
 
-            ack_rows = [
-                (s.alert_id, s.acked_at, s.actor_id, s.command_id)
-                for s in read_ack_states(self.commands_dir).values()
-                if s is not None
-            ]
-            if ack_rows:
-                con.executemany("INSERT INTO alert_ack VALUES (?, ?, ?, ?)", ack_rows)
             rule_rows = [
                 (
                     r.rule_id,
@@ -605,8 +593,6 @@ CREATE TABLE signals(global_sequence BIGINT, signal_id VARCHAR, strategy_id VARC
 CREATE TABLE paper_accounts(account_id VARCHAR, as_of_time TIMESTAMPTZ, cash DECIMAL(18,2),
   available_cash DECIMAL(18,2), nav DECIMAL(18,2), unrealized_pnl DECIMAL(18,2),
   realized_pnl DECIMAL(18,2));
-CREATE TABLE alert_ack(alert_id VARCHAR, acked_at TIMESTAMPTZ, actor_id VARCHAR,
-  command_id VARCHAR);
 CREATE TABLE paper_holdings(account_id VARCHAR, ts_code VARCHAR, quantity DECIMAL(18,2),
   available_quantity DECIMAL(18,2), average_cost DECIMAL(18,4), market_price DECIMAL(18,4),
   market_value DECIMAL(18,2), unrealized_pnl DECIMAL(18,2), as_of_time TIMESTAMPTZ);
@@ -694,19 +680,6 @@ class FixtureSource:
         self.con.execute(_FIXTURE_DDL)
         _seed(self.con, today or datetime.now(UTC).date())
         self.built_at = datetime.now(UTC)
-
-    def record_ack(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Fixture stand-in for page control + Serving republish of ``ack_alert``."""
-        self.con.execute(
-            "INSERT INTO alert_ack VALUES (?, now(), ?, ?)",
-            [payload["alert_id"], payload["actor_id"], payload["command_id"]],
-        )
-        return {"command_id": payload["command_id"], "status": "succeeded"}
-
-    def record_unack(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Drop the ack row so the alert reads as unconfirmed again."""
-        self.con.execute("DELETE FROM alert_ack WHERE alert_id = ?", [payload["alert_id"]])
-        return {"command_id": payload["command_id"], "status": "succeeded"}
 
     def record_rule(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Fixture stand-in for ``save_alert_rule`` + Serving republish (latest wins)."""

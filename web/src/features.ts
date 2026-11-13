@@ -8,8 +8,3 @@ function enabled(value: unknown): boolean {
 export function screenerSchemesEnabled(): boolean {
   return enabled(import.meta.env.VITE_FEATURE_SCREENER_SCHEMES);
 }
-
-/** Undo an alert acknowledgement. Production page-control rejects unack, so this stays off. */
-export function alertUnackEnabled(): boolean {
-  return enabled(import.meta.env.VITE_FEATURE_ALERT_UNACK);
-}

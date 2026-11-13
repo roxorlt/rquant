@@ -1,12 +1,11 @@
 """rquant-web-commands: append-only JSONL write sink and read projections for web commands.
 
 Accepts ``POST /v1/commands`` with the payload ``rquant.web.page_control`` sends
-(``ack_alert``, ``unack_alert``, ``add_watchlist_item``, ``remove_watchlist_item``,
-``save_alert_rule``, ``save_canvas``), validates it with local Pydantic command models
-(zero dependency on legacy ``rquant.page_control``), and appends one JSON line
-(idempotent by ``command_id``) under a fixed data directory:
+(``add_watchlist_item``, ``remove_watchlist_item``, ``save_alert_rule``,
+``save_canvas``), validates it with local Pydantic command models (zero dependency on
+legacy ``rquant.page_control``), and appends one JSON line (idempotent by ``command_id``)
+under a fixed data directory:
 
-    <dir>/alert_acks/acks.jsonl      ack_alert / unack_alert
     <dir>/watchlist/items.jsonl      add_watchlist_item / remove_watchlist_item
     <dir>/alert_rules/rules.jsonl    save_alert_rule
     <dir>/canvas_saves/saves.jsonl   save_canvas
@@ -36,7 +35,6 @@ from pydantic import (
     field_validator,
 )
 
-ALERT_ACK_LOG = Path("alert_acks") / "acks.jsonl"
 WATCHLIST_LOG = Path("watchlist") / "items.jsonl"
 ALERT_RULE_LOG = Path("alert_rules") / "rules.jsonl"
 CANVAS_SAVE_LOG = Path("canvas_saves") / "saves.jsonl"
@@ -51,20 +49,6 @@ class WebCommandBase(BaseModel):
     kind: str
     command_id: str = Field(min_length=1, max_length=128)
     requested_at: AwareDatetime
-
-
-class AckAlert(WebCommandBase):
-    kind: Literal["ack_alert"] = "ack_alert"
-    alert_id: str = Field(pattern=r"^[0-9a-f]{64}$")
-    generation_id: str = Field(min_length=1, max_length=128)
-    actor_id: str = Field(min_length=1, max_length=256)
-
-
-class UnackAlert(WebCommandBase):
-    kind: Literal["unack_alert"] = "unack_alert"
-    alert_id: str = Field(pattern=r"^[0-9a-f]{64}$")
-    generation_id: str = Field(min_length=1, max_length=128)
-    actor_id: str = Field(min_length=1, max_length=256)
 
 
 class WatchlistItem(BaseModel):
@@ -133,9 +117,7 @@ class SaveCanvas(WebCommandBase):
 
 
 WebCommand = Annotated[
-    AckAlert
-    | UnackAlert
-    | AddWatchlistItem
+    AddWatchlistItem
     | RemoveWatchlistItem
     | SaveAlertRule
     | SaveCanvas,
@@ -144,13 +126,6 @@ WebCommand = Annotated[
 _ADAPTER: TypeAdapter[WebCommand] = TypeAdapter(WebCommand)
 _LOCK = threading.Lock()
 log = logging.getLogger("rquant-web-commands")
-
-
-class AckStateRecord(BaseModel):
-    alert_id: str
-    acked_at: datetime | None = None
-    actor_id: str | None = None
-    command_id: str
 
 
 class WatchlistRecord(BaseModel):
@@ -183,8 +158,6 @@ class SavedPoolRecord(BaseModel):
 class RecordedOperation(BaseModel):
     at: datetime | None = None
     kind: Literal[
-        "ack_alert",
-        "unack_alert",
         "add_watchlist_item",
         "remove_watchlist_item",
         "save_alert_rule",
@@ -217,15 +190,6 @@ def record_for(command: WebCommand) -> tuple[Path, dict[str, object]]:
         "command_id": command.command_id,
         "ts": command.requested_at.astimezone(UTC).isoformat(timespec="seconds"),
     }
-    if isinstance(command, AckAlert | UnackAlert):
-        record.update(
-            alert_id=command.alert_id,
-            generation_id=command.generation_id,
-            actor_id=command.actor_id,
-        )
-        if isinstance(command, UnackAlert):
-            record["action"] = "unack"
-        return ALERT_ACK_LOG, record
     if isinstance(command, AddWatchlistItem):
         record.update(ts_code=command.item.ts_code, note=command.item.note)
         return WATCHLIST_LOG, record
@@ -297,26 +261,6 @@ def _iter_jsonl(path: Path) -> list[dict[str, Any]]:
         if isinstance(row, dict):
             out.append(row)
     return out
-
-
-def read_ack_states(data_dir: Path) -> dict[str, AckStateRecord | None]:
-    """Latest ack state per alert_id; ``None`` means explicitly unacked."""
-    states: dict[str, AckStateRecord | None] = {}
-    for row in _iter_jsonl(data_dir / ALERT_ACK_LOG):
-        aid = str(row.get("alert_id") or "")
-        cid = str(row.get("command_id") or "")
-        if not aid or not cid:
-            continue
-        if row.get("action") == "unack":
-            states[aid] = None
-        else:
-            states[aid] = AckStateRecord(
-                alert_id=aid,
-                acked_at=_parse_ts(row.get("ts")),
-                actor_id=str(row["actor_id"]) if row.get("actor_id") else None,
-                command_id=cid,
-            )
-    return states
 
 
 def read_watchlist_items(data_dir: Path) -> list[WatchlistRecord]:
@@ -410,23 +354,8 @@ def read_saved_pools(data_dir: Path) -> list[SavedPoolRecord]:
 
 
 def read_operations(data_dir: Path) -> list[RecordedOperation]:
-    """Audit trail across all four JSONL command logs, newest first."""
+    """Audit trail across all three JSONL command logs, newest first."""
     ops: list[RecordedOperation] = []
-    for row in _iter_jsonl(data_dir / ALERT_ACK_LOG):
-        aid = str(row.get("alert_id") or "")
-        cid = str(row.get("command_id") or "")
-        if not aid or not cid:
-            continue
-        unack = row.get("action") == "unack"
-        ops.append(
-            RecordedOperation(
-                at=_parse_ts(row.get("ts")),
-                kind="unack_alert" if unack else "ack_alert",
-                summary=f"{'撤销确认' if unack else '确认告警'} {aid[:12]}",
-                actor=str(row["actor_id"]) if row.get("actor_id") else None,
-                command_id=cid,
-            )
-        )
     for row in _iter_jsonl(data_dir / WATCHLIST_LOG):
         code = str(row.get("ts_code") or (row.get("item") or {}).get("ts_code") or "").upper()
         cid = str(row.get("command_id") or "")

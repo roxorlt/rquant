@@ -6,7 +6,7 @@
 
 ### Changed
 
-- **Web 命令服务解耦旧 `page_control` 并开启选股方案与告警撤销正式构建**：`rquant.web.commands_service` 移除对历史 `rquant.page_control` 的全部依赖，内置独立 Pydantic 校验与 `fcntl.flock` 幂等 JSONL 读写投影；`web-release.yml` 正式开启 `VITE_FEATURE_SCREENER_SCHEMES=1` 与 `VITE_FEATURE_ALERT_UNACK=1`；`snapshots.build_universe` 与 `load_alert_rules` 直接消费 `rquant-web-commands` 自选/自定义池子及 `market.duckdb` 选股结果。
+- **Web 命令服务解耦旧 `page_control`、移除告警「确认/撤销」伪需求并开启选股方案构建**：`rquant.web.commands_service` 移除对历史 `rquant.page_control` 的全部依赖，内置独立 Pydantic 校验与 `fcntl.flock` 幂等 JSONL 读写投影；移除不符合个人单用户盯盘场景的告警 `ack` / `unack` 接口、状态列与总览「未确认」横幅，顶栏铃铛改为基于本地浏览时间的当日新告警计数；`web-release.yml` 正式开启 `VITE_FEATURE_SCREENER_SCHEMES=1`；`snapshots.build_universe` 与 `load_alert_rules` 直接消费 `rquant-web-commands` 自选/自定义池子及 `market.duckdb` 选股结果。
 
 - **L2 归档分片大小可诊断覆盖**：`MAX_SHARD` / `MAX_LINE` 默认 32MiB / 20MiB 保持不变，新增 `RQUANT_ARCHIVE_SHARD_BYTES` / `RQUANT_ARCHIVE_LINE_BYTES` 环境变量覆盖（仅用于诊断运行；该边界同时用于恢复校验，正常作业不要设置）。
 
@@ -23,7 +23,7 @@
 
 ### Fixed
 
-- **Web 写操作不回显、默认空格池名被拒与表格重渲染卸载修复**：打通 `GET /pools`、`GET /alerts`、`GET /alert-rules`、`GET /operations` 对 `~/rquant-web-commands` JSONL 的实时回读闭环；修复选股器默认保存池名（如 `选股 10-20`）因不含空格规则被拒收、筛选结果 `codes` 与 `mode="existing"` 未保存的问题；修复 `DataTable` 在父组件查询刷新重渲染时因 `flexRender` 匿名组件包装导致单元格 DOM 节点被卸载重建的问题。
+- **Web 写操作不回显、默认空格池名被拒与表格重渲染卸载修复**：打通 `GET /pools`、`GET /alert-rules`、`GET /operations` 对 `~/rquant-web-commands` JSONL 的实时回读闭环；修复选股器默认保存池名（如 `选股 10-20`）因不含空格规则被拒收、筛选结果 `codes` 与 `mode="existing"` 未保存的问题；修复 `DataTable` 在父组件查询刷新重渲染时因 `flexRender` 匿名组件包装导致单元格 DOM 节点被卸载重建的问题。
 
 - **L2 归档可靠性（R2 瞬时失败重试、失败可诊断、已上传分片幂等续跑）**：R2 客户端 PUT/HEAD/GET/DELETE 统一增加指数退避重试（默认 5 次、1/2/4/8s，仅重试超时/连接错误/`URLError`/`http.client` 异常/5xx，4xx 不重试；单请求超时可配 `R2_TIMEOUT_S`，默认 600s）；条件写重试遇到 412 时交回既有“核对远端字节”路径，已提交且字节一致仍判成功，幂等语义不变。归档失败时不再被吞成单一 `archive_failed`：`main` 捕获处生成脱敏的错误描述（类型、消息、阶段、`first/last_sequence`、chunk/day），写入 `state_root/archive-error.json` 并打印 stderr，失败 receipt 新增 `error` / `error_artifact` 字段（仍 exit 1，成功时清除旧错误文件）。`_new_chunks` 上传前按内容寻址 key HEAD 校验，size+sha256 一致则跳过重复 PUT、仍做完整类型化验证读取，避免全天重跑时重复上传。背景：2026-11-10 归档运行 4 小时+ 后失败且无 traceback，R2 catalog 未推进；本机 R2 实测带宽仅 ~0.7–1.3 MB/s，判断为长串行请求中单次超时且无重试。本版尚未部署；部署前须通过 archive 验收（synthetic + 真 R2 selftest）、新 tag release 与盘后首次诊断运行（建议 `R2_TIMEOUT_S=120`）。
 

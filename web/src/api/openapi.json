@@ -1,20 +1,6 @@
 {
   "components": {
     "schemas": {
-      "AckAlertRequest": {
-        "properties": {
-          "alert_id": {
-            "pattern": "^[0-9a-f]{64}$",
-            "title": "Alert Id",
-            "type": "string"
-          }
-        },
-        "required": [
-          "alert_id"
-        ],
-        "title": "AckAlertRequest",
-        "type": "object"
-      },
       "AddWatchRequest": {
         "properties": {
           "code": {
@@ -36,29 +22,6 @@
       },
       "AlertItem": {
         "properties": {
-          "acked_at": {
-            "anyOf": [
-              {
-                "format": "date-time",
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Acked At"
-          },
-          "acked_by": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Acked By"
-          },
           "alert_id": {
             "title": "Alert Id",
             "type": "string"
@@ -4770,8 +4733,6 @@
           },
           "kind": {
             "enum": [
-              "ack_alert",
-              "unack_alert",
               "add_watchlist_item",
               "remove_watchlist_item",
               "save_alert_rule",
@@ -7704,82 +7665,6 @@
           }
         },
         "summary": "告警时间线"
-      }
-    },
-    "/api/v1/alerts/ack": {
-      "post": {
-        "operationId": "ack_alert_api_v1_alerts_ack_post",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/AckAlertRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/CommandReceipt"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "确认告警"
-      }
-    },
-    "/api/v1/alerts/unack": {
-      "post": {
-        "operationId": "unack_alert_api_v1_alerts_unack_post",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/AckAlertRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/CommandReceipt"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "撤销确认"
       }
     },
     "/api/v1/backtests": {

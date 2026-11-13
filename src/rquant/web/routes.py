@@ -40,7 +40,6 @@ from rquant.web.intraday import IntradayData, load_intraday
 from rquant.web.macro import MacroData, load_macro, load_summary
 from rquant.web.market_live import MarketLiveData, load_market_live
 from rquant.web.models import (
-    AckAlertRequest,
     AddWatchRequest,
     AlertItem,
     AlertRuleBody,
@@ -872,45 +871,28 @@ def surge_events(request: Request, source: SourceDep, day: date | None = None,
 
 
 @router.get("/alerts", response_model=Envelope[AlertsData], summary="告警时间线")
-def alerts(source: SourceDep, limit: int = 200,
-           request: Request = None) -> Envelope[AlertsData]:  # type: ignore[assignment]
+def alerts(source: SourceDep, limit: int = 200) -> Envelope[AlertsData]:
     names = _names(source)
     rows = source.query(
         "SELECT trade_date, trigger_time, ts_code, level, trigger_price, level_price, "
         "trigger_type, pool FROM monitor_event ORDER BY trigger_time DESC LIMIT ?",
         [max(1, min(limit, 1000))])
-    acks = _acks(source)
-    cmd_dir = _commands_dir(request) if request is not None else None
-    if cmd_dir is not None:
-        from rquant.web.commands_service import read_ack_states
-
-        for aid, state in read_ack_states(cmd_dir).items():
-            if state is None:
-                acks.pop(aid, None)
-            else:
-                acks[aid] = {"alert_id": aid, "acked_at": state.acked_at,
-                             "actor_id": state.actor_id}
-    items = []
-    for r in rows:
-        aid = alert_id(r)
-        ack = acks.get(aid, {})
-        items.append(AlertItem(
-            alert_id=aid, trade_date=r["trade_date"], at=r["trigger_time"], code=r["ts_code"],
-            name=names.get(r["ts_code"]), level=r["level"], trigger_type=r["trigger_type"],
-            trigger_price=_f(r["trigger_price"]), level_price=_f(r["level_price"]),
-            pool=r["pool"], acked_at=ack.get("acked_at"), acked_by=ack.get("actor_id")))
+    items = [
+        AlertItem(
+            alert_id=alert_id(r),
+            trade_date=r["trade_date"],
+            at=r["trigger_time"],
+            code=r["ts_code"],
+            name=names.get(r["ts_code"]),
+            level=r["level"],
+            trigger_type=r["trigger_type"],
+            trigger_price=_f(r["trigger_price"]),
+            level_price=_f(r["level_price"]),
+            pool=r["pool"],
+        )
+        for r in rows
+    ]
     return _envelope(source, AlertsData(items=items))
-
-
-def _acks(source: Source) -> dict[str, dict[str, Any]]:
-    try:
-        rows = source.query(
-            "SELECT alert_id, acked_at, actor_id FROM alert_ack LIMIT 20000")
-    except Exception as exc:  # noqa: BLE001 - only "not published yet" is tolerated
-        if table_missing(exc):
-            return {}
-        raise
-    return {r["alert_id"]: r for r in rows}
 
 
 @router.get("/paper", response_model=Envelope[PaperData], summary="模拟盘")
@@ -1041,8 +1023,6 @@ def _remember(
     receipt: CommandReceipt,
     *,
     kind: Literal[
-        "ack_alert",
-        "unack_alert",
         "add_watchlist_item",
         "remove_watchlist_item",
         "save_alert_rule",
@@ -1051,7 +1031,6 @@ def _remember(
     summary: str,
     actor: str | None,
 ) -> CommandReceipt:
-    """Keep ack and unack both visible after the ack row itself is removed."""
     if receipt.status in {"failed", "rejected"} or not receipt.command_id:
         return receipt
     log = getattr(request.app.state, "operation_log", None)
@@ -1079,30 +1058,6 @@ def save_pool(body: SavePoolRequest, request: Request) -> CommandReceipt:
                      summary=f"保存池子 {body.name}", actor=_user(request))
 
 
-@router.post("/alerts/ack", response_model=CommandReceipt, summary="确认告警")
-def ack_alert(body: AckAlertRequest, request: Request, source: SourceDep) -> CommandReceipt:
-    generation_id, _ = source.generation()
-    gen = generation_id if generation_id and len(generation_id) == 64 else hashlib.sha256(
-        str(generation_id).encode()).hexdigest()
-    actor = _user(request) or "owner"
-    receipt = _send(request, "ack_alert",
-                    {"alert_id": body.alert_id, "generation_id": gen, "actor_id": actor})
-    return _remember(request, receipt, kind="ack_alert",
-                     summary=f"确认告警 {body.alert_id[:12]}", actor=actor)
-
-
-@router.post("/alerts/unack", response_model=CommandReceipt, summary="撤销确认")
-def unack_alert(body: AckAlertRequest, request: Request, source: SourceDep) -> CommandReceipt:
-    generation_id, _ = source.generation()
-    gen = generation_id if generation_id and len(generation_id) == 64 else hashlib.sha256(
-        str(generation_id).encode()).hexdigest()
-    actor = _user(request) or "owner"
-    receipt = _send(request, "unack_alert",
-                    {"alert_id": body.alert_id, "generation_id": gen, "actor_id": actor})
-    return _remember(request, receipt, kind="unack_alert",
-                     summary=f"撤销确认 {body.alert_id[:12]}", actor=actor)
-
-
 def _optional_rows(source: Source, sql: str) -> list[dict[str, Any]]:
     try:
         return source.query(sql)
@@ -1115,12 +1070,7 @@ def _optional_rows(source: Source, sql: str) -> list[dict[str, Any]]:
 @router.get("/operations", response_model=Envelope[OperationsData], summary="操作记录")
 def operations(request: Request, source: SourceDep) -> Envelope[OperationsData]:
     """Web writes read back from both command logs and Serving projections."""
-    items = [OperationRow(at=r["acked_at"], kind="ack_alert",
-                          summary=f"确认告警 {r['alert_id'][:12]}",
-                          actor=r["actor_id"], command_id=r["command_id"])
-             for r in _optional_rows(source, "SELECT alert_id, acked_at, actor_id, command_id "
-                                     "FROM alert_ack ORDER BY acked_at DESC LIMIT 200")]
-    items += [OperationRow(at=r["added_at"], kind="add_watchlist_item",
+    items = [OperationRow(at=r["added_at"], kind="add_watchlist_item",
                            summary=f"加自选 {r['ts_code']} {r['note']}".strip(), actor=None,
                            command_id=r["command_id"])
               for r in _optional_rows(source, "SELECT ts_code, note, added_at, command_id "
@@ -1401,7 +1351,7 @@ def stock_profile(code: str, request: Request, source: SourceDep) -> Envelope[St
     in_pools = sorted({p.name for p in pools(source, request).data.pools
                        if any(m.code == code for m in p.members)})
     recent = [a.model_dump(mode="json", include={"at", "level", "trigger_type", "trigger_price"})
-              for a in alerts(source, 1000, request).data.items if a.code == code][:20]
+              for a in alerts(source, 1000).data.items if a.code == code][:20]
     if base["name"] is None:
         base["name"] = _names(source).get(code)
     if not base["bars"] and base["name"] is None and fund is None:

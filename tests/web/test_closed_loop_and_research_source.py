@@ -121,20 +121,7 @@ def test_standalone_write_to_read_closed_loop(
     )
     assert [m["code"] for m in saved_pool["members"]] == ["600519.SH", "300750.SZ"]
 
-    # 3. Alert ack + unack round-trip via JSONL projection
-    aid = client.get("/api/v1/alerts").json()["data"]["items"][0]["alert_id"]
-    assert client.post("/api/v1/alerts/ack", json={"alert_id": aid}).status_code == 200
-    acked = next(
-        i for i in client.get("/api/v1/alerts").json()["data"]["items"] if i["alert_id"] == aid
-    )
-    assert acked["acked_at"] is not None
-    assert client.post("/api/v1/alerts/unack", json={"alert_id": aid}).status_code == 200
-    unacked = next(
-        i for i in client.get("/api/v1/alerts").json()["data"]["items"] if i["alert_id"] == aid
-    )
-    assert unacked["acked_at"] is None
-
-    # 4. Alert rule save -> GET /alert-rules + monitor's load_alert_rules()
+    # 3. Alert rule save -> GET /alert-rules + monitor's load_alert_rules()
     rule_body = {
         "rule_id": "watch-l1",
         "title": "自选一档告警",
@@ -149,11 +136,9 @@ def test_standalone_write_to_read_closed_loop(
     loaded = load_alert_rules(tmp_path / "no-serving", commands_dir=cmds_dir)
     assert len(loaded) == 1 and loaded[0].rule_id == "watch-l1"
 
-    # 5. Operations audit trail covers all 6 command kinds
+    # 4. Operations audit trail covers all 4 command kinds
     ops = client.get("/api/v1/operations").json()["data"]["items"]
     assert {o["kind"] for o in ops} >= {
-        "ack_alert",
-        "unack_alert",
         "add_watchlist_item",
         "remove_watchlist_item",
         "save_alert_rule",

@@ -17,10 +17,13 @@ test("every MVP page opens from the rail", async ({ page }) => {
   }
 });
 
-test("acknowledging an alert goes through page control", async ({ page }) => {
-  await page.goto("./#/monitor");
-  await page.getByRole("button", { name: "确认", exact: true }).first().click();
-  await expect(page.getByText("已确认 1 条告警")).toBeVisible();
+test("adding a stock to watchlist persists in pools", async ({ page }) => {
+  await page.goto("./#/screener");
+  await page.getByRole("button", { name: "加自选" }).first().click();
+  await expect(page.getByText("已加入自选")).toBeVisible();
+  await page.goto("./#/pools");
+  await page.getByRole("button", { name: /自选股/ }).click();
+  await expect(page.getByText("贵州茅台")).toBeVisible();
 });
 
 test("a backtest run shows its performance block", async ({ page }) => {

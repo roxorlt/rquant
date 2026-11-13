@@ -50,9 +50,8 @@ jobs:
         working-directory: web
         env:
           # Build switches (web/src/features.ts). Saved screener schemes: on (web store
-          # sqlite on the server). Alert unack: on (supported by rquant-web-commands).
+          # sqlite on the server).
           VITE_FEATURE_SCREENER_SCHEMES: "1"
-          VITE_FEATURE_ALERT_UNACK: "1"
         run: |
           pnpm install --frozen-lockfile
           pnpm run build

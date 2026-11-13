@@ -62,18 +62,14 @@ def test_panorama_pulse(client: TestClient) -> None:
 
 
 def test_writes_forward_one_command_each(client: TestClient, sent: list[dict]) -> None:
-    alert = client.get("/api/v1/alerts").json()["data"]["items"][0]["alert_id"]
-    assert client.post("/api/v1/alerts/ack", json={"alert_id": alert}).json()["status"] == (
-        "accepted")
     client.post("/api/v1/pools", json={"name": "p1", "pool_refs": ["breakout"]})
     client.post("/api/v1/watchlist", json={"code": "600519.SH"})
-    assert [p["kind"] for p in sent] == ["ack_alert", "save_canvas", "add_watchlist_item"]
-    assert sent[0]["alert_id"] == alert and len(sent[0]["generation_id"]) == 64
+    assert [p["kind"] for p in sent] == ["save_canvas", "add_watchlist_item"]
 
 
 def test_write_validation(client: TestClient, sent: list[dict]) -> None:
     assert client.post("/api/v1/watchlist", json={"code": "bad"}).status_code == 422
-    assert client.post("/api/v1/alerts/ack", json={"alert_id": "x"}).status_code == 422
+    assert client.post("/api/v1/pools", json={"name": "../bad"}).status_code == 422
     assert sent == []
 
 
@@ -135,17 +131,6 @@ def test_forward_builds_command() -> None:
                                    lambda p: seen.append(p) or {"status": "accepted"})
     assert receipt == {"status": "accepted"}
     assert seen[0]["kind"] == "save_canvas" and seen[0]["command_id"] and seen[0]["requested_at"]
-
-
-def test_alert_ack_state_is_read_back() -> None:
-    source = FixtureSource()
-    client = TestClient(create_app(source, dist=None))
-    first = client.get("/api/v1/alerts").json()["data"]["items"][0]
-    assert first["acked_at"] is None
-    source.record_ack({"alert_id": first["alert_id"], "actor_id": "owner", "command_id": "c1"})
-    items = {i["alert_id"]: i for i in client.get("/api/v1/alerts").json()["data"]["items"]}
-    assert items[first["alert_id"]]["acked_by"] == "owner"
-    assert items[first["alert_id"]]["acked_at"] is not None
 
 
 def test_meta_carries_deploy_notice(monkeypatch) -> None:
@@ -300,7 +285,10 @@ def test_viewer_cannot_write_and_operations_list_web_writes(monkeypatch) -> None
     fixture = FixtureSource()
     app = create_app(fixture, dist=None)
     app.state.page_control_transport = lambda p: (
-        fixture.record_rule(p) if p["kind"] == "save_alert_rule" else fixture.record_ack(p))
+        fixture.record_rule(p)
+        if p["kind"] == "save_alert_rule"
+        else {"command_id": p["command_id"], "status": "succeeded"}
+    )
     client = TestClient(app)
     rule = {"rule_id": "p2", "title": "二号池"}
     monkeypatch.setenv("RQUANT_WEB_ADMINS", "roxor")
@@ -309,40 +297,12 @@ def test_viewer_cannot_write_and_operations_list_web_writes(monkeypatch) -> None
     assert client.post("/api/v1/alert-rules", json=rule, headers=viewer).status_code == 403
     admin = {"X-Remote-User": "roxor"}
     assert client.post("/api/v1/alert-rules", json=rule, headers=admin).status_code == 200
-    assert client.post("/api/v1/alerts/ack", json={"alert_id": "b" * 64},
+    assert client.post("/api/v1/watchlist", json={"code": "600519.SH"},
                        headers=admin).status_code == 200
     kinds = [i["kind"] for i in client.get("/api/v1/operations").json()["data"]["items"]]
-    assert sorted(kinds) == ["ack_alert", "save_alert_rule"]
+    assert sorted(kinds) == ["add_watchlist_item", "save_alert_rule"]
     monkeypatch.delenv("RQUANT_WEB_ADMINS")
     assert client.get("/api/v1/meta").json()["data"]["role"] == "admin"
-
-
-def test_unack_clears_the_ack_and_keeps_both_operation_lines() -> None:
-    from fastapi.testclient import TestClient
-
-    from rquant.web.app import create_app
-    from rquant.web.source import FixtureSource
-
-    fixture = FixtureSource()
-    app = create_app(fixture, dist=None)
-
-    def transport(payload: dict) -> dict:
-        if payload["kind"] == "unack_alert":
-            return fixture.record_unack(payload)
-        return fixture.record_ack(payload)
-
-    app.state.page_control_transport = transport
-    client = TestClient(app)
-    alert_id = client.get("/api/v1/alerts").json()["data"]["items"][0]["alert_id"]
-    assert client.post("/api/v1/alerts/ack", json={"alert_id": alert_id}).status_code == 200
-    acked = client.get("/api/v1/alerts").json()["data"]["items"]
-    assert next(row for row in acked if row["alert_id"] == alert_id)["acked_at"]
-    assert client.post("/api/v1/alerts/unack", json={"alert_id": alert_id}).status_code == 200
-    cleared = client.get("/api/v1/alerts").json()["data"]["items"]
-    assert next(row for row in cleared if row["alert_id"] == alert_id)["acked_at"] is None
-    summaries = [row["summary"] for row in client.get("/api/v1/operations").json()["data"]["items"]]
-    assert any(text.startswith("确认告警") for text in summaries)
-    assert any(text.startswith("撤销确认") for text in summaries)
 
 
 def test_stock_profile_reads_the_research_market(tmp_path) -> None:

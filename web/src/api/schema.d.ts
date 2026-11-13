@@ -39,40 +39,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/alerts/ack": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** 确认告警 */
-        post: operations["ack_alert_api_v1_alerts_ack_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/alerts/unack": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** 撤销确认 */
-        post: operations["unack_alert_api_v1_alerts_unack_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/v1/backtests": {
         parameters: {
             query?: never;
@@ -868,11 +834,6 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
-        /** AckAlertRequest */
-        AckAlertRequest: {
-            /** Alert Id */
-            alert_id: string;
-        };
         /** AddWatchRequest */
         AddWatchRequest: {
             /** Code */
@@ -885,10 +846,6 @@ export interface components {
         };
         /** AlertItem */
         AlertItem: {
-            /** Acked At */
-            acked_at?: string | null;
-            /** Acked By */
-            acked_by?: string | null;
             /** Alert Id */
             alert_id: string;
             /** At */
@@ -2343,7 +2300,7 @@ export interface components {
              * Kind
              * @enum {string}
              */
-            kind: "ack_alert" | "unack_alert" | "add_watchlist_item" | "remove_watchlist_item" | "save_alert_rule" | "save_canvas";
+            kind: "add_watchlist_item" | "remove_watchlist_item" | "save_alert_rule" | "save_canvas";
             /** Summary */
             summary: string;
         };
@@ -3281,72 +3238,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_AlertsData_"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    ack_alert_api_v1_alerts_ack_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["AckAlertRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["CommandReceipt"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    unack_alert_api_v1_alerts_unack_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["AckAlertRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["CommandReceipt"];
                 };
             };
             /** @description Validation Error */

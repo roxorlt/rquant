@@ -243,8 +243,6 @@ describe("public copy", () => {
                         trigger_price: 10,
                         level_price: 10,
                         pool: null,
-                        acked_at: null,
-                        acked_by: null,
                       },
                       {
                         alert_id: "b".repeat(64),
@@ -257,8 +255,6 @@ describe("public copy", () => {
                         trigger_price: 10,
                         level_price: 10,
                         pool: null,
-                        acked_at: null,
-                        acked_by: null,
                       },
                     ],
                   }
