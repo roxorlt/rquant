@@ -5,6 +5,19 @@
 
 ---
 
+## 2026-11-13 · 已安装 · Web 独立发布 `v0.37.0`（`web-573b25bc`）
+
+- **状态**：已于 **2026-11-13 21:33:29 CST** 在 `82.156.0.68` 完成原子发布并自检通过。
+- **版本切换**：`/home/lighthouse/rquant-web-rel/9b15a034` → `/home/lighthouse/rquant-web-rel/573b25bc`（GitHub Release `web-573b25bc`，tag `v0.37.0`，SHA256 `dd065b10aeeaca6dbd5d79588bfaadf4024d201c4cdbe8c9e0106edffab8ffee` 核验 `OK`）。
+- **变更摘要**：合入 Wave 1（`v0.35.9` Web 全链路读写闭环、移除告警 `ack/unack` 伪需求、解耦旧 `page_control`、新增只读 `ResearchSource`）、Wave 2（`v0.36.0` Web 侧栏 18→11 页收敛、移除多人 RBAC / 操作审计 / SQL 查询 / Brinson & PBO 伪需求）与 Wave 3（`v0.37.0` `/screener` 形态 A 级联选股工作台：全市场/自定义池级联集合运算、26 内置规则 + 实时可执行 TDX + 财务与已验证因子分位、白盒自然语言生成与「★ 存为我的积木」、可点击预览中间层的漏斗诊断条）。不触碰 L2 常驻组件与 `deploy/systemd/`。
+- **上线自检**：`http://127.0.0.1:8768/api/v1/meta` 返回 `200`，`state="ready"`，`generated_at="2026-11-13T13:30:15.228080Z"`，`notice=null`。
+- **回滚命令**：
+  ```bash
+  ~/bin/rquant-web-deploy --rollback   # 自动切回 /home/lighthouse/rquant-web-rel/9b15a034 并校验 /api/v1/meta
+  ```
+
+---
+
 ## 2026-09-25 · 已安装 · v0.33.22（第十六窗口，协调者主会话，休市日）
 
 **状态**：**已安装并启动**。代码 `df621ef2`（tag `v0.33.22`，PR #309 merge commit），路线 A bundle 第十五代
