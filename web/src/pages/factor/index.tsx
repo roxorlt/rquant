@@ -1,11 +1,13 @@
+import { useSearchParams } from "react-router";
 import { useFactor, useFactors } from "@/api/endpoints";
 import { useUrlState } from "@/app/useUrlState";
 import { TimeChart } from "@/charts/Chart";
 import { formatFixed } from "@/format/number";
 import { DataTable } from "@/table/DataTable";
-import { KpiStrip, PageHeader, Panel } from "@/ui";
+import { KpiStrip, PageHeader, Panel, Segmented } from "@/ui";
 import { QueryView } from "../shared";
 import { CorrelationPanel } from "./Correlation";
+import { ReportMiningTab } from "./ReportMining";
 
 const num = (v: number | null | undefined, d = 3) => (v == null ? "—" : formatFixed(v, d));
 const pct = (v: number | null | undefined) => (v == null ? "—" : `${formatFixed(v * 100, 2)}%`);
@@ -218,12 +220,11 @@ function QuantilePanel({ result }: { result: TestResult }) {
   );
 }
 
-export default function FactorPage() {
+function CustomFactorsTab() {
   const query = useFactors();
   const [id, setId] = useUrlState("factor");
   return (
     <>
-      <PageHeader eyebrow="研究" title="因子研究" />
       <QueryView query={query}>
         {(data) => (
           <Panel title={`因子 · ${data.factors.length}`} sub="检验结果出现在这里" flush>
@@ -272,6 +273,30 @@ export default function FactorPage() {
       </QueryView>
       <CorrelationPanel />
       {id ? <Detail id={id} /> : null}
+    </>
+  );
+}
+
+type FactorTab = "custom" | "reports";
+
+export default function FactorPage() {
+  const [params] = useSearchParams();
+  const [rawTab, setTab] = useUrlState("tab");
+  const inferredDefault: FactorTab = params.has("f") ? "reports" : "custom";
+  const tab: FactorTab = rawTab === "reports" || rawTab === "custom" ? rawTab : inferredDefault;
+  return (
+    <>
+      <PageHeader eyebrow="研究" title="因子库" />
+      <Segmented
+        label="因子来源"
+        value={tab}
+        onChange={(next) => setTab(next === "custom" ? null : next)}
+        options={[
+          { value: "custom", label: "自研因子" },
+          { value: "reports", label: "研报挖掘" },
+        ]}
+      />
+      {tab === "custom" ? <CustomFactorsTab /> : <ReportMiningTab />}
     </>
   );
 }

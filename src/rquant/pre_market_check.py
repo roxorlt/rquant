@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
 from contextlib import suppress
@@ -27,13 +26,6 @@ from typing import Literal
 from loguru import logger
 
 from rquant.config import settings
-from rquant.daily_receipt_socket_authority import (
-    probe_daily_receipt_authority_identity,
-)
-from rquant.runtime_deployment_preflight import (
-    RuntimeDeploymentInspection,
-    inspect_runtime_deployment,
-)
 
 CheckStatus = Literal["ok", "warn", "fail", "skip"]
 
@@ -52,12 +44,9 @@ SERVICES_TO_CHECK = [
     "rquant-monitor-watchdog.timer",
     "rquant-daily.timer",
     "rquant-dashboard.service",
-    "rquant-page-control.service",
     "rquant-nl-screen.service",
     "rquant-backup.timer",
     "rquant-daily-report.timer",
-    "rquant-daily-receipt-signer.socket",
-    "rquant-daily-receipt-signer.service",
 ]
 
 
@@ -224,50 +213,6 @@ def check_systemd_services(units: list[str]) -> list[CheckResult]:
     return results
 
 
-def check_daily_receipt_authority_identity() -> CheckResult:
-    """Authenticate the source SHA served by the fixed root signer socket."""
-
-    if not shutil.which("systemctl"):
-        return CheckResult(
-            "daily_receipt_authority_identity",
-            "skip",
-            "无 systemctl（mac 本地 dev）",
-        )
-    try:
-        identity = probe_daily_receipt_authority_identity(
-            timeout_seconds=2.0,
-            max_attempts=1,
-        )
-    except Exception as exc:
-        return CheckResult(
-            "daily_receipt_authority_identity",
-            "fail",
-            f"identity probe 失败: {type(exc).__name__}: {str(exc)[:160]}",
-        )
-    return CheckResult(
-        "daily_receipt_authority_identity",
-        "ok",
-        f"running_sha={identity.source_sha256} key={identity.key_id}",
-    )
-
-
-def runtime_deployment_service_checks(
-    runtime_root: Path,
-) -> tuple[RuntimeDeploymentInspection, CheckResult]:
-    inspection = inspect_runtime_deployment(runtime_root)
-    return (
-        inspection,
-        CheckResult(
-            "watchlist_quote_runtime",
-            inspection.status,
-            "{}; inventory={}".format(
-                inspection.summary,
-                ",".join(inspection.inventory_units) or "none",
-            ),
-        ),
-    )
-
-
 def check_recent_errors(
     units: list[str],
     hours: int = 24,
@@ -314,22 +259,13 @@ def check_recent_errors(
 
 def run_all_checks(*, runtime_root: Path | None = None) -> list[CheckResult]:
     """跑所有体检，返回结果列表。"""
-    resolved_runtime_root = runtime_root or Path(
-        os.environ.get("RQUANT_RUNTIME_ROOT", str(settings.data_dir / "runtime"))
-    )
-    runtime_inspection, runtime_result = runtime_deployment_service_checks(resolved_runtime_root)
-    systemd_units = list(
-        dict.fromkeys((*SERVICES_TO_CHECK, *runtime_inspection.strict_authority_units))
-    )
-    journal_units = list(dict.fromkeys((*SERVICES_TO_CHECK, *runtime_inspection.inventory_units)))
+    _ = runtime_root
     results: list[CheckResult] = []
     results.append(check_duckdb_lock(settings.duckdb_path))
     results.append(check_disk_space(settings.duckdb_path.parent))
     results.append(check_tushare_credits(settings.tushare_token_main))
-    results.extend(check_systemd_services(systemd_units))
-    results.append(runtime_result)
-    results.append(check_daily_receipt_authority_identity())
-    results.append(check_recent_errors(journal_units))
+    results.extend(check_systemd_services(SERVICES_TO_CHECK))
+    results.append(check_recent_errors(SERVICES_TO_CHECK))
     return results
 
 

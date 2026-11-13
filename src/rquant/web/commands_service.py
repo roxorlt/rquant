@@ -155,19 +155,6 @@ class SavedPoolRecord(BaseModel):
     command_id: str
 
 
-class RecordedOperation(BaseModel):
-    at: datetime | None = None
-    kind: Literal[
-        "add_watchlist_item",
-        "remove_watchlist_item",
-        "save_alert_rule",
-        "save_canvas",
-    ]
-    summary: str
-    actor: str | None = None
-    command_id: str
-
-
 def _append_jsonl_idempotent(path: Path, record: dict[str, object], command_id: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_APPEND, 0o600)
@@ -351,58 +338,6 @@ def read_saved_pools(data_dir: Path) -> list[SavedPoolRecord]:
                 command_id=cid or name,
             )
     return list(reversed(list(by_name.values())))
-
-
-def read_operations(data_dir: Path) -> list[RecordedOperation]:
-    """Audit trail across all three JSONL command logs, newest first."""
-    ops: list[RecordedOperation] = []
-    for row in _iter_jsonl(data_dir / WATCHLIST_LOG):
-        code = str(row.get("ts_code") or (row.get("item") or {}).get("ts_code") or "").upper()
-        cid = str(row.get("command_id") or "")
-        if not code or not cid:
-            continue
-        removed = row.get("action") == "remove"
-        note = str(row.get("note") or "")
-        ops.append(
-            RecordedOperation(
-                at=_parse_ts(row.get("ts")),
-                kind="remove_watchlist_item" if removed else "add_watchlist_item",
-                summary=f"移出自选 {code}" if removed else f"加自选 {code} {note}".strip(),
-                actor=None,
-                command_id=cid,
-            )
-        )
-    for row in _iter_jsonl(data_dir / ALERT_RULE_LOG):
-        title = str(row.get("title") or "")
-        cid = str(row.get("command_id") or "")
-        if not title or not cid:
-            continue
-        enabled = bool(row.get("enabled", True))
-        ops.append(
-            RecordedOperation(
-                at=_parse_ts(row.get("ts")),
-                kind="save_alert_rule",
-                summary=f"{'启用' if enabled else '停用'}告警规则 {title}",
-                actor=None,
-                command_id=cid,
-            )
-        )
-    for row in _iter_jsonl(data_dir / CANVAS_SAVE_LOG):
-        name = str(row.get("name") or "").strip()
-        cid = str(row.get("command_id") or "")
-        if not name or not cid:
-            continue
-        ops.append(
-            RecordedOperation(
-                at=_parse_ts(row.get("ts")),
-                kind="save_canvas",
-                summary=f"保存池子 {name}",
-                actor=None,
-                command_id=cid,
-            )
-        )
-    ops.sort(key=lambda i: i.at.timestamp() if i.at else 0, reverse=True)
-    return ops
 
 
 def make_handler(data_dir: Path) -> type[BaseHTTPRequestHandler]:

@@ -160,7 +160,7 @@ def test_portfolio_backtests_are_read_from_result_files(tmp_path) -> None:
     assert client.get("/api/v1/portfolio-backtests/nope").status_code == 404
 
 
-def test_portfolio_compare_and_overfit_block(tmp_path) -> None:
+def test_portfolio_compare(tmp_path) -> None:
     from fastapi.testclient import TestClient
 
     from rquant.web.app import create_app
@@ -170,7 +170,7 @@ def test_portfolio_compare_and_overfit_block(tmp_path) -> None:
     client = TestClient(create_app(FixtureSource(), dist=None, research_root=tmp_path))
     run_id = client.get("/api/v1/portfolio-backtests").json()["data"]["runs"][0]["run_id"]
     detail = client.get(f"/api/v1/portfolio-backtests/{run_id}").json()["data"]
-    assert detail["overfit"]["trials"] == 1
+    assert "overfit" not in detail
     both = client.get(f"/api/v1/portfolio-backtests/compare?a={run_id}&b={run_id}").json()
     assert both["data"]["a"]["run"]["run_id"] == both["data"]["b"]["run"]["run_id"]
 
@@ -276,7 +276,7 @@ def test_band_endpoint(tmp_path) -> None:
     assert client.get(f"/api/v1/portfolio-backtests/{run_id}/band?days=0").status_code == 422
 
 
-def test_viewer_cannot_write_and_operations_list_web_writes(monkeypatch) -> None:
+def test_authenticated_user_has_full_write_access() -> None:
     from fastapi.testclient import TestClient
 
     from rquant.web.app import create_app
@@ -290,19 +290,13 @@ def test_viewer_cannot_write_and_operations_list_web_writes(monkeypatch) -> None
         else {"command_id": p["command_id"], "status": "succeeded"}
     )
     client = TestClient(app)
-    rule = {"rule_id": "p2", "title": "二号池"}
-    monkeypatch.setenv("RQUANT_WEB_ADMINS", "roxor")
-    viewer = {"X-Remote-User": "guest"}
-    assert client.get("/api/v1/meta", headers=viewer).json()["data"]["role"] == "viewer"
-    assert client.post("/api/v1/alert-rules", json=rule, headers=viewer).status_code == 403
-    admin = {"X-Remote-User": "roxor"}
-    assert client.post("/api/v1/alert-rules", json=rule, headers=admin).status_code == 200
+    headers = {"X-Remote-User": "roxor"}
+    meta = client.get("/api/v1/meta", headers=headers).json()["data"]
+    assert meta["user"] == "roxor" and "role" not in meta
+    assert client.post("/api/v1/alert-rules", json={"rule_id": "p2", "title": "二号池"},
+                       headers=headers).status_code == 200
     assert client.post("/api/v1/watchlist", json={"code": "600519.SH"},
-                       headers=admin).status_code == 200
-    kinds = [i["kind"] for i in client.get("/api/v1/operations").json()["data"]["items"]]
-    assert sorted(kinds) == ["add_watchlist_item", "save_alert_rule"]
-    monkeypatch.delenv("RQUANT_WEB_ADMINS")
-    assert client.get("/api/v1/meta").json()["data"]["role"] == "admin"
+                       headers=headers).status_code == 200
 
 
 def test_stock_profile_reads_the_research_market(tmp_path) -> None:
@@ -324,22 +318,6 @@ def test_stock_profile_reads_the_research_market(tmp_path) -> None:
     assert body["valuation"]["ps_ttm"] is not None and body["valuation"]["dv_ttm"] is not None
     assert client.get("/api/v1/stocks/bad").status_code == 422
     assert client.get("/api/v1/stocks/999999.SH").status_code == 404
-
-
-def test_brinson_effects_add_up_to_excess(tmp_path) -> None:
-    from fastapi.testclient import TestClient
-
-    from rquant.web.app import create_app
-    from rquant.web.source import FixtureSource, write_demo_research
-
-    write_demo_research(tmp_path)
-    client = TestClient(create_app(FixtureSource(), dist=None, research_root=tmp_path))
-    run_id = client.get("/api/v1/portfolio-backtests").json()["data"]["runs"][0]["run_id"]
-    b = client.get(f"/api/v1/portfolio-backtests/{run_id}/brinson").json()["data"]
-    assert b is not None and b["days"] > 0
-    total = b["allocation"] + b["selection"] + b["interaction"]
-    assert total == pytest.approx(b["portfolio_return"] - b["benchmark_return"], abs=1e-9)
-    assert {r["industry"] for r in b["rows"]} >= {"白酒", "银行", "现金"}
 
 
 def test_screen_rows_carry_valuation_fundamentals_and_factor_pct(tmp_path) -> None:
@@ -371,9 +349,6 @@ def test_factor_correlation_matrix(tmp_path) -> None:
     body = client.get("/api/v1/factors/correlation").json()["data"]
     assert body["names"] == ["演示动量因子"]
     assert body["ic_corr"] == [[1.0]]
-def test_query_schema_lists_columns(client) -> None:
-    body = client.get("/api/v1/query/schema").json()["data"]
-    assert ["ts_code", "VARCHAR"] in body["stock_basic"]
 
 
 def test_text_to_condition_and_event_studies(tmp_path) -> None:

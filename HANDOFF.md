@@ -9,7 +9,7 @@
 
 ## 一、项目定位与当前真实边界
 
-**rQuant** 是个人自用的 A 股量化选股、实时盯盘、告警推送与可信策略研究平台（当前主线基线标签：`v0.35.7` / `web-d518e931`（L2 常驻组件仍为 v0.35.5 / 8de81101，archive 修复尚未部署））。
+**rQuant** 是个人自用的 A 股量化选股、实时盯盘、告警推送与可信策略研究平台（当前主线基线标签：`v0.36.0`（L2 常驻组件仍为 v0.35.5 / 8de81101，archive 修复尚未部署））。
 
 ### 1.1 核心边界
 - **只做**：盘后日线/因子/状态更新 → 条件筛选与候选池生成 → 盘中实时监控（分钟/快照/竞价/量能异动/受控 L2）→ 多通道告警通知（PushDeer / PushPlus）→ Point-in-Time（PIT）可信历史回放、策略评估与自动模拟盘。
@@ -17,9 +17,10 @@
 
 ### 1.2 历史文档认知对齐（防踩旧文档坑）
 仓库早期文档（如 `_index.md`、`TODO.md` 及 `AGENTS.md` / `CLAUDE.md` 中部分 MVP 初期表格）写于 2026-04～05 月，阅读时需以以下**当前真实状态**为准：
-1. **前端 UI 已演进为 React SPA**：主力界面已迁至 `src/rquant/web/`（FastAPI）+ `web/`（React 19 + TypeScript + Vite，线上 `:8081/app/`）；旧 Streamlit 页面仅保留市场全景 `src/rquant/dashboard/market_panorama.py`（`:8506` / `:28080`）及预览实例（`:8509`）。
-2. **L2 原始行情已作为独立受控组件上线**：`src/rquant/l2/` 采集并缓存单连接节流原始批次，提供本地回环 HTTP/WebSocket 消费与盘后 Cloudflare R2 校验归档（生产常驻 **20 股 / 60 流** 档位，非高频下单用途）。
-3. **新增 MacBook 本地五虎刘海插件**：`notch_app/`（macOS 14+ 原生 SwiftUI + `NSPanel` 顶层刘海挂件 `RQuantNotch.app`）配合云端只读聚合接口 `notch_app/server/wuhu_live.py`（`:8775`，经 nginx `:8081/api/v1/wuhu/` 反代）。
+1. **前端 UI 已演进为精简 11 页 React SPA**：主力界面已迁至 `src/rquant/web/`（FastAPI）+ `web/`（React 19 + TypeScript + Vite，线上 `:8081/app/`，已收敛为 11 个核心导航页并移除多人 RBAC/操作审计等伪需求）；旧 Streamlit 页面仅保留市场全景 `src/rquant/dashboard/market_panorama.py`（`:8506` / `:28080`）及停用引导桩。
+2. **旧版 Codex Route-A / `page_control` / `source_broker` / `lab` 守护进程体系已在 `v0.36.0` 下线清理**：删除 217 个不可达 Python 模块、35 个遗留脚本与 372 个旧套件测试（净减约 67 万行代码与测试），保留实际运行的 `daily` / `monitor` / `research` / `l2` / `web` / `wuhu` 与 Stage 1 `formal-smoke-replay` 链路。
+3. **L2 原始行情已作为独立受控组件上线**：`src/rquant/l2/` 采集并缓存单连接节流原始批次，提供本地回环 HTTP/WebSocket 消费与盘后 Cloudflare R2 校验归档（生产常驻 **20 股 / 60 流** 档位，非高频下单用途）。
+4. **新增 MacBook 本地五虎刘海插件**：`notch_app/`（macOS 14+ 原生 SwiftUI + `NSPanel` 顶层刘海挂件 `RQuantNotch.app`）配合云端只读聚合接口 `notch_app/server/wuhu_live.py`（`:8775`，经 nginx `:8081/api/v1/wuhu/` 反代）。
 
 ---
 
@@ -30,25 +31,24 @@ rquant/
 ├── HANDOFF.md               # 本项目持续交接主文档（新 Session 首读 + 全量迭代记录）
 ├── AGENTS.md / CLAUDE.md    # 项目级 AI 协作与工程约束规则
 ├── CHANGELOG.md / DEPLOY.md # 版本变更日志 / 腾讯云生产部署台账
-├── src/rquant/              # Python 核心业务包（CLI 入口 rquant.cli:main，40+ 子命令）
-│   ├── adapter/ & data/     # Tushare Pro 主源 + AKShare/Ashare/sina/dc 兜底采集
+├── src/rquant/              # Python 核心业务包（CLI 入口 rquant.cli:main）
+│   ├── adapter/ & data/     # Tushare Pro 主源 + AKShare/Ashare/sina/dc 兜底采集与 data_catalog 审计
 │   ├── storage/             # DuckDB 存储、Schema 迁移与只读副本连接封装（open_readonly_store）
 │   ├── indicator/ & state/  # 前复权行情、技术指标（ta/MyTT）与 daily_state 涨跌停/连板派生列
-│   ├── screen/              # 通达信/MyTT 风格积木规则与 Pool1/Pool2 选股管线
+│   ├── screen/ & llm/       # 通达信/MyTT 风格积木规则、Pool1/Pool2 管线与 DeepSeek 白盒自然语言编译
+│   ├── factor/ & backtest/  # 自研因子评估、TDX 公式引擎、单策略/组合回测（portfolio/ & perf/）
+│   ├── macro/               # 宏观估值/利差/宽度/国家队与机构持仓指标刷新
 │   ├── notify/              # PushDeer + PushPlus 独立通道、熔断门禁与事故去重通知
 │   ├── research/            # 可信研究平台：PIT 契约、L1 3s 快照采集、R2 归档、竞价池与归因、量能异动、研报因子挖掘
-│   ├── runtime_*.py         # 工作负载解耦（Route A）：25 个角色化实例运行时、权威代际发布、Schema Rollout、沙箱与恢复
-│   ├── source_broker*.py    # 数据源网关 v2 与 source_quota_* 配额租约治理
-│   ├── signal_*.py          # 信号总线、路由 spool 与信号族差分校验（R07）
 │   ├── l2/                  # 受控 L2 原始行情采集、.head 批次缓存、HTTP/WS 接口、冷存与 R2 归档
 │   ├── risk/                # 负向因子日度 PIT 过滤（risk_flags_daily）与交易所异动监控/预测
 │   ├── vp/                  # 三重锁相 Volume Profile 子包（engine/ 只读底座 + sandbox/ 7 文件研究沙盒）
-│   ├── dashboard/           # 遗留/专用 Streamlit 页面（market_panorama.py 等）
-│   └── web/                 # FastAPI 服务端（ResearchSource 实时只读/Serving 代 + 3s 板块流 + 命令与偏好闭环）
-├── web/                     # React 19 + TypeScript + Vite 前端（总览/选股/池子/回测/模拟盘/告警/全景/健康/个股 F9）
+│   ├── dashboard/           # 市场全景 Streamlit 页面（market_panorama.py）与旧入口兼容桩
+│   └── web/                 # FastAPI 服务端（ResearchSource 实时只读/Serving 兼容 + 3s 板块流 + 命令与偏好闭环）
+├── web/                     # React 19 + TypeScript + Vite 前端（精简 11 页导航 + 个股 F9 工作台）
 ├── notch_app/               # MacBook 五虎盯盘刘海插件（Sources/RQuantNotch/*.swift + server/wuhu_live.py）
 ├── deploy/                  # systemd units & slices、launchd plists、nginx 配置、web 发布脚本、sudoers
-├── scripts/                 # 受控生产部署器、云地同步、单日沙箱回放（route_a_day_replay.py）、质量门禁等
+├── scripts/                 # L2 受控组件发布器、云地同步、日度入库、Stage 1 验收与核心质量门禁
 ├── docs/                    # 架构设计（architecture/）、运维手册（ops/README.md）、L2 规范、研究报告与阶段计划
 └── tests/                   # 单元/集成/Web API 测试（pytest）与前端 E2E（web/e2e Playwright）
 ```
@@ -60,13 +60,12 @@ rquant/
    - 研究数据湖独立于生产主库：`research.duckdb` + 交易日分区 Parquet，支持 `research-export`、`research-ingest`、`research-repair-auction`、`research-repair-minute`、`dataset-snapshot` 与 `formal-smoke-replay`。
    - 策略成熟度分四级：`exploratory` → `comparable` → `paper_candidate` → `monitor_approved`（当前 N 字、科创/创业放量、集合竞价均处 `exploratory`，待完整资格 manifest 覆盖达标后晋级）。
 
-2. **工作负载解耦与角色化运行时（Workload Isolation / Route A）**
-   - 通过 systemd cgroup v2 层级隔离资源：`rquant.slice` 下设 `rquant-live.slice`（含子级 `rquant-live-runtime.slice` 承载运行时 role）、`rquant-serving.slice`、`rquant-research.slice`、`rquant-maintenance.slice`，并由 root-owned `/usr/local/libexec/rquant-workload-arbiter` 保证 `research` 与 `maintenance` 跨平面互斥。
-   - 25 个受保护 `rquant-runtime-*@.service` 统一经固定 `/usr/local/libexec/rquant-runtime-exec.pyz` 拉起，只认 `/var/lib/rquant/runtime-authority/current.json` 签发代际。
-   - `notifier` 支持三档投递模式：`paused`（急停）/ `shadow`（走完整 live 入库与 `signals` 权威发布，但不向外发包，回执带 `shadow:` 前缀）/ `live`（真实推送）。
+2. **宿主机资源隔离（systemd slice）**
+   - 通过 systemd cgroup v2 层级隔离资源：`rquant.slice` 下设 `rquant-live.slice`、`rquant-serving.slice`、`rquant-research.slice`、`rquant-maintenance.slice`，防止重型研究/因子任务挤占盘中采集与盯盘内存。
+   - 早期实验性的 Route-A 25 角色运行时、`source_broker_v2`、`signal_bus`、`page_control` 与 `lab` 守护进程代码已在 `v0.36.0` 完整清理下线。
 
 3. **全市场 3 秒快照、竞价池与盘中异动（`rquant.research`）**
-   - `rquant-snapshot-collector`（工作日 `09:10` 启动）：每 ~3.25s 采集全 A 快照写 `snapshots/YYYY-MM-DD/quotes/part-*.parquet`（30s 正式分片）及 `stream/d-*.parquet`（~3s 增量流，供 Web 板块资金流与刘海插件低延迟读取），内嵌量能异动扫描器 `rquant.research.surge`；盘后 `16:20` 由 `rquant-snapshot-archive` 打包校验归档至 Cloudflare R2（`rquant-snapshots`）。
+   - `rquant-snapshot-collector`（工作日 `09:10` 启动）：每 ~3.25s 采集全 A 快照写 `snapshots/YYYY-MM-DD/quotes/part-*.parquet`（30s 正式分片）及 `stream/d-*.parquet`（~3s 增量流，供 Web 板块资金流与刘海插件低延迟读取），内嵌量能异动扫描器 `rquant.research.surge`；盘后 `16:50` 由 `rquant-snapshot-archive` 打包校验归档至 Cloudflare R2（`rquant-snapshots`）。
    - 竞价选股链路：`08:40` 候选池（`rquant-auction-pool-candidates`）→ `09:26:30` 竞价定池（`rquant-auction-pool-pick`，产出 `pools/auction/YYYY-MM-DD.json`）→ `09:27` 概念/新闻/DeepSeek 归因与推送（`rquant-auction-pool-attrib`）。
    - 研报因子挖掘：`rquant-report-factors`（周二至周五 `06:30` 重算）+ `rquant-report-tracking`（周六 `06:30` 增量追踪新金工研报）。
 
@@ -74,9 +73,10 @@ rquant/
    - 采集器维护唯一上游连接（或受控多连接候选参数，默认关闭），将成交、买委托、卖委托批次原子写入本地缓存并发布 `.head`；本地回环 API 提供股票列表管理、HTTP 游标补取与最多 8 路单向 WebSocket 推送。
    - 生产常驻 20 股核心（`v0.34.0`–`v0.35.5`），已配置 `Restart=on-failure`、`OnFailure=rquant-alert@%n.service` 与交易时段每 2 分钟的 `rquant-l2-collector-watchdog.timer`。严禁与生产共享同一上游设备会话跑并行测试（`run_80_window.sh` 有硬门禁）。
 
-5. **Web 应用（`src/rquant/web/` + `web/`）**
-   - 支持双只读底座切换：`ResearchSource`（`RQUANT_WEB_SOURCE=research`，以内存 DuckDB 只读挂载 `market.duckdb` 与可选只读副本 `rquant_ro.duckdb`，代码硬拦截直连主库 `rquant.duckdb`，动态投影 18 张标准视图）与兼容旧 `ServingSource`（`RQUANT_SERVING_ROOT`）。
-   - 彻底解耦旧 `rquant.page_control`：`rquant.web.commands_service`（线上 `127.0.0.1:8769` 或进程内直写 `~/rquant-web-commands`）提供幂等 JSONL 落盘与实时读取投影，闭环「加/删自选、保存/并入池子（含筛选后精确股票列表与空格池名）、确认/撤销告警、告警规则与操作记录」；选股方案与跨端 UI 偏好由独立 SQLite Web Store（`screener_schemes.py`）持久化。
+5. **Web 应用（`src/rquant/web/` + `web/`，11 个核心导航页）**
+   - 支持双只读底座切换：`ResearchSource`（`RQUANT_WEB_SOURCE=research`，以内存 DuckDB 只读挂载 `market.duckdb` 与可选只读副本 `rquant_ro.duckdb`，代码硬拦截直连主库 `rquant.duckdb`，动态投影标准视图）与兼容旧 `ServingSource`（`RQUANT_SERVING_ROOT`）。
+   - 侧栏收敛为 **11 个核心页面**：`总览` (`/overview`)、`选股器` (`/screener`)、`池子` (`/pools`)、`因子库` (`/factor`，含自研因子与研报挖掘双 Tab)、`盯盘与告警` (`/monitor`)、`市场全景` (`/panorama`)、`板块资金流` (`/sectorflow`)、`模拟盘` (`/paper`)、`回测` (`/backtest`，含单策略回测 / 组合回测 / 策略版本三 Tab)、`宏观` (`/macro`)、`系统状态` (`/health`，统一整合健康度、systemd 服务/定时器日志抽屉与数据集覆盖率审计）。旧路由（`/experiments`、`/strategies`、`/reportmining`、`/tasks`、`/data`、`/query`）均保留兼容重定向。
+   - 单用户无锁闭环：`rquant.web.commands_service`（线上 `127.0.0.1:8769` 或进程内直写 `~/rquant-web-commands`）提供幂等 JSONL 落盘与实时读取投影，闭环「加/删自选、保存/并入池子（含筛选后精确股票列表与空格池名）、告警规则」；选股方案与跨端 UI 偏好由独立 SQLite Web Store（`screener_schemes.py`）持久化；已彻底移除多人 RBAC 只读锁、告警 `ack/unack`、`/ops` 操作审计页、网页 SQL 查询与 Brinson/PBO 过度包装指标。
    - 个股页提供日 K（含 VP / 筹码分布）、分时（240 分钟连续交易轴 + VWAP/BVC 订单流估算）、5 日分时、TPO 市场轮廓、资金流、财务指标及一键加/移自选。
 
 6. **MacBook 五虎盯盘刘海插件（`notch_app/`，当前 `v1.0.5`）**
@@ -95,7 +95,7 @@ rquant/
 
 | 节点 | 角色与关键路径 | 说明 |
 |---|---|---|
-| **腾讯云生产机** `lighthouse@82.156.0.68` | OpenCloudOS 9.2，宝塔 nginx（`/www/server/panel/vhost/nginx/`）<br>• `~/rquant/`：主仓 checkout 与 `data/`（生产 DuckDB、Runtime 代际）<br>• `~/rquant-research/`：研究根（`market.duckdb`、`intraday.duckdb`、`snapshots/`、`pools/`、`alerts/`、`report_factors/`）<br>• `~/rquant-web-rel/current`：Web 发布软链（`:8768`，静态根 `~/rquant-web/app`）<br>• `~/rquant-wuhu/`：五虎刘海插件只读服务（`:8775`）<br>• `/var/lib/rquant/`：runtime-authority、receipt signer、workload-isolation 状态 | **避坑**：服务器 IP 唯一为 `82.156.0.68`，严禁误写历史错误 IP `82.156.4.48`。SSH 显式指定密钥 `~/.ssh/rquant_deploy`（或 Host `rquant`）。 |
+| **腾讯云生产机** `lighthouse@82.156.0.68` | OpenCloudOS 9.2，宝塔 nginx（`/www/server/panel/vhost/nginx/`）<br>• `~/rquant/`：主仓 checkout 与 `data/`（生产 DuckDB 与只读副本）<br>• `~/rquant-research/`：研究根（`market.duckdb`、`intraday.duckdb`、`snapshots/`、`pools/`、`alerts/`、`report_factors/`）<br>• `~/rquant-web-rel/current`：Web 发布软链（`:8768`，静态根 `~/rquant-web/app`）<br>• `~/rquant-wuhu/`：五虎刘海插件只读服务（`:8775`） | **避坑**：服务器 IP 唯一为 `82.156.0.68`，严禁误写历史错误 IP `82.156.4.48`。SSH 显式指定密钥 `~/.ssh/rquant_deploy`（或 Host `rquant`）。 |
 | **本地 MacBook** | `/Users/roxor/brain/30-projects/rQuant`（开发主目录）<br>`/Users/roxor/rquant-notch/notch_app`（本地刘海插件构建目录）<br>`/Applications/RQuantNotch.app`（已安装五虎刘海插件） | 负责本地开发、离线研究/重型回补与云端 DuckDB 热备同步；**禁止**在本地运行 `rquant serve` 生产日度调度。 |
 
 ### 3.2 线上核心端口映射（`82.156.0.68`）
@@ -117,8 +117,8 @@ rquant/
 ```bash
 # 1. Python 后端与核心单测（worktree 注意指定 Python 3.11）
 uv sync --python 3.11
-uv run pytest tests/unit/test_<target>.py -q     # 改哪块测哪块（全量 13k+ 用例耗时约 60min）
-uv run ruff check <改动的文件>                    # 仅检查本次改动文件（避免历史存量告警干扰）
+uv run pytest tests/unit/test_<target>.py -q     # 改哪块测哪块（瘦身后全量 4.7k 用例）
+uv run ruff check <改动的文件>                    # 检查本次改动文件
 bash scripts/check-core-quality.sh               # 核心质量门禁
 
 # 2. Web 前后端（Node 22 + pnpm）
@@ -130,10 +130,10 @@ cd .. && uv run pytest -q tests/web
 cd notch_app && ./build.sh && ./install.sh
 ```
 
-> **CI 现状说明**：GitHub Actions 中历史重型全量套件 `.github/workflows/ci.yml` 已改为仅 `workflow_dispatch` 手动触发；日常 PR 与 `main` 合并门禁为 `.github/workflows/web-mvp.yml`（L2 + Web API + 前端检查），`main` 通过后自动触发 `web-release.yml` 产出 `web-<sha8>` 发布包。
+> **CI 现状说明**：日常 PR 与 `main` 合并门禁为 `.github/workflows/web-mvp.yml`（L2 + Web/Research API + 核心模块单测 + 前端 lint/typecheck/vitest/build/OpenAPI/Playwright E2E），`main` 通过后自动触发 `web-release.yml` 产出 `web-<sha8>` 发布包；`.github/workflows/ci.yml` 为精简后的手动全量验证入口（`workflow_dispatch`）。
 
 ### 4.2 生产发布与高风险变更纪律
-1. **主仓受控自动发布**：仅允许通过 `bash scripts/deploy-production.sh --target <exact-tag-or-full-sha>` 发布已合并且 CI 全绿的精确版本（工作日 `09:15–15:10` 自动拒绝重启类发布），发布后同步登记 `DEPLOY.md`。
+1. **L2 受控组件发布**：仅允许通过 `bash scripts/deploy-production.sh --component <l2|l2-archive> ...` 发布已合并且验收通过的精确版本，发布后同步登记 `DEPLOY.md`。
 2. **Web 独立发布**：`deploy/web/deploy-from-box.sh <sha8|latest|--rollback>`（内部调用服务器 `~/bin/rquant-web-deploy`，原子切换 `~/rquant-web-rel/current` 并自检 `/api/v1/meta`，失败自动回滚）。
 3. **高风险操作必须单独获用户明确授权**：任何涉及 `deploy/systemd/`（含修改前必须在云端跑 `systemd-analyze verify` 与 `systemd-analyze calendar`）、`deploy/nginx/`、sudoers、生产数据库写入/修复、L2 容量档位切换或凭据轮换的操作，绝不可借日常代码发布绕过。
 
@@ -141,8 +141,8 @@ cd notch_app && ./build.sh && ./install.sh
 
 ## 五、当前推进重点（Active Focus）
 
-1. **L2 持续稳定性与归档闭环**：观察 20 股常驻核心 + `rquant-l2-collector-watchdog`（含帧内行情 lag 告警）表现；独立完成 R2 日终归档组件验收与部署；后续摸索上游连接与写盘吞吐真实上限。
-2. **Web 实时数据源切换与旧版 Codex 减法（Wave 2）**：合并并发布 Web 读写闭环版后，在生产非交易窗口将 `/etc/rquant-web.env` 切换至 `RQUANT_WEB_SOURCE=research`；随后推进 Wave 2 清理已废弃的 Route-A / `page_control` / `source_broker` / `lab` 重型代码。
+1. **L2 持续稳定性、段式写盘上限验证与归档闭环**：观察 20 股常驻核心 + `rquant-l2-collector-watchdog`（含帧内行情 lag 告警）表现；推进 40/80 股段式写盘窗口验证与 R2 日终归档组件独立验收部署。
+2. **Web 新版选股器工作台（Wave 3 · 形态 A）与生产 `ResearchSource` 切换**：Wave 1（`v0.35.9` 读写闭环）与 Wave 2（`v0.36.0` ~67 万行旧版 Codex 代码清理 + Web 18→11 页收敛）已完成；下一步推进 `/screener` 形态 A（单池 + 级联上游池输入 + 全积木/TDX 公式/已验证因子 + DeepSeek 白盒自然语言编译与「存为我的积木」+ 实时漏斗计数，优先适配 MacBook 触控板手势交互，数据结构预留 DAG 画布形态 B），并在盘后窗口将生产 `/etc/rquant-web.env` 切至 `RQUANT_WEB_SOURCE=research`。
 3. **Stage 1 三策略正式验收晋级**：推进 N 字、科创/创业放量、集合竞价三策略真实资格 manifest 回补与覆盖率达标（baseline ≥95%，eligibility/B/S ≥99%），通过 `formal-smoke-replay` 后从 `exploratory` 晋级。
 4. **终端盯盘体验迭代**：Web 桌面/手机端细节打磨与 MacBook `notch_app` 五虎盘中盯盘体验优化。
 
@@ -161,7 +161,23 @@ cd notch_app && ./build.sh && ./install.sh
 > - **验证与部署状态**：...
 > ```
 
-### 2026-11-12 · Web 平台全链路读写闭环、移除告警「确认/撤销」伪需求、解耦旧 `page_control` & 新增实时只读 `ResearchSource`（`feat/web-closed-loop`）
+### 2026-11-13 · Wave 2 旧版 Codex 后端模块大瘦身（净减 ~67 万行）与 Web 18→11 页收敛及伪需求清理（`refactor/wave2-codex-slimming` → `v0.36.0`）
+- **背景/问题**：
+  1. 历史 Codex 迭代遗留了庞大的实验性 Route-A 25 角色运行时（`runtime_*.py`）、数据源配额网关（`source_broker*.py`、`source_quota*.py`）、信号总线与 R07 差分门禁（`signal_*.py`）、旧签名画布守护进程（`page_control*.py`）及离线 `lab_*` 形式化守护进程，造成主仓积压二十余万行不可达业务代码与四十余万行重型测试，严重拖慢研发与维护。
+  2. Web 端存在 18 个碎片化侧栏菜单及多项脱离个人单用户自用定位的「企业级/学术化伪需求」：多人 RBAC 只读访客锁（`viewer | admin` 与 `<ReadOnlyBanner />`）、独立「操作记录」审计页（`/ops`）、重复拆分的回测/实验/策略 3 个入口与长期霸屏的 `<FlowSteps />` 教学条、割裂的系统健康/任务调度/数据中心/网页 SQL 查询 4 个入口（且健康页展示已退役 Route-A 微服务表）、回测详情中的公募 FOF 风格 `Brinson 归因` / `PBO/DSR 过拟合概率` / `AI 解读`，以及拆成两个独立菜单的「因子研究」与「研报挖掘」。
+- **主要变更**：
+  1. **Web 18 → 11 页导航收敛与伪需求彻底移除**：
+     - **A1/A2（删审计与多人 RBAC）**：移除 `/ops` 页面及 `GET /api/v1/operations`；移除 `viewer | admin` 角色区分、`RQUANT_WEB_ADMINS`、`<ReadOnlyBanner />` 与 `useReadOnlyReason()`，通过网关鉴权即具备完整操作权限。
+     - **A3/B2（3 页合一为「回测」`/backtest` 并精简机构包装指标）**：将单策略回测、组合回测（原 `/experiments`）、策略版本与事件研究（原 `/strategies`）整合为 `/backtest` 页内三 Tab（`单策略回测` / `组合回测` / `策略版本`），移除 `<FlowSteps />`；保留独立 `/macro` 页，删除 `Brinson 归因`、`PBO/DSR 过拟合统计` 及 `POST /api/v1/portfolio-backtests/{run_id}/explain`（保留 `llm.py` 供自然语言转公式使用）。
+     - **A4/B1（运维与数据审计合一为「系统状态」`/health`）**：将分层健康度、关键表新鲜度、真实活跃 systemd 服务/定时器（支持点击打开日志抽屉）与数据集 Schema/覆盖率审计（原 `/data`）整合进单一 `/health` 页，剔除已废弃的 `runtime_services` 表；下线网页版 SQL 查询（`/query` 与 `/api/v1/query*`）及 `/api/v1/fundamentals` 孤立接口。
+     - **B3（因子与研报合一为「因子库」`/factor`）**：将自研因子与研报挖掘整合为 `/factor` 页内双 Tab（`自研因子` / `研报挖掘`）；为 `/experiments`、`/strategies`、`/reportmining`、`/reportfactors`、`/tasks`、`/data`、`/query` 保留前端兼容重定向，并同步重生成 OpenAPI 契约与更新 Playwright E2E 冒烟用例。
+  2. **切断生产入口中的 Route-A 钩子并完成 AST 可达性精确瘦身（净减 ~67 万行）**：
+     - 清理 `monitor.py`、`surge_watch.py`、`pre_market_check.py`、`preflight.py` 与 `cli.py`（`8,845` → `4,690` 行）中的 `legacy_shadow_export`、Route-A 权威回执校验与废弃 CLI 子命令，完整保留日度管线、盘中监控、研究湖与回补、`formal-smoke-replay`、`stage1-acceptance`、竞价池、异动监控、通知与 `notch_app` 五虎接口；严守并行边界，**零触碰** `src/rquant/l2/`、`scripts/*l2*`、`scripts/deploy-production.sh` 及 `deploy/systemd/`。
+     - 基于全量入口与受保护套件 AST 传递闭包校验，精确删除 **217 个不可达源码文件**（`src/rquant/` 约 26.6 万行）、**35 个废弃脚本**与 **372 个旧测试/辅助文件及旧分片清单**（清理 `tests/conftest.py` 中的 Route-A autouse 夹具，瘦身后全仓 `4,752` 条用例 `pytest --collect-only` 零错误收集）；同步精简 `.github/workflows/web-mvp.yml` 与手动 `.github/workflows/ci.yml`。
+- **涉及文件**：`src/rquant/{cli,monitor,pre_market_check,preflight,surge_watch}.py`、`src/rquant/web/{commands_service,models,routes,source,tasks}.py`（并删除 `ai_explain.py`、`brinson.py`、`overfit_stats.py`、`query.py` 及 217 个旧后端模块与 35 个旧脚本）、`web/src/app/{pages,routes,icons}.tsx`、`web/src/pages/{backtest,factor,health,monitor,pools,screener,stock}/`（并删除 `ops`、`experiments`、`strategies`、`tasks`、`data`、`query`、`reportmining` 独立页）、`web/src/api/{endpoints.ts,openapi.json,schema.d.ts}`、`web/e2e/smoke.spec.ts`、`tests/conftest.py`、`tests/web/*`、`tests/unit/test_{cli,monitor,preflight,surge_watch}.py`（并删除 372 个旧测试文件）、`.github/workflows/{web-mvp,ci}.yml`、`CHANGELOG.md`、`HANDOFF.md`。
+- **验证与部署状态**：`bash scripts/check-core-quality.sh` 全绿；`ruff check` 零告警；L2 套件、Web/Research 套件、Roadmap 套件与 CLI/Monitor/Preflight/SurgeWatch/Wuhu 单测全部通过；前端 `pnpm run lint`、`pnpm run typecheck`、`vitest`（31 文件 133 用例）、`vite build`、OpenAPI 契约一致性与 Playwright E2E（11 用例）全绿。合并主线并打标 `v0.36.0` 产出 `web-<sha8>` 发布包。
+
+### 2026-11-12 · Web 平台全链路读写闭环、移除告警「确认/撤销」伪需求、解耦旧 `page_control` & 新增实时只读 `ResearchSource`（`feat/web-closed-loop` → `v0.35.9`）
 - **背景/问题**：
   1. 线上 Web 原依赖冻结于 `2026-09-25` 的 Route-A `ServingSource` 快照与旧 `rquant.page_control` 模型；`rquant-web-commands` 虽然已将操作写入 JSONL，但读取端未消费，导致「加自选、保存池子（尤其默认带空格名称如 `选股 10-20` 被旧正则拒收，且未保存筛选后精确股票列表）、告警规则、操作记录」写入后均无法回显，选股方案开关也在构建中被隐藏。
   2. 旧版 Codex 引入的告警逐条「确认 / 撤销确认」（`ack` / `unack` 及总览「N 条告警未确认」横幅）属于多人值班 PagerDuty 式伪需求，不符合个人单用户盯盘场景；同时 Route-A 25 角色控制面与 `page_control` 体系过度沉重，阻碍新版 Web + Research + L2 平台敏捷演进。

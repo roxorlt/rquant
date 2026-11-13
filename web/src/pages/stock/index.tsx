@@ -1,7 +1,6 @@
 import type { ReactNode } from "react";
 import { Link, useParams } from "react-router";
 import { useAddWatch, useRemoveWatch, useStock, useWatchlist } from "@/api/endpoints";
-import { useReadOnlyReason } from "@/api/useMeta";
 import { useUrlState } from "@/app/useUrlState";
 import { poolRefLabel, triggerLabel } from "@/copy/publicText";
 import { formatFixed } from "@/format/number";
@@ -43,7 +42,6 @@ function ChartTabs({
 /** 个股档案 (F9-lite): quote, K-line, valuation, returns, fundamentals, pools, alerts. */
 export default function StockPage() {
   const { code } = useParams();
-  const readOnly = useReadOnlyReason();
   const query = useStock(code);
   const watchlist = useWatchlist();
   const addWatch = useAddWatch();
@@ -57,7 +55,6 @@ export default function StockPage() {
           Array.isArray(watchlist.data?.items) &&
           watchlist.data.items.some((item) => item.code === s.code);
         const toggleWatch = () => {
-          if (readOnly) return;
           if (inWatch) {
             removeWatch.mutate(s.code, {
               onSuccess: () => toast({ text: "已移出自选", duration: 3000 }),
@@ -87,7 +84,6 @@ export default function StockPage() {
                 <Button
                   size="sm"
                   variant={inWatch ? "quiet" : "ghost"}
-                  ariaDisabled={!!readOnly}
                   disabled={addWatch.isPending || removeWatch.isPending}
                   onClick={toggleWatch}
                 >

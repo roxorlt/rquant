@@ -33,9 +33,3 @@ export function useMeta() {
   }, [generationId, query.data, queryClient]);
   return query;
 }
-
-/** Undefined when the user may write; otherwise why not (shown on disabled buttons). */
-export function useReadOnlyReason(): string | undefined {
-  const query = useQuery({ queryKey: META_QUERY_KEY, queryFn: fetchMeta, staleTime: 15_000 });
-  return query.data?.data.role === "viewer" ? "只读账号" : undefined;
-}

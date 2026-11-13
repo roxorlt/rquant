@@ -1,7 +1,6 @@
 import { useState } from "react";
 import { Link } from "react-router";
 import {
-  useExplainBacktest,
   usePortfolioBacktest,
   usePortfolioBacktestMany,
   usePortfolioBacktests,
@@ -13,10 +12,9 @@ import { TimeChart } from "@/charts/Chart";
 import { presetLabel } from "@/copy/publicText";
 import { formatPrice } from "@/format/number";
 import { DataTable } from "@/table/DataTable";
-import { Button, ChangeText, KpiStrip, Panel, Pill } from "@/ui";
+import { Button, ChangeText, Panel, Pill } from "@/ui";
 import { StockLink } from "@/ui/StockLink";
 import { QueryView } from "../shared";
-import { BrinsonPanel } from "./Brinson";
 import { PerfPanel } from "./Perf";
 
 type Perf = components["schemas"]["BacktestPerf"];
@@ -150,46 +148,6 @@ function Compare({ ids, onRemove }: { ids: string[]; onRemove: (id: string) => v
   );
 }
 
-function Explain({ runId }: { runId: string }) {
-  const explain = useExplainBacktest();
-  const result = explain.data;
-  return (
-    <Panel
-      title="AI 解读"
-      sub="只用上面的指标；回答里的每个数字都会和指标核对"
-      actions={
-        <Button size="sm" variant="ghost" onClick={() => explain.mutate(runId)}>
-          {explain.isPending ? "解读中…" : "生成解读"}
-        </Button>
-      }
-    >
-      {explain.error ? (
-        <div className="notice crit" role="alert">
-          <span>解读没生成。解读服务暂时没有响应，回测数字不受影响。</span>
-          <span className="acts">
-            <button type="button" className="act" onClick={() => explain.mutate(runId)}>
-              重试
-            </button>
-          </span>
-        </div>
-      ) : null}
-      {result ? (
-        <>
-          {result.unverified.length ? (
-            <Pill kind="warn">{`有 ${result.unverified.length} 个数字无法核对：${result.unverified.join("、")}`}</Pill>
-          ) : (
-            <Pill kind="ok">数字已全部核对</Pill>
-          )}
-          <p aria-live="polite" style={{ whiteSpace: "pre-wrap" }}>
-            {result.text}
-          </p>
-          <span className="sub">{`模型：${result.model}`}</span>
-        </>
-      ) : null}
-    </Panel>
-  );
-}
-
 function Detail({ runId, onCompare }: { runId: string; onCompare: () => void }) {
   const query = usePortfolioBacktest(runId);
   return (
@@ -197,33 +155,6 @@ function Detail({ runId, onCompare }: { runId: string; onCompare: () => void }) 
       {(data) => (
         <>
           {data.perf ? <PerfPanel perf={data.perf} /> : null}
-          <Panel
-            title="过拟合检查"
-            sub={`同一预设已存 ${data.overfit?.trials ?? 0} 次回测，按试验数计 DSR（下限估计）`}
-            actions={
-              <Button size="sm" variant="ghost" className="touch-44" onClick={onCompare}>
-                加入对比
-              </Button>
-            }
-          >
-            <KpiStrip
-              label="过拟合指标"
-              compact
-              items={[
-                { key: "psr", label: "PSR(>0)", value: pct(data.overfit?.psr) },
-                { key: "dsr", label: "DSR", value: pct(data.overfit?.dsr) },
-                {
-                  key: "trl",
-                  label: "最短样本(95%)",
-                  value: data.overfit?.min_track_record_days ?? "—",
-                  unit: "天",
-                },
-                { key: "obs", label: "样本天数", value: data.overfit?.observations ?? "—" },
-              ]}
-            />
-          </Panel>
-          <Explain runId={runId} />
-          <BrinsonPanel runId={runId} />
           {(data.exposure ?? []).length ? (
             <Panel title="行业暴露" sub="期末权重 vs 最后一次候选池等权" flush>
               <table className="tbl" aria-label="行业暴露">
@@ -250,7 +181,16 @@ function Detail({ runId, onCompare }: { runId: string; onCompare: () => void }) 
               </table>
             </Panel>
           ) : null}
-          <Panel title={`委托 · ${data.orders?.length ?? 0}`} sub="含拒单原因" flush>
+          <Panel
+            title={`委托 · ${data.orders?.length ?? 0}`}
+            sub="含拒单原因"
+            actions={
+              <Button size="sm" variant="ghost" className="touch-44" onClick={onCompare}>
+                加入对比
+              </Button>
+            }
+            flush
+          >
             <DataTable
               label="组合回测委托"
               rows={data.orders ?? []}
@@ -477,7 +417,7 @@ export function StrategyList() {
                 header: "",
                 sortable: false,
                 value: () => null,
-                cell: () => <Link to="/backtest">看回测 →</Link>,
+                cell: () => <Link to="/backtest?tab=portfolio">看回测 →</Link>,
               },
             ]}
           />

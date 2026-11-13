@@ -15,7 +15,6 @@ from rquant.data_catalog.models import CatalogDataset
 from rquant.factor.condition import ConditionRun
 from rquant.factor.evaluation import FactorTestResult
 from rquant.factor.store import FactorTracking
-from rquant.web.overfit_stats import OverfitStats
 
 T = TypeVar("T")
 ServingState = Literal["ready", "stale", "degraded", "unavailable"]
@@ -39,9 +38,8 @@ class MetaData(BaseModel):
     generation: ServingMeta
     #: deploy-time banner (env ``RQUANT_WEB_NOTICE``), e.g. "回放数据 2026-09-25"
     notice: str | None = None
-    #: who is asking (nginx basic-auth user via X-Remote-User) and what they may do
+    #: signed-in user from nginx basic-auth via X-Remote-User
     user: str | None = None
-    role: Literal["admin", "viewer"] = "admin"
 
 
 class Kpi(BaseModel):
@@ -291,7 +289,6 @@ class PortfolioRunDetailData(BaseModel):
     perf: BacktestPerf | None
     orders: list[PortfolioOrder]
     holdings: dict[str, int]
-    overfit: OverfitStats | None = None
     exposure: list[IndustryExposure] = []
 
 
@@ -531,23 +528,6 @@ class BandData(BaseModel):
     run_id: str
     days: int
     points: list[BandPoint]
-
-
-class OperationRow(BaseModel):
-    at: datetime | None
-    kind: Literal[
-        "add_watchlist_item",
-        "remove_watchlist_item",
-        "save_alert_rule",
-        "save_canvas",
-    ]
-    summary: str
-    actor: str | None
-    command_id: str
-
-
-class OperationsData(BaseModel):
-    items: list[OperationRow]
 
 
 class SurgeEvent(BaseModel):

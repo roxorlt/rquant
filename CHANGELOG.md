@@ -6,7 +6,13 @@
 
 ### Changed
 
+- **Web 侧栏 18→11 页整合与单用户无锁化重构**：将单策略回测、组合回测（原 `/experiments`）与策略版本/事件研究（原 `/strategies`）整合进统一「回测」（`/backtest`）三 Tab；将自研因子与研报挖掘（原 `/reportmining`）整合进统一「因子库」（`/factor`）双 Tab；将分层健康度、活跃 systemd 服务/定时器（含日志抽屉，原 `/tasks`）与数据集覆盖率审计（原 `/data`）整合进统一「系统状态」（`/health`），并为全部旧路径保留前端兼容重定向。
+
 - **Web 命令服务解耦旧 `page_control`、移除告警「确认/撤销」伪需求并开启选股方案构建**：`rquant.web.commands_service` 移除对历史 `rquant.page_control` 的全部依赖，内置独立 Pydantic 校验与 `fcntl.flock` 幂等 JSONL 读写投影；移除不符合个人单用户盯盘场景的告警 `ack` / `unack` 接口、状态列与总览「未确认」横幅，顶栏铃铛改为基于本地浏览时间的当日新告警计数；`web-release.yml` 正式开启 `VITE_FEATURE_SCREENER_SCHEMES=1`；`snapshots.build_universe` 与 `load_alert_rules` 直接消费 `rquant-web-commands` 自选/自定义池子及 `market.duckdb` 选股结果。
+
+### Removed
+
+- **清理旧版 Codex 后端重型模块与 Web 企业级/学术化伪需求（净减约 67 万行代码与测试）**：切断 `cli.py`、`monitor.py`、`surge_watch.py`、`pre_market_check.py` 与 `preflight.py` 中的废弃钩子，经 AST 可达性校验移除 217 个不可达 Python 模块（Route-A `runtime_*.py` 25 角色控制面、`source_broker*.py`、`source_quota*.py`、`signal_*.py`、`page_control*.py`、离线 `lab_*` 守护进程、`overfit*.py` 等）、35 个遗留脚本及 372 个对应测试/分片清单；Web 端移除多人 RBAC 只读访客锁（`viewer | admin`、`<ReadOnlyBanner />`、`RQUANT_WEB_ADMINS`）、独立「操作记录」页（`/ops` 与 `/api/v1/operations`）、网页端 SQL 查询（`/query` 与 `/api/v1/query*`）、新手引导条 `<FlowSteps />` 及组合回测中的 `Brinson 归因`、`PBO/DSR 过拟合统计` 与 `AI 解读` 接口。
 
 - **L2 归档分片大小可诊断覆盖**：`MAX_SHARD` / `MAX_LINE` 默认 32MiB / 20MiB 保持不变，新增 `RQUANT_ARCHIVE_SHARD_BYTES` / `RQUANT_ARCHIVE_LINE_BYTES` 环境变量覆盖（仅用于诊断运行；该边界同时用于恢复校验，正常作业不要设置）。
 

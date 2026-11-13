@@ -9,7 +9,6 @@ import {
   useScreen,
   useWatchlist,
 } from "@/api/endpoints";
-import { useReadOnlyReason } from "@/api/useMeta";
 import { presetLabel } from "@/copy/publicText";
 import { formatFixed, formatPrice } from "@/format/number";
 import { DataTable } from "@/table/DataTable";
@@ -18,10 +17,8 @@ import {
   Button,
   ChangeText,
   FailureNotice,
-  FlowSteps,
   PageHeader,
   Panel,
-  ReadOnlyBanner,
   Segmented,
   useToast,
 } from "@/ui";
@@ -210,7 +207,6 @@ function watchBanner(fails: WatchFail[]): FailureCopy {
 const ALL = "__all__";
 
 export default function ScreenerPage() {
-  const readOnly = useReadOnlyReason();
   const [preset, setPreset] = useState<string>(ALL);
   const query = useScreen(preset === ALL ? null : preset);
   const savePool = useSavePool();
@@ -258,7 +254,6 @@ export default function ScreenerPage() {
     setSaveOpen(true);
   };
   const save = () => {
-    if (readOnly) return;
     const name = poolName.trim();
     if (!name) return;
     savePool.mutate(
@@ -283,7 +278,6 @@ export default function ScreenerPage() {
     );
   };
   const watch = (row: ScreenRow) => {
-    if (readOnly) return;
     addWatch.mutate(row.code, {
       onSuccess: () => {
         rememberedWatch.add(row.code);
@@ -311,20 +305,11 @@ export default function ScreenerPage() {
         title="选股器"
         note={query.data?.trade_date ?? undefined}
         actions={
-          <>
-            <FlowSteps />
-            <Button
-              onClick={openSave}
-              aria-describedby={readOnly ? "readonly-notice" : undefined}
-              ariaDisabled={!!readOnly}
-              disabled={!readOnly && presets.length === 0}
-            >
-              保存为池子
-            </Button>
-          </>
+          <Button onClick={openSave} disabled={presets.length === 0}>
+            保存为池子
+          </Button>
         }
       />
-      <ReadOnlyBanner />
       <Segmented
         label="选股方案"
         value={preset}
@@ -493,8 +478,6 @@ export default function ScreenerPage() {
                         <Button
                           size="sm"
                           variant="ghost"
-                          aria-describedby={readOnly ? "readonly-notice" : undefined}
-                          ariaDisabled={!!readOnly}
                           disabled={addWatch.isPending}
                           onClick={() => watch(row)}
                         >
@@ -514,12 +497,7 @@ export default function ScreenerPage() {
         title="保存为池子"
         label="保存为池子"
         footer={
-          <Button
-            variant="primary"
-            aria-busy={savePool.isPending || undefined}
-            ariaDisabled={!!readOnly}
-            onClick={save}
-          >
+          <Button variant="primary" aria-busy={savePool.isPending || undefined} onClick={save}>
             保存
           </Button>
         }
