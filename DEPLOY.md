@@ -5,6 +5,19 @@
 
 ---
 
+## 2026-11-16 · 已安装 · Web 独立发布 `v0.38.0`（`web-f5bd71c4`）
+
+- **状态**：已于 **2026-11-16 09:14:56 CST** 在 `82.156.0.68` 完成原子发布并自检通过。
+- **版本切换**：`/home/lighthouse/rquant-web-rel/573b25bc` → `/home/lighthouse/rquant-web-rel/f5bd71c4`（GitHub Release `web-f5bd71c4`，tag `v0.38.0`，SHA256 `5468d84fb7ea36c3117d848675f69485f54ae4829bf05c22141781241a3e2810` 核验 `OK`）。
+- **变更摘要**：上线选股器形态 B 池子节点依赖画布（`/screener?view=canvas`，适配 MacBook 触控板双指滑动平移与 pinch 缩放、节点自由拖拽、新建初始/下游节点抽屉行内编辑筛选条件、自然语言新增条件直通 `★ 我的积木`、多父节点拓扑级联求值）；修复选股器与池子页单股命中多个预设策略时的重复行问题（统一按 `ts_code` 去重并聚合来源标签），并为只读宿主目录补充 SQLite 多候选路径与 `MemorySchemeStore` 兜底。不触碰 L2 常驻组件与 `deploy/systemd/`。
+- **上线自检**：`http://127.0.0.1:8768/api/v1/meta` 返回 `200`，`state="ready"`，`generated_at="2026-11-16T01:12:48.823456Z"`，`notice=null`。
+- **回滚命令**：
+  ```bash
+  ~/bin/rquant-web-deploy --rollback   # 自动切回 /home/lighthouse/rquant-web-rel/573b25bc 并校验 /api/v1/meta
+  ```
+
+---
+
 ## 2026-11-13 · 已安装 · Web 独立发布 `v0.37.0`（`web-573b25bc`）
 
 - **状态**：已于 **2026-11-13 21:33:29 CST** 在 `82.156.0.68` 完成原子发布并自检通过。
