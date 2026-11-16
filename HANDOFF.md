@@ -9,7 +9,7 @@
 
 ## 一、项目定位与当前真实边界
 
-**rQuant** 是个人自用的 A 股量化选股、实时盯盘、告警推送与可信策略研究平台（当前主线基线标签：`v0.38.0`（L2 常驻组件仍为 v0.35.5 / 8de81101，archive 修复尚未部署））。
+**rQuant** 是个人自用的 A 股量化选股、实时盯盘、告警推送与可信策略研究平台（当前主线基线标签：`v0.38.1`（Web 已上线 `web-f5bd71c4`；L2 常驻采集核心仍为 `v0.35.5` / `8de81101`，独立归档组件 `l2-archive` 已于 2026-11-16 升级至 `f5bd71c4` 并完成新 archive epoch 初始化））。
 
 ### 1.1 核心边界
 - **只做**：盘后日线/因子/状态更新 → 条件筛选与候选池生成 → 盘中实时监控（分钟/快照/竞价/量能异动/受控 L2）→ 多通道告警通知（PushDeer / PushPlus）→ Point-in-Time（PIT）可信历史回放、策略评估与自动模拟盘。
@@ -160,6 +160,17 @@ cd notch_app && ./build.sh && ./install.sh
 > - **涉及文件**：...
 > - **验证与部署状态**：...
 > ```
+
+### 2026-11-16 · 补齐 L2 行情时间新鲜度（P0 `card-06968b3b`）收尾项：watchdog 恢复自动 resolve `DEDUP_LAG`、OpenAPI 契约同步与「滞后 vs 断线」运维手册，并同步 `l2-archive` 上线进展（`fix/l2-freshness-runbook-and-watchdog` → `v0.38.1`）
+- **背景/问题**：
+  1. 梳理 `dsh-kanban` 全部 `rQuant` 卡片时核对主仓代码发现：`card-06968b3b`（`P0 行情时间新鲜度指标与告警`）的核心字段与双连击告警虽已在 `v0.35.8`（PR `#452`）合入，但存在三处收尾遗漏：① `scripts/l2-collector-watchdog.sh` 在 `VERDICT=OK` 恢复分支仅执行了 `resolve "${DEDUP_FRESH}"` 并删除 `LAG_STATE_FILE`，遗漏了 `resolve "${DEDUP_LAG}"`（导致触发过 `service:rquant-l2-collector-lag` 后即使恢复正常也不会自动结案）；② 静态契约 `docs/l2-openapi.json` 未同步重生成，缺少 `FeedStatus.last_market_timestamp` 与 `FeedStatus.market_time_lag_ms`；③ `docs/ops/README.md` 缺少卡片要求的「滞后 `LAG` vs 断线 `STALE` / `FAILED`」故障判定与处置手册及 L2 systemd 单元表项。
+  2. 同日 `82.156.0.68` 已完成两项线上推进需同步至交接基线：① Web `v0.38.0`（`web-f5bd71c4`）已于 `09:14:56 CST` 原子切换上线；② 独立归档组件 `l2-archive` 已升级至 `f5bd71c4`（R2 验收 proof `bd3cef2b` 通过，`17:20` 归档 timer 与 `23:30` archive-gated retention 已启用）并于 `15:42 CST` 完成缓存备份（`sha d51e7aee`）与新 archive epoch 初始化（`floor=0`），同时 40 股段式写盘开盘峰值窗口（`09:30–10:00 CST`，`204,668` 批 / 30 段 / 峰值 `238.9` 批/s / 0 重连 0 错误）验证通过。
+- **主要变更**：
+  1. **修复 watchdog 滞后恢复结案闭环并支持无副作用离线单测**（`scripts/l2-collector-watchdog.sh`）：在 `OK*)` 分支补齐 `resolve "${DEDUP_LAG}"`，并以 `${VAR:-default}` 方式开放测试环境覆写（生产默认路径与 `sudo systemctl` 行为零变更）。
+  2. **同步 L2 静态 OpenAPI 契约并加装防漂移单测**（`docs/l2-openapi.json`、`tests/unit/test_l2_web.py`）：重生成 `docs/l2-openapi.json` 补齐 `last_market_timestamp` 与 `market_time_lag_ms`，在 `test_l2_web.py` 新增 `test_documented_l2_openapi_matches_standalone_app` 与 `test_l2_watchdog_lag_two_strike_alert_and_ok_resolves_both_dedup_keys`（覆盖盘外静默、首见仅落状态文件、二次连击告警、`OK` 同时 resolve 双键、`STALE` 优先于 `LAG`）。
+  3. **补齐 L2 运维手册**（`docs/ops/README.md`）：在 systemd 矩阵中补全 `rquant-l2-{collector,api,collector-watchdog,archive,retention}`，新增「滞后 `LAG` vs 断线 `STALE` / `FAILED` 判定与处置」章节（明确区分半开静默断流重连 vs 本地写盘积压切勿盲目重启丢帧造 gap vs 纯委托帧无新成交的良性状态）。
+- **涉及文件**：`scripts/l2-collector-watchdog.sh`、`docs/l2-openapi.json`、`docs/ops/README.md`、`tests/unit/test_l2_web.py`、`CHANGELOG.md`、`HANDOFF.md`。
+- **验证与部署状态**：`ruff check`、`bash scripts/check-core-quality.sh` 与全套 L2 离线门禁测试通过；严守边界，不触碰 `src/rquant/l2/`、`deploy/` 与线上常驻 L2 进程（`status.json` 新字段待后续段式写盘 / 空种子修复合并完成新一轮 `acceptance-v3` 后随 L2 组件统一上线）。
 
 ### 2026-11-13 · Wave 3.1 选股器形态 B 池子节点依赖画布上线、多预设重复标的去重与只读沙箱容错修复（`feat/pool-canvas-and-dedup` → `v0.38.0`）
 - **背景/问题**：

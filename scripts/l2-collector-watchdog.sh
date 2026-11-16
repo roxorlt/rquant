@@ -11,21 +11,20 @@
 # 告警走 rquant alert（PushDeer），带 dedup key + 15 分钟冷却，避免每 2 分钟刷屏。
 set -uo pipefail
 
-PROJECT_DIR=/home/lighthouse/rquant
-RQUANT_BIN="${PROJECT_DIR}/.venv/bin/rquant"
-UNIT="rquant-l2-collector.service"
+PROJECT_DIR="${PROJECT_DIR:-/home/lighthouse/rquant}"
+RQUANT_BIN="${RQUANT_BIN:-${PROJECT_DIR}/.venv/bin/rquant}"
+UNIT="${UNIT:-rquant-l2-collector.service}"
 STATUS_FILE="${STATUS_FILE:-/home/lighthouse/rquant-l2-state/cache/status.json}"
-LOG_FILE="${PROJECT_DIR}/logs/l2-collector-watchdog-$(date +%F).log"
+STATE_LOG_DIR="${STATE_LOG_DIR:-/home/lighthouse/rquant-l2-state/logs}"
 STALE_SECONDS="${STALE_SECONDS:-300}"
 LAG_ALERT_MS="${LAG_ALERT_MS:-30000}"
-LAG_STATE_FILE="${LAG_STATE_FILE:-/home/lighthouse/rquant-l2-state/logs/l2-collector-lag.state}"
+LAG_STATE_FILE="${LAG_STATE_FILE:-${STATE_LOG_DIR}/l2-collector-lag.state}"
 DEDUP_FAIL="service:${UNIT}"
 DEDUP_FRESH="service:rquant-l2-collector-freshness"
 DEDUP_LAG="service:rquant-l2-collector-lag"
 
-mkdir -p "${PROJECT_DIR}/logs" /home/lighthouse/rquant-l2-state/logs 2>/dev/null || true
-mkdir -p /home/lighthouse/rquant-l2-state/logs 2>/dev/null || true
-LOG_FILE=/home/lighthouse/rquant-l2-state/logs/l2-collector-watchdog-$(date +%F).log
+mkdir -p "${PROJECT_DIR}/logs" "${STATE_LOG_DIR}" 2>/dev/null || true
+LOG_FILE="${LOG_FILE:-${STATE_LOG_DIR}/l2-collector-watchdog-$(date +%F).log}"
 
 log_event() { printf '%s %s\n' "$(date -Iseconds)" "$*" >> "${LOG_FILE}"; }
 alert() {  # $1=dedup $2=subject $3=body
@@ -34,9 +33,16 @@ alert() {  # $1=dedup $2=subject $3=body
     fi
 }
 resolve() { "${RQUANT_BIN}" alert-resolve --dedup-key "$1" >/dev/null 2>&1 || true; }
+run_systemctl() {
+    if [ -n "${WATCHDOG_SYSTEMCTL:-}" ]; then
+        "${WATCHDOG_SYSTEMCTL}" "$@"
+    else
+        sudo systemctl "$@"
+    fi
+}
 
 # 交易时段 gate（timer 已限定 Mon..Fri 9..15:0/2，这里再收窄到实际盘中）
-NOW_HM=$(date +%H%M); NOW_HM_INT=$((10#${NOW_HM}))
+NOW_HM="${WATCHDOG_NOW_HM:-$(date +%H%M)}"; NOW_HM_INT=$((10#${NOW_HM}))
 IN_WINDOW=0
 # 收盘集合竞价 15:00 结束；窗口截到 15:03，避免 15:03 之后把「收盘后无数据」误报为断流
 if { [ "${NOW_HM_INT}" -ge 915 ] && [ "${NOW_HM_INT}" -le 1135 ]; } || \
@@ -46,10 +52,10 @@ fi
 if [ "${IN_WINDOW}" != 1 ]; then log_event "out-of-window"; exit 0; fi
 
 # 1) failed → 自愈一次 + 告警
-if sudo systemctl is-failed --quiet "${UNIT}"; then
+if run_systemctl is-failed --quiet "${UNIT}"; then
     log_event "unit-failed: attempting reset-failed + start"
-    sudo systemctl reset-failed "${UNIT}" || true
-    if sudo systemctl start "${UNIT}"; then
+    run_systemctl reset-failed "${UNIT}" || true
+    if run_systemctl start "${UNIT}"; then
         log_event "unit-failed: restart-ok"
         alert "${DEDUP_FAIL}" \
           "🚨 [RQ] L2 采集器失败并已自动重启" \
@@ -90,7 +96,7 @@ sudo journalctl -u ${UNIT} -n 100 --no-pager
 fi
 
 # 2) 不活跃（非 failed，例如被手工停）→ 仅告警
-if ! sudo systemctl is-active --quiet "${UNIT}"; then
+if ! run_systemctl is-active --quiet "${UNIT}"; then
     log_event "unit-inactive: alert-only"
     alert "${DEDUP_FAIL}" \
       "🚨 [RQ] L2 采集器未运行（非 failed）" \
@@ -137,7 +143,7 @@ else:
 PY
 )
 case "${VERDICT}" in
-  OK*) log_event "fresh ${VERDICT}"; resolve "${DEDUP_FRESH}"; rm -f "${LAG_STATE_FILE}" ;;
+  OK*) log_event "fresh ${VERDICT}"; resolve "${DEDUP_FRESH}"; resolve "${DEDUP_LAG}"; rm -f "${LAG_STATE_FILE}" ;;
   IDLE*) log_event "idle ${VERDICT}" ;;
   LAG*)
     log_event "lag ${VERDICT}"
