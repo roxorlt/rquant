@@ -31,6 +31,8 @@
 
 ### Fixed
 
+- **补齐 L2 行情时间新鲜度（P0）告警闭环、OpenAPI 契约同步与「滞后 vs 断线」运维手册**：修复 `scripts/l2-collector-watchdog.sh` 在行情恢复 `OK` 时仅 `alert-resolve` 传输新鲜度键（`service:rquant-l2-collector-freshness`）而遗漏解决滞后事故键（`service:rquant-l2-collector-lag`）的缺陷，并补充离线双连击触发/恢复单测；重生成 `docs/l2-openapi.json` 补齐 `FeedStatus.last_market_timestamp` 与 `FeedStatus.market_time_lag_ms` 字段并加入单元测试防漂移门禁；在 `docs/ops/README.md` 补齐 L2 受控服务/定时器矩阵及「滞后 `LAG` vs 静默断流 `STALE` vs 断线退出 `FAILED`」判定与处置手册。
+
 - **修复选股器与池子页多预设命中重复行（如单股出现多条记录）及云端只读目录 SQLite 降级故障（`v0.38.0`）**：修复 `GET /api/v1/screen`、`GET /api/v1/pools`、`screener_engine` 与前端兜底在单只股票同日命中多个预设策略时按 `(preset_name, ts_code)` 重复返回多行的问题，统一按 `ts_code` 去重并聚合展示全部命中来源标签（`presets` 数组及 `/` 分隔中文标签），`GET /api/v1/overview` 候选池计数同步改为 `count(DISTINCT ts_code)`；修复 `rquant-web` 在 `ProtectSystem=strict` + `ProtectHome=read-only` 且未配置 `RQUANT_SCREENER_SCHEMES_DB` 时打开默认 SQLite 抛 `Read-only file system` 导致 `/api/v1/screener/{catalog,run}` 报 500 降级的问题，新增多候选可写目录探测与 `MemorySchemeStore` 自动兜底。
 
 - **Web 写操作不回显、默认空格池名被拒与表格重渲染卸载修复**：打通 `GET /pools`、`GET /alert-rules`、`GET /operations` 对 `~/rquant-web-commands` JSONL 的实时回读闭环；修复选股器默认保存池名（如 `选股 10-20`）因不含空格规则被拒收、筛选结果 `codes` 与 `mode="existing"` 未保存的问题；修复 `DataTable` 在父组件查询刷新重渲染时因 `flexRender` 匿名组件包装导致单元格 DOM 节点被卸载重建的问题。

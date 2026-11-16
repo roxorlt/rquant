@@ -723,3 +723,133 @@ def test_cell_and_containing_openapi_schema_is_unchanged(tmp_path):
     payload = json.dumps(selected, sort_keys=True, separators=(",", ":")).encode()
     assert hashlib.sha256(payload).hexdigest() == "addfe6ae3e09b81a538d8a4c8720930076344bf0ebc6bafeeb5518ba31499573"
     assert not (tmp_path / "schema-only").exists()
+
+
+def test_documented_l2_openapi_matches_standalone_app(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    documented = json.loads((repo_root / "docs" / "l2-openapi.json").read_text(encoding="utf-8"))
+    app = module("api").create_app(
+        tmp_path / "cache-absent",
+        control_root=tmp_path / "control-absent",
+    )
+    generated = app.openapi()
+    feed_props = generated["components"]["schemas"]["FeedStatus"]["properties"]
+    assert "last_market_timestamp" in feed_props
+    assert "market_time_lag_ms" in feed_props
+    assert documented == generated
+    assert not (tmp_path / "cache-absent").exists()
+
+
+def test_l2_watchdog_lag_two_strike_alert_and_ok_resolves_both_dedup_keys(tmp_path: Path) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    repo_root = Path(__file__).resolve().parents[2]
+    watchdog_script = repo_root / "scripts" / "l2-collector-watchdog.sh"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    calls_file = tmp_path / "rquant_calls.jsonl"
+
+    mock_rquant = bin_dir / "mock-rquant"
+    mock_rquant.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "with open(os.environ['MOCK_CALLS_FILE'], 'a', encoding='utf-8') as fh:\n"
+        "    fh.write(json.dumps(sys.argv[1:]) + '\\n')\n",
+        encoding="utf-8",
+    )
+    mock_rquant.chmod(0o700)
+
+    mock_systemctl = bin_dir / "mock-systemctl"
+    mock_systemctl.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [ "$1" = "is-failed" ]; then exit 1; fi\n'
+        'if [ "$1" = "is-active" ]; then exit 0; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    mock_systemctl.chmod(0o700)
+
+    status_file = tmp_path / "status.json"
+    lag_state_file = tmp_path / "lag.state"
+    log_file = tmp_path / "watchdog.log"
+
+    def write_status(*, transport_age_s: int, lag_ms: int | None) -> None:
+        ts = (datetime.now(UTC) - timedelta(seconds=transport_age_s)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        status_file.write_text(
+            json.dumps(
+                {
+                    "state": "listening_candidate",
+                    "last_transport_received_at": ts,
+                    "market_time_lag_ms": lag_ms,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def run_watchdog(now_hm: str = "1005") -> None:
+        env = {
+            **os.environ,
+            "MOCK_CALLS_FILE": str(calls_file),
+            "PROJECT_DIR": str(tmp_path / "proj"),
+            "RQUANT_BIN": str(mock_rquant),
+            "WATCHDOG_SYSTEMCTL": str(mock_systemctl),
+            "STATUS_FILE": str(status_file),
+            "STATE_LOG_DIR": str(tmp_path / "state-logs"),
+            "LAG_STATE_FILE": str(lag_state_file),
+            "LOG_FILE": str(log_file),
+            "WATCHDOG_NOW_HM": now_hm,
+        }
+        res = subprocess.run(
+            ["bash", str(watchdog_script)],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert res.returncode == 0, res.stderr
+
+    def read_calls() -> list[list[str]]:
+        if not calls_file.exists():
+            return []
+        lines = calls_file.read_text(encoding="utf-8").splitlines()
+        return [json.loads(line) for line in lines if line.strip()]
+
+    # 1) Outside trading window: silent exit
+    write_status(transport_age_s=2, lag_ms=45_000)
+    run_watchdog(now_hm="1510")
+    assert read_calls() == []
+
+    # 2) First LAG observation in window: records state file, does not alert yet
+    run_watchdog(now_hm="1005")
+    assert lag_state_file.exists()
+    assert read_calls() == []
+
+    # 3) Second consecutive LAG observation within 360s: fires LAG alert
+    write_status(transport_age_s=3, lag_ms=52_000)
+    run_watchdog(now_hm="1007")
+    calls = read_calls()
+    assert len(calls) == 1
+    assert calls[0][0] == "alert"
+    assert "service:rquant-l2-collector-lag" in calls[0]
+
+    # 4) Recovery to OK: clears state file and resolves BOTH freshness and lag dedup keys
+    calls_file.unlink()
+    write_status(transport_age_s=1, lag_ms=1_200)
+    run_watchdog(now_hm="1009")
+    assert not lag_state_file.exists()
+    assert read_calls() == [
+        ["alert-resolve", "--dedup-key", "service:rquant-l2-collector-freshness"],
+        ["alert-resolve", "--dedup-key", "service:rquant-l2-collector-lag"],
+    ]
+
+    # 5) Stale transport takes precedence over lag and alerts on freshness dedup key
+    calls_file.unlink()
+    write_status(transport_age_s=600, lag_ms=45_000)
+    run_watchdog(now_hm="1011")
+    stale_calls = read_calls()
+    assert len(stale_calls) == 1
+    assert stale_calls[0][0] == "alert"
+    assert "service:rquant-l2-collector-freshness" in stale_calls[0]
+

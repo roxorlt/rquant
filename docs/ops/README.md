@@ -62,6 +62,9 @@ Host rquant 82.156.0.68
 | ↳ `rquant-snapshot-collector.service.d/surge-push.conf` | — | sets `SURGE_PUSH_ENV_FILE` (PushDeer key names read from `~/rquant/.env`) for the in-collector surge scanner | `deploy/systemd/rquant-snapshot-collector.service.d/` |
 | `rquant-auction-pool-candidates.timer` / `rquant-auction-pool-pick.timer` / `rquant-auction-pool-attrib.timer` | Mon-Fri **08:40** / **09:26:30** / **09:27** | 竞价选股 pool: T-1 candidates (limit-up non-一字, 封单/流通市值 ≤0.94%, non-ST/BJ; plus `base` = same without the seal filter), then rt_k auction picks at 09:26:30 after the auction settles (gap ≥5.37% incl. auction at limit-up — flagged `limit_open`, badge 竞价涨停, top 3 by auction vol) and `ths_screen` (raw 同花顺 screen: gap >4%, top 5 by vol, 一字 flagged) → `pools/auction/YYYY-MM-DD.json`; 09:27 attribution (`rquant.research.auction_attrib`: Tushare ths_member/ths_index concepts + major_news, Eastmoney news/announcements, DeepSeek via `/etc/rquant-web.secrets.env` or `~/rquant/.env`) stored as `attribution`, shown on the 池子 page and pushed once via PushDeer (`pushed_at`); collector universe (top priority, reloaded 09:26:45), surge push ★ first | `deploy/systemd/`, `rquant.research.auction_pool`, `rquant.research.auction_attrib` |
 | `rquant-snapshot-archive.timer` | Mon-Fri **16:20** | tar.gz finished day dirs → R2, verify, prune >14d (verified only) | `deploy/systemd/` |
+| `rquant-l2-collector.service` / `rquant-l2-api.service` | trading session / always on (`127.0.0.1:8771`) | controlled single-session raw L2 collector + loopback HTTP/WS API (`~/rquant-l2-rel/current`, 20-stock baseline) | `deploy/systemd/`, `rquant.l2` |
+| `rquant-l2-collector-watchdog.timer` | Mon-Fri **09:15–11:35, 12:55–15:03** (every 2m) | L2 self-heal (`failed` → reset+start once) + transport `STALE` (`>300s`) + 2-strike market event `LAG` (`>30s`) PushDeer alert | `deploy/systemd/`, `scripts/l2-collector-watchdog.sh` |
+| `rquant-l2-archive.timer` / `rquant-l2-retention.timer` | Mon-Fri **17:20** / daily **23:30** | L2 raw cache → Cloudflare R2 verified archive (`rquant.l2.archive`) + archive-gated cold-store/retention (`rquant.l2.retention`) | `deploy/systemd/`, `rquant.l2` |
 | `rquant-artifact-retention.timer` | every 5 min | artifact tiering/GC | `deploy/systemd/` |
 
 Also on the server (user crontab, not systemd): `~/itick_probe` collect 09:10 / stop 15:12 / report 15:20.
@@ -140,6 +143,47 @@ it never stops collection.
   (`rquant.research.auction`; columns documented in the module). Manual:
   `.venv/bin/python -m rquant.research.auction ~/rquant-research/snapshots/2026-10-12`.
 
+## L2 raw feed & watchdog runbook（滞后 `LAG` vs 断线 `STALE` / `FAILED` 判定与处置）
+
+`rquant-l2-collector.service` maintains the single authorized upstream session (never run parallel stage collectors sharing the same vendor device credentials during live trading). `rquant-l2-collector-watchdog.timer` executes `scripts/l2-collector-watchdog.sh` every 2 minutes in trading windows (`09:15–11:35`, `12:55–15:03` CST) and classifies incidents into three distinct failure modes:
+
+| Failure mode | Alert `dedup-key` | Trigger condition | What is actually broken |
+|---|---|---|---|
+| **断线 / 进程退出 (`FAILED` / `INACTIVE`)** | `service:rquant-l2-collector.service` | `systemctl is-failed` or `! systemctl is-active` | Upstream closed (`peer_closed`, `transport_error`), protocol/cache error, or manual stop |
+| **静默断流 (`STALE`)** | `service:rquant-l2-collector-freshness` | Process is `active`, `state` in active set, `now - last_transport_received_at > 300s` (`STALE_SECONDS`) | Half-open TCP / upstream silent drop: neither market frames nor heartbeats are arriving |
+| **行情时间滞后 (`LAG`)** | `service:rquant-l2-collector-lag` | Process is `active`, transport is fresh (`age ≤ 300s`), AND `market_time_lag_ms > 30000` (`LAG_ALERT_MS`) on **2 consecutive** checks (`≤ 360s` apart) | Frames keep arriving (`cache_stale=false`), so legacy transport-only checks look `OK`, **but** in-frame trade event timestamps (`34320`) lag behind `received_at` |
+
+### 1. 判定步骤（先区分「断线/静默断流」还是「消费积压滞后」）
+
+Run two status snapshots 10 seconds apart on `82.156.0.68`:
+
+```bash
+for i in 1 2; do
+  curl -s http://127.0.0.1:8771/api/v1/l2/status | \
+    python3 -m json.tool | grep -E '"(state|error_code|gap|last_sequence|heartbeat_count|last_transport_received_at|last_market_received_at|last_market_timestamp|market_time_lag_ms)"'
+  [ "$i" -eq 1 ] && sleep 10
+done
+sudo systemctl status rquant-l2-collector.service --no-pager -n 25
+```
+
+- **Case A — `FAILED` / `INACTIVE`（进程退出）**：
+  - `systemd` `Restart=on-failure` (`RestartSec=10s`, `StartLimitBurst=3` / `300s`) handles transient drops; if burst-limited into `failed`, watchdog runs `reset-failed + start` once. If `inactive` (manual stop), watchdog alerts only and **never** auto-starts.
+  - Check `error_code` in `status.json` and `sudo journalctl -u rquant-l2-collector.service -n 80 --no-pager`:
+    - `peer_closed` / `transport_error`: verify no local/stage test session is competing for the same vendor account, then `sudo systemctl start rquant-l2-collector.service`.
+    - `cache_error` / `byte_limit`: check `df -h /home/lighthouse` (collector enforces a 5 GiB free-space reserve) before restarting.
+
+- **Case B — `STALE`（静默断流：传输时间与心跳全停）**：
+  - Both snapshots show identical `last_transport_received_at`, `last_sequence`, and `heartbeat_count` during active market hours (`09:30–11:30`, `13:00–15:00`).
+  - **Action**: force a clean reconnect with `sudo systemctl restart rquant-l2-collector.service` (this records an explicit `gap=true` in the cache; never edit batch files to hide gaps). Confirm `state` returns to `seeded_waiting` / `listening_candidate` within 60s; the next `OK` watchdog tick automatically runs `rquant alert-resolve --dedup-key service:rquant-l2-collector-freshness`.
+
+- **Case C — `LAG`（行情滞后：连接不断、序号在涨，但帧内行情时间落后）**：
+  - `last_transport_received_at` is current (`age` is 0–5s), **do NOT confuse with `STALE`**:
+    1. **`last_sequence` is climbing rapidly AND `market_time_lag_ms` keeps growing** (e.g. 2026-11-06 incident where per-batch `fsync` ~6.9 ms caused 10.6 min socket backlog): local disk write / `fsync` cannot keep up with upstream push rate, so frames queue in kernel/vendor buffers.
+       - Inspect host I/O contention first: `iostat -xz 1 3` and `systemctl status rquant-research.slice rquant-maintenance.slice` (stop any unscheduled heavy disk job).
+       - **Do NOT blindly restart if lag is already plateauing or draining** (e.g. post-open 10:00+): keeping the TCP session alive drains queued frames losslessly, whereas restarting drops all queued upstream frames and creates an unrecoverable `gap`. Only restart (`sudo systemctl restart rquant-l2-collector.service`) if lag exceeds ~5 minutes, continues diverging, and live consumers require current-time quotes over completeness.
+    2. **`last_sequence` barely moves (only `4027` order frames arriving, no new `4013` trade frames)**: `last_market_timestamp` only updates on `4013` trade pages; illiquid stretches with order-only pushes are benign and self-clear on the next trade without intervention.
+  - Once `market_time_lag_ms <= LAG_ALERT_MS` and transport is fresh (`OK`), watchdog clears `l2-collector-lag.state` and resolves **both** `service:rquant-l2-collector-freshness` and `service:rquant-l2-collector-lag`.
+
 ## Data dirs (server)
 
 | Path | Contents |
@@ -147,6 +191,7 @@ it never stops collection.
 | `~/rquant-research/` (`RQUANT_RESEARCH_ROOT`) | research root: `market.duckdb`, `intraday.duckdb`, `factor/`, `condition/`, `strategy/`, … |
 | `~/rquant-research/snapshots/YYYY-MM-DD/` | L1 snapshots (`quotes.parquet`, ticks); `.r2_archived.json` once in R2 |
 | `~/rquant-research/minute_backfill/` | minute backfill `staging/`, `done/`, `done-daily/`, `backfill.log` |
+| `~/rquant-l2-rel/` / `~/rquant-l2-state/` | controlled L2 component releases (`current` symlink) & runtime state (`cache/`, `control/`, `capacity.json`, `logs/`, `cold/`) |
 | `/var/lib/rquant/` | runtime-authority, receipt signer, lab-highwater, shadow-recovery |
 | `~/rquant-web-rel/` | code releases (`current` symlink) |
 

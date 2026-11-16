@@ -176,6 +176,18 @@
             ],
             "title": "Last Market Received At"
           },
+          "last_market_timestamp": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Market Timestamp"
+          },
           "last_sequence": {
             "default": 0,
             "minimum": 0.0,
@@ -199,6 +211,18 @@
             "minimum": 0.0,
             "title": "Market Batch Count",
             "type": "integer"
+          },
+          "market_time_lag_ms": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Market Time Lag Ms"
           },
           "mode": {
             "const": "seed_then_passive_listen_candidate",
