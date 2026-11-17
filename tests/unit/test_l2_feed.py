@@ -1278,3 +1278,76 @@ def test_status_carries_candidate_market_freshness_fields() -> None:
     assert payload["last_market_timestamp"].startswith("2026-10-")
     assert "last_market_timestamp" in FeedStatus.model_fields
     assert "market_time_lag_ms" in FeedStatus.model_fields
+
+
+def test_throttled_status_skips_repeated_candidate_push_snapshots(tmp_path: Path) -> None:
+    """Fast mode must not write status for every candidate_push frame.
+
+    A candidate_push sets state/subscription_state on every frame; forcing a
+    snapshot per frame would keep the batch-directory fsync cost in the write
+    path.  Only value changes may flush.
+    """
+    from rquant.l2.cache import RawL2Cache
+
+    class CountingCache(RawL2Cache):
+        writes = 0
+
+        def write_status(self, status):  # type: ignore[no-untyped-def]
+            CountingCache.writes += 1
+            return super().write_status(status)
+
+    def run(interval: float, name: str) -> int:
+        clock = Clock()
+        provider = Provider(clock)
+        cache = CountingCache(tmp_path / name)
+        obj, _, _ = _collector_with_inputs(tmp_path, provider, clock, cache=cache,
+                                           status_flush_interval=interval)
+        obj.run()
+        writes = CountingCache.writes
+        CountingCache.writes = 0
+        return writes
+
+    legacy = run(0.0, "legacy")
+    throttled = run(60.0, "throttled")
+    assert throttled < legacy
+    assert throttled <= 8
+
+def test_cache_failure_records_diagnostic_side_file(tmp_path: Path) -> None:
+    from rquant.l2.cache import CacheError
+    from rquant.l2.cache import RawL2Cache as _RawL2Cache
+
+    class BrokenCache(_RawL2Cache):
+        def append(self, observation):  # type: ignore[no-untyped-def]
+            raise CacheError("disk_full", "free=0 needed=1234")
+
+    clock = Clock()
+    provider = Provider(clock)
+    cache = BrokenCache(tmp_path / "broken-cache")
+    obj, _, _ = _collector_with_inputs(tmp_path, provider, clock, cache=cache)
+    status = obj.run()
+    assert status.error_code == "cache_error"
+
+    detail = json.loads((tmp_path / "broken-cache" / ".last-cache-error.json").read_text())
+    assert detail["code"] == "disk_full"
+    assert detail["detail"] == "free=0 needed=1234"
+
+
+def test_subscription_receipt_cache_failure_records_diagnostic_side_file(tmp_path: Path) -> None:
+    from rquant.l2.cache import CacheError
+    from rquant.l2.cache import RawL2Cache as _RawL2Cache
+
+    class BrokenReceiptCache(_RawL2Cache):
+        def write_subscription_status(self, receipt):  # type: ignore[no-untyped-def]
+            raise CacheError("io_error", "errno=5")
+
+    clock = Clock()
+    provider = Provider(clock)
+    cache = BrokenReceiptCache(tmp_path / "broken-receipt-cache")
+    obj, _, _ = _collector_with_inputs(tmp_path, provider, clock, cache=cache)
+    status = obj.run()
+    assert status.error_code == "cache_error"
+
+    detail = json.loads((tmp_path / "broken-receipt-cache" / ".last-cache-error.json").read_text())
+    assert detail["code"] == "io_error"
+    assert detail["detail"] == "errno=5"
+

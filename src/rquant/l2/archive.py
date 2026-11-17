@@ -22,7 +22,7 @@ from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, model_validator
 
-from rquant.l2.cache import RawL2Cache
+from rquant.l2.cache import CacheError, RawL2Cache
 from rquant.l2.models import EpochId, ErrorCode, FeedStatus, RawL2Batch, Sha256
 from rquant.research.snapshot_archive import R2
 
@@ -246,7 +246,14 @@ def _observation(status: FeedStatus) -> SourceObservation:
 
 
 def _batch(cache: RawL2Cache, sequence: int) -> RawL2Batch:
-    # The existing bounded reader avoids read_batches' incidental moving-tail status read.
+    # Backend-neutral read: segmented logs go through read_one, the legacy
+    # directory layout keeps the original bounded _read_batch path (its error
+    # codes are asserted by the archive tests).
+    if (cache.root / ".layout").exists():
+        batch = cache.read_one(sequence)
+        if batch is None:
+            raise CacheError("invalid_batch")
+        return batch
     return cache._read_batch(cache.root / "batches" / f"{sequence:020d}", sequence)
 
 

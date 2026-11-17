@@ -149,11 +149,47 @@ class HotUsage:
     head_link: int | None
 
 
+def _segments_layout(root: Path) -> bool:
+    return (Path(root) / ".layout").exists()
+
+
+def _segments_hot_usage(root: Path, floor: int) -> HotUsage:
+    from .segment_log import SegmentError, load_snapshot, segments_dir
+
+    try:
+        snapshot = load_snapshot(root)
+    except SegmentError:
+        raise RetentionError("io_error") from None
+    seg = segments_dir(root)
+    allocated = 0
+    logical = 0
+    try:
+        with os.scandir(seg) as entries:
+            for entry in entries:
+                info = entry.stat(follow_symlinks=False)
+                if entry.is_dir(follow_symlinks=False):
+                    raise RetentionError("unsafe_path")
+                allocated += info.st_blocks * 512
+                if entry.name.endswith((".l2s", ".idx")):
+                    logical += info.st_size
+    except OSError:
+        raise RetentionError("io_error") from None
+    head = snapshot.committed_through
+    newest = snapshot.last_received_at
+    if newest is None and head:
+        newest = _try_read_received_at(root, head)
+    return HotUsage(floor=floor, head=head, batches=snapshot.committed_records,
+                    allocated_bytes=allocated, logical_bytes=logical,
+                    newest_received_at=newest, head_link=None)
+
+
 def hot_usage(cache_root: Path) -> HotUsage:
     """Measure the hot cache tree; logical bytes are ``batch.json`` payloads."""
     root = Path(cache_root)
-    batches = root / "batches"
     floor = read_floor(root)
+    if _segments_layout(root):
+        return _segments_hot_usage(root, floor)
+    batches = root / "batches"
     if not batches.is_dir():
         return HotUsage(floor=floor, head=floor, batches=0, allocated_bytes=0,
                         logical_bytes=0, newest_received_at=None, head_link=None)
@@ -567,6 +603,8 @@ def _prune_hot_prefix(cache_root: Path, through: int, *, reason: str,
                       now: datetime) -> tuple[int, int]:
     """Delete ``batches/floor+1..through`` after publishing the new floor."""
     root = Path(cache_root)
+    if _segments_layout(root):
+        return _prune_hot_prefix_segments(root, through, reason=reason, now=now)
     batches = root / "batches"
     floor = read_floor(root)
     if through < 1:
@@ -626,6 +664,87 @@ def _prune_hot_prefix(cache_root: Path, through: int, *, reason: str,
     finally:
         os.close(lock)
     return deleted, allocated
+
+
+def _prune_hot_prefix_segments(root: Path, through: int, *, reason: str,
+                               now: datetime) -> tuple[int, int]:
+    """Retire whole closed segments at or below ``through`` (active segment kept)."""
+    import tempfile as _tempfile
+
+    from .segment_log import SegmentEntry, SegmentError, read_index, segments_dir
+
+    floor = read_floor(root)
+    if through < 1:
+        return 0, 0
+    lock = os.open(root / ".writer.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    deleted = 0
+    allocated = 0
+    try:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RetentionError("writer_active") from None
+        target = max(through, floor)
+        if through > floor:
+            write_floor(root, through, reason=reason, now=now)
+        try:
+            entries = read_index(root)
+        except SegmentError:
+            raise RetentionError("io_error") from None
+        segment_dir = segments_dir(root)
+        keep: list[SegmentEntry] = []
+        removed: list[SegmentEntry] = []
+        for entry in entries:
+            (removed if entry.last_sequence <= target else keep).append(entry)
+        for entry in removed:
+            path = segment_dir / entry.file
+            try:
+                info = path.lstat()
+                allocated += info.st_blocks * 512
+                index_path = path.with_name(path.name + ".idx")
+                if index_path.exists():
+                    allocated += index_path.lstat().st_blocks * 512
+                path.unlink(missing_ok=True)
+                index_path.unlink(missing_ok=True)
+            except OSError:
+                raise RetentionError("io_error") from None
+            deleted += entry.records
+        if removed:
+            index_file = segment_dir / "index.jsonl"
+            payload = b"".join(
+                json.dumps({
+                    "file": entry.file, "first_sequence": entry.first_sequence,
+                    "last_sequence": entry.last_sequence, "records": entry.records,
+                    "bytes": entry.bytes, "closed_at_ns": entry.closed_at_ns,
+                }, sort_keys=True).encode() + b"\n"
+                for entry in keep)
+            fd, name = _tempfile.mkstemp(prefix=".index-", dir=segment_dir)
+            temporary = Path(name)
+            try:
+                with os.fdopen(fd, "wb") as stream:
+                    stream.write(payload)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, index_file)
+                temporary = None
+                dir_fd = os.open(segment_dir, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+    finally:
+        os.close(lock)
+    return deleted, allocated
+
+
+def _hot_allocated(cache_root: Path) -> int:
+    root = Path(cache_root)
+    if _segments_layout(root):
+        return hot_usage(root).allocated_bytes
+    return allocated_bytes(root / "batches")
 
 
 def _evict_cold_segments(cold_root: Path, files: tuple[str, ...], *, now: datetime) -> int:
@@ -770,7 +889,7 @@ def run_retention(
 
     if compact_blocked is not None:
         plan = replace(plan, blockers=plan.blockers + (compact_blocked,))
-    hot_after = (allocated_bytes(Path(cache_dir) / "batches") if not dry_run
+    hot_after = (_hot_allocated(cache_dir) if not dry_run
                  else plan.hot_allocated_bytes)
     cold_after = (sum(entry.stored_bytes for entry in load_manifest(cold_dir).segments)
                   if cold_dir.exists() else 0)

@@ -56,6 +56,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--status-flush-interval", type=float, default=0.0,
                         help="minimum seconds between non-transition status.json snapshots "
                              "(0 keeps the legacy per-update snapshot); 80-stock windows should use 1.0")
+    parser.add_argument("--write-mode", choices=("batches", "segments"), default=None,
+                        help="cache write backend; default auto-detects from .layout "
+                             "(fresh caches use batches unless set to segments)")
+    parser.add_argument("--segment-commit-every", type=int, default=256,
+                        help="segments backend: commit every N batches")
+    parser.add_argument("--segment-commit-ms", type=float, default=200.0,
+                        help="segments backend: max milliseconds between commits")
+    parser.add_argument("--segment-mb", type=int, default=64,
+                        help="segments backend: rotate a segment after N MiB")
+    parser.add_argument("--segment-seconds", type=float, default=60.0,
+                        help="segments backend: rotate a segment after N seconds")
     parser.add_argument("--frame-tap-dir", type=Path,
                         help="record raw frames into a new child directory (also enabled by "
                              "RQUANT_L2_FRAME_TAP=1 + RQUANT_L2_FRAME_TAP_DIR)")
@@ -67,6 +78,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     if (not math.isfinite(args.status_flush_interval)
             or not 0 <= args.status_flush_interval <= 60):
         parser.error("invalid status flush interval")
+    if not 1 <= args.segment_commit_every <= 1_000_000:
+        parser.error("invalid segment commit size")
+    if not math.isfinite(args.segment_commit_ms) or not 0 <= args.segment_commit_ms <= 5000:
+        parser.error("invalid segment commit interval")
+    if not 1 <= args.segment_mb <= 1024:
+        parser.error("invalid segment size")
+    if not math.isfinite(args.segment_seconds) or not 1 <= args.segment_seconds <= 3600:
+        parser.error("invalid segment rotation seconds")
     if (not math.isfinite(args.duration_seconds) or not 0 < args.duration_seconds <= 21600
             or not math.isfinite(args.reconnect_delay_seconds) or args.reconnect_delay_seconds < 60):
         parser.error("invalid duration or reconnect delay")
@@ -111,7 +130,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         from rquant.l2.feed import FeedCollector
 
         collector = FeedCollector(
-            RawL2Cache(args.cache_root, group_commit=args.commit_group),
+            RawL2Cache(args.cache_root, group_commit=args.commit_group,
+                       write_mode=args.write_mode,
+                       segment_commit_every=args.segment_commit_every,
+                       segment_commit_interval=args.segment_commit_ms / 1000.0,
+                       segment_bytes=args.segment_mb * 1024 * 1024,
+                       segment_seconds=args.segment_seconds),
             bootstrap_path=args.bootstrap_file,
             order_template_path=args.order_template, trade_template_path=args.trade_template,
             duration_seconds=None if args.resident else args.duration_seconds, trade_pages=args.trade_pages,

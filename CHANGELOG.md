@@ -6,6 +6,8 @@
 
 ### Changed
 
+- **L2 段式 append 写盘后端（`--write-mode segments`，默认关闭）**：新增段式日志后端（`rquant.l2.segment_log`）——批次以 zlib-1 压缩的规范 JSON 追加进大段文件，每 N 批 / T 毫秒写一次链式 sha256 commit 并仅 fsync 一次；每段生成稀疏 `.idx` 检查点，`head.json` 暴露 `committed_offset` / `committed_records`；崩溃恢复自动将撕裂尾截断至最后一个合法 commit；同顺手修复 `status_flush_interval > 0` 快模式下每帧 `candidate_push` 重复强制刷写 `status.json` 的 fsync 瓶颈。服务器真实盘 2 万批基准 3,837–4,644 批/s、每批 fsync 0.004–0.025 次、崩溃重开 6–10 ms、9.3KB 批压至 2,136B；回放门禁 segments 后端 9/9 通过，40 股周一开盘峰值真实窗口（09:30–10:00，`204,668` 批 / 峰值 `238.9` 批/s / 0 重连 0 错误）验证通过。`RawL2Cache`/CLI 与读路径（API/归档/冷存/保留/回放门禁）按 `.layout` 自动分派，默认仍保持原批次目录后端。
+
 - **Web 选股器升级为形态 A 级联工作台（`/screener`）**：将原仅针对落盘候选池的客户端简单数值过滤升级为前后端联动的实时积木选股工作台，支持全市场 A 股 / 今日候选池 / 预设 / 自定义与竞价池 / 自选股输入范围切换与并集、交集、排除集合运算，选股方案持久化平滑扩展 `upstream_json` 与 `blocks_json`（兼容旧版 4 列 SQLite 表并预留形态 B DAG 画布节点结构），交互全面适配 MacBook 触控板。
 
 - **Web 侧栏 18→11 页整合与单用户无锁化重构**：将单策略回测、组合回测（原 `/experiments`）与策略版本/事件研究（原 `/strategies`）整合进统一「回测」（`/backtest`）三 Tab；将自研因子与研报挖掘（原 `/reportmining`）整合进统一「因子库」（`/factor`）双 Tab；将分层健康度、活跃 systemd 服务/定时器（含日志抽屉，原 `/tasks`）与数据集覆盖率审计（原 `/data`）整合进统一「系统状态」（`/health`），并为全部旧路径保留前端兼容重定向。
@@ -30,6 +32,8 @@
 - **L2 字节预算候选（未部署）**：已识别sentinel成交与委托按完整列结构及1 MiB二进制/逻辑数据边界接入，保留查询500/20行预算和旧小批次兼容；在分配嵌套单元格前检查形状。候选缓存/归档单记录20 MiB、批次页24 MiB，保持完整游标和原子提交。归档验证器逐批及逐行比较固定四批，避免单页和全量内存假设。Linux资源、实际HTTP/WS、归档384 MiB和新源码树R2门禁仍待通过；不重启现有核心。
 
 ### Fixed
+
+- **L2 采集器重启恢复有界化与写盘异常可诊断化**：目录后端且 `.head` 有效、批数 ≥10,000 时，启动恢复仅扫描目录名并完整重验末尾 64 批，实测 `1,878,612` 批缓存恢复从全量审计约 528 秒降至 **2.0 秒**（不一致自动回退全量审计）；`CacheError` 增加 `detail` 诊断信息（细分 `disk_full` / `io_error` / `permission` / `out_of_memory`），缓存写入/状态/订阅回执异常时落盘 `.last-cache-error.json`，同时保持 `status.json` 的 `error_code="cache_error"` 兼容外部 schema。
 
 - **补齐 L2 行情时间新鲜度（P0）告警闭环、OpenAPI 契约同步与「滞后 vs 断线」运维手册**：修复 `scripts/l2-collector-watchdog.sh` 在行情恢复 `OK` 时仅 `alert-resolve` 传输新鲜度键（`service:rquant-l2-collector-freshness`）而遗漏解决滞后事故键（`service:rquant-l2-collector-lag`）的缺陷，并补充离线双连击触发/恢复单测；重生成 `docs/l2-openapi.json` 补齐 `FeedStatus.last_market_timestamp` 与 `FeedStatus.market_time_lag_ms` 字段并加入单元测试防漂移门禁；在 `docs/ops/README.md` 补齐 L2 受控服务/定时器矩阵及「滞后 `LAG` vs 静默断流 `STALE` vs 断线退出 `FAILED`」判定与处置手册。
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import hashlib
 import json
@@ -18,6 +19,11 @@ from pathlib import Path
 from threading import Lock
 
 from rquant.l2.models import BatchPage, FeedStatus, MarketObservation, RawL2Batch, SubscriptionReceipt
+from rquant.l2.segment_log import (
+    SegmentError, SegmentWriter, iter_payloads as segment_iter_payloads,
+    layout_path, load_snapshot as segment_snapshot, read_layout,
+    read_payload as segment_read_payload, read_payload_bytes as segment_read_payload_bytes,
+)
 
 _ACTIVE = {"starting", "connected", "seeded_waiting", "listening_candidate"}
 _STALE_SECONDS = 60
@@ -40,9 +46,26 @@ def _INTERNAL_BATCH_NAME(name: str) -> bool:
 
 
 class CacheError(RuntimeError):
-    def __init__(self, code: str) -> None:
+    def __init__(self, code: str, detail: str | None = None) -> None:
         self.code = code
+        self.detail = detail
         super().__init__(code)
+
+
+_ERRNO_CODES = {
+    errno.ENOSPC: "disk_full",
+    errno.EDQUOT: "disk_full",
+    errno.EIO: "io_error",
+    errno.EACCES: "permission",
+    errno.EPERM: "permission",
+    errno.ENOMEM: "out_of_memory",
+}
+
+
+def _cache_io_error(error: BaseException, action: str) -> CacheError:
+    """Map an OSError to a fixed, diagnosable cache error code."""
+    code = _ERRNO_CODES.get(getattr(error, "errno", None), "cache_io")
+    return CacheError(code, f"{action}:errno={getattr(error, 'errno', None)}")
 
 
 def _directory(path: Path) -> None:
@@ -53,8 +76,10 @@ def _directory(path: Path) -> None:
 def read_floor(root: Path) -> int:
     """Return the retired prefix length; 0 when no marker exists."""
     root = Path(root)
-    path = root / "batches" / FLOOR_NAME
-    if root.is_symlink() or (root / "batches").is_symlink() or path.is_symlink():
+    segments_layout = layout_path(root).exists()
+    path = root / FLOOR_NAME if segments_layout else root / "batches" / FLOOR_NAME
+    if root.is_symlink() or path.is_symlink() or (
+            not segments_layout and (root / "batches").is_symlink()):
         raise CacheError("unsafe_path")
     try:
         info = path.lstat()
@@ -79,7 +104,8 @@ def write_floor(root: Path, pruned_through: int, *, reason: str,
                 now: datetime | None = None, extra: dict | None = None) -> None:
     """Atomically publish the retired prefix marker."""
     root = Path(root)
-    batches = root / "batches"
+    segments_layout = layout_path(root).exists()
+    batches = root if segments_layout else root / "batches"
     if type(pruned_through) is not int or not 1 <= pruned_through < 10**20:
         raise ValueError("invalid pruned sequence")
     if root.is_symlink() or batches.is_symlink():
@@ -181,8 +207,26 @@ def _replace_snapshot(root: Path, name: str, payload: bytes) -> None:
 
 
 class RawL2Cache:
-    def __init__(self, root: Path, *, group_commit: int = 0) -> None:
+    def __init__(self, root: Path, *, group_commit: int = 0,
+                 write_mode: str | None = None,
+                 segment_commit_every: int = 256,
+                 segment_commit_interval: float = 0.2,
+                 segment_bytes: int = 64 * 1024 * 1024,
+                 segment_seconds: float = 60.0) -> None:
         self.root = Path(root)
+        detected = read_layout(self.root)
+        if write_mode is None:
+            write_mode = detected or "batches"
+        if write_mode not in ("batches", "segments"):
+            raise ValueError("invalid cache write mode")
+        if detected is not None and detected != write_mode:
+            raise CacheError("layout_mismatch")
+        self._segments_mode = write_mode == "segments"
+        self._segment_commit_every = segment_commit_every
+        self._segment_commit_interval = segment_commit_interval
+        self._segment_bytes = segment_bytes
+        self._segment_seconds = segment_seconds
+        self._segment_writer: SegmentWriter | None = None
         # ``group_commit >= 2`` batches the *directory* fsync of every N published
         # batches into one: each batch keeps its own two file fsyncs plus the
         # pending-directory fsync (crash safety), but the rename of the N batch
@@ -216,6 +260,9 @@ class RawL2Cache:
             except BlockingIOError:
                 raise CacheError("writer_busy") from None
             self._writer_fd = fd
+            if self._segments_mode:
+                yield from self._writer_segment()
+                return
             batches = self.root / "batches"
             batches.mkdir(mode=0o700, exist_ok=True)
             _directory(batches)
@@ -225,20 +272,27 @@ class RawL2Cache:
                         shutil.rmtree(item, ignore_errors=True)
             except OSError:
                 raise CacheError("cache_io") from None
-            committed = self._directories()
             floor = self._floor_sequence()
-            for offset, directory in enumerate(committed):
-                self._last_received_at = self._read_batch(directory, floor + 1 + offset).received_at
-            self._highwater = floor + len(committed)
-            if committed:
-                try:
-                    head = self._published_head()
-                except CacheError:
-                    head = None  # a crash left .head pointing at a retired directory
-                if head is None or head[0] != self._highwater:
-                    (batches / ".head").unlink(missing_ok=True)
-                    self._publish_head(committed[-1])
-                    _fsync_dir(batches)
+            bounded = self._recover_bounded(floor)
+            if bounded is not None:
+                self._highwater, self._last_received_at = bounded
+                committed = ()
+                head_ok = True
+            else:
+                committed = self._directories()
+                self._highwater = floor + len(committed)
+                head_ok = False
+                if committed:
+                    head_ok = self._recover_from_published_head(committed, floor)
+            if committed and not head_ok:
+                # No usable .head: audit every raw record before accepting the
+                # cache (legacy caches only; production writes .head on publish).
+                for offset, directory in enumerate(committed):
+                    self._last_received_at = self._read_batch(
+                        directory, floor + 1 + offset).received_at
+                (batches / ".head").unlink(missing_ok=True)
+                self._publish_head(committed[-1])
+                _fsync_dir(batches)
             previous = self.read_status()
             if previous.state in _ACTIVE or committed:
                 self.write_status(previous.model_copy(update={
@@ -261,6 +315,157 @@ class RawL2Cache:
             self._last_received_at = None
             if fd is not None:
                 os.close(fd)
+
+    def _writer_segment(self) -> Iterator[RawL2Cache]:
+        writer = SegmentWriter(self.root,
+                               commit_every_batches=self._segment_commit_every,
+                               commit_interval_seconds=self._segment_commit_interval,
+                               segment_bytes=self._segment_bytes,
+                               segment_seconds=self._segment_seconds)
+        try:
+            writer.open()
+        except SegmentError as error:
+            raise CacheError("invalid_cache" if error.code.startswith("invalid")
+                             or error.code in ("sequence_gap", "missing_segment",
+                                               "missing_footer", "duplicate_segment")
+                             else "cache_io") from None
+        except OSError:
+            raise CacheError("cache_io") from None
+        self._segment_writer = writer
+        snapshot = segment_snapshot(self.root)
+        self._highwater = snapshot.committed_through
+        self._last_received_at = snapshot.last_received_at
+        try:
+            previous = self.read_status()
+        except CacheError:
+            previous = None
+        if previous is not None and (previous.state in _ACTIVE or self._highwater):
+            self.write_status(previous.model_copy(update={
+                "state": "disconnected", "gap": True, "error_code": "restart_gap",
+            }))
+        try:
+            yield self
+        except BaseException:
+            # Leave the active segment for recovery: a partially written record is
+            # truncated to the last commit on the next open.
+            raise
+        else:
+            try:
+                writer.close()
+            except SegmentError:
+                raise CacheError("cache_io") from None
+            except OSError:
+                raise CacheError("cache_io") from None
+        finally:
+            self._segment_writer = None
+
+    #: How many tail batches writer recovery re-validates behind a trusted head.
+    _RECOVERY_TAIL_BATCHES = 64
+    #: Above this many batches a valid .head enables the bounded recovery path
+    #: (scan names only) instead of the per-batch full audit.  Smaller caches keep
+    #: the historical full audit: it is cheap there and is what the safety tests
+    #: exercise.
+    _BOUNDED_RECOVERY_MIN_BATCHES = 10_000
+
+    def _recover_bounded(self, floor: int) -> tuple[int, datetime] | None:
+        """Recover a large cache from .head + a name scan + the tail window.
+
+        The full audit stats 4-5 paths per batch; at 1.88M batches that took
+        102 s on the production disk (and minutes more under IO pressure).  When
+        .head is valid we only read directory names (scandir d_type, no stats),
+        verify the exact contiguous sequence range, and re-validate the last
+        ``_RECOVERY_TAIL_BATCHES`` payloads.  Any inconsistency returns ``None``
+        so the caller falls back to the full audit.
+        """
+        if self._BOUNDED_RECOVERY_MIN_BATCHES <= 0:
+            return None
+        try:
+            head = self._published_head()
+        except CacheError:
+            return None
+        if head is None or head[1] is None:
+            return None
+        count = head[0] - floor
+        if count < self._BOUNDED_RECOVERY_MIN_BATCHES:
+            return None
+        path = self.root / "batches"
+        try:
+            names: list[int] = []
+            with os.scandir(path) as entries:
+                for entry in entries:
+                    name = entry.name
+                    if _INTERNAL_BATCH_NAME(name):
+                        continue
+                    if len(name) != 20 or not name.isdigit():
+                        raise CacheError("invalid_cache")
+                    value = int(name)
+                    if value <= 0:
+                        raise CacheError("sequence_gap")
+                    names.append(value)
+        except CacheError:
+            return None
+        except OSError:
+            raise CacheError("cache_io") from None
+        if len(names) != count:
+            return None
+        names.sort()
+        if names[0] != floor + 1 or names[-1] != head[0]:
+            return None
+        for index, value in enumerate(names):
+            if value != floor + 1 + index:
+                return None
+        start = max(0, count - self._RECOVERY_TAIL_BATCHES)
+        try:
+            for offset in range(start, count):
+                self._read_batch(path / f"{floor + 1 + offset:020d}", floor + 1 + offset)
+        except CacheError:
+            return None
+        return head[0], head[1]
+
+    def _recover_from_published_head(self, committed: tuple[Path, ...],
+                                     floor: int) -> bool:
+        """Bounded recovery: trust .head for count/last, re-check only the tail.
+
+        The directory layout pays one full payload audit per batch on startup;
+        at 1.88M batches that took 25+ minutes on the production disk.  A valid
+        .head (hard link to the last published batch) plus a bounded tail window
+        makes startup O(#names + tail) while still refusing a torn/inconsistent
+        cache.  Anything unexpected falls back to the full audit.
+        """
+        try:
+            head = self._published_head()
+        except CacheError:
+            return False
+        if head is None or head[0] != floor + len(committed):
+            return False
+        if head[1] is None:
+            return False
+        start = max(0, len(committed) - self._RECOVERY_TAIL_BATCHES)
+        try:
+            for offset in range(start, len(committed)):
+                self._read_batch(committed[offset], floor + 1 + offset)
+        except CacheError:
+            return False
+        self._last_received_at = head[1]
+        return True
+
+    def record_cache_error(self, error: CacheError) -> None:
+        """Persist a best-effort diagnostic so the next restart can explain the stop.
+
+        Status keeps its fixed ``error_code`` (cache_error); this side file carries
+        the finer code/errno for operators.  Failures are ignored: the primary
+        error must not be replaced by a diagnostic write error.
+        """
+        payload = json.dumps({
+            "schema": "rquant-l2-cache-error-v1",
+            "code": error.code,
+            "detail": error.detail,
+            "at": datetime.now(UTC).isoformat(),
+        }, sort_keys=True).encode() + b"\n"
+        try:
+            _replace_snapshot(self.root, ".last-cache-error.json", payload)
+        except Exception:  # noqa: BLE001 - diagnostics must never mask the trigger
+            pass
 
     def _floor_sequence(self) -> int:
         return read_floor(self.root)
@@ -414,6 +619,13 @@ class RawL2Cache:
     def _snapshot(self, *, after_sequence: int | None = None
                   ) -> tuple[FeedStatus, int, datetime | None, tuple[RawL2Batch, os.stat_result, str] | None]:
         status = self._stored_status()
+        if self._segments_mode:
+            snapshot = segment_snapshot(self.root)
+            last = snapshot.last_received_at
+            if last is None and snapshot.committed_through > 0:
+                batch = segment_read_payload(self.root, snapshot.committed_through)
+                last = batch.received_at if batch is not None else None
+            return status, snapshot.committed_through, last, None
         floor = self._floor_sequence()
         head = self._published_head(minimum=status.last_sequence, after_sequence=after_sequence)
         if head is not None:
@@ -430,6 +642,18 @@ class RawL2Cache:
         return status, floor + len(directories), last, None
 
     def _position(self) -> tuple[int, datetime | None]:
+        if self._segments_mode:
+            writer = self._segment_writer
+            if writer is not None:
+                try:
+                    writer.commit()
+                except SegmentError:
+                    raise CacheError("cache_io") from None
+                except OSError:
+                    raise CacheError("cache_io") from None
+                return writer.committed_through, writer.last_received_at
+            snapshot = segment_snapshot(self.root)
+            return snapshot.committed_through, snapshot.last_received_at
         if self._writer_fd is not None:
             # A status/receipt snapshot must never claim a batch that is still
             # sitting in the in-memory group: publish the group first.
@@ -442,6 +666,8 @@ class RawL2Cache:
         self._require_writer()
         if not isinstance(observation, MarketObservation):
             raise ValueError("typed market observation required")
+        if self._segments_mode:
+            return self._append_segment(observation)
         batch = RawL2Batch.model_validate({
             **observation.model_dump(mode="python", serialize_as_any=True),
             "local_batch_sequence": self._highwater + len(self._pending_group) + 1,
@@ -478,11 +704,36 @@ class RawL2Cache:
             self._publish_head(target)
             _fsync_dir(parent)
             return batch
-        except OSError:
-            raise CacheError("cache_io") from None
+        except OSError as error:
+            raise _cache_io_error(error, "append") from None
         finally:
             if pending is not None and not queued:
                 shutil.rmtree(pending, ignore_errors=True)
+
+    def _append_segment(self, observation: MarketObservation) -> RawL2Batch:
+        writer = self._segment_writer
+        if writer is None:
+            raise CacheError("writer_required")
+        batch = RawL2Batch.model_validate({
+            **observation.model_dump(mode="python", serialize_as_any=True),
+            "local_batch_sequence": writer.next_sequence,
+            "cached_at": datetime.now(UTC),
+        })
+        payload = batch.model_dump_json().encode() + b"\n"
+        if len(payload) > _MAX_BATCH_BYTES:
+            raise CacheError("invalid_batch")
+        self._check_disk_space(len(payload))
+        try:
+            writer.append(batch)
+        except SegmentError as error:
+            code = "sequence_gap" if error.code == "sequence_gap" else (
+                "invalid_batch" if error.code == "invalid_batch" else "cache_io")
+            raise CacheError(code) from None
+        except OSError:
+            raise CacheError("cache_io") from None
+        self._highwater = batch.local_batch_sequence
+        self._last_received_at = batch.received_at
+        return batch
 
     def _check_disk_space(self, payload_size: int) -> None:
         try:
@@ -494,9 +745,10 @@ class RawL2Cache:
             needed = 5 * 1024**3 + ((payload_size + block - 1) // block
                       + (65 + block - 1) // block) * block + 1024**2
             if space.f_bavail * block < needed:
-                raise CacheError("cache_io")
-        except (OSError, AttributeError, TypeError, ValueError):
-            raise CacheError("cache_io") from None
+                raise CacheError("disk_full",
+                                 f"free={space.f_bavail * block} needed={needed}")
+        except (OSError, AttributeError, TypeError, ValueError) as error:
+            raise _cache_io_error(error, "statvfs") from None
 
     def _flush_group(self) -> None:
         """Publish the buffered batch group with one directory fsync.
@@ -531,6 +783,70 @@ class RawL2Cache:
         for pending, _target, _batch in self._pending_group:
             shutil.rmtree(pending, ignore_errors=True)
         self._pending_group = []
+
+    def _read_batches_segments(self, stored_status: FeedStatus, count: int,
+                               last: datetime | None, after_sequence: int,
+                               limit: int) -> BatchPage:
+        selected_list: list[RawL2Batch] = []
+        payload_bytes = 0
+        try:
+            for batch in segment_iter_payloads(
+                    self.root, after_sequence=after_sequence,
+                    limit=min(limit, max(0, count - after_sequence))):
+                size = len(batch.model_dump_json().encode()) + 1
+                if payload_bytes + size > MAX_BATCH_PAGE_BYTES:
+                    break
+                selected_list.append(batch)
+                payload_bytes += size
+        except SegmentError:
+            raise CacheError("invalid_batch") from None
+        selected = tuple(selected_list)
+        status = self._with_committed_receipt(stored_status, count, last, datetime.now(UTC))
+        return BatchPage(batches=selected,
+                         next_sequence=(selected[-1].local_batch_sequence if selected
+                                        else after_sequence),
+                         status=status)
+
+    def committed_head(self) -> tuple[int, datetime | None]:
+        """Backend-neutral committed (count, last_received_at) for non-writer readers."""
+        return self._snapshot()[1:3]
+
+    def read_payload_bytes(self, sequence: int) -> bytes | None:
+        """Stored canonical payload bytes for one committed batch (backend neutral)."""
+        if type(sequence) is not int or sequence < 1:
+            raise ValueError("invalid local batch cursor")
+        if self._segments_mode:
+            try:
+                return segment_read_payload_bytes(self.root, sequence)
+            except SegmentError:
+                raise CacheError("invalid_batch") from None
+        path = self.root / "batches" / f"{sequence:020d}" / "batch.json"
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            return None
+        except OSError:
+            raise CacheError("cache_io") from None
+        if not stat.S_ISREG(info.st_mode) or info.st_size > _MAX_BATCH_BYTES:
+            raise CacheError("invalid_batch")
+        try:
+            return path.read_bytes()
+        except OSError:
+            raise CacheError("cache_io") from None
+
+    def read_one(self, sequence: int) -> RawL2Batch | None:
+        """Backend-neutral single committed batch read."""
+        if type(sequence) is not int or sequence < 1:
+            raise ValueError("invalid local batch cursor")
+        if self._segments_mode:
+            try:
+                return segment_read_payload(self.root, sequence)
+            except SegmentError:
+                raise CacheError("invalid_batch") from None
+        page = self.read_batches(after_sequence=sequence - 1, limit=1)
+        if page.batches and page.batches[0].local_batch_sequence == sequence:
+            return page.batches[0]
+        return None
 
     def _stored_status(self) -> FeedStatus:
         path = self.root / "status.json"
@@ -622,6 +938,8 @@ class RawL2Cache:
         stored_status, count, last, candidate = self._snapshot(after_sequence=after_sequence)
         if after_sequence > count:
             raise ValueError("invalid local batch cursor")
+        if self._segments_mode:
+            return self._read_batches_segments(stored_status, count, last, after_sequence, limit)
         selected_list = []
         payload_bytes = 0
         for sequence in range(after_sequence + 1, min(count, after_sequence + limit) + 1):
@@ -659,6 +977,10 @@ class RawL2Cache:
             raise ValueError("invalid local batch cursor")
         if limit is not None and (type(limit) is not int or limit < 0):
             raise ValueError("invalid local batch limit")
+        if self._segments_mode:
+            yield from segment_iter_payloads(self.root, after_sequence=after_sequence,
+                                             limit=limit)
+            return
         directories = self._directories()
         floor = self._floor_sequence()
         emitted = 0

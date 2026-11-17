@@ -391,8 +391,8 @@ class _TimedCache(RawL2Cache):
     """RawL2Cache that records the recv-to-committed-append wall latency per frame."""
 
     def __init__(self, root: Path, tap: _ConnectionLatencyTap,
-                 samples_ns: list[int]) -> None:
-        super().__init__(root)
+                 samples_ns: list[int], *, write_mode: str | None = None) -> None:
+        super().__init__(root, write_mode=write_mode)
         self._tap = tap
         self._samples_ns = samples_ns
 
@@ -626,11 +626,12 @@ def _percentiles_us(samples_ns: Sequence[int]) -> dict[str, int]:
 
 
 def _committed_batches(root: Path) -> int:
-    batches = root / "batches"
-    if not batches.is_dir():
+    from .cache import CacheError, RawL2Cache
+
+    try:
+        return RawL2Cache(Path(root)).committed_head()[0]
+    except CacheError:
         return 0
-    return sum(1 for entry in batches.iterdir()
-               if entry.is_dir() and entry.name.isdigit() and len(entry.name) == 20)
 
 
 def _cache_bytes(root: Path) -> int:
@@ -702,12 +703,13 @@ def _batch_sequence_digest(root: Path) -> str:
 def _execute_run(pack: Path, symbols: Sequence[str], faults: FaultInjection, *,
                  cache_root: Path, inputs: GateInputs, push_window_seconds: float | None,
                  speed: float, connections: int = 1,
-                 flow_control: bool = False) -> tuple[L2ReplaySource, _RunArtifacts]:
+                 flow_control: bool = False,
+                 write_mode: str | None = None) -> tuple[L2ReplaySource, _RunArtifacts]:
     source = build_source(pack, symbols, speed=speed,
                           push_window_seconds=push_window_seconds, faults=faults)
     samples_ns: list[int] = []
     tap = _ConnectionLatencyTap(source.connect)
-    cache = _TimedCache(cache_root, tap, samples_ns)
+    cache = _TimedCache(cache_root, tap, samples_ns, write_mode=write_mode)
     collector = FeedCollector(
         cache, bootstrap_path=inputs.bootstrap, order_template_path=inputs.order,
         trade_template_path=inputs.trade,
@@ -908,7 +910,7 @@ def _scenario_expectations(*, spec: ScenarioSpec, tier: TierSymbols,
 def _scenario_config(spec: ScenarioSpec, tier: TierSymbols, source: L2ReplaySource, *,
                      speed: float, push_window_seconds: float | None,
                      cache_dirs: Sequence[Path], inputs: GateInputs,
-                     cache_kept: bool) -> dict[str, Any]:
+                     cache_kept: bool, write_mode: str | None = None) -> dict[str, Any]:
     return {
         "name": spec.name,
         "stocks": spec.stocks,
@@ -929,12 +931,13 @@ def _scenario_config(spec: ScenarioSpec, tier: TierSymbols, source: L2ReplaySour
         "cache_dirs": [str(path) for path in cache_dirs],
         "cache_kept": cache_kept,
         "input_source": inputs.source,
+        "write_mode": write_mode or "batches",
     }
 
 
 def run_scenario(pack: Path | str, spec: ScenarioSpec, *, work_dir: Path,
                  inputs: GateInputs, push_window_seconds: float | None, speed: float,
-                 keep: bool) -> dict[str, Any]:
+                 keep: bool, write_mode: str | None = None) -> dict[str, Any]:
     """Run one scenario in its own temporary cache root and return its report block."""
     pack_path = Path(pack)
     tier = tier_symbols(spec.stocks)
@@ -950,7 +953,8 @@ def run_scenario(pack: Path | str, spec: ScenarioSpec, *, work_dir: Path,
         source, artifacts = _execute_run(
             pack_path, tier.symbols, spec.faults, cache_root=cache_dir, inputs=inputs,
             push_window_seconds=push_window_seconds, speed=speed,
-            connections=spec.connections, flow_control=spec.flow_control)
+            connections=spec.connections, flow_control=spec.flow_control,
+            write_mode=write_mode)
         determinism: dict[str, Any] | None = None
         if spec.runs > 1:
             first_digest = _batch_sequence_digest(artifacts.cache_root)
@@ -960,7 +964,8 @@ def run_scenario(pack: Path | str, spec: ScenarioSpec, *, work_dir: Path,
             _second_source, second = _execute_run(
                 pack_path, tier.symbols, spec.faults, cache_root=second_cache, inputs=inputs,
                 push_window_seconds=push_window_seconds, speed=speed,
-                connections=spec.connections, flow_control=spec.flow_control)
+                connections=spec.connections, flow_control=spec.flow_control,
+                write_mode=write_mode)
             second_digest = _batch_sequence_digest(second.cache_root)
             determinism = {
                 "runs": spec.runs,
@@ -981,7 +986,8 @@ def run_scenario(pack: Path | str, spec: ScenarioSpec, *, work_dir: Path,
             "name": spec.name,
             "config": _scenario_config(
                 spec, tier, source, speed=speed, push_window_seconds=push_window_seconds,
-                cache_dirs=cache_dirs, inputs=inputs, cache_kept=keep),
+                cache_dirs=cache_dirs, inputs=inputs, cache_kept=keep,
+                write_mode=write_mode),
             "status": "pass" if passed else "fail",
             "wall_ms": int(round((time.perf_counter() - started) * 1000)),
             "expectations": expectations,
@@ -1155,7 +1161,8 @@ def run_gate(pack: Path | str, *, out: Path | str | None = None,
              scenarios: Sequence[ScenarioSpec] | None = None,
              push_window_seconds: float | None = None, speed: float = 0.0,
              keep: bool = False, inputs_dir: Path | str | None = None,
-             reference_dir: Path | str | None = None) -> dict[str, Any]:
+             reference_dir: Path | str | None = None,
+             write_mode: str | None = None) -> dict[str, Any]:
     """Run the requested scenarios and return (and optionally write) the gate report."""
     pack_path = Path(pack)
     try:
@@ -1172,6 +1179,8 @@ def run_gate(pack: Path | str, *, out: Path | str | None = None,
         raise GateError("duplicate_scenario")
     if type(speed) not in (int, float) or not math.isfinite(speed) or speed < 0:
         raise GateError("invalid_speed")
+    if write_mode not in (None, "batches", "segments"):
+        raise GateError("invalid_write_mode")
     started_at = datetime.now(UTC)
     started = time.perf_counter()
     work_dir = Path(tempfile.mkdtemp(prefix="rquant-l2-replay-gate-"))
@@ -1182,7 +1191,8 @@ def run_gate(pack: Path | str, *, out: Path | str | None = None,
             try:
                 scenario_reports.append(run_scenario(
                     pack_path, spec, work_dir=work_dir, inputs=inputs,
-                    push_window_seconds=push_window_seconds, speed=float(speed), keep=keep))
+                    push_window_seconds=push_window_seconds, speed=float(speed), keep=keep,
+                    write_mode=write_mode))
             except Exception as error:  # a broken scenario must fail the gate, not abort it
                 scenario_reports.append(_scenario_failure(
                     spec, error, push_window_seconds=push_window_seconds, speed=float(speed)))
@@ -1205,6 +1215,7 @@ def run_gate(pack: Path | str, *, out: Path | str | None = None,
                 "pid": os.getpid(),
                 "work_dir": str(work_dir),
                 "work_dir_kept": keep,
+                "write_mode": write_mode or "batches",
             },
             "gate": {
                 "status": "pass" if not failed and not budget_exceeded else "fail",
@@ -1263,6 +1274,8 @@ def _build_parser() -> argparse.ArgumentParser:
                       help="replay speed; 0 is full speed (default)")
     gate.add_argument("--keep", action="store_true",
                       help="keep every scenario's temporary cache directory")
+    gate.add_argument("--write-mode", choices=("batches", "segments"), default=None,
+                      help="cache write backend used by the replay scenarios")
     gate.add_argument("--inputs-dir", type=Path, default=None,
                       help="directory with bootstrap.bin/order-template.bin/"
                            "trade-template.bin (mode 0600, owner current user)")
@@ -1280,6 +1293,8 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--speed", type=float, choices=(0.0, 1.0, 10.0), default=0.0,
                      help="replay speed; 0 is full speed (default)")
     run.add_argument("--out", type=Path, default=None, help="report JSON path")
+    run.add_argument("--write-mode", choices=("batches", "segments"), default=None,
+                     help="cache write backend used by the replay run")
     return parser
 
 
@@ -1320,14 +1335,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "gate":
             report = run_gate(args.pack, out=args.out,
                               push_window_seconds=args.push_seconds, speed=args.speed,
-                              keep=args.keep, inputs_dir=args.inputs_dir)
+                              keep=args.keep, inputs_dir=args.inputs_dir,
+                              write_mode=args.write_mode)
             _print_gate_summary(report, args.out)
             return 0 if report["gate"]["status"] == "pass" else 1
         report = run_gate(args.pack, out=args.out, speed=args.speed,
                           scenarios=(_single_scenario(
                               args.stocks, args.fault,
                               connections=args.connections,
-                              flow_control=args.flow_control),))
+                              flow_control=args.flow_control),),
+                          write_mode=args.write_mode)
         _print_run_summary(report, args.out)
         return 0 if report["gate"]["status"] == "pass" else 1
     except GateError as error:

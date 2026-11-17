@@ -958,8 +958,15 @@ class CompactionResult:
     orphans_removed_bytes: int = 0
 
 
+def _segments_layout(cache_root: Path) -> bool:
+    return (Path(cache_root) / ".layout").exists()
+
+
 def _payload_info(cache_root: Path, sequence: int) -> tuple[int, int]:
     """Return (batch.json bytes, sha256 sidecar bytes) for a committed sequence."""
+    if _segments_layout(cache_root):
+        payload = _source_payload(cache_root, sequence)
+        return len(payload), 0
     path = Path(cache_root) / "batches" / f"{sequence:020d}"
     try:
         batch = path / "batch.json"
@@ -975,6 +982,15 @@ def _payload_info(cache_root: Path, sequence: int) -> tuple[int, int]:
 
 def _source_payload(cache_root: Path, sequence: int) -> bytes:
     """Read one committed batch payload and re-check its sidecar checksum."""
+    if _segments_layout(cache_root):
+        from .segment_log import SegmentError, read_payload_bytes
+        try:
+            payload = read_payload_bytes(cache_root, sequence)
+        except SegmentError:
+            raise ColdStoreError("invalid_batch") from None
+        if payload is None or len(payload) > 20 * 1024 * 1024:
+            raise ColdStoreError("invalid_batch")
+        return payload
     path = Path(cache_root) / "batches" / f"{sequence:020d}"
     try:
         payload = (path / "batch.json").read_bytes()

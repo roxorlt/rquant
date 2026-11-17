@@ -1015,9 +1015,10 @@ def test_published_disk_guard_rejects_before_new_allocations(tmp_path: Path, mon
             if fault == 'absent': return SimpleNamespace()
             return SimpleNamespace(f_bavail=-1 if fault == 'negative_blocks' else 'invalid' if fault == 'wrong_type' else 1,
                                    f_frsize=0 if fault == 'zero_block' else 4096)
+        expected = 'disk_full' if fault == 'low' else 'cache_io'
         with monkeypatch.context() as patch:
             patch.setattr(module.os, 'statvfs', unavailable)
-            with pytest.raises(module.CacheError, match='^cache_io$'): cache.append(observation())
+            with pytest.raises(module.CacheError, match=f'^{expected}$'): cache.append(observation())
         after = {str(p.relative_to(cache.root)): p.read_bytes() for p in cache.root.rglob('*') if p.is_file()}
         assert after == before
         assert len(cache._directories()) == 1
@@ -1039,7 +1040,7 @@ def test_published_disk_guard_exact_budget_and_one_byte_below(tmp_path: Path, mo
     minimum = 5 * 1024**3 + len(payload) + 65 + 1024**2
     with cache.writer():
         monkeypatch.setattr(module.os, 'statvfs', lambda path: SimpleNamespace(f_frsize=1, f_bavail=minimum - 1))
-        with pytest.raises(module.CacheError, match='^cache_io$'): cache.append(data)
+        with pytest.raises(module.CacheError, match='^disk_full$'): cache.append(data)
         assert list((cache.root / 'batches').iterdir()) == []
         monkeypatch.setattr(module.os, 'statvfs', lambda path: SimpleNamespace(f_frsize=1, f_bavail=minimum))
         assert cache.append(data).local_batch_sequence == 1

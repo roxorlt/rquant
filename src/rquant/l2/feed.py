@@ -552,6 +552,14 @@ class FeedCollector:
         if self.frame_tap is not None:
             self.frame_tap.record_event(event)
 
+    def _record_cache_error(self, error: BaseException) -> None:
+        """Best-effort on-disk cause for a cache failure (status keeps cache_error)."""
+        if isinstance(error, CacheError):
+            try:
+                self.cache.record_cache_error(error)
+            except Exception:  # noqa: BLE001 - diagnostics never mask the trigger
+                pass
+
     def _write_receipt(self) -> None:
         if self.status.epoch_id is None:
             return
@@ -559,7 +567,8 @@ class FeedCollector:
             self.cache.write_subscription_status(SubscriptionReceipt(
                 epoch_id=self.status.epoch_id, desired_revision=self._desired_revision,
                 collector_state=self.status.state, streams=tuple(self._stream_receipts.values())))
-        except Exception:
+        except Exception as error:
+            self._record_cache_error(error)
             raise FeedError('cache_error') from None
 
     def _transition(self, binding: Binding, **changes: Any) -> None:
@@ -610,6 +619,18 @@ class FeedCollector:
     })
 
     def _update(self, *, force: bool | None = None, **changes: Any) -> None:
+        if self.status_flush_interval > 0 and changes:
+            # Fast mode: a candidate_push sets state/subscription_state on every
+            # frame, which would otherwise force a status fsync per batch.  Only
+            # differences from the current snapshot are persisted.
+            current = self.status
+            changed = {key: value for key, value in changes.items()
+                       if getattr(current, key, None) != value}
+            if not changed:
+                return
+            if force is None:
+                force = any(key in self._FORCE_STATUS_KEYS for key in changed)
+            changes = changed
         self.status = self.status.model_copy(update=changes)
         if force is None:
             force = any(key in self._FORCE_STATUS_KEYS for key in changes)
@@ -620,7 +641,8 @@ class FeedCollector:
                 return
         try:
             self.cache.write_status(self.status)
-        except Exception:
+        except Exception as error:
+            self._record_cache_error(error)
             raise FeedError("cache_error") from None
         self._last_status_flush = self.clock()
 
@@ -727,7 +749,8 @@ class FeedCollector:
             raise FeedError("decode_error") from None
         try:
             batch = self.cache.append(observation)
-        except Exception:
+        except Exception as error:
+            self._record_cache_error(error)
             raise FeedError("cache_error") from None
         changes: dict[str, Any] = {"last_market_received_at": received_at,
                                   "market_batch_count": self.status.market_batch_count + 1}
@@ -1155,6 +1178,7 @@ class FeedCollector:
                         break
                 return self.cache.read_status()
         except (CacheError, FeedError) as error:
+            self._record_cache_error(error)
             code = "writer_busy" if isinstance(error, CacheError) and error.code == "writer_busy" else "cache_error"
             return self.status.model_copy(update={"state": "blocked", "gap": True, "error_code": code})
         finally:
