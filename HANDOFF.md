@@ -161,6 +161,16 @@ cd notch_app && ./build.sh && ./install.sh
 > - **验证与部署状态**：...
 > ```
 
+### 2026-11-17 · L2 段式 append 写盘后端（`--write-mode segments`）、大缓存有界重启恢复与缓存异常诊断合入主线（`feat/l2-segment-log`）
+- **背景/问题**：
+  1. 原逐批目录写盘路径每批创建子目录、写 `batch.json` + sidecar sha256 并触发多次 fsync，实盘极限仅 ~125–290 批/s，且当缓存累积至百万级批次目录后（如 2026-11-06 事故 `1,878,612` 批），采集器重启全量审计耗时达 528 秒（实盘曾阻塞 25+ 分钟）；同时缓存层异常统一对外折叠为 `cache_error`，缺少磁盘满/IO 错误细节定位文件。
+  2. 段式写盘 P1+P2 与周一 40 股开盘峰值真实窗口（`2026-11-16 09:30–10:00 CST`，`204,668` 批 / 30 段 / 299 MB / 峰值 `238.9` 批/s / 0 重连 0 错误，服务器合成基准 `3,837–4,644` 批/s，回放门禁 segments 后端 `9/9` 通过）已完成验收，具备合入主线条件（默认仍保持批次目录后端，线上常驻进程盘中零变更）。
+- **主要变更**：
+  1. **段式日志写盘与全读侧透明适配**（`src/rquant/l2/segment_log.py`、`src/rquant/l2/{cache,__main__,archive,cold_store,retention,replay_gate}.py`、`docs/l2-segmented-append.md`）：新增 `--write-mode segments`（`--segment-commit-every`、`--segment-commit-ms`、`--segment-mb`、`--segment-seconds`），批次以 zlib-1 压缩规范 JSON 追加写入 `.l2s` 段文件，链式 sha256 commit 单次 fsync，生成稀疏 `.idx` 检查点并在崩溃重开时 O(1) 截断未提交撕裂尾；API、R2 归档、冷存压缩、滚动保留与回放门禁按 `.layout` 自动分派。
+  2. **修复快模式状态刷写放大、大目录缓存有界恢复与写盘错误落盘诊断**（`src/rquant/l2/{cache,feed}.py`）：修复 `status_flush_interval > 0` 时每帧 `candidate_push` 仍重复触发 `write_status` 的问题（仅字段值真实变化才刷盘）；目录后端 `.head` 有效且批数 ≥10,000 时仅扫描目录序号并完整重验末尾 64 批（百万批恢复从 ~528s 降至 ~2.0s，异常自动回退全量审计）；`CacheError` 细分 `disk_full` / `io_error` / `permission` / `out_of_memory` 并写入 `.last-cache-error.json`（同时修复 `FeedCollector._write_receipt` 异常分支漏绑 `as error` 的潜在 `NameError` 并补充单测）。
+- **涉及文件**：`src/rquant/l2/{segment_log,cache,feed,__main__,archive,cold_store,retention,replay_gate}.py`、`docs/l2-segmented-append.md`、`tests/unit/test_l2_{segment_log,cache_segments,cache_recovery,cache,feed}.py`、`.github/workflows/web-mvp.yml`、`CHANGELOG.md`、`HANDOFF.md`。
+- **验证与部署状态**：全量 L2 单元测试（含新增 `segment_log`、`cache_segments`、`cache_recovery` 与订阅回执缓存错误诊断单测）及 `bash scripts/check-core-quality.sh` 全部通过；严守盘中交易时段（`09:15–15:10 CST`）生产冻结红线，仅合入 GitHub 主线，不触碰线上 `82.156.0.68` 服务。
+
 ### 2026-11-16 · 补齐 L2 行情时间新鲜度（P0 `card-06968b3b`）收尾项：watchdog 恢复自动 resolve `DEDUP_LAG`、OpenAPI 契约同步与「滞后 vs 断线」运维手册，并同步 `l2-archive` 上线进展（`fix/l2-freshness-runbook-and-watchdog` → `v0.38.1`）
 - **背景/问题**：
   1. 梳理 `dsh-kanban` 全部 `rQuant` 卡片时核对主仓代码发现：`card-06968b3b`（`P0 行情时间新鲜度指标与告警`）的核心字段与双连击告警虽已在 `v0.35.8`（PR `#452`）合入，但存在三处收尾遗漏：① `scripts/l2-collector-watchdog.sh` 在 `VERDICT=OK` 恢复分支仅执行了 `resolve "${DEDUP_FRESH}"` 并删除 `LAG_STATE_FILE`，遗漏了 `resolve "${DEDUP_LAG}"`（导致触发过 `service:rquant-l2-collector-lag` 后即使恢复正常也不会自动结案）；② 静态契约 `docs/l2-openapi.json` 未同步重生成，缺少 `FeedStatus.last_market_timestamp` 与 `FeedStatus.market_time_lag_ms`；③ `docs/ops/README.md` 缺少卡片要求的「滞后 `LAG` vs 断线 `STALE` / `FAILED`」故障判定与处置手册及 L2 systemd 单元表项。
