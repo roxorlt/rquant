@@ -81,7 +81,7 @@ def test_archive_units_and_dispatch_leave_core_authority_separate() -> None:
     assert "/etc/rquant-web.env" not in service and "/usr/bin/env -i" not in service
     assert "ReadOnlyPaths=/home/lighthouse/rquant-l2-state/cache" in service
     assert "InaccessiblePaths=/home/lighthouse/rquant-l2-private" in service
-    for setting in ("TimeoutStartSec=2h", "CPUQuota=20%", "MemoryMax=384M", "IOWeight=20", "Nice=15"):
+    for setting in ("TimeoutStartSec=8h", "CPUQuota=20%", "MemoryMax=384M", "IOWeight=20", "Nice=15"):
         assert setting in service
     assert "Restart=" not in service and "ExecStartPre=" not in service
     assert "OnCalendar=Mon..Fri *-*-* 17:20:00 Asia/Shanghai" in timer and "Persistent=true" in timer
