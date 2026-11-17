@@ -33,6 +33,8 @@
 
 ### Fixed
 
+- **L2 空行情表容错、可选开盘前种子重试与 `09:30:10` 启动 timer 入库（`card-8264e7ff`）**：修复供应商在早盘集合竞价/开盘前返回结构合法但零行行情表时被误判为 `decode_error` 触发反复重启循环的问题（2026-11-09 事故）——空种子表按 `no_data` 记录并递增 `control_count`，空推送表仅计数不写缓存（新增 `empty_table_responses` / `empty_seed_responses` / `empty_push_responses` 指标）；新增可选 `--seed-retry-until-open`（默认关闭，上海时间 `09:32` 前整轮种子全空时每 25s 建立新连接重跑种子阶段，`09:32` 仍无数据则报告 `blocked` / `seed_timeout`）；同步将线上已验证的 `deploy/systemd/rquant-l2-collector-start.timer`（`Mon..Fri *-*-* 09:30:10`）入库并将 `scripts/l2-collector-watchdog.sh` 早盘窗口起点对齐至 `09:30`。
+
 - **L2 采集器重启恢复有界化与写盘异常可诊断化**：目录后端且 `.head` 有效、批数 ≥10,000 时，启动恢复仅扫描目录名并完整重验末尾 64 批，实测 `1,878,612` 批缓存恢复从全量审计约 528 秒降至 **2.0 秒**（不一致自动回退全量审计）；`CacheError` 增加 `detail` 诊断信息（细分 `disk_full` / `io_error` / `permission` / `out_of_memory`），缓存写入/状态/订阅回执异常时落盘 `.last-cache-error.json`，同时保持 `status.json` 的 `error_code="cache_error"` 兼容外部 schema。
 
 - **补齐 L2 行情时间新鲜度（P0）告警闭环、OpenAPI 契约同步与「滞后 vs 断线」运维手册**：修复 `scripts/l2-collector-watchdog.sh` 在行情恢复 `OK` 时仅 `alert-resolve` 传输新鲜度键（`service:rquant-l2-collector-freshness`）而遗漏解决滞后事故键（`service:rquant-l2-collector-lag`）的缺陷，并补充离线双连击触发/恢复单测；重生成 `docs/l2-openapi.json` 补齐 `FeedStatus.last_market_timestamp` 与 `FeedStatus.market_time_lag_ms` 字段并加入单元测试防漂移门禁；在 `docs/ops/README.md` 补齐 L2 受控服务/定时器矩阵及「滞后 `LAG` vs 静默断流 `STALE` vs 断线退出 `FAILED`」判定与处置手册。

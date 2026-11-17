@@ -62,8 +62,8 @@ Host rquant 82.156.0.68
 | ↳ `rquant-snapshot-collector.service.d/surge-push.conf` | — | sets `SURGE_PUSH_ENV_FILE` (PushDeer key names read from `~/rquant/.env`) for the in-collector surge scanner | `deploy/systemd/rquant-snapshot-collector.service.d/` |
 | `rquant-auction-pool-candidates.timer` / `rquant-auction-pool-pick.timer` / `rquant-auction-pool-attrib.timer` | Mon-Fri **08:40** / **09:26:30** / **09:27** | 竞价选股 pool: T-1 candidates (limit-up non-一字, 封单/流通市值 ≤0.94%, non-ST/BJ; plus `base` = same without the seal filter), then rt_k auction picks at 09:26:30 after the auction settles (gap ≥5.37% incl. auction at limit-up — flagged `limit_open`, badge 竞价涨停, top 3 by auction vol) and `ths_screen` (raw 同花顺 screen: gap >4%, top 5 by vol, 一字 flagged) → `pools/auction/YYYY-MM-DD.json`; 09:27 attribution (`rquant.research.auction_attrib`: Tushare ths_member/ths_index concepts + major_news, Eastmoney news/announcements, DeepSeek via `/etc/rquant-web.secrets.env` or `~/rquant/.env`) stored as `attribution`, shown on the 池子 page and pushed once via PushDeer (`pushed_at`); collector universe (top priority, reloaded 09:26:45), surge push ★ first | `deploy/systemd/`, `rquant.research.auction_pool`, `rquant.research.auction_attrib` |
 | `rquant-snapshot-archive.timer` | Mon-Fri **16:20** | tar.gz finished day dirs → R2, verify, prune >14d (verified only) | `deploy/systemd/` |
-| `rquant-l2-collector.service` / `rquant-l2-api.service` | trading session / always on (`127.0.0.1:8771`) | controlled single-session raw L2 collector + loopback HTTP/WS API (`~/rquant-l2-rel/current`, 20-stock baseline) | `deploy/systemd/`, `rquant.l2` |
-| `rquant-l2-collector-watchdog.timer` | Mon-Fri **09:15–11:35, 12:55–15:03** (every 2m) | L2 self-heal (`failed` → reset+start once) + transport `STALE` (`>300s`) + 2-strike market event `LAG` (`>30s`) PushDeer alert | `deploy/systemd/`, `scripts/l2-collector-watchdog.sh` |
+| `rquant-l2-collector-start.timer` → `rquant-l2-collector.service` / `rquant-l2-api.service` | Mon-Fri **09:30:10** / always on (`127.0.0.1:8771`) | controlled single-session raw L2 collector + loopback HTTP/WS API (`~/rquant-l2-rel/current`, 20-stock baseline) | `deploy/systemd/`, `rquant.l2` |
+| `rquant-l2-collector-watchdog.timer` | Mon-Fri **09:30–11:35, 12:55–15:03** (every 2m) | L2 self-heal (`failed` → reset+start once) + transport `STALE` (`>300s`) + 2-strike market event `LAG` (`>30s`) PushDeer alert | `deploy/systemd/`, `scripts/l2-collector-watchdog.sh` |
 | `rquant-l2-archive.timer` / `rquant-l2-retention.timer` | Mon-Fri **17:20** / daily **23:30** | L2 raw cache → Cloudflare R2 verified archive (`rquant.l2.archive`) + archive-gated cold-store/retention (`rquant.l2.retention`) | `deploy/systemd/`, `rquant.l2` |
 | `rquant-artifact-retention.timer` | every 5 min | artifact tiering/GC | `deploy/systemd/` |
 
@@ -145,7 +145,7 @@ it never stops collection.
 
 ## L2 raw feed & watchdog runbook（滞后 `LAG` vs 断线 `STALE` / `FAILED` 判定与处置）
 
-`rquant-l2-collector.service` maintains the single authorized upstream session (never run parallel stage collectors sharing the same vendor device credentials during live trading). `rquant-l2-collector-watchdog.timer` executes `scripts/l2-collector-watchdog.sh` every 2 minutes in trading windows (`09:15–11:35`, `12:55–15:03` CST) and classifies incidents into three distinct failure modes:
+`rquant-l2-collector.service` maintains the single authorized upstream session (never run parallel stage collectors sharing the same vendor device credentials during live trading). `rquant-l2-collector-watchdog.timer` executes `scripts/l2-collector-watchdog.sh` every 2 minutes in trading windows (`09:30–11:35`, `12:55–15:03` CST) and classifies incidents into three distinct failure modes:
 
 | Failure mode | Alert `dedup-key` | Trigger condition | What is actually broken |
 |---|---|---|---|
