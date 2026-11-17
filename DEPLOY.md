@@ -5,6 +5,14 @@
 
 ---
 
+## 2026-11-16/18 · 已安装 · L2 archive 组件 `f5bd71c4` 部署 + 新 archive epoch 初始化
+
+- **组件部署（2026-11-16 10:07 CST）**：`deploy-production.sh --component l2-archive` 升级到 target `f5bd71c4`（tree `ab2912bd`），archive 验收 proof `bd3cef2b…`（R2 真实往返、6 类用例全过、幂等 0 重复上传）；units 由新 release 安装，archive timer `Mon-Fri 17:20` 启用，retention 改为 archive-gated（每日 02:00、8h 超时）。背景：上一版 `afc30325` 为 2026-10-19 构建，含 PR #450 前的旧归档逻辑。
+- **epoch 重置（2026-11-16 15:37–15:42）**：远端 catalog 停在 2026-11-09 测试 epoch（`last_sequence=60`），而热缓存 floor 已到 6,971,314（11-10~16 数据在归档故障期间被 retention 清理），archive 的 `_source`/`_index` 无法跨缺口续接。处理：备份当日热缓存（1,703,580 批 → 602 MB zstd，服务器+本地，sha `d51e7aee…`）、重置热缓存为 floor=0、旧冷存移为 `cold-20261116`（322 MB，服务器+本地留档）、删除陈旧 catalog（保留 `catalog-epoch-20261109.json`）并在空缓存上 `archive init`（新 catalog sha `9ddec9db…`，`last_sequence=0`，`archive check` 通过）。**代价**：2026-11-09~16 数据只保留冷存与本地备份，不进 R2。
+- **首次真实归档 + retention（2026-11-17 17:20 → 2026-11-18 04:21）**：17:20 首跑在 19:20 被 unit `TimeoutStartSec=2h` 杀掉（`Result=timeout`，无数据损失、无 error 产物）；运维临时补到 6h、清理 647 MB 孤儿临时目录后 21:21 重跑，02:44 成功：receipt `archived`、**records=1,900,938**、R2 catalog `last_sequence=1,900,938`（sha `43f67d45…`）。archive-gated retention（02:46–04:21）将同量数据压实为 7 个冷存段 / 94.5 MB、清理 1,900,937 批（释放 15.8 GiB）、`.floor=1,900,937`，磁盘 19→36.9 GiB；retention timer 恢复每日 02:00。
+- **待办**：`deploy/systemd/rquant-l2-archive.service` 的 `TimeoutStartSec` 已在仓库修正为 8h（随下一次 archive 组件部署生效）；线上当前是 6h 临时补丁，原 unit 备份于 `/home/lighthouse/rquant-l2-state/ops-backups/`。
+- **回滚命令**：`bash scripts/deploy-production.sh --component l2-archive --target afc30325ba883f54d9f279f8ab015982e8a1fb7d --rollback`
+
 ## 2026-11-16 · 已安装 · Web 独立发布 `v0.38.0`（`web-f5bd71c4`）
 
 - **状态**：已于 **2026-11-16 09:14:56 CST** 在 `82.156.0.68` 完成原子发布并自检通过。

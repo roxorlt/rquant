@@ -161,6 +161,17 @@ cd notch_app && ./build.sh && ./install.sh
 > - **验证与部署状态**：...
 > ```
 
+### 2026-11-18 · L2 archive 组件升级（`f5bd71c4`）、新 archive epoch 初始化、首次整日归档 + retention 验证与 unit 超时修复
+- **背景/问题**：archive 组件停在 2026-10-19 旧构建，2026-11-10 起真实归档 4h+ 后失败（R2 长串行请求无重试）；修复代码（PR #450）虽已随 `v0.35.7` 合入主线，但组件迟迟未升级，期间 retention 只能以 `--no-archive-required` 兜底清理，导致远端 catalog 停在 11-09 测试 epoch（`last_sequence=60`）而热缓存 floor 不断前移（到 6,971,314），archive 的 source/index 校验无法跨缺口续接；2026-11-16 升级组件（target `f5bd71c4`，archive 验收 proof `bd3cef2b…`）后确认必须重置 epoch 才能恢复。
+- **主要变更**：
+  1. **epoch 重置**：备份 11-16 热缓存（602 MB，服务器+本地 sha 校验）、移开旧冷存（`cold-20261116`，322 MB，服务器+本地留档）、删除陈旧 catalog（保留 `catalog-epoch-20261109.json` 备份）、空缓存上 `archive init`（catalog sha `9ddec9db…`，`last_sequence=0`，`archive check` 通过）。历史 2026-11-09~16 数据不再进 R2（仅冷存+本地备份）。
+  2. **首次整日归档验证（11-17）**：17:20 首跑被 archive unit `TimeoutStartSec=2h` 在 19:20 SIGTERM 杀掉（`Result=timeout`，无数据损失、无错误产物）；运维临时把线上 unit 补到 6h、清理 647 MB 孤儿临时目录后 21:21 重跑，02:44 成功——receipt `archived`、**1,900,938 批**、R2 catalog `last_sequence=1,900,938`（sha `43f67d45…`）。
+  3. **retention 验证（11-18 02:46–04:21）**：archive-gated 模式压缩 1,900,938 批 → **7 个冷存段 / 94.5 MB**，清理 1,900,937 批（**释放 15.8 GiB**），`.floor=1,900,937`，磁盘 19→36.9 GiB；retention timer 恢复每日 02:00（8h 超时）。
+  4. **unit 超时回归修复**：`deploy/systemd/rquant-l2-archive.service` 的 `TimeoutStartSec` 由 2h 修正为 **8h**（与 retention unit 对齐）；同步在 `DEPLOY.md` 记录 archive 组件部署/epoch 重置/首次归档结果，`CHANGELOG.md` 记录本修复。
+- **涉及文件**：`deploy/systemd/rquant-l2-archive.service`、`CHANGELOG.md`、`DEPLOY.md`、`HANDOFF.md`。
+- **验证与部署状态**：归档链路在生产真实数据上完整跑通（归档 1,900,938 批 → R2，retention 压缩/清理对齐归档边界）；本 PR 仅改 unit 超时默认值与文档（无 Python 逻辑变更）。**待办**：仓库 8h 修正需随下一次 archive 组件部署生效（线上当前为 6h 临时补丁，原 unit 备份在 `/home/lighthouse/rquant-l2-state/ops-backups/`）；L2 组件 `v0.39.0`（含空种子容错、段式写盘默认关闭、`09:30:10` timer）的 acceptance-v3 与受控部署另行排期。
+- **证据**：`evidence/l2-archive-component-deploy-2026-11-16.json`、`evidence/l2-archive-epoch-reset-2026-11-16.json`、`evidence/l2-archive-first-run-20261117/`、`evidence/l2-retention-20261118/`。
+
 ### 2026-11-17 · L2 空行情表容错、可选开盘前种子重试与 `09:30:10` 启动 timer 入库（`fix/l2-empty-seed-response` → `v0.39.0`）
 - **背景/问题**：
   1. 2026-11-09 早盘开盘前供应商对种子请求返回了结构合法但零行的行情表，原 `FeedCollector._market` 将零行表一律判为 `decode_error` 导致采集器陷入重启循环并触发启动限频熔断；同时线上已启用的 `09:30:10` 启动 timer 与 `09:30` watchdog 早盘窗口尚未同步合入主仓（本次已获用户明确授权将 `deploy/systemd/` 与 `watchdog` 配置一并合入 `main`，且盘中绝不触碰线上服务）。

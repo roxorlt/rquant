@@ -23,7 +23,9 @@ Nice=15
 CPUQuota=20%
 IOWeight=20
 MemoryMax=384M
-TimeoutStartSec=2h
+# 2026-11-17 事故：190 万批 / 16 GB 真实归档约需 5h23m；旧的 2h 在 19:20 被 systemd SIGTERM 杀掉
+# （Result=timeout，无数据损失）。8h 与 retention unit 对齐，给大缓存日留足余量。
+TimeoutStartSec=8h
 TimeoutStopSec=30
 StandardOutput=journal
 StandardError=journal

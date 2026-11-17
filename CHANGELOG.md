@@ -33,6 +33,8 @@
 
 ### Fixed
 
+- **归档 unit 超时配置回归（`TimeoutStartSec` 2h → 8h）**：`deploy/systemd/rquant-l2-archive.service` 的 `TimeoutStartSec` 由 2h 提升到 8h（与 retention unit 对齐）。背景：2026-11-17 新 epoch 首次真实归档为 190 万批 / 16 GB，运行约 5h23m，旧 unit 的 2h 超时在 19:20 以 SIGTERM 杀掉首次运行（`Result=timeout`，无数据损失，但也没有错误诊断产物）；运维侧已临时把线上 unit 补到 6h 并在 21:21 重跑成功（1,900,938 批入库、R2 catalog 推进），本版把仓库默认值修正到 8h，避免下次部署 archive 组件时覆盖回归。
+
 - **L2 空行情表容错、可选开盘前种子重试与 `09:30:10` 启动 timer 入库（`card-8264e7ff`）**：修复供应商在早盘集合竞价/开盘前返回结构合法但零行行情表时被误判为 `decode_error` 触发反复重启循环的问题（2026-11-09 事故）——空种子表按 `no_data` 记录并递增 `control_count`，空推送表仅计数不写缓存（新增 `empty_table_responses` / `empty_seed_responses` / `empty_push_responses` 指标）；新增可选 `--seed-retry-until-open`（默认关闭，上海时间 `09:32` 前整轮种子全空时每 25s 建立新连接重跑种子阶段，`09:32` 仍无数据则报告 `blocked` / `seed_timeout`）；同步将线上已验证的 `deploy/systemd/rquant-l2-collector-start.timer`（`Mon..Fri *-*-* 09:30:10`）入库并将 `scripts/l2-collector-watchdog.sh` 早盘窗口起点对齐至 `09:30`。
 
 - **L2 采集器重启恢复有界化与写盘异常可诊断化**：目录后端且 `.head` 有效、批数 ≥10,000 时，启动恢复仅扫描目录名并完整重验末尾 64 批，实测 `1,878,612` 批缓存恢复从全量审计约 528 秒降至 **2.0 秒**（不一致自动回退全量审计）；`CacheError` 增加 `detail` 诊断信息（细分 `disk_full` / `io_error` / `permission` / `out_of_memory`），缓存写入/状态/订阅回执异常时落盘 `.last-cache-error.json`，同时保持 `status.json` 的 `error_code="cache_error"` 兼容外部 schema。
