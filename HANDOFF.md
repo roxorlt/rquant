@@ -9,7 +9,7 @@
 
 ## 一、项目定位与当前真实边界
 
-**rQuant** 是个人自用的 A 股量化选股、实时盯盘、告警推送与可信策略研究平台（当前主线基线标签：`v0.38.1`（Web 已上线 `web-f5bd71c4`；L2 常驻采集核心仍为 `v0.35.5` / `8de81101`，独立归档组件 `l2-archive` 已于 2026-11-16 升级至 `f5bd71c4` 并完成新 archive epoch 初始化））。
+**rQuant** 是个人自用的 A 股量化选股、实时盯盘、告警推送与可信策略研究平台（当前主线基线标签：`v0.39.0`（Web 已上线 `web-f5bd71c4`；L2 常驻采集核心仍为 `v0.35.5` / `8de81101`，段式写盘与空种子修复已合入主线待盘后受控验收发布；独立归档组件 `l2-archive` 已于 2026-11-16 升级至 `f5bd71c4` 并完成新 archive epoch 初始化））。
 
 ### 1.1 核心边界
 - **只做**：盘后日线/因子/状态更新 → 条件筛选与候选池生成 → 盘中实时监控（分钟/快照/竞价/量能异动/受控 L2）→ 多通道告警通知（PushDeer / PushPlus）→ Point-in-Time（PIT）可信历史回放、策略评估与自动模拟盘。
@@ -160,6 +160,16 @@ cd notch_app && ./build.sh && ./install.sh
 > - **涉及文件**：...
 > - **验证与部署状态**：...
 > ```
+
+### 2026-11-17 · L2 空行情表容错、可选开盘前种子重试与 `09:30:10` 启动 timer 入库（`fix/l2-empty-seed-response` → `v0.39.0`）
+- **背景/问题**：
+  1. 2026-11-09 早盘开盘前供应商对种子请求返回了结构合法但零行的行情表，原 `FeedCollector._market` 将零行表一律判为 `decode_error` 导致采集器陷入重启循环并触发启动限频熔断；同时线上已启用的 `09:30:10` 启动 timer 与 `09:30` watchdog 早盘窗口尚未同步合入主仓（本次已获用户明确授权将 `deploy/systemd/` 与 `watchdog` 配置一并合入 `main`，且盘中绝不触碰线上服务）。
+- **主要变更**：
+  1. **零行合法行情表非致命处理**（`src/rquant/l2/feed.py`）：`result["table"]["rows"]` 为空时不再抛 `decode_error`，按控制帧计数（`control_count + 1`）；若为种子响应则将流状态标记为 `no_data`（`empty_seed_responses`），若为候选推送则仅计数不写缓存（`empty_push_responses`）。
+  2. **可选开盘前整轮种子重试**（`src/rquant/l2/{__main__,feed}.py`）：新增 `--seed-retry-until-open`（默认关闭），当整轮种子均无行情落地且上海时间早于 `09:32` 时，每 25s 断开重连发起新一轮种子请求；若过 `09:32` 仍全空则如实落盘 `blocked` / `seed_timeout`。
+  3. **启动 timer 与 watchdog 窗口入库同步**（`deploy/systemd/rquant-l2-collector-start.timer`、`scripts/l2-collector-watchdog.sh`、`docs/ops/README.md`）：入库 `Mon..Fri *-*-* 09:30:10` 启动 timer（`systemd-analyze calendar` 校验通过），将 `l2-collector-watchdog.sh` 早盘检查起点由 `09:15` 对齐至 `09:30`，并同步更新 `docs/ops/README.md` 服务表与运行手册。
+- **涉及文件**：`src/rquant/l2/{feed,__main__}.py`、`deploy/systemd/rquant-l2-collector-start.timer`、`scripts/l2-collector-watchdog.sh`、`docs/ops/README.md`、`tests/unit/test_l2_feed.py`、`CHANGELOG.md`、`HANDOFF.md`。
+- **验证与部署状态**：`ruff check --select F821,F822,F823,E9`、`pytest tests/unit/test_l2_feed.py tests/unit/test_l2_web.py`（含新增 6 项空种子/空推送/开盘前重试单测与 watchdog 双连击单测）及 `bash scripts/check-core-quality.sh` 全部通过；合入主线并打标 `v0.39.0`，盘中严守冻结纪律不重启线上服务，留待 `15:10 CST` 后统一完成新一轮 `acceptance-v3` 与受控发布。
 
 ### 2026-11-17 · L2 段式 append 写盘后端（`--write-mode segments`）、大缓存有界重启恢复与缓存异常诊断合入主线（`feat/l2-segment-log`）
 - **背景/问题**：

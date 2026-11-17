@@ -5,14 +5,15 @@ import socket
 import struct
 import json
 import time
-from datetime import UTC, datetime, timedelta, tzinfo
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 
 import pytest
 
 from rquant.l2.models import FeedStatus, MarketObservation
 
-from tests.unit.test_l2_codec import bootstrap, frame, module, response, template
+from tests.unit.test_l2_codec import bootstrap, frame, literal, module, response, template
 
 
 class Clock:
@@ -1112,7 +1113,7 @@ def test_receive_pump_prioritises_the_seed_over_queued_pushes(tmp_path: Path, pu
     provider = BurstProvider(clock, burst=200, at=1)
     cache = _slow_cache(0.004)(tmp_path / "cache")
     obj, cache, _ = _collector_with_inputs(
-        tmp_path, provider, clock, cache=cache, duration_seconds=6,
+        tmp_path, provider, clock, cache=cache, duration_seconds=12,
         symbols=("603258",), max_symbols=1, receive_pump=pump)
     status = obj.run()
     receipt = cache.read_subscription_status()
@@ -1246,6 +1247,8 @@ def test_batched_connections_assign_contiguous_stock_chunks(tmp_path: Path) -> N
     {"seed_pace_seconds": 0.5}, {"seed_pace_max_seconds": 0.5},
     {"seed_latency_soft_seconds": 0}, {"seed_retry_limit": 4},
     {"seed_retry_cooldown_seconds": 0}, {"receive_pump": "yes"},
+    {"seed_retry_until_open": "yes"}, {"seed_retry_interval_seconds": 0},
+    {"wall_clock": "clock"},
     {"pump_queue_frames": 0}, {"pump_priority_frames": 0},
 ])
 def test_flow_control_options_are_validated(tmp_path: Path, options: dict) -> None:
@@ -1312,6 +1315,7 @@ def test_throttled_status_skips_repeated_candidate_push_snapshots(tmp_path: Path
     assert throttled < legacy
     assert throttled <= 8
 
+
 def test_cache_failure_records_diagnostic_side_file(tmp_path: Path) -> None:
     from rquant.l2.cache import CacheError
     from rquant.l2.cache import RawL2Cache as _RawL2Cache
@@ -1350,4 +1354,192 @@ def test_subscription_receipt_cache_failure_records_diagnostic_side_file(tmp_pat
     detail = json.loads((tmp_path / "broken-receipt-cache" / ".last-cache-error.json").read_text())
     assert detail["code"] == "io_error"
     assert detail["detail"] == "errno=5"
+
+
+# --- 2026-11-09 pre-open empty seed: a data-less table is not a decode error ---
+
+
+SHANGHAI = timezone(timedelta(hours=8), "Asia/Shanghai")
+
+
+def empty_response(*, trade: bool, request_id: int, page_id: int,
+                   code: str = "603258") -> bytes:
+    """A well-formed market response whose decoded table carries zero rows."""
+    if trade:
+        columns = [(0x2001, 4), (0x38, 30), (0x100A, 4), (0x100D, 4),
+                   (0x104A, 4), (0x104B, 4), (0xA610, 4), (0x1012, 4)]
+        header = b"tb3.0\0" + struct.pack("<iiiHHH", 0, -1, 0, 156, 66, 8)
+        header += b"".join(struct.pack("<HBB", flag, width, 165) for flag, width in columns)
+        header += b"\0" * (156 - len(header))
+        data = header + struct.pack("<I", 4) + struct.pack(">I", 0)
+        flags = 0x1110
+    else:
+        title = (code + "-逐笔委托").encode("utf-16le")
+        extra = struct.pack("<H", len(title) // 2) + title + b"\0\0" * 6
+        header = b"tb1.0\0" + struct.pack("<iiiHHH", 0, -1, 0, 48 + len(extra), 30, 6)
+        header += b"".join(struct.pack("<HBB", flag, 4, 220)
+                           for flag in (0x2001, 0x100A, 0x100D, 0x200C, 0x2038, 0xA561))
+        data = header + extra
+        flags = 0x1100
+    payload = literal(data)
+    # Both families answer under the common 2357 outer window (the collector
+    # builds order requests that way); only the inner table schema differs.
+    return struct.pack("<HIIHIII", 32, request_id, flags, page_id,
+                       len(payload), 2357, 0) + b"\0" * 8 + payload
+
+
+class EmptySeedProvider(Provider):
+    """Answer seed requests with a zero-row table; optional wall-clock switch.
+
+    Handles repeated connections because a pre-open retry run starts a fresh
+    epoch (new socket) for every round.
+    """
+
+    def __init__(self, clock: Clock, wall_clock: Callable[[], datetime] | None = None,
+                 opens_at: datetime | None = None) -> None:
+        super().__init__(clock)
+        self.wall_clock, self.opens_at = wall_clock, opens_at
+        self.auth_frames = 0
+        self.empty_seeds = 0
+
+    def _empty_now(self) -> bool:
+        return self.opens_at is None or self.wall_clock() < self.opens_at
+
+    def sendall(self, data: bytes) -> None:
+        body = data[13:]
+        command = int.from_bytes(body[16:20], "little") if len(body) >= 20 else 0
+        if command not in (2267, 2357):
+            Socket.sendall(self, data)
+            self.auth_frames += 1
+            self.chunks.append(control(auth=True))
+            return
+        insertion = len(self.chunks)
+        super().sendall(data)
+        del self.chunks[insertion + 1:]  # drop the provider's synthetic EOF markers
+        if not self._empty_now():
+            return
+        self.empty_seeds += 1
+        parsed = self.business[-1][1]
+        self.chunks[insertion] = frame(empty_response(
+            trade=parsed["kind"] == "vendor4013", request_id=parsed["request_id"],
+            page_id=int(parsed["page_id"]), code=parsed["parameters"]["stockcode"]))
+
+
+class OneEmptySeedProvider(EmptySeedProvider):
+    """Only the very first seed request gets a zero-row table."""
+
+    def _empty_now(self) -> bool:
+        return len(self.business) == 1
+
+
+def test_empty_seed_tables_are_no_data_not_a_decode_failure(tmp_path: Path) -> None:
+    clock = Clock()
+    provider = EmptySeedProvider(clock)
+    obj, cache, calls = collector(tmp_path, provider, clock)
+    status = obj.run()
+    assert len(calls) == 1 and provider.closed and provider.auth_frames == 1
+    assert status.state == "stopped" and status.error_code == "duration_limit"
+    assert status.market_batch_count == 0 and status.last_sequence == 0
+    # One control for the bootstrap ack plus one per empty table.
+    assert status.control_count == 7 and status.unknown_push_count == 0
+    assert status.seed_queries == 6
+    assert obj.metrics["empty_seed_responses"] == 6
+    assert obj.metrics["empty_push_responses"] == 0
+    assert obj.metrics["seed_retry_until_open"] is False
+    assert obj.metrics["seed_retry_rounds"] == 0
+    receipt = cache.read_subscription_status()
+    assert receipt is not None and receipt.collector_state == "stopped"
+    assert all(stream.state == "no_data" and stream.seed_sequence is None
+               for stream in receipt.streams)
+    assert all(stream.request_id is not None for stream in receipt.streams)
+
+
+def test_one_empty_seed_marks_only_that_stream_no_data(tmp_path: Path) -> None:
+    clock = Clock()
+    provider = OneEmptySeedProvider(clock)
+    obj, cache, calls = collector(tmp_path, provider, clock)
+    status = obj.run()
+    assert len(calls) == 1 and provider.empty_seeds == 1
+    assert status.state == "stopped" and status.error_code == "duration_limit"
+    assert status.market_batch_count == 5 and status.last_sequence == 5
+    assert status.control_count == 2 and status.unknown_push_count == 0
+    assert obj.metrics["empty_seed_responses"] == 1
+    receipt = cache.read_subscription_status()
+    assert receipt is not None
+    empty = next(stream for stream in receipt.streams if stream.binding.page_id == 10117)
+    assert empty.state == "no_data" and empty.seed_sequence is None and empty.request_id == 3
+    assert sum(stream.seed_sequence is not None for stream in receipt.streams) == 5
+
+
+def test_empty_candidate_push_is_counted_and_never_cached(tmp_path: Path) -> None:
+    from rquant.l2.models import Binding
+
+    clock = Clock()
+    provider = Provider(clock)
+    obj, cache, _ = collector(tmp_path, provider, clock)
+    binding = Binding(page_id=10117, kind="vendor4013", code="603258", market=17)
+    obj.status = FeedStatus(state="connected", epoch_id="empty-push")
+    obj.registered[binding.page_id] = obj.issued[3] = binding
+    obj._deadline = clock() + 30
+    seed = response(trade=True, request_id=3, page_id=10117, code="603258")
+    push = sentinel_push(empty_response(trade=True, request_id=0xFFFFFFFF,
+                                        page_id=10117, code="603258"))
+    received_at = datetime.now(UTC)
+    with cache.writer():
+        assert obj._market(seed, 1, 3, "seed", received_at) is not None
+        assert obj._market(push, 2, 3, "seed", received_at) is None
+        stored = cache.read_status()
+    assert stored.market_batch_count == 1 and stored.last_sequence == 1
+    assert stored.control_count == 1 and stored.unknown_push_count == 0
+    assert obj.metrics["empty_push_responses"] == 1
+    assert obj.metrics["empty_seed_responses"] == 0
+    assert cache.read_subscription_status() is None
+
+
+def _wall_from(clock: Clock, started: datetime) -> Callable[[], datetime]:
+    origin = clock()
+
+    def wall() -> datetime:
+        return started + timedelta(seconds=clock() - origin)
+
+    return wall
+
+
+def test_preopen_seed_retry_waits_for_the_open_then_seeds(tmp_path: Path) -> None:
+    clock = Clock()
+    started = datetime(2026, 11, 9, 9, 29, 0, tzinfo=SHANGHAI)
+    wall = _wall_from(clock, started)
+    opens_at = started + timedelta(minutes=1)  # 09:30:00
+    provider = EmptySeedProvider(clock, wall, opens_at)
+    obj, cache, calls = collector(tmp_path, provider, clock, duration_seconds=360,
+                                  seed_retry_until_open=True,
+                                  seed_retry_interval_seconds=25, wall_clock=wall)
+    status = obj.run()
+    assert len(calls) == 3 and provider.auth_frames == 3
+    assert provider.empty_seeds == 12
+    assert obj.metrics["seed_retry_rounds"] == 2
+    assert status.state == "stopped" and status.error_code == "duration_limit"
+    assert status.market_batch_count == 6 and status.last_sequence == 6
+    assert obj.metrics["empty_seed_responses"] == 12
+    receipt = cache.read_subscription_status()
+    assert receipt is not None
+    assert all(stream.seed_sequence is not None for stream in receipt.streams)
+
+
+def test_seed_retry_stops_at_cutoff_and_reports_seed_timeout(tmp_path: Path) -> None:
+    clock = Clock()
+    started = datetime(2026, 11, 9, 9, 28, 0, tzinfo=SHANGHAI)
+    wall = _wall_from(clock, started)
+    provider = EmptySeedProvider(clock, wall)  # never opens: always empty
+    obj, cache, calls = collector(tmp_path, provider, clock, duration_seconds=600,
+                                  seed_retry_until_open=True,
+                                  seed_retry_interval_seconds=25, wall_clock=wall)
+    status = obj.run()
+    assert status.state == "blocked" and status.error_code == "seed_timeout"
+    assert status.market_batch_count == 0 and len(calls) >= 5
+    assert 200 <= clock() - 100 <= 320  # stopped near 09:32, not at the 600 s limit
+    assert obj.metrics["seed_retry_rounds"] >= 5
+    receipt = cache.read_subscription_status()
+    assert receipt is not None and receipt.collector_state == "blocked"
+    assert all(stream.state == "no_data" for stream in receipt.streams)
 

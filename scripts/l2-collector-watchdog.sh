@@ -45,7 +45,7 @@ run_systemctl() {
 NOW_HM="${WATCHDOG_NOW_HM:-$(date +%H%M)}"; NOW_HM_INT=$((10#${NOW_HM}))
 IN_WINDOW=0
 # 收盘集合竞价 15:00 结束；窗口截到 15:03，避免 15:03 之后把「收盘后无数据」误报为断流
-if { [ "${NOW_HM_INT}" -ge 915 ] && [ "${NOW_HM_INT}" -le 1135 ]; } || \
+if { [ "${NOW_HM_INT}" -ge 930 ] && [ "${NOW_HM_INT}" -le 1135 ]; } || \
    { [ "${NOW_HM_INT}" -ge 1255 ] && [ "${NOW_HM_INT}" -le 1503 ]; }; then
     IN_WINDOW=1
 fi
