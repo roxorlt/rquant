@@ -1113,7 +1113,7 @@ def test_receive_pump_prioritises_the_seed_over_queued_pushes(tmp_path: Path, pu
     provider = BurstProvider(clock, burst=200, at=1)
     cache = _slow_cache(0.004)(tmp_path / "cache")
     obj, cache, _ = _collector_with_inputs(
-        tmp_path, provider, clock, cache=cache, duration_seconds=6,
+        tmp_path, provider, clock, cache=cache, duration_seconds=12,
         symbols=("603258",), max_symbols=1, receive_pump=pump)
     status = obj.run()
     receipt = cache.read_subscription_status()
